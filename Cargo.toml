@@ -1,0 +1,26 @@
+[package]
+name = "scapegoat-bot"
+version = "0.1.0-alpha.1"
+edition = "2024"
+description = "ScapegoatBot - 一个 QQ Agent，代替用户像真人一样回复消息"
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+# HTTP 客户端，用于调用 LLM API
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# 序列化 / 反序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# TOML 解析（用于 Skill 清单文件）
+toml = "0.8"
+# 异步 trait 支持
+async-trait = "0.1"
+# 错误处理
+anyhow = "1"
+thiserror = "2"
+# 日志与追踪
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 时间处理
+chrono = "0.4"
