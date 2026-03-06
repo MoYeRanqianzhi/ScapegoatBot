@@ -1,0 +1,23 @@
+# ScapegoatBot 配置文件
+
+[napcat]
+# NapCat WebSocket 服务器地址
+ws_url = "ws://127.0.0.1:3001"
+# 认证 Token（与 NapCat 端配置一致，可选）
+# token = "your_token_here"
+
+[whitelist]
+# 可接收消息的群号列表
+recv_groups = []
+# 可接收消息的私聊 QQ 号列表
+recv_privates = []
+# 可发送消息的群号列表（必须是 recv_groups 的子集）
+send_groups = []
+# 可发送消息的私聊 QQ 号列表（必须是 recv_privates 的子集）
+send_privates = []
+
+[storage]
+# 工作区根目录
+workspace_dir = "./workspace"
+# 单个文件的最大消息条数（超过自动拆分新文件）
+max_messages_per_file = 500
