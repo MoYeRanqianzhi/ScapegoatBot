@@ -4,7 +4,14 @@ version = "0.1.0-alpha.1"
 edition = "2024"
 description = "ScapegoatBot - 一个 QQ Agent，代替用户像真人一样回复消息"
 
+# 二进制目标：生成名为 sbot 的可执行文件
+[[bin]]
+name = "sbot"
+path = "src/main.rs"
+
 [dependencies]
+# 命令行参数解析（derive 模式）
+clap = { version = "4", features = ["derive"] }
 # NapCatLink SDK — QQ 机器人 WebSocket 客户端
 napcat-link = { path = "../NapCatLink" }
 # 异步运行时
@@ -26,3 +33,5 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 时间处理
 chrono = "0.4"
+# 能力安全的文件系统访问（将读写限制在 workspace 目录内）
+cap-std = "3"

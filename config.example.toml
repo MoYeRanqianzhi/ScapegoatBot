@@ -21,3 +21,9 @@ send_privates = []
 workspace_dir = "./workspace"
 # 单个文件的最大消息条数（超过自动拆分新文件）
 max_messages_per_file = 500
+
+[identity]
+# LLM 模型名称（注入到系统提示的运行时段）
+model_name = "unknown"
+# 额外注入的身份文件（相对于 workspace_dir 的路径）
+# extra_files = ["custom/NOTES.md"]

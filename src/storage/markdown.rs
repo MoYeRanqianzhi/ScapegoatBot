@@ -9,6 +9,42 @@ use std::io::Write;
 use std::path::Path;
 
 // ============================================================================
+// 消息状态枚举
+// ============================================================================
+
+/// 消息存储状态，标识该消息在 Markdown 记录中的存储形式
+///
+/// 不同状态决定了正文内容的格式：
+/// - Raw：正文为消息原文（纯文本），可直接阅读
+/// - Wrapped：正文为 `<message>` 包裹的 CQ XML，包含转义和结构化标签
+/// - Compact：正文为压缩摘要，原文需查阅 JSONL
+/// - Linked：正文为引用标识，详情需查阅 JSONL
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageState {
+    /// 原始状态 — 纯文本消息，正文直接是消息原文，无任何 XML 包裹或 CQ 码转换
+    Raw,
+    /// 包裹状态 — 包含非文本段（@、表情、图片等需要 CQ 码表示）或存在格式干扰风险，
+    /// 正文使用 `<message>` 标签包裹并以 CQ XML 格式存储
+    Wrapped,
+    /// 压缩状态 — 原始消息过长，正文已压缩为摘要；如需原文应查阅 JSONL 文件
+    Compact,
+    /// 链接状态 — 不适合压缩也不适合直接嵌入（合并转发、超长 JSON 卡片等），
+    /// 正文仅包含指向原始数据的引用标识
+    Linked,
+}
+
+impl std::fmt::Display for MessageState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Raw => f.write_str("Raw"),
+            Self::Wrapped => f.write_str("Wrapped"),
+            Self::Compact => f.write_str("Compact"),
+            Self::Linked => f.write_str("Linked"),
+        }
+    }
+}
+
+// ============================================================================
 // 消息记录结构
 // ============================================================================
 
@@ -33,8 +69,8 @@ pub struct MessageRecord {
     pub remark: Option<String>,
     /// 身份描述（Friend / GroupMember (群号列表) / Stranger）
     pub identity: String,
-    /// 消息状态（Raw / Wrapped）
-    pub state: String,
+    /// 消息存储状态
+    pub state: MessageState,
     /// 消息内容（已经过 CQ XML 格式化的 <message>...</message>）
     pub content: String,
 }
