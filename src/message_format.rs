@@ -1,7 +1,13 @@
 // src/message_format.rs
 // 消息格式化模块
-// 将 NapCatLink 的 MessageSegment 数组转换为 <message> 包裹的 CQ XML 格式
-// 所有用户输入文本进行 XML 转义，防止提示词注入攻击
+// 职责：
+// 1. 判断消息是否需要 CQ XML 包裹（is_pure_text / needs_wrapping）
+// 2. 将 NapCatLink 的 MessageSegment 数组转换为 <message> 包裹的 CQ XML 格式
+// 所有用户输入文本在 CQ XML 中进行 XML 转义，防止提示词注入攻击
+//
+// 状态判定流程：
+// - 纯文本消息（仅 Text 段）且无格式干扰 → Raw 状态，直接存储 raw_message 原文
+// - 包含非文本段（@、表情、图片等）或存在格式干扰 → Wrapped 状态，使用本模块生成 CQ XML
 
 use napcat_link::MessageSegment;
 
@@ -84,6 +90,27 @@ fn face_name(id: &str) -> &str {
         "246" => "加油抱抱", "247" => "口罩护体",
         _ => "",
     }
+}
+
+// ============================================================================
+// 消息状态判断
+// ============================================================================
+
+/// 判断消息段数组是否全部为纯文本（不包含任何非 Text 段）
+/// 全部为 Text 段时返回 true —— 意味着可以直接使用 raw_message 存储（Raw 状态）
+/// 包含任何非 Text 段（@、表情、图片、回复等）时返回 false —— 需要 CQ XML 包裹（Wrapped 状态）
+pub fn is_pure_text(segments: &[MessageSegment]) -> bool {
+    segments
+        .iter()
+        .all(|seg| matches!(seg, MessageSegment::Text { .. }))
+}
+
+/// 判断一条消息是否需要 Wrapped（CQ XML 包裹）存储
+/// 需要包裹的条件（满足任一即可）：
+/// 1. 包含非文本段（@、表情、图片等需要 CQ 码表示的内容）
+/// 2. 原始文本包含 Markdown 记录分隔符 `\n---\n`，会干扰消息记录格式
+pub fn needs_wrapping(segments: &[MessageSegment], raw_message: &str) -> bool {
+    !is_pure_text(segments) || raw_message.contains("\n---\n")
 }
 
 // ============================================================================
@@ -378,5 +405,59 @@ mod tests {
         let xml = segments_to_message_xml(&segs);
         assert!(xml.contains("<CQ:image"));
         assert!(xml.contains("一张风景照"));
+    }
+
+    // ===== is_pure_text / needs_wrapping 测试 =====
+
+    #[test]
+    fn pure_text_segments_detected() {
+        // 仅 Text 段 → 纯文本
+        let segs = vec![
+            MessageSegment::Text { text: "你好".to_string() },
+            MessageSegment::Text { text: "世界".to_string() },
+        ];
+        assert!(is_pure_text(&segs));
+    }
+
+    #[test]
+    fn mixed_segments_not_pure_text() {
+        // 含 At 段 → 非纯文本
+        let segs = vec![
+            MessageSegment::At { qq: "123".to_string(), name: None },
+            MessageSegment::Text { text: " hello".to_string() },
+        ];
+        assert!(!is_pure_text(&segs));
+    }
+
+    #[test]
+    fn empty_segments_is_pure_text() {
+        // 空消息视为纯文本（无非文本段）
+        let segs: Vec<MessageSegment> = vec![];
+        assert!(is_pure_text(&segs));
+    }
+
+    #[test]
+    fn needs_wrapping_for_non_text_segment() {
+        // 含 Face 段 → 需要包裹
+        let segs = vec![MessageSegment::Face {
+            id: "178".to_string(),
+            result_id: None,
+            chain_count: None,
+        }];
+        assert!(needs_wrapping(&segs, ""));
+    }
+
+    #[test]
+    fn needs_wrapping_for_separator_in_raw() {
+        // 纯文本但 raw_message 含 \n---\n → 需要包裹（格式干扰）
+        let segs = vec![MessageSegment::Text { text: "aaa\n---\nbbb".to_string() }];
+        assert!(needs_wrapping(&segs, "aaa\n---\nbbb"));
+    }
+
+    #[test]
+    fn no_wrapping_for_simple_text() {
+        // 纯文本且无格式干扰 → 不需要包裹（Raw 状态）
+        let segs = vec![MessageSegment::Text { text: "你好世界".to_string() }];
+        assert!(!needs_wrapping(&segs, "你好世界"));
     }
 }

@@ -22,6 +22,15 @@ pub struct AppConfig {
     pub whitelist: WhitelistConfig,
     /// 消息存储配置
     pub storage: StorageConfig,
+    /// 身份与提示词配置（可选，缺省使用默认值）
+    #[serde(default)]
+    pub identity: IdentityConfig,
+    /// Skill 系统配置（可选，缺省无额外 skill 目录）
+    #[serde(default)]
+    pub skills: SkillsConfig,
+    /// 控制通道配置（可选，缺省使用默认端口 19800）
+    #[serde(default)]
+    pub control: ControlConfig,
 }
 
 // ============================================================================
@@ -85,6 +94,129 @@ fn default_workspace_dir() -> String {
 /// 默认每文件最大消息数
 fn default_max_messages() -> u32 {
     500
+}
+
+// ============================================================================
+// 身份与提示词配置
+// ============================================================================
+
+/// 身份与提示词注入配置
+/// 控制如何构建系统提示词（身份文件、Skill 注入模式、模型名称等）
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdentityConfig {
+    /// 主人账号（QQ 号字符串 或 "self"）
+    /// "self" 表示使用当前登录的 QQ 账号作为主人
+    /// 主人的消息将被单独复制用于语言风格总结
+    #[serde(default = "default_master")]
+    pub master: String,
+    /// 额外注入的身份文件列表（相对于 workspace_dir 的路径）
+    /// 除默认的 AGENTS.md、SOUL.md 等之外，额外注入的自定义文件
+    #[serde(default)]
+    pub extra_files: Vec<String>,
+    /// LLM 模型名称（注入到运行时段，供 LLM 自我认知）
+    #[serde(default = "default_model_name")]
+    pub model_name: String,
+}
+
+impl Default for IdentityConfig {
+    fn default() -> Self {
+        Self {
+            master: default_master(),
+            extra_files: Vec::new(),
+            model_name: default_model_name(),
+        }
+    }
+}
+
+impl IdentityConfig {
+    /// 判断 master 是否为 "self" 模式
+    pub fn is_master_self(&self) -> bool {
+        self.master.eq_ignore_ascii_case("self")
+    }
+
+    /// 获取 master 在系统提示词中的显示文本
+    /// "self" → "你当前所用账号"
+    /// QQ 号 → 原样返回
+    pub fn master_display(&self) -> &str {
+        if self.is_master_self() {
+            "你当前所用账号"
+        } else {
+            &self.master
+        }
+    }
+
+    /// 将 master 配置解析为实际 QQ 号
+    /// "self" 模式需要传入 bot 自身的 QQ 号
+    /// 返回 None 表示配置无效（非 "self" 且无法解析为数字）
+    pub fn resolve_master_qq(&self, self_qq: i64) -> Option<i64> {
+        if self.is_master_self() {
+            Some(self_qq)
+        } else {
+            self.master.parse::<i64>().ok()
+        }
+    }
+}
+
+/// 默认主人账号：self（使用当前登录账号）
+fn default_master() -> String {
+    "self".to_string()
+}
+
+/// 默认模型名称
+fn default_model_name() -> String {
+    "unknown".to_string()
+}
+
+// ============================================================================
+// Skill 系统配置
+// ============================================================================
+
+/// Skill 系统配置
+/// 指定要扫描的 skill 目录列表
+/// 每个目录下的子目录如果包含 SKILL.md 则被视为一个 Skill
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct SkillsConfig {
+    /// 要扫描的 skill 目录路径列表
+    /// 支持 `~` 展开为用户主目录
+    /// 目录不存在时自动跳过（便于跨机器共享配置）
+    #[serde(default)]
+    pub dirs: Vec<String>,
+}
+
+impl SkillsConfig {
+    /// 将配置中的路径字符串解析为 PathBuf
+    /// 展开 `~` 为用户主目录
+    pub fn resolve_dirs(&self) -> Vec<std::path::PathBuf> {
+        self.dirs
+            .iter()
+            .map(|raw| crate::skills::expand_tilde(raw))
+            .collect()
+    }
+}
+
+// ============================================================================
+// 控制通道配置
+// ============================================================================
+
+/// 控制通道配置
+/// 守护进程在 localhost 上监听此端口，接受来自 CLI 的控制指令
+#[derive(Debug, Clone, Deserialize)]
+pub struct ControlConfig {
+    /// 控制端口（默认 19800）
+    #[serde(default = "default_control_port")]
+    pub port: u16,
+}
+
+/// 默认控制端口
+/// 从 control 模块获取 DEFAULT_CONTROL_PORT 常量
+fn default_control_port() -> u16 {
+    crate::control::DEFAULT_CONTROL_PORT
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self { port: default_control_port() }
+    }
 }
 
 // ============================================================================
@@ -243,5 +375,42 @@ ws_url = "ws://127.0.0.1:3001"
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.storage.workspace_dir, "./workspace");
         assert_eq!(config.storage.max_messages_per_file, 500);
+    }
+
+    /// 测试：master 默认值为 "self"
+    #[test]
+    fn default_master_is_self() {
+        let toml_str = r#"
+[napcat]
+ws_url = "ws://127.0.0.1:3001"
+
+[whitelist]
+
+[storage]
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.identity.is_master_self());
+        assert_eq!(config.identity.master_display(), "你当前所用账号");
+        assert_eq!(config.identity.resolve_master_qq(123456), Some(123456));
+    }
+
+    /// 测试：master 设置为指定 QQ 号
+    #[test]
+    fn master_with_explicit_qq() {
+        let toml_str = r#"
+[napcat]
+ws_url = "ws://127.0.0.1:3001"
+
+[whitelist]
+
+[storage]
+
+[identity]
+master = "987654321"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.identity.is_master_self());
+        assert_eq!(config.identity.master_display(), "987654321");
+        assert_eq!(config.identity.resolve_master_qq(0), Some(987654321));
     }
 }

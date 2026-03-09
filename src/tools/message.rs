@@ -37,6 +37,8 @@ pub async fn send_private_message(
                 .get("message_id")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
+            // 记录 agent 发送的消息 ID（用于 master=self 时过滤）
+            ctx.record_agent_sent(msg_id);
             ToolResult::ok(format!("私聊消息已发送给 {user_id}，消息ID: {msg_id}"))
         }
         Err(e) => ToolResult::err(format!("发送私聊消息失败: {e}")),
@@ -73,6 +75,8 @@ pub async fn send_group_message(
                 .get("message_id")
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
+            // 记录 agent 发送的消息 ID（用于 master=self 时过滤）
+            ctx.record_agent_sent(msg_id);
             ToolResult::ok(format!("群消息已发送到群 {group_id}，消息ID: {msg_id}"))
         }
         Err(e) => ToolResult::err(format!("发送群消息失败: {e}")),

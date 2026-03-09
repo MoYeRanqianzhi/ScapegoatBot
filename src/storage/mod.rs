@@ -3,6 +3,7 @@
 // 路由消息到对应的 JSONL（原始）和 MD（AI可读）写入器
 // 管理按日期+序号拆分的文件结构
 
+pub mod cursor;
 pub mod jsonl;
 pub mod markdown;
 
@@ -140,6 +141,21 @@ impl StorageManager {
         record: &markdown::MessageRecord,
     ) -> Result<()> {
         let dir = self.session_dir(session_type, session_id)?;
+        let today = Local::now().date_naive();
+        let path = self.resolve_file_path(&dir, today, "md")?;
+
+        markdown::append_markdown(&path, record)
+    }
+
+    /// 存储主人的消息到风格分析文件
+    /// 独立存储到 messages/master_style/ 目录下，按日期拆分
+    /// 用于 LLM 学习主人的说话风格
+    pub fn store_master_style(&self, record: &markdown::MessageRecord) -> Result<()> {
+        let dir = self.messages_dir.join("master_style");
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("创建 master_style 目录失败: {}", dir.display()))?;
+        }
         let today = Local::now().date_naive();
         let path = self.resolve_file_path(&dir, today, "md")?;
 
