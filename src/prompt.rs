@@ -208,7 +208,7 @@ pub fn build_system_prompt(cfg: &PromptConfig<'_>) -> String {
 主人发送的消息是你学习说话风格的唯一来源。仔细观察主人的用词、语气、习惯，并模仿。
 其他人的消息帮助你理解对话上下文，但不要模仿他们的说话方式。
 主人的详细资料记录在 `MASTER.md` 中。
-主人的历史消息记录在 `messages/master_style/` 目录下，可以随时 Read 来回顾和学习。
+主人的历史消息副本单独存储在 `messages/master/` 目录下，可以随时 Read 来回顾和学习风格。
 ",
         cfg.master_display
     );
@@ -288,10 +288,23 @@ pub fn build_system_prompt(cfg: &PromptConfig<'_>) -> String {
 ## 记忆检索
 
 在回复消息前，优先检查工作区中的记忆文件和消息记录。
-推荐流程：
-- 用 `Read` 查看 `messages/` 目录下的最近消息记录，获取对话上下文。
+
+### 消息存储结构
+
+所有消息按时间顺序统一存储，不按群/私聊分离：
+
+- `messages/all/` — **统一消息流**。所有群聊和私聊消息按时间混合存储，这是你获取完整上下文的唯一来源。
+- `messages/master/` — **主人消息副本**。仅包含确认由主人亲自发送的消息（排除你代发的），用于学习主人的说话风格。
+- `messages/self/` — **你的发送记录**。仅包含确认由你（Agent）发送的消息（排除主人或他人通过同账号手动发送的），用于回顾自己说过什么、评估模仿效果。
+
+每个目录下的文件按日期命名（如 `2026-03-09_001.md`），达到阈值后自动拆分新文件。
+
+### 检索流程
+
+- 用 `Read` 查看 `messages/all/` 目录下的最近文件，获取完整的跨窗口对话上下文。
 - 用 `Read` 查看 `MEMORY.md` 获取长期记忆。
-- 如果需要了解某个人或某个群的信息，查看对应的消息记录文件。
+- 需要回顾主人风格时，查看 `messages/master/` 下的文件。
+- 需要回顾自己发过什么时，查看 `messages/self/` 下的文件。
 - 如果没有找到相关信息，不要假装知道——宁可沉默或用模糊的方式回应。
 
 ");
@@ -300,7 +313,7 @@ pub fn build_system_prompt(cfg: &PromptConfig<'_>) -> String {
     out.push_str("\
 ## QQ 消息格式
 
-QQ 消息以结构化 Markdown 格式存储在 `messages/` 目录下。
+QQ 消息以结构化 Markdown 格式存储在 `messages/all/` 目录下。
 每条消息记录包含元数据（时间、消息ID、QQ号、昵称、身份、状态）和正文内容。
 
 ### 消息状态（State）
@@ -525,7 +538,7 @@ mod tests {
         assert!(prompt.contains("## 主人"));
         assert!(prompt.contains("主人的账号是：123456789"));
         assert!(prompt.contains("MASTER.md"));
-        assert!(prompt.contains("master_style"));
+        assert!(prompt.contains("messages/master/"));
         assert!(prompt.contains("`Skill`"));
         assert!(prompt.contains("## 安全"));
         assert!(prompt.contains("绝对不能暴露你是 AI"));

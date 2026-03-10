@@ -13,35 +13,19 @@ use chrono::{Local, NaiveDate};
 use std::path::{Path, PathBuf};
 
 // ============================================================================
-// 会话类型
-// ============================================================================
-
-/// 会话类型枚举，用于确定存储目录
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionType {
-    /// 群聊会话
-    Group,
-    /// 私聊会话
-    Private,
-}
-
-impl SessionType {
-    /// 获取对应的子目录名
-    fn dir_name(&self) -> &str {
-        match self {
-            SessionType::Group => "group",
-            SessionType::Private => "private",
-        }
-    }
-}
-
-// ============================================================================
 // 存储管理器
 // ============================================================================
 
 /// 消息存储管理器
 /// 负责将消息持久化到文件系统
-/// 文件结构: {messages_dir}/{group|private}/{session_id}/{date}_{seq}.{jsonl|md}
+///
+/// 核心设计：所有消息按时间顺序统一存储在 `messages/all/` 目录中，
+/// 不按群/私聊分离，确保 Agent 能看到完整的时间线上下文。
+///
+/// 文件结构:
+/// - `messages/all/{date}_{seq}.{jsonl|md}` — 全部消息的统一时间流
+/// - `messages/master/{date}_{seq}.md` — 主人消息副本（用于风格学习）
+/// - `messages/self/{date}_{seq}.md` — Agent 自发消息副本（用于自我分析）
 #[derive(Debug, Clone)]
 pub struct StorageManager {
     /// 消息存储根目录（如 ./workspace/messages）
@@ -60,14 +44,9 @@ impl StorageManager {
         }
     }
 
-    /// 获取指定会话的存储目录路径
-    /// 如果目录不存在则自动创建
-    fn session_dir(&self, session_type: SessionType, session_id: i64) -> Result<PathBuf> {
-        let dir = self
-            .messages_dir
-            .join(session_type.dir_name())
-            .join(session_id.to_string());
-        // 确保目录存在
+    /// 确保指定子目录存在并返回其路径
+    fn ensure_dir(&self, sub: &str) -> Result<PathBuf> {
+        let dir = self.messages_dir.join(sub);
         if !dir.exists() {
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("创建存储目录失败: {}", dir.display()))?;
@@ -79,12 +58,12 @@ impl StorageManager {
     /// 如果当天最新文件的行数已达上限，序号 +1
     ///
     /// # 参数
-    /// - `session_dir`: 会话目录路径
+    /// - `dir`: 目标目录路径
     /// - `date`: 当天日期
     /// - `ext`: 文件扩展名（"jsonl" 或 "md"）
     fn resolve_file_path(
         &self,
-        session_dir: &Path,
+        dir: &Path,
         date: NaiveDate,
         ext: &str,
     ) -> Result<PathBuf> {
@@ -94,14 +73,9 @@ impl StorageManager {
         // 查找当天已存在的最大序号
         loop {
             let filename = format!("{date_str}_{seq:03}.{ext}");
-            let path = session_dir.join(&filename);
+            let path = dir.join(&filename);
 
             if !path.exists() {
-                // 文件不存在：如果是序号 1 则直接用，否则前一个文件未满就用前一个
-                if seq > 1 {
-                    // 前一个文件存在但可能未满
-                    return Ok(path);
-                }
                 return Ok(path);
             }
 
@@ -117,48 +91,43 @@ impl StorageManager {
         }
     }
 
-    /// 存储一条原始消息到 JSONL 文件
-    /// 将消息的完整 JSON 追加到对应的 .jsonl 文件中
-    pub fn store_raw_jsonl(
-        &self,
-        session_type: SessionType,
-        session_id: i64,
-        raw_json: &serde_json::Value,
-    ) -> Result<()> {
-        let dir = self.session_dir(session_type, session_id)?;
+    /// 存储一条原始消息到统一 JSONL 文件
+    /// 所有群聊和私聊的原始 JSON 按时间顺序追加到 messages/all/ 下
+    pub fn store_raw_jsonl(&self, raw_json: &serde_json::Value) -> Result<()> {
+        let dir = self.ensure_dir("all")?;
         let today = Local::now().date_naive();
         let path = self.resolve_file_path(&dir, today, "jsonl")?;
-
         jsonl::append_jsonl(&path, raw_json)
     }
 
-    /// 存储一条格式化消息到 MD 文件
-    /// 将结构化的 MessageRecord 追加到对应的 .md 文件中
-    pub fn store_markdown(
-        &self,
-        session_type: SessionType,
-        session_id: i64,
-        record: &markdown::MessageRecord,
-    ) -> Result<()> {
-        let dir = self.session_dir(session_type, session_id)?;
+    /// 存储一条格式化消息到统一 MD 文件
+    /// 所有群聊和私聊的结构化消息按时间顺序追加到 messages/all/ 下
+    pub fn store_markdown(&self, record: &markdown::MessageRecord) -> Result<()> {
+        let dir = self.ensure_dir("all")?;
         let today = Local::now().date_naive();
         let path = self.resolve_file_path(&dir, today, "md")?;
-
         markdown::append_markdown(&path, record)
     }
 
     /// 存储主人的消息到风格分析文件
-    /// 独立存储到 messages/master_style/ 目录下，按日期拆分
+    /// 独立存储到 messages/master/ 目录下，按日期拆分
     /// 用于 LLM 学习主人的说话风格
-    pub fn store_master_style(&self, record: &markdown::MessageRecord) -> Result<()> {
-        let dir = self.messages_dir.join("master_style");
-        if !dir.exists() {
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("创建 master_style 目录失败: {}", dir.display()))?;
-        }
+    /// 注意：当 master=self 时，此处仅包含主人本人发送的消息，不含 Agent 发送的
+    pub fn store_master(&self, record: &markdown::MessageRecord) -> Result<()> {
+        let dir = self.ensure_dir("master")?;
         let today = Local::now().date_naive();
         let path = self.resolve_file_path(&dir, today, "md")?;
+        markdown::append_markdown(&path, record)
+    }
 
+    /// 存储 Agent 自发消息到独立文件
+    /// 独立存储到 messages/self/ 目录下，按日期拆分
+    /// 仅包含 Agent 确认发送的消息（排除主人或他人通过同账号发送的）
+    /// 用于自我分析、模仿程度评估等
+    pub fn store_self(&self, record: &markdown::MessageRecord) -> Result<()> {
+        let dir = self.ensure_dir("self")?;
+        let today = Local::now().date_naive();
+        let path = self.resolve_file_path(&dir, today, "md")?;
         markdown::append_markdown(&path, record)
     }
 }

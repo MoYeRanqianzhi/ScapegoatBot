@@ -26,12 +26,20 @@ pub const ROLE_TOOL: &str = "tool";
 
 /// 对话中的单条消息
 /// 每条消息包含角色（system/user/assistant/tool）和文本内容
+/// 扩展字段支持 OpenAI 原生工具调用协议
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// 消息角色：system、user、assistant 或 tool
     pub role: String,
     /// 消息文本内容
     pub content: String,
+    /// 助手消息中的工具调用请求列表（仅 role=assistant 时使用）
+    /// 空列表表示没有工具调用
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    /// 此消息回复的工具调用 ID（仅 role=tool 时使用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -40,6 +48,8 @@ impl ChatMessage {
         Self {
             role: ROLE_SYSTEM.into(),
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -48,6 +58,8 @@ impl ChatMessage {
         Self {
             role: ROLE_USER.into(),
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
@@ -56,14 +68,46 @@ impl ChatMessage {
         Self {
             role: ROLE_ASSISTANT.into(),
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
 
-    /// 创建工具消息，代表工具执行后的返回值
+    /// 创建带工具调用的助手消息
+    /// LLM 请求执行一个或多个工具时使用
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
+        Self {
+            role: ROLE_ASSISTANT.into(),
+            content: content.into(),
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// 创建工具消息，代表工具执行后的返回值（无 tool_call_id 的兼容版本）
     pub fn tool(content: impl Into<String>) -> Self {
         Self {
             role: ROLE_TOOL.into(),
             content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    /// 创建工具结果消息，包含 tool_call_id 以关联回原始请求
+    /// 这是 OpenAI 原生工具调用协议要求的格式
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: ROLE_TOOL.into(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 }

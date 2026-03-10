@@ -23,7 +23,45 @@ workspace_dir = "./workspace"
 max_messages_per_file = 500
 
 [identity]
-# LLM 模型名称（注入到系统提示的运行时段）
-model_name = "unknown"
+# 主人账号：填写 QQ 号或 "self"（使用当前登录账号）
+# master = "self"
 # 额外注入的身份文件（相对于 workspace_dir 的路径）
 # extra_files = ["custom/NOTES.md"]
+
+[llm]
+# OpenAI 兼容的 API 基础 URL
+# 支持 OpenAI、DeepSeek、Moonshot、本地 Ollama 等任何兼容服务
+base_url = "https://api.openai.com/v1"
+# API 密钥（Bearer token）
+api_key = ""
+# 模型名称
+model = "gpt-4o"
+# 系统指令的角色名称（默认 "system"，某些提供商如 OpenAI o 系列要求 "developer"）
+# system_role_name = "system"
+# 推理深度/努力程度（可选，仅对支持该参数的模型有效）
+# 常见值：none, minimal, low, medium, high, xhigh
+# reasoning_effort = "medium"
+# 每个任务的最大工具调用步数（安全上限，防止无限循环）
+max_steps = 32
+
+[compaction]
+# 是否启用上下文压缩（当对话过长时自动将历史压缩为摘要）
+enabled = true
+# 触发压缩的近似总 token 数阈值
+# 包括：系统提示 + 已有摘要 + 对话消息 + 工具定义
+trigger_tokens = 180000
+# 保留为最近后缀的近似 token 预算（这些最新消息保持原样不被压缩）
+keep_recent_tokens = 8000
+# 为摘要生成响应预留的最大 token 数
+reserve_summary_tokens = 4096
+# 拒绝压缩的最少消息数（过少的对话无需压缩）
+min_messages_to_compact = 8
+
+[skills]
+# 要扫描的 skill 目录路径列表（支持 ~ 展开为用户主目录）
+# 目录不存在时自动跳过
+# dirs = ["~/my-skills", "/shared/skills"]
+
+[control]
+# 控制通道端口（CLI 通过此端口与守护进程通信）
+port = 19800

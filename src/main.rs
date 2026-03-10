@@ -7,10 +7,12 @@
 // 模块声明
 // ============================================================================
 
+mod agent;
 mod agent_state;
 mod cli;
 mod control;
 mod control_server;
+mod compact;
 mod config;
 mod message_format;
 mod prompt;
@@ -28,7 +30,7 @@ use config::AppConfig;
 use message_format::{needs_wrapping, segments_to_message_xml};
 use skills::SkillRegistry;
 use storage::markdown::{MessageRecord, MessageState};
-use storage::{SessionType, StorageManager};
+use storage::StorageManager;
 use tools::ToolContext;
 use whitelist::Whitelist;
 
@@ -301,12 +303,48 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
         if master_is_self { "self 模式" } else { "指定 QQ 号" }
     );
 
+    // ===== 6.5 Bot 自身 QQ 号 =====
+
+    // bot_qq 始终从第一条收到消息的 self_id 解析，用于判断自发消息
+    // 与 master_qq 独立：master 可能是不同的 QQ 号
+    let bot_qq = Arc::new(AtomicI64::new(0));
+
+    // ===== 6.6 Agent 消息通道与启动 =====
+
+    // 创建无界通道，用于事件监听器向 Agent 发送消息事件
+    let (agent_tx, agent_rx) = tokio::sync::mpsc::unbounded_channel::<agent::MessageEvent>();
+
+    // 创建并启动 Agent 运行器
+    if config.llm.is_configured() {
+        match agent::AgentRunner::new(
+            Arc::new(config.clone()),
+            tool_ctx.clone(),
+            agent_state.clone(),
+            agent_rx,
+        ) {
+            Ok(runner) => {
+                tokio::spawn(runner.run());
+                tracing::info!("Agent 循环已启动（模型: {}）", config.llm.model);
+            }
+            Err(e) => {
+                tracing::error!("Agent 初始化失败: {}（消息存储将继续，但不会自动回复）", e);
+                // agent_rx 被丢弃，agent_tx.send() 后续会返回 Err 但无害
+            }
+        }
+    } else {
+        tracing::warn!("LLM 未配置（base_url 或 api_key 为空），Agent 不会启动。消息存储正常工作。");
+        // agent_rx 被丢弃
+        drop(agent_rx);
+    }
+
     // ===== 7. 消息事件监听任务 =====
 
     // 克隆 Arc 引用，传入 spawn 的异步任务
     let storage_clone = storage.clone();
     let tool_ctx_clone = tool_ctx.clone();
     let master_qq_clone = master_qq.clone();
+    let bot_qq_clone = bot_qq.clone();
+    let agent_tx_clone = agent_tx.clone();
     // 在后台 tokio 任务中运行消息事件监听循环
     tokio::spawn(async move {
         tracing::info!("消息事件监听任务已启动");
@@ -327,17 +365,27 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
             if event_name.starts_with("message.group") {
                 // ----- 群消息处理 -----
                 if let Ok(msg) = serde_json::from_value::<GroupMessageEvent>(event.data.clone()) {
-                    // 首次收到消息时解析 self_id（用于 master=self 模式）
+                    // 首次收到消息时解析 bot 自身 QQ 号和 master QQ
+                    if bot_qq_clone.load(Ordering::Relaxed) == 0 {
+                        bot_qq_clone.store(msg.self_id, Ordering::Relaxed);
+                        tracing::info!("Bot QQ 已解析为 {}", msg.self_id);
+                    }
                     if master_is_self && master_qq_clone.load(Ordering::Relaxed) == 0 {
                         master_qq_clone.store(msg.self_id, Ordering::Relaxed);
-                        tracing::info!("master=self 模式：已解析主人 QQ 为 {}", msg.self_id);
+                        tracing::info!("master=self 模式：主人 QQ = {}", msg.self_id);
+                    }
+                    // 白名单过滤：不在收白名单中的群消息直接丢弃
+                    if !tool_ctx_clone.whitelist.can_recv_group(msg.group_id) {
+                        continue;
                     }
                     handle_group_message(
                         &storage_clone,
                         &msg,
                         master_qq_clone.load(Ordering::Relaxed),
+                        bot_qq_clone.load(Ordering::Relaxed),
                         master_is_self,
                         &tool_ctx_clone,
+                        &agent_tx_clone,
                     );
                 }
             } else if event_name.starts_with("message.private") {
@@ -345,17 +393,27 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
                 if let Ok(msg) =
                     serde_json::from_value::<PrivateMessageEvent>(event.data.clone())
                 {
-                    // 首次收到消息时解析 self_id（用于 master=self 模式）
+                    // 首次收到消息时解析 bot 自身 QQ 号和 master QQ
+                    if bot_qq_clone.load(Ordering::Relaxed) == 0 {
+                        bot_qq_clone.store(msg.self_id, Ordering::Relaxed);
+                        tracing::info!("Bot QQ 已解析为 {}", msg.self_id);
+                    }
                     if master_is_self && master_qq_clone.load(Ordering::Relaxed) == 0 {
                         master_qq_clone.store(msg.self_id, Ordering::Relaxed);
-                        tracing::info!("master=self 模式：已解析主人 QQ 为 {}", msg.self_id);
+                        tracing::info!("master=self 模式：主人 QQ = {}", msg.self_id);
+                    }
+                    // 白名单过滤：不在收白名单中的私聊消息直接丢弃
+                    if !tool_ctx_clone.whitelist.can_recv_private(msg.user_id) {
+                        continue;
                     }
                     handle_private_message(
                         &storage_clone,
                         &msg,
                         master_qq_clone.load(Ordering::Relaxed),
+                        bot_qq_clone.load(Ordering::Relaxed),
                         master_is_self,
                         &tool_ctx_clone,
+                        &agent_tx_clone,
                     );
                 }
             } else if event_name.starts_with("request.friend") {
@@ -388,9 +446,37 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
 
     // ===== 8. 连接 NapCat 服务器 =====
 
-    // 发起 WebSocket 连接（阻塞直到握手成功）
-    client.connect().await?;
-    tracing::info!("已连接到 NapCat: {}", config.napcat.ws_url);
+    // 带重试的初始连接：如果 NapCat 尚未就绪，每隔一段时间重试
+    // 避免因启动顺序导致 sbot 直接退出
+    {
+        let max_initial_retries = 30; // 最多重试 30 次（约 5 分钟）
+        let retry_interval = std::time::Duration::from_secs(10);
+        let mut attempt = 0;
+
+        loop {
+            attempt += 1;
+            match client.connect().await {
+                Ok(()) => {
+                    tracing::info!("已连接到 NapCat: {}", config.napcat.ws_url);
+                    break;
+                }
+                Err(e) => {
+                    if attempt >= max_initial_retries {
+                        tracing::error!(
+                            "连接 NapCat 失败，已重试 {} 次，放弃: {}",
+                            attempt, e
+                        );
+                        anyhow::bail!("无法连接到 NapCat: {}", e);
+                    }
+                    tracing::warn!(
+                        "连接 NapCat 失败 (第 {}/{} 次)，{}秒后重试: {}",
+                        attempt, max_initial_retries, retry_interval.as_secs(), e
+                    );
+                    tokio::time::sleep(retry_interval).await;
+                }
+            }
+        }
+    }
 
     // ===== 9. 等待关闭信号 =====
 
@@ -459,21 +545,22 @@ fn spawn_daemon(config_path: &str) -> anyhow::Result<()> {
 // 消息处理函数
 // ============================================================================
 
-/// 处理群聊消息：白名单检查 → 存储 JSONL → 存储 MD → 主人消息复制
+/// 处理群聊消息：统一存储 → 主人消息副本 → Agent 自发消息副本 → 通知 Agent
 fn handle_group_message(
     storage: &StorageManager,
     msg: &GroupMessageEvent,
     master_qq: i64,
+    bot_qq: i64,
     master_is_self: bool,
     tool_ctx: &ToolContext,
+    agent_tx: &tokio::sync::mpsc::UnboundedSender<agent::MessageEvent>,
 ) {
     let group_id = msg.group_id;
 
-    // 白名单检查已在上层完成（此处可由 whitelist 做二次检查）
-    // 存储原始 JSON
+    // ===== 统一存储：JSONL + MD =====
     if let Ok(raw_json) = serde_json::to_value(msg) {
-        if let Err(e) = storage.store_raw_jsonl(SessionType::Group, group_id, &raw_json) {
-            tracing::error!("存储群消息 JSONL 失败 (群={}): {}", group_id, e);
+        if let Err(e) = storage.store_raw_jsonl(&raw_json) {
+            tracing::error!("存储消息 JSONL 失败 (群={}): {}", group_id, e);
         }
     }
 
@@ -484,16 +571,12 @@ fn handle_group_message(
         .map(|dt| dt.format("%H:%M:%S").to_string())
         .unwrap_or_else(|| "??:??:??".to_string());
 
-    // 根据消息内容判断存储状态和格式：
-    // - Raw：纯文本消息，直接存储 raw_message 原文
-    // - Wrapped：包含非文本段（@、表情、图片等）或存在格式干扰，用 <message> + CQ XML 包裹
     let (state, content) = if needs_wrapping(&msg.message, &msg.raw_message) {
         (MessageState::Wrapped, segments_to_message_xml(&msg.message))
     } else {
         (MessageState::Raw, msg.raw_message.clone())
     };
 
-    // 提取发送者信息
     let nick = msg
         .sender
         .nickname
@@ -509,54 +592,84 @@ fn handle_group_message(
         qq: msg.user_id,
         nick,
         group_nick,
-        remark: None, // 群消息中没有备注信息
+        remark: None,
         identity: format!("GroupMember ({group_id})"),
         state,
         content,
     };
 
-    if let Err(e) = storage.store_markdown(SessionType::Group, group_id, &record) {
-        tracing::error!("存储群消息 MD 失败 (群={}): {}", group_id, e);
+    if let Err(e) = storage.store_markdown(&record) {
+        tracing::error!("存储消息 MD 失败 (群={}): {}", group_id, e);
     }
 
-    // ===== 主人消息复制 =====
-    // 如果发送者是主人，将消息复制到 master_style 目录用于语言风格学习
+    // ===== 主人消息副本 =====
+    // 确认为主人发送：master=self 模式下排除 Agent 发送的消息
     if master_qq != 0 && msg.user_id == master_qq {
-        // master=self 模式：过滤 agent 发送的消息
         let is_agent_msg = master_is_self && tool_ctx.is_agent_sent(msg.message_id);
         if !is_agent_msg {
-            if let Err(e) = storage.store_master_style(&record) {
+            if let Err(e) = storage.store_master(&record) {
                 tracing::error!("存储主人风格消息失败 (群={}): {}", group_id, e);
             }
         }
     }
+
+    // ===== Agent 自发消息副本 =====
+    // 确认为 Agent 发送：来自 bot 账号且被 is_agent_sent 追踪到
+    if bot_qq != 0 && msg.user_id == bot_qq && tool_ctx.is_agent_sent(msg.message_id) {
+        if let Err(e) = storage.store_self(&record) {
+            tracing::error!("存储自发消息失败 (群={}): {}", group_id, e);
+        }
+    }
+
+    // ===== 通知 Agent =====
+    // 将格式化的消息记录发送给 Agent 处理
+    // Agent 自己发送的消息不需要通知（避免自我循环）
+    let is_self_sent = bot_qq != 0 && msg.user_id == bot_qq;
+    if !is_self_sent {
+        let formatted = format!(
+            "[群消息] 群:{} | 时间:{} | MsgID:{} | QQ:{} | 昵称:{}{} | 身份:{}\n{}",
+            group_id,
+            record.time,
+            record.message_id,
+            record.qq,
+            record.nick,
+            record
+                .group_nick
+                .as_ref()
+                .map(|n| format!("({})", n))
+                .unwrap_or_default(),
+            record.identity,
+            record.content,
+        );
+        let _ = agent_tx.send(agent::MessageEvent { formatted });
+    }
 }
 
-/// 处理私聊消息：白名单检查 → 存储 JSONL → 存储 MD → 主人消息复制
+/// 处理私聊消息：统一存储 → 主人消息副本 → Agent 自发消息副本 → 通知 Agent
 fn handle_private_message(
     storage: &StorageManager,
     msg: &PrivateMessageEvent,
     master_qq: i64,
+    bot_qq: i64,
     master_is_self: bool,
     tool_ctx: &ToolContext,
+    agent_tx: &tokio::sync::mpsc::UnboundedSender<agent::MessageEvent>,
 ) {
     let user_id = msg.user_id;
 
-    // 存储原始 JSON
+    // ===== 统一存储：JSONL + MD =====
     if let Ok(raw_json) = serde_json::to_value(msg) {
-        if let Err(e) = storage.store_raw_jsonl(SessionType::Private, user_id, &raw_json) {
-            tracing::error!("存储私聊消息 JSONL 失败 (QQ={}): {}", user_id, e);
+        if let Err(e) = storage.store_raw_jsonl(&raw_json) {
+            tracing::error!("存储消息 JSONL 失败 (QQ={}): {}", user_id, e);
         }
     }
 
-    // 构建 MD 记录
     let time_str = Local
         .timestamp_opt(msg.time, 0)
         .single()
         .map(|dt| dt.format("%H:%M:%S").to_string())
         .unwrap_or_else(|| "??:??:??".to_string());
 
-    // 根据消息内容判断存储状态和格式（逻辑同群消息）
     let (state, content) = if needs_wrapping(&msg.message, &msg.raw_message) {
         (MessageState::Wrapped, segments_to_message_xml(&msg.message))
     } else {
@@ -569,7 +682,6 @@ fn handle_private_message(
         .clone()
         .unwrap_or_else(|| msg.user_id.to_string());
 
-    // 根据 sub_type 判断身份
     let identity = match msg.sub_type.as_str() {
         "friend" => "Friend".to_string(),
         "group" => "GroupMember".to_string(),
@@ -590,19 +702,39 @@ fn handle_private_message(
         content,
     };
 
-    if let Err(e) = storage.store_markdown(SessionType::Private, user_id, &record) {
-        tracing::error!("存储私聊消息 MD 失败 (QQ={}): {}", user_id, e);
+    if let Err(e) = storage.store_markdown(&record) {
+        tracing::error!("存储消息 MD 失败 (QQ={}): {}", user_id, e);
     }
 
-    // ===== 主人消息复制 =====
-    // 如果发送者是主人，将消息复制到 master_style 目录用于语言风格学习
+    // ===== 主人消息副本 =====
     if master_qq != 0 && msg.user_id == master_qq {
-        // master=self 模式：过滤 agent 发送的消息
         let is_agent_msg = master_is_self && tool_ctx.is_agent_sent(msg.message_id);
         if !is_agent_msg {
-            if let Err(e) = storage.store_master_style(&record) {
+            if let Err(e) = storage.store_master(&record) {
                 tracing::error!("存储主人风格消息失败 (QQ={}): {}", user_id, e);
             }
         }
+    }
+
+    // ===== Agent 自发消息副本 =====
+    if bot_qq != 0 && msg.user_id == bot_qq && tool_ctx.is_agent_sent(msg.message_id) {
+        if let Err(e) = storage.store_self(&record) {
+            tracing::error!("存储自发消息失败 (QQ={}): {}", user_id, e);
+        }
+    }
+
+    // ===== 通知 Agent =====
+    let is_self_sent = bot_qq != 0 && msg.user_id == bot_qq;
+    if !is_self_sent {
+        let formatted = format!(
+            "[私聊消息] 时间:{} | MsgID:{} | QQ:{} | 昵称:{} | 身份:{}\n{}",
+            record.time,
+            record.message_id,
+            record.qq,
+            record.nick,
+            record.identity,
+            record.content,
+        );
+        let _ = agent_tx.send(agent::MessageEvent { formatted });
     }
 }

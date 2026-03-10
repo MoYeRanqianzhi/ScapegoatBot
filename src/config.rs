@@ -25,6 +25,12 @@ pub struct AppConfig {
     /// 身份与提示词配置（可选，缺省使用默认值）
     #[serde(default)]
     pub identity: IdentityConfig,
+    /// LLM 提供商配置（可选，缺省需要在启动前手动配置）
+    #[serde(default)]
+    pub llm: LlmConfig,
+    /// 上下文压缩配置（可选，缺省使用默认值）
+    #[serde(default)]
+    pub compaction: CompactionConfig,
     /// Skill 系统配置（可选，缺省无额外 skill 目录）
     #[serde(default)]
     pub skills: SkillsConfig,
@@ -101,7 +107,7 @@ fn default_max_messages() -> u32 {
 // ============================================================================
 
 /// 身份与提示词注入配置
-/// 控制如何构建系统提示词（身份文件、Skill 注入模式、模型名称等）
+/// 控制如何构建系统提示词（身份文件、主人账号等）
 #[derive(Debug, Clone, Deserialize)]
 pub struct IdentityConfig {
     /// 主人账号（QQ 号字符串 或 "self"）
@@ -113,9 +119,6 @@ pub struct IdentityConfig {
     /// 除默认的 AGENTS.md、SOUL.md 等之外，额外注入的自定义文件
     #[serde(default)]
     pub extra_files: Vec<String>,
-    /// LLM 模型名称（注入到运行时段，供 LLM 自我认知）
-    #[serde(default = "default_model_name")]
-    pub model_name: String,
 }
 
 impl Default for IdentityConfig {
@@ -123,7 +126,6 @@ impl Default for IdentityConfig {
         Self {
             master: default_master(),
             extra_files: Vec::new(),
-            model_name: default_model_name(),
         }
     }
 }
@@ -162,9 +164,140 @@ fn default_master() -> String {
     "self".to_string()
 }
 
+// ============================================================================
+// LLM 提供商配置
+// ============================================================================
+
+/// LLM 提供商配置
+/// 控制 Agent 使用的语言模型连接参数
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmConfig {
+    /// OpenAI 兼容的 API 基础 URL（如 https://api.openai.com/v1）
+    #[serde(default)]
+    pub base_url: String,
+    /// API 密钥，作为 Authorization: Bearer 头部发送
+    #[serde(default)]
+    pub api_key: String,
+    /// 模型名称（如 gpt-4o、deepseek-chat 等）
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+    /// 系统指令的角色名称（默认 "system"，某些提供商要求 "developer"）
+    #[serde(default)]
+    pub system_role_name: Option<String>,
+    /// 推理深度/努力程度（可选，传递给支持该参数的模型）
+    /// 常见值：none, minimal, low, medium, high, xhigh
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// 每个任务的最大工具调用步数（安全上限）
+    #[serde(default = "default_max_steps")]
+    pub max_steps: u32,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            api_key: String::new(),
+            model: default_llm_model(),
+            system_role_name: None,
+            reasoning_effort: None,
+            max_steps: default_max_steps(),
+        }
+    }
+}
+
+impl LlmConfig {
+    /// 返回系统指令的有效角色名称
+    /// 缺失或空白 → "system"
+    pub fn effective_system_role_name(&self) -> &str {
+        self.system_role_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("system")
+    }
+
+    /// 返回有效的推理努力（空白视为 None）
+    pub fn effective_reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// 检查 LLM 配置是否已就绪（base_url 和 api_key 非空）
+    pub fn is_configured(&self) -> bool {
+        !self.base_url.trim().is_empty() && !self.api_key.trim().is_empty()
+    }
+}
+
 /// 默认模型名称
-fn default_model_name() -> String {
+fn default_llm_model() -> String {
     "unknown".to_string()
+}
+
+/// 默认最大工具调用步数
+const fn default_max_steps() -> u32 {
+    32
+}
+
+// ============================================================================
+// 上下文压缩配置
+// ============================================================================
+
+/// 上下文压缩配置
+/// 当对话上下文的估算 token 数超过阈值时，将历史消息压缩为摘要
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompactionConfig {
+    /// 是否启用上下文压缩（总开关）
+    #[serde(default = "default_compaction_enabled")]
+    pub enabled: bool,
+    /// 触发压缩的近似总 token 数阈值
+    /// 包括：系统提示 + 已有摘要 + 对话消息 + 工具定义
+    #[serde(default = "default_compaction_trigger_tokens")]
+    pub trigger_tokens: usize,
+    /// 保留为最近后缀的近似 token 预算
+    /// 这些最新消息保持原样不被压缩
+    #[serde(default = "default_compaction_keep_recent_tokens")]
+    pub keep_recent_tokens: usize,
+    /// 为摘要生成响应预留的最大 token 数
+    #[serde(default = "default_compaction_reserve_summary_tokens")]
+    pub reserve_summary_tokens: usize,
+    /// 拒绝压缩的最少消息数（过少的对话无需压缩）
+    #[serde(default = "default_compaction_min_messages")]
+    pub min_messages_to_compact: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_compaction_enabled(),
+            trigger_tokens: default_compaction_trigger_tokens(),
+            keep_recent_tokens: default_compaction_keep_recent_tokens(),
+            reserve_summary_tokens: default_compaction_reserve_summary_tokens(),
+            min_messages_to_compact: default_compaction_min_messages(),
+        }
+    }
+}
+
+const fn default_compaction_enabled() -> bool {
+    true
+}
+
+const fn default_compaction_trigger_tokens() -> usize {
+    180_000
+}
+
+const fn default_compaction_keep_recent_tokens() -> usize {
+    8_000
+}
+
+const fn default_compaction_reserve_summary_tokens() -> usize {
+    4_096
+}
+
+const fn default_compaction_min_messages() -> usize {
+    8
 }
 
 // ============================================================================

@@ -577,16 +577,41 @@ impl Provider for OpenAiProvider {
 
         if has_tools {
             // 使用原生工具调用格式
-            // 将统一消息格式转换为原生 API 消息格式
+            // 将统一消息格式转换为原生 API 消息格式（包含 tool_calls 和 tool_call_id）
             let native_messages: Vec<NativeApiMessage> = request
                 .messages
                 .iter()
-                .map(|m| NativeApiMessage {
-                    role: m.role.clone(),
-                    content: Some(m.content.clone()),
-                    tool_call_id: None,
-                    tool_calls: None,
-                    reasoning_content: None,
+                .map(|m| {
+                    // 将 ChatMessage 中的 tool_calls 转换为 API 原生格式
+                    let tool_calls = if m.tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            m.tool_calls
+                                .iter()
+                                .map(|tc| NativeToolCallPayload {
+                                    id: Some(tc.id.clone()),
+                                    kind: Some("function".to_string()),
+                                    function: NativeFunctionCall {
+                                        name: tc.name.clone(),
+                                        arguments: tc.arguments.clone(),
+                                    },
+                                })
+                                .collect(),
+                        )
+                    };
+                    NativeApiMessage {
+                        role: m.role.clone(),
+                        // tool 角色的消息始终发送 content（即使为空），其他角色空内容发 None
+                        content: if m.content.is_empty() && m.role != "tool" {
+                            None
+                        } else {
+                            Some(m.content.clone())
+                        },
+                        tool_call_id: m.tool_call_id.clone(),
+                        tool_calls,
+                        reasoning_content: None,
+                    }
                 })
                 .collect();
 

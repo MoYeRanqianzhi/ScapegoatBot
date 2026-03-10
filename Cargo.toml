@@ -3,6 +3,10 @@ name = "scapegoat-bot"
 version = "0.1.0-alpha.1"
 edition = "2024"
 description = "ScapegoatBot - 一个 QQ Agent，代替用户像真人一样回复消息"
+license = "MIT"
+repository = "https://github.com/MoYeRanqianzhi/ScapegoatBot"
+homepage = "https://github.com/MoYeRanqianzhi/ScapegoatBot"
+authors = ["墨叶染千枝"]
 
 # 二进制目标：生成名为 sbot 的可执行文件
 [[bin]]
@@ -35,3 +39,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = "0.4"
 # 能力安全的文件系统访问（将读写限制在 workspace 目录内）
 cap-std = "3"
+# 跨平台磁盘空间查询（写入前检查可用空间，防止 Agent 填满磁盘）
+fs2 = "0.4"
