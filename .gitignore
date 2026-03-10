@@ -1,2 +1,50 @@
-/target
+# ============================================================================
+# ScapegoatBot .gitignore
+# ============================================================================
+
+# ---- Rust 编译产物 ----
+/target/
+
+# ---- 用户配置（含 API Key、QQ 号等敏感信息）----
 config.toml
+.env
+.env.*
+
+# ---- 运行时用户数据（聊天记录、AI 记忆等）----
+# workspace/ 下的模板文件（*.md）由项目提供，作为初始工作区结构
+# 但运行时产生的子目录必须排除
+workspace/messages/
+workspace/temp/
+workspace/logs/
+
+# ---- 密钥和证书 ----
+*.pem
+*.key
+*.cert
+*.crt
+*.pfx
+*.p12
+
+# ---- 日志 ----
+*.log
+*.log.*
+*.log.gz
+/logs/
+
+# ---- IDE / 编辑器 ----
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.vim/
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ---- 临时和备份文件 ----
+*.bak
+*.tmp
+*.orig
