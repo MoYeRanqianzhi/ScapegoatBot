@@ -41,3 +41,11 @@ chrono = "0.4"
 cap-std = "3"
 # 跨平台磁盘空间查询（写入前检查可用空间，防止 Agent 填满磁盘）
 fs2 = "0.4"
+# Base64 编码（ReadImage 工具将图片编码为 base64 供多模态 LLM 识别）
+base64 = "0.22"
+# 嵌入式 SQLite 数据库（消息图片注册表等持久化存储）
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[dev-dependencies]
+# 临时目录（用于 ImageStore 等模块的单元测试）
+tempfile = "3"

@@ -10,7 +10,6 @@
 // - 支持增量更新：后续压缩会更新已有摘要而不是从头生成
 
 use crate::config::CompactionConfig;
-use crate::providers::openai::OpenAiProvider;
 use crate::providers::traits::{ChatMessage, Provider};
 use anyhow::Context as _;
 use std::fmt::Write as _;
@@ -148,7 +147,7 @@ impl CompactionState {
     }
 
     /// 设置新的检查点摘要
-    fn set_summary(&mut self, summary: String) {
+    pub fn set_summary(&mut self, summary: String) {
         self.summary = Some(summary);
     }
 }
@@ -270,7 +269,7 @@ pub fn estimate_tokens(message: &ChatMessage) -> usize {
 /// 此函数不会修改系统提示，也不会在存储的对话中注入合成摘要。
 /// 合成摘要只在调用方通过 `build_request_messages` 构建实际请求时才会出现。
 pub async fn maybe_compact_history(
-    provider: &OpenAiProvider,
+    provider: &dyn Provider,
     model: &str,
     system_role_name: &str,
     system_message: &ChatMessage,
@@ -565,7 +564,7 @@ fn build_turn_prefix_prompt(conversation_text: &str) -> String {
 
 /// 调用 LLM 生成历史摘要
 async fn generate_summary(
-    provider: &OpenAiProvider,
+    provider: &dyn Provider,
     model: &str,
     system_role_name: &str,
     reasoning_effort: Option<&str>,
@@ -598,7 +597,7 @@ async fn generate_summary(
 
 /// 调用 LLM 生成分割轮前缀的摘要
 async fn generate_turn_prefix_summary(
-    provider: &OpenAiProvider,
+    provider: &dyn Provider,
     model: &str,
     system_role_name: &str,
     reasoning_effort: Option<&str>,

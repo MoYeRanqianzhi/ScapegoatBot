@@ -4,13 +4,30 @@
 // 管理按日期+序号拆分的文件结构
 
 pub mod cursor;
+pub mod images;
 pub mod jsonl;
 pub mod markdown;
+pub mod message_index;
+pub mod session;
 
 use crate::config::StorageConfig;
 use anyhow::{Context, Result};
 use chrono::{Local, NaiveDate};
 use std::path::{Path, PathBuf};
+
+// ============================================================================
+// 存储位置信息
+// ============================================================================
+
+/// JSONL 文件写入后返回的物理位置信息
+/// main.rs 用此信息调用 message_index.index_message() 建立索引
+#[derive(Debug, Clone)]
+pub struct StoredLocation {
+    /// JSONL 文件路径（相对于 messages_dir，如 "all/2026-03-10_001.jsonl"）
+    pub file_path: String,
+    /// 写入的行号（1-based）
+    pub line_number: u32,
+}
 
 // ============================================================================
 // 存储管理器
@@ -91,13 +108,34 @@ impl StorageManager {
         }
     }
 
-    /// 存储一条原始消息到统一 JSONL 文件
-    /// 所有群聊和私聊的原始 JSON 按时间顺序追加到 messages/all/ 下
-    pub fn store_raw_jsonl(&self, raw_json: &serde_json::Value) -> Result<()> {
-        let dir = self.ensure_dir("all")?;
+    /// 存储一条原始消息到 JSONL 文件
+    /// 所有群聊和私聊的原始 JSON 按时间顺序追加到 messages/raw/ 下
+    /// 此目录受写保护，LLM 不可修改（仅系统写入）
+    /// 返回文件路径和行号，供消息索引使用
+    pub fn store_raw_jsonl(&self, raw_json: &serde_json::Value) -> Result<StoredLocation> {
+        let dir = self.ensure_dir("raw")?;
         let today = Local::now().date_naive();
         let path = self.resolve_file_path(&dir, today, "jsonl")?;
-        jsonl::append_jsonl(&path, raw_json)
+
+        // 在追加前统计当前行数，确定写入后的行号
+        let current_count = count_lines(&path)?;
+        let line_number = current_count + 1;
+
+        // 追加 JSON 到文件
+        jsonl::append_jsonl(&path, raw_json)?;
+
+        // 提取相对于 messages_dir 的路径（如 "raw/2026-03-10_001.jsonl"）
+        let relative = path
+            .strip_prefix(&self.messages_dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            // 统一使用正斜杠（跨平台兼容）
+            .replace('\\', "/");
+
+        Ok(StoredLocation {
+            file_path: relative,
+            line_number,
+        })
     }
 
     /// 存储一条格式化消息到统一 MD 文件

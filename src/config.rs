@@ -172,15 +172,29 @@ fn default_master() -> String {
 /// 控制 Agent 使用的语言模型连接参数
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmConfig {
-    /// OpenAI 兼容的 API 基础 URL（如 https://api.openai.com/v1）
+    /// LLM 提供商类型（默认 "openai"）
+    /// - "openai" — OpenAI 兼容 API（ChatCompletions / Responses 端点）
+    /// - "anthropic" — Anthropic Messages API（Claude 系列模型）
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    /// API 基础 URL
+    /// OpenAI 兼容：如 https://api.openai.com/v1
+    /// Anthropic：如 https://api.anthropic.com（留空时使用此默认值）
     #[serde(default)]
     pub base_url: String,
-    /// API 密钥，作为 Authorization: Bearer 头部发送
+    /// API 密钥
+    /// OpenAI 兼容：作为 Authorization: Bearer 头部发送
+    /// Anthropic：作为 x-api-key 头部发送（OAuth token 以 sk-ant-oat01- 开头时使用 Bearer）
     #[serde(default)]
     pub api_key: String,
-    /// 模型名称（如 gpt-4o、deepseek-chat 等）
+    /// 模型名称（如 gpt-4o、claude-sonnet-4-20250514 等）
     #[serde(default = "default_llm_model")]
     pub model: String,
+    /// 最大输出 token 数（可选）
+    /// Anthropic API 强制要求此字段，默认 16384
+    /// OpenAI 可选，不设置时由模型自行决定
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
     /// 系统指令的角色名称（默认 "system"，某些提供商要求 "developer"）
     #[serde(default)]
     pub system_role_name: Option<String>,
@@ -191,17 +205,33 @@ pub struct LlmConfig {
     /// 每个任务的最大工具调用步数（安全上限）
     #[serde(default = "default_max_steps")]
     pub max_steps: u32,
+    /// HTTP 请求超时时间（秒），默认 300 秒（5 分钟）
+    /// 所有 API 请求均使用流式传输，此超时为最后安全网
+    /// 如果 LLM 在此时间内未完成响应，请求将被客户端主动中止
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    /// API 协议类型，决定使用哪个端点（仅 OpenAI 提供商使用）
+    /// - "chat_completions"（默认）：使用 /v1/chat/completions 端点，兼容绝大多数渠道
+    /// - "responses"：使用 /v1/responses 端点（OpenAI 新一代 API）
+    /// 某些渠道仅支持其中一种端点，通过此参数切换
+    /// Anthropic 提供商忽略此字段（始终使用 /v1/messages 端点）
+    #[serde(default = "default_wire_api")]
+    pub wire_api: String,
 }
 
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            provider: default_provider(),
             base_url: String::new(),
             api_key: String::new(),
             model: default_llm_model(),
+            max_tokens: None,
             system_role_name: None,
             reasoning_effort: None,
             max_steps: default_max_steps(),
+            timeout_secs: default_timeout_secs(),
+            wire_api: default_wire_api(),
         }
     }
 }
@@ -225,10 +255,30 @@ impl LlmConfig {
             .filter(|s| !s.is_empty())
     }
 
-    /// 检查 LLM 配置是否已就绪（base_url 和 api_key 非空）
-    pub fn is_configured(&self) -> bool {
-        !self.base_url.trim().is_empty() && !self.api_key.trim().is_empty()
+    /// 返回 Anthropic 的有效 max_tokens 值
+    /// Anthropic API 强制要求此字段，默认 16384
+    pub fn effective_anthropic_max_tokens(&self) -> u32 {
+        self.max_tokens.unwrap_or(16384)
     }
+
+    /// 检查 LLM 配置是否已就绪
+    /// 不同提供商有不同的必填项：
+    /// - OpenAI：base_url 和 api_key 均非空
+    /// - Anthropic：仅 api_key 非空（base_url 有内置默认值 https://api.anthropic.com）
+    pub fn is_configured(&self) -> bool {
+        let has_api_key = !self.api_key.trim().is_empty();
+        match self.provider.to_ascii_lowercase().as_str() {
+            // Anthropic 有内置默认 base_url，仅需 api_key
+            "anthropic" => has_api_key,
+            // OpenAI 及其他提供商需要 base_url 和 api_key
+            _ => !self.base_url.trim().is_empty() && has_api_key,
+        }
+    }
+}
+
+/// 默认 LLM 提供商类型
+fn default_provider() -> String {
+    "openai".to_string()
 }
 
 /// 默认模型名称
@@ -237,8 +287,21 @@ fn default_llm_model() -> String {
 }
 
 /// 默认最大工具调用步数
+/// codex 没有硬性上限，但我们保留安全网防止无限循环
+/// 128 步足够完成复杂的多文件读取 + 回复 + 记忆更新流程
 const fn default_max_steps() -> u32 {
-    32
+    128
+}
+
+/// 默认 HTTP 请求超时时间（秒）
+/// 300 秒 = 5 分钟，足够复杂的工具调用请求完成
+const fn default_timeout_secs() -> u64 {
+    300
+}
+
+/// 默认 API 协议类型：chat_completions
+fn default_wire_api() -> String {
+    "chat_completions".to_string()
 }
 
 // ============================================================================

@@ -21,12 +21,33 @@ pub const ROLE_ASSISTANT: &str = "assistant";
 pub const ROLE_TOOL: &str = "tool";
 
 // ============================================================================
+// 图片数据
+// ============================================================================
+
+/// 内联图片数据（base64 编码）
+/// 用于多模态消息中的图片内容
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageData {
+    /// MIME 类型（如 "image/png"、"image/jpeg"）
+    pub mime: String,
+    /// base64 编码的图片数据
+    pub base64: String,
+}
+
+impl ImageData {
+    /// 生成 data URL 格式字符串（data:<mime>;base64,<data>）
+    pub fn to_data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime, self.base64)
+    }
+}
+
+// ============================================================================
 // 聊天消息
 // ============================================================================
 
 /// 对话中的单条消息
 /// 每条消息包含角色（system/user/assistant/tool）和文本内容
-/// 扩展字段支持 OpenAI 原生工具调用协议
+/// 扩展字段支持 OpenAI 原生工具调用协议和多模态图片
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// 消息角色：system、user、assistant 或 tool
@@ -40,6 +61,10 @@ pub struct ChatMessage {
     /// 此消息回复的工具调用 ID（仅 role=tool 时使用）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// 内联图片列表（多模态支持）
+    /// 工具返回图片时使用，provider 会将其序列化为 API 对应的多模态格式
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageData>,
 }
 
 impl ChatMessage {
@@ -50,6 +75,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -60,6 +86,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -70,6 +97,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -84,6 +112,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -94,6 +123,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -108,6 +138,23 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            images: Vec::new(),
+        }
+    }
+
+    /// 创建带图片的工具结果消息（多模态）
+    /// 用于 ReadImage 等需要返回图片的工具
+    pub fn tool_result_with_images(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        images: Vec<ImageData>,
+    ) -> Self {
+        Self {
+            role: ROLE_TOOL.into(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+            images,
         }
     }
 }

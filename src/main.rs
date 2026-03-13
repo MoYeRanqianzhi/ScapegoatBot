@@ -30,13 +30,15 @@ use config::AppConfig;
 use message_format::{needs_wrapping, segments_to_message_xml};
 use skills::SkillRegistry;
 use storage::markdown::{MessageRecord, MessageState};
+use storage::images::ImageStore;
+use storage::message_index::MessageIndex;
 use storage::StorageManager;
 use tools::ToolContext;
 use whitelist::Whitelist;
 
 use chrono::{Local, TimeZone};
 use clap::Parser;
-use napcat_link::{GroupMessageEvent, NapLink, PrivateMessageEvent};
+use napcat_link::{GroupMessageEvent, MessageSegment, NapLink, PrivateMessageEvent};
 use napcat_link::{FriendRequestEvent, GroupRequestEvent};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -259,8 +261,30 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
     // 在连接前创建事件订阅（避免丢失早期事件）
     let mut sub = client.subscribe();
 
-    // 创建工具执行上下文（API + 白名单 + Skill 注册表）
-    let tool_ctx = ToolContext::new(client.api().clone(), whitelist, skill_registry);
+    // 创建图片注册表数据库（SQLite 持久化，存储在 workspace/data/ 下）
+    let image_db_path = std::path::PathBuf::from(&config.storage.workspace_dir)
+        .join("data")
+        .join("images.db");
+    let image_store = ImageStore::open(&image_db_path)?;
+
+    // 创建消息索引数据库（SQLite 持久化，存储 message_id → 文件位置映射）
+    let msg_db_path = std::path::PathBuf::from(&config.storage.workspace_dir)
+        .join("data")
+        .join("messages.db");
+    let message_index = MessageIndex::open(&msg_db_path)?;
+
+    // 消息存储根目录（供 GetMessage 工具读取 JSONL 原始内容）
+    let messages_dir = std::path::PathBuf::from(&config.storage.workspace_dir).join("messages");
+
+    // 创建工具执行上下文（API + 白名单 + Skill 注册表 + 图片注册表 + 消息索引）
+    let tool_ctx = ToolContext::new(
+        client.api().clone(),
+        whitelist,
+        skill_registry,
+        image_store,
+        message_index,
+        messages_dir,
+    );
     let tool_ctx = Arc::new(tool_ctx);
 
     // ===== 5. AI Agent 状态 + 控制通道 =====
@@ -416,6 +440,43 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
                         &agent_tx_clone,
                     );
                 }
+            } else if event_name.starts_with("message_sent.group") {
+                // ----- Bot 自身发送的群消息（message_sent 事件） -----
+                // NapCat 在 Bot 账号发送消息后推送此事件，用于记录 Agent 自发消息
+                if let Ok(msg) =
+                    serde_json::from_value::<GroupMessageEvent>(event.data.clone())
+                {
+                    // 首次收到消息时也可解析 bot QQ（兜底）
+                    if bot_qq_clone.load(Ordering::Relaxed) == 0 {
+                        bot_qq_clone.store(msg.self_id, Ordering::Relaxed);
+                        tracing::info!("Bot QQ 已解析为 {} (via message_sent)", msg.self_id);
+                    }
+                    handle_self_sent_group_message(
+                        &storage_clone,
+                        &msg,
+                        master_qq_clone.load(Ordering::Relaxed),
+                        master_is_self,
+                        &tool_ctx_clone,
+                    );
+                }
+            } else if event_name.starts_with("message_sent.private") {
+                // ----- Bot 自身发送的私聊消息（message_sent 事件） -----
+                if let Ok(msg) =
+                    serde_json::from_value::<PrivateMessageEvent>(event.data.clone())
+                {
+                    // 首次收到消息时也可解析 bot QQ（兜底）
+                    if bot_qq_clone.load(Ordering::Relaxed) == 0 {
+                        bot_qq_clone.store(msg.self_id, Ordering::Relaxed);
+                        tracing::info!("Bot QQ 已解析为 {} (via message_sent)", msg.self_id);
+                    }
+                    handle_self_sent_private_message(
+                        &storage_clone,
+                        &msg,
+                        master_qq_clone.load(Ordering::Relaxed),
+                        master_is_self,
+                        &tool_ctx_clone,
+                    );
+                }
             } else if event_name.starts_with("request.friend") {
                 // ----- 好友请求事件（记录到日志，不主动存储） -----
                 if let Ok(req) =
@@ -559,9 +620,39 @@ fn handle_group_message(
 
     // ===== 统一存储：JSONL + MD =====
     if let Ok(raw_json) = serde_json::to_value(msg) {
-        if let Err(e) = storage.store_raw_jsonl(&raw_json) {
-            tracing::error!("存储消息 JSONL 失败 (群={}): {}", group_id, e);
+        match storage.store_raw_jsonl(&raw_json) {
+            Ok(location) => {
+                // 写入消息索引：message_id → (file_path, line_number) + 元数据
+                tool_ctx.message_index.index_message(
+                    msg.message_id,
+                    &location.file_path,
+                    location.line_number,
+                    msg.time,
+                    msg.user_id,
+                    Some(msg.group_id),
+                    "group",
+                );
+            }
+            Err(e) => {
+                tracing::error!("存储消息 JSONL 失败 (群={}): {}", group_id, e);
+            }
         }
+    }
+
+    // 注册消息中的图片 URL（供 ReadImage 工具安全查找）
+    let image_urls: Vec<String> = msg
+        .message
+        .iter()
+        .filter_map(|seg| {
+            if let MessageSegment::Image { url, .. } = seg {
+                url.clone()
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !image_urls.is_empty() {
+        tool_ctx.register_message_images(msg.message_id, &image_urls);
     }
 
     // 构建 MD 记录
@@ -613,17 +704,10 @@ fn handle_group_message(
         }
     }
 
-    // ===== Agent 自发消息副本 =====
-    // 确认为 Agent 发送：来自 bot 账号且被 is_agent_sent 追踪到
-    if bot_qq != 0 && msg.user_id == bot_qq && tool_ctx.is_agent_sent(msg.message_id) {
-        if let Err(e) = storage.store_self(&record) {
-            tracing::error!("存储自发消息失败 (群={}): {}", group_id, e);
-        }
-    }
-
     // ===== 通知 Agent =====
     // 将格式化的消息记录发送给 Agent 处理
     // Agent 自己发送的消息不需要通知（避免自我循环）
+    // 注意：Agent 自发消息的存储（messages/self/）已移交给 message_sent.* 事件处理器
     let is_self_sent = bot_qq != 0 && msg.user_id == bot_qq;
     if !is_self_sent {
         let formatted = format!(
@@ -659,9 +743,40 @@ fn handle_private_message(
 
     // ===== 统一存储：JSONL + MD =====
     if let Ok(raw_json) = serde_json::to_value(msg) {
-        if let Err(e) = storage.store_raw_jsonl(&raw_json) {
-            tracing::error!("存储消息 JSONL 失败 (QQ={}): {}", user_id, e);
+        match storage.store_raw_jsonl(&raw_json) {
+            Ok(location) => {
+                // 写入消息索引：message_id → (file_path, line_number) + 元数据
+                // 私聊消息 group_id 为 None
+                tool_ctx.message_index.index_message(
+                    msg.message_id,
+                    &location.file_path,
+                    location.line_number,
+                    msg.time,
+                    msg.user_id,
+                    None,
+                    "private",
+                );
+            }
+            Err(e) => {
+                tracing::error!("存储消息 JSONL 失败 (QQ={}): {}", user_id, e);
+            }
         }
+    }
+
+    // 注册消息中的图片 URL（供 ReadImage 工具安全查找）
+    let image_urls: Vec<String> = msg
+        .message
+        .iter()
+        .filter_map(|seg| {
+            if let MessageSegment::Image { url, .. } = seg {
+                url.clone()
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !image_urls.is_empty() {
+        tool_ctx.register_message_images(msg.message_id, &image_urls);
     }
 
     let time_str = Local
@@ -716,14 +831,8 @@ fn handle_private_message(
         }
     }
 
-    // ===== Agent 自发消息副本 =====
-    if bot_qq != 0 && msg.user_id == bot_qq && tool_ctx.is_agent_sent(msg.message_id) {
-        if let Err(e) = storage.store_self(&record) {
-            tracing::error!("存储自发消息失败 (QQ={}): {}", user_id, e);
-        }
-    }
-
     // ===== 通知 Agent =====
+    // 注意：Agent 自发消息的存储（messages/self/）已移交给 message_sent.* 事件处理器
     let is_self_sent = bot_qq != 0 && msg.user_id == bot_qq;
     if !is_self_sent {
         let formatted = format!(
@@ -737,4 +846,248 @@ fn handle_private_message(
         );
         let _ = agent_tx.send(agent::MessageEvent { formatted });
     }
+}
+
+// ============================================================================
+// Bot 自身发送的消息处理函数（message_sent 事件）
+// ============================================================================
+
+/// 处理 Bot 自身发送的群消息（post_type = "message_sent", message_type = "group"）
+///
+/// 与 handle_group_message 的关键区别：
+/// - 通过 message_index 去重，避免与 echo 事件重复存储 JSONL/MD
+/// - 负责 messages/self/ 的写入（核心修复：此职责从 message.* 处理器移交至此）
+/// - 不通知 Agent（避免自我循环）
+fn handle_self_sent_group_message(
+    storage: &StorageManager,
+    msg: &GroupMessageEvent,
+    master_qq: i64,
+    master_is_self: bool,
+    tool_ctx: &ToolContext,
+) {
+    let group_id = msg.group_id;
+
+    // 去重检查：如果此消息已被 echo 的 message.* 事件处理过，跳过基础存储
+    // 使用 message_index.lookup() 作为"已处理"标志
+    let already_stored = tool_ctx.message_index.lookup(msg.message_id).is_some();
+
+    if !already_stored {
+        // ===== 基础存储：JSONL + 消息索引 =====
+        if let Ok(raw_json) = serde_json::to_value(msg) {
+            match storage.store_raw_jsonl(&raw_json) {
+                Ok(location) => {
+                    // 写入消息索引
+                    tool_ctx.message_index.index_message(
+                        msg.message_id,
+                        &location.file_path,
+                        location.line_number,
+                        msg.time,
+                        msg.user_id,
+                        Some(msg.group_id),
+                        "group",
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("存储自发群消息 JSONL 失败 (群={}): {}", group_id, e);
+                }
+            }
+        }
+
+        // 注册消息中的图片 URL（供 ReadImage 工具安全查找）
+        let image_urls: Vec<String> = msg
+            .message
+            .iter()
+            .filter_map(|seg| {
+                if let MessageSegment::Image { url, .. } = seg {
+                    url.clone()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !image_urls.is_empty() {
+            tool_ctx.register_message_images(msg.message_id, &image_urls);
+        }
+    }
+
+    // 构建 MD 记录（store_self / store_master / store_markdown 均需要）
+    let time_str = Local
+        .timestamp_opt(msg.time, 0)
+        .single()
+        .map(|dt| dt.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "??:??:??".to_string());
+
+    let (state, content) = if needs_wrapping(&msg.message, &msg.raw_message) {
+        (MessageState::Wrapped, segments_to_message_xml(&msg.message))
+    } else {
+        (MessageState::Raw, msg.raw_message.clone())
+    };
+
+    let nick = msg
+        .sender
+        .nickname
+        .clone()
+        .unwrap_or_else(|| msg.user_id.to_string());
+    let group_nick = msg.sender.card.clone().filter(|c| !c.is_empty());
+
+    let record = MessageRecord {
+        time: time_str,
+        message_id: msg.message_id,
+        message_type: "Group".to_string(),
+        group_info: Some(format!("{group_id}")),
+        qq: msg.user_id,
+        nick,
+        group_nick,
+        remark: None,
+        identity: format!("GroupMember ({group_id})"),
+        state,
+        content,
+    };
+
+    // 统一 MD 存储（去重：仅在 echo 未处理时写入）
+    if !already_stored {
+        if let Err(e) = storage.store_markdown(&record) {
+            tracing::error!("存储自发群消息 MD 失败 (群={}): {}", group_id, e);
+        }
+    }
+
+    // ===== Agent 自发消息副本（核心修复） =====
+    // 由 record_agent_sent() 追踪的消息 ID 确认为 Agent 发送
+    if tool_ctx.is_agent_sent(msg.message_id) {
+        if let Err(e) = storage.store_self(&record) {
+            tracing::error!("存储 Agent 自发群消息到 self/ 失败 (群={}): {}", group_id, e);
+        }
+    }
+
+    // ===== 主人消息副本（master=self 模式） =====
+    // master=self 时，Bot 账号也是主人账号，非 Agent 发送的消息属于主人手动发送
+    if master_is_self && master_qq != 0 && msg.user_id == master_qq
+        && !tool_ctx.is_agent_sent(msg.message_id)
+    {
+        if let Err(e) = storage.store_master(&record) {
+            tracing::error!("存储主人自发群消息到 master/ 失败 (群={}): {}", group_id, e);
+        }
+    }
+
+    // 不通知 Agent：Bot 自身消息不需要触发 Agent 处理循环
+}
+
+/// 处理 Bot 自身发送的私聊消息（post_type = "message_sent", message_type = "private"）
+///
+/// 与 handle_self_sent_group_message 对称，处理私聊版本。
+/// 关键区别：无 group_id、无 group_nick、identity 根据 sub_type 判断
+fn handle_self_sent_private_message(
+    storage: &StorageManager,
+    msg: &PrivateMessageEvent,
+    master_qq: i64,
+    master_is_self: bool,
+    tool_ctx: &ToolContext,
+) {
+    let user_id = msg.user_id;
+
+    // 去重检查：如果此消息已被 echo 的 message.* 事件处理过，跳过基础存储
+    let already_stored = tool_ctx.message_index.lookup(msg.message_id).is_some();
+
+    if !already_stored {
+        // ===== 基础存储：JSONL + 消息索引 =====
+        if let Ok(raw_json) = serde_json::to_value(msg) {
+            match storage.store_raw_jsonl(&raw_json) {
+                Ok(location) => {
+                    // 写入消息索引（私聊消息 group_id 为 None）
+                    tool_ctx.message_index.index_message(
+                        msg.message_id,
+                        &location.file_path,
+                        location.line_number,
+                        msg.time,
+                        msg.user_id,
+                        None,
+                        "private",
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("存储自发私聊消息 JSONL 失败 (QQ={}): {}", user_id, e);
+                }
+            }
+        }
+
+        // 注册消息中的图片 URL
+        let image_urls: Vec<String> = msg
+            .message
+            .iter()
+            .filter_map(|seg| {
+                if let MessageSegment::Image { url, .. } = seg {
+                    url.clone()
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !image_urls.is_empty() {
+            tool_ctx.register_message_images(msg.message_id, &image_urls);
+        }
+    }
+
+    // 构建 MD 记录
+    let time_str = Local
+        .timestamp_opt(msg.time, 0)
+        .single()
+        .map(|dt| dt.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| "??:??:??".to_string());
+
+    let (state, content) = if needs_wrapping(&msg.message, &msg.raw_message) {
+        (MessageState::Wrapped, segments_to_message_xml(&msg.message))
+    } else {
+        (MessageState::Raw, msg.raw_message.clone())
+    };
+
+    let nick = msg
+        .sender
+        .nickname
+        .clone()
+        .unwrap_or_else(|| msg.user_id.to_string());
+
+    let identity = match msg.sub_type.as_str() {
+        "friend" => "Friend".to_string(),
+        "group" => "GroupMember".to_string(),
+        _ => "Stranger".to_string(),
+    };
+
+    let record = MessageRecord {
+        time: time_str,
+        message_id: msg.message_id,
+        message_type: "Private".to_string(),
+        group_info: None,
+        qq: user_id,
+        nick,
+        group_nick: None,
+        remark: None,
+        identity,
+        state,
+        content,
+    };
+
+    // 统一 MD 存储（去重）
+    if !already_stored {
+        if let Err(e) = storage.store_markdown(&record) {
+            tracing::error!("存储自发私聊消息 MD 失败 (QQ={}): {}", user_id, e);
+        }
+    }
+
+    // ===== Agent 自发消息副本（核心修复） =====
+    if tool_ctx.is_agent_sent(msg.message_id) {
+        if let Err(e) = storage.store_self(&record) {
+            tracing::error!("存储 Agent 自发私聊消息到 self/ 失败 (QQ={}): {}", user_id, e);
+        }
+    }
+
+    // ===== 主人消息副本（master=self 模式） =====
+    if master_is_self && master_qq != 0 && msg.user_id == master_qq
+        && !tool_ctx.is_agent_sent(msg.message_id)
+    {
+        if let Err(e) = storage.store_master(&record) {
+            tracing::error!("存储主人自发私聊消息到 master/ 失败 (QQ={}): {}", user_id, e);
+        }
+    }
+
+    // 不通知 Agent
 }

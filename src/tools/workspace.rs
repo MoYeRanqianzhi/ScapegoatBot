@@ -58,6 +58,22 @@ const MAX_WRITE_CONTENT_BYTES: usize = 1_048_576; // 1 MB
 /// 低于此阈值时拒绝所有写入操作，保护宿主机磁盘
 const MIN_FREE_DISK_SPACE: u64 = 100 * 1024 * 1024; // 100 MB
 
+/// Grep 工具单次搜索返回的最大匹配数
+/// 防止搜索结果过多导致上下文爆炸
+const MAX_GREP_RESULTS: usize = 50;
+
+/// Grep 工具跳过大于此大小的文件（500 KB）
+/// 大文件通常是数据文件或二进制文件，跳过以提高搜索效率
+const MAX_GREP_FILE_BYTES: u64 = 500_000;
+
+/// Grep 工具每个匹配行的最大显示字符数
+/// 截断过长的行，防止单条匹配占用过多上下文
+const MAX_GREP_LINE_DISPLAY: usize = 200;
+
+/// Grep 工具递归搜索的最大目录深度
+/// 防止目录结构过深导致搜索卡住
+const MAX_GREP_DEPTH: usize = 10;
+
 /// 工作区允许的最大总文件大小（2 GB）
 /// 防止 Agent 通过反复创建文件逐步填满磁盘
 /// 注意：此限制包含系统存储的消息文件，设置较宽松以避免误拦
@@ -210,6 +226,14 @@ impl WorkspaceTools {
 
         // ======== 安全检查 ========
 
+        // 0. 写保护检查：messages/raw/ 和 data/ 目录禁止 LLM 写入
+        if is_write_protected(&clean_path) {
+            bail!(
+                "路径 '{}' 位于受保护目录中（messages/raw/ 和 data/ 为只读），禁止写入",
+                relative_path
+            );
+        }
+
         // 1. 检查写入内容大小
         let content_bytes = content.len();
         if content_bytes > MAX_WRITE_CONTENT_BYTES {
@@ -272,6 +296,14 @@ impl WorkspaceTools {
         replace_all: bool,
     ) -> anyhow::Result<String> {
         let clean_path = normalize_relative_path(relative_path)?;
+
+        // 写保护检查：messages/raw/ 和 data/ 目录禁止 LLM 编辑
+        if is_write_protected(&clean_path) {
+            bail!(
+                "路径 '{}' 位于受保护目录中（messages/raw/ 和 data/ 为只读），禁止编辑",
+                relative_path
+            );
+        }
 
         // 检查 Edit 前置条件：必须先 Read
         session.require_fresh_read(&clean_path)?;
@@ -339,6 +371,85 @@ impl WorkspaceTools {
         ))
     }
 
+    /// Ls 工具：列出工作区内指定目录的内容
+    ///
+    /// # 安全保障
+    /// - 通过 cap-std Dir 限制，无法列出 workspace 外的目录
+    /// - 路径遍历攻击被 normalize + cap-std 双重拒绝
+    /// - 特殊处理根目录：传入 "/" 或空字符串时列出工作区根
+    ///
+    /// # 返回格式
+    /// 每行一个条目，目录以 `/` 结尾，文件附带大小
+    pub fn list_dir(&self, relative_path: &str) -> anyhow::Result<String> {
+        // 特殊处理根目录："/", ".", "" 都指向工作区根
+        let clean_path = {
+            let trimmed = relative_path.trim();
+            if trimmed.is_empty() || trimmed == "/" || trimmed == "." || trimmed == "./" {
+                ".".to_string()
+            } else {
+                normalize_relative_path(trimmed)?
+            }
+        };
+
+        // 通过 cap-std 打开目录（自动限制在沙箱内）
+        let sub_dir = if clean_path == "." {
+            // 列出根目录：直接使用沙箱根句柄
+            // cap-std 的 open_dir(".") 返回自身的引用
+            self.dir.open_dir(".").with_context(|| {
+                "无法打开工作区根目录".to_string()
+            })?
+        } else {
+            self.dir.open_dir(&clean_path).with_context(|| {
+                format!("目录不存在或无法访问: {}", clean_path)
+            })?
+        };
+
+        // 收集目录条目
+        let mut entries: Vec<String> = Vec::new();
+        for entry in sub_dir.entries().with_context(|| {
+            format!("无法读取目录内容: {}", clean_path)
+        })? {
+            let entry = entry.with_context(|| {
+                format!("读取目录条目失败: {}", clean_path)
+            })?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            // 获取条目类型（文件 / 目录）
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => {
+                    entries.push(format!("{}/", name));
+                }
+                Ok(_) => {
+                    // 文件：附带大小信息
+                    let size_str = entry
+                        .metadata()
+                        .map(|m| format_file_size(m.len()))
+                        .unwrap_or_else(|_| "?".to_string());
+                    entries.push(format!("{}  ({})", name, size_str));
+                }
+                Err(_) => {
+                    entries.push(name);
+                }
+            }
+        }
+
+        // 按名称排序（目录优先）
+        entries.sort_by(|a, b| {
+            let a_is_dir = a.ends_with('/');
+            let b_is_dir = b.ends_with('/');
+            match (a_is_dir, b_is_dir) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.to_lowercase().cmp(&b.to_lowercase()),
+            }
+        });
+
+        if entries.is_empty() {
+            Ok("(空目录)".to_string())
+        } else {
+            Ok(entries.join("\n"))
+        }
+    }
+
     /// 检查磁盘可用空间是否满足最低要求
     /// 使用 fs2 crate 进行跨平台磁盘空间查询
     /// 采用 fail-closed 策略：无法获取空间信息时也拒绝写入
@@ -391,6 +502,101 @@ impl WorkspaceTools {
     pub fn root_display(&self) -> &Path {
         &self.root_abs
     }
+
+    /// Grep 工具：在工作区内搜索文件内容
+    /// 通过 cap-std Dir 句柄递归遍历目录，仅执行读取操作
+    ///
+    /// # 安全保障
+    /// - 所有文件访问通过 cap-std Dir 句柄，自动限制在工作区内
+    /// - 仅执行读操作（read_to_string / entries / metadata），不暴露任何写能力
+    /// - 跳过二进制文件（非 UTF-8）和大文件（> MAX_GREP_FILE_BYTES）
+    /// - 递归深度限制（MAX_GREP_DEPTH）和结果数量限制（MAX_GREP_RESULTS）
+    ///
+    /// # 参数
+    /// - `pattern`: 搜索文本（子串匹配）
+    /// - `path`: 搜索起始目录（相对于工作区根，空字符串或 "." 表示根）
+    /// - `file_ext`: 可选的文件扩展名过滤（如 "md"、"jsonl"，不含前导点号）
+    /// - `case_insensitive`: 是否忽略大小写
+    pub fn grep(
+        &self,
+        pattern: &str,
+        path: &str,
+        file_ext: Option<&str>,
+        case_insensitive: bool,
+    ) -> anyhow::Result<String> {
+        // 不允许空搜索模式
+        if pattern.is_empty() {
+            bail!("搜索模式不能为空");
+        }
+
+        // 规范化搜索路径（支持根目录的多种写法）
+        let base_path = {
+            let trimmed = path.trim();
+            if trimmed.is_empty() || trimmed == "/" || trimmed == "." || trimmed == "./" {
+                ".".to_string()
+            } else {
+                normalize_relative_path(trimmed)?
+            }
+        };
+
+        // 打开搜索起始目录
+        let base_dir = if base_path == "." {
+            self.dir.open_dir(".").with_context(|| "无法打开工作区根目录")?
+        } else {
+            self.dir.open_dir(&base_path).with_context(|| {
+                format!("目录不存在或无法访问: {}", base_path)
+            })?
+        };
+
+        // 大小写不敏感时，将搜索模式转为小写
+        let match_pattern = if case_insensitive {
+            pattern.to_lowercase()
+        } else {
+            pattern.to_string()
+        };
+
+        // 收集匹配结果
+        let mut matches: Vec<GrepMatch> = Vec::new();
+        let display_prefix = if base_path == "." {
+            String::new()
+        } else {
+            format!("{}/", base_path)
+        };
+
+        // 递归搜索目录树
+        grep_dir_recursive(
+            &base_dir,
+            &display_prefix,
+            &match_pattern,
+            case_insensitive,
+            file_ext,
+            &mut matches,
+            MAX_GREP_RESULTS,
+            0, // 当前深度
+        )?;
+
+        // 格式化输出
+        if matches.is_empty() {
+            Ok(format!("未找到匹配 \"{}\" 的内容", pattern))
+        } else {
+            let count = matches.len();
+            let lines: Vec<String> = matches
+                .iter()
+                .map(|m| format!("{}:{}: {}", m.file, m.line_number, m.content))
+                .collect();
+            let mut output = lines.join("\n");
+            output.push_str(&format!(
+                "\n\n共找到 {} 处匹配{}",
+                count,
+                if count >= MAX_GREP_RESULTS {
+                    format!("（已达上限 {} 条，可能还有更多）", MAX_GREP_RESULTS)
+                } else {
+                    String::new()
+                }
+            ));
+            Ok(output)
+        }
+    }
 }
 
 // ============================================================================
@@ -440,6 +646,197 @@ fn estimate_workspace_usage(root: &Path) -> (u64, usize) {
     }
 
     (total_bytes, file_count)
+}
+
+// ============================================================================
+// 文件大小格式化
+// ============================================================================
+
+/// 将字节数格式化为人类可读的大小字符串
+fn format_file_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+// ============================================================================
+// 写保护检查
+// ============================================================================
+
+/// 检查路径是否位于写保护目录
+/// messages/raw/ 目录存储消息原始数据（JSONL），禁止 LLM 篡改
+/// data/ 目录存储 SQLite 数据库文件（图片注册表、消息索引），禁止 LLM 篡改
+///
+/// 注意：messages/all/、messages/master/、messages/self/ 等 MD 格式目录
+/// 允许 LLM 自由修改（如编辑摘要、更新标注等），不在写保护范围内。
+///
+/// # 安全设计
+/// - 这是 cap-std 沙箱之上的额外防御层
+/// - cap-std 确保 LLM 无法访问工作区外的文件
+/// - is_write_protected 确保 LLM 无法修改工作区内的关键数据文件
+/// - 大小写不敏感比较（防止 Windows 上的大小写绕过）
+fn is_write_protected(normalized_path: &str) -> bool {
+    // 统一为小写和正斜杠进行比较（跨平台兼容）
+    let lower = normalized_path.to_lowercase().replace('\\', "/");
+    // messages/raw/ 目录：消息原始 JSONL 数据（仅此子目录受保护）
+    lower == "messages/raw"
+        || lower.starts_with("messages/raw/")
+        // data/ 目录：SQLite 数据库文件
+        || lower == "data"
+        || lower.starts_with("data/")
+        // sessions/ 目录：会话 JSONL 记录文件（系统管理，AI 只读）
+        || lower == "sessions"
+        || lower.starts_with("sessions/")
+}
+
+// ============================================================================
+// Grep 辅助结构和函数
+// ============================================================================
+
+/// Grep 单条匹配结果
+struct GrepMatch {
+    /// 文件路径（相对于工作区根）
+    file: String,
+    /// 匹配行号（1-based）
+    line_number: usize,
+    /// 匹配行内容（截断后）
+    content: String,
+}
+
+/// 递归搜索目录树中的文件内容
+/// 通过 cap-std Dir 句柄遍历，仅执行读取操作
+///
+/// # 参数
+/// - `dir`: 当前 cap-std 目录句柄
+/// - `path_prefix`: 当前路径前缀（用于结果显示）
+/// - `pattern`: 搜索模式（大小写不敏感时已转为小写）
+/// - `case_insensitive`: 是否忽略大小写
+/// - `file_ext`: 可选的文件扩展名过滤
+/// - `results`: 匹配结果收集器
+/// - `max_results`: 最大匹配数
+/// - `depth`: 当前递归深度
+fn grep_dir_recursive(
+    dir: &Dir,
+    path_prefix: &str,
+    pattern: &str,
+    case_insensitive: bool,
+    file_ext: Option<&str>,
+    results: &mut Vec<GrepMatch>,
+    max_results: usize,
+    depth: usize,
+) -> anyhow::Result<()> {
+    // 达到最大结果数或最大深度时停止
+    if results.len() >= max_results || depth > MAX_GREP_DEPTH {
+        return Ok(());
+    }
+
+    // 遍历当前目录的所有条目
+    let entries = dir.entries().with_context(|| {
+        format!("无法读取目录: {}", path_prefix)
+    })?;
+
+    for entry in entries {
+        // 达到最大结果数时提前退出
+        if results.len() >= max_results {
+            return Ok(());
+        }
+
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue, // 跳过无法读取的条目
+        };
+
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // 跳过隐藏文件和目录（以 . 开头）
+        if name_str.starts_with('.') {
+            continue;
+        }
+
+        // 构造完整显示路径
+        let full_path = format!("{}{}", path_prefix, name_str);
+
+        // 根据文件类型处理
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        if file_type.is_dir() {
+            // 递归进入子目录
+            if let Ok(sub_dir) = dir.open_dir(&*name) {
+                let sub_prefix = format!("{}/", full_path);
+                grep_dir_recursive(
+                    &sub_dir,
+                    &sub_prefix,
+                    pattern,
+                    case_insensitive,
+                    file_ext,
+                    results,
+                    max_results,
+                    depth + 1,
+                )?;
+            }
+        } else if file_type.is_file() {
+            // 文件扩展名过滤
+            if let Some(ext) = file_ext {
+                let file_ext_match = name_str
+                    .rsplit('.')
+                    .next()
+                    .is_some_and(|e| e.eq_ignore_ascii_case(ext));
+                if !file_ext_match {
+                    continue;
+                }
+            }
+
+            // 检查文件大小（跳过过大文件）
+            if let Ok(meta) = dir.metadata(&*name) {
+                if meta.len() > MAX_GREP_FILE_BYTES {
+                    continue;
+                }
+            }
+
+            // 读取文件内容（跳过非 UTF-8 文件）
+            let Ok(content) = dir.read_to_string(&*name) else {
+                continue;
+            };
+
+            // 逐行搜索匹配
+            for (i, line) in content.lines().enumerate() {
+                if results.len() >= max_results {
+                    return Ok(());
+                }
+
+                let is_match = if case_insensitive {
+                    line.to_lowercase().contains(pattern)
+                } else {
+                    line.contains(pattern)
+                };
+
+                if is_match {
+                    // 截断过长的行
+                    let display_content = if line.len() > MAX_GREP_LINE_DISPLAY {
+                        format!("{}...", &line[..MAX_GREP_LINE_DISPLAY])
+                    } else {
+                        line.to_string()
+                    };
+
+                    results.push(GrepMatch {
+                        file: full_path.clone(),
+                        line_number: i + 1, // 1-based
+                        content: display_content,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ============================================================================
@@ -671,6 +1068,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(temp);
     }
 
+    /// 测试：Ls 列出目录内容
+    #[test]
+    fn sandbox_ls() {
+        let temp = std::env::temp_dir().join("scapegoat_ls_test");
+        let _ = std::fs::remove_dir_all(&temp);
+        let _ = std::fs::create_dir_all(&temp);
+
+        let tools = WorkspaceTools::new(&temp).unwrap();
+
+        // 创建测试文件和目录
+        tools.write_file("hello.md", "hello").unwrap();
+        tools.write_file("sub/nested.txt", "nested").unwrap();
+
+        // Ls 根目录
+        let listing = tools.list_dir("/").unwrap();
+        assert!(listing.contains("sub/"), "应包含子目录 sub/");
+        assert!(listing.contains("hello.md"), "应包含文件 hello.md");
+
+        // Ls 子目录
+        let listing = tools.list_dir("sub").unwrap();
+        assert!(listing.contains("nested.txt"), "应包含文件 nested.txt");
+
+        // Ls 空字符串 = 根目录
+        let listing = tools.list_dir("").unwrap();
+        assert!(listing.contains("sub/"), "空路径应列出根目录");
+
+        // Ls 不存在的目录
+        let result = tools.list_dir("nonexistent");
+        assert!(result.is_err(), "不存在的目录应返回错误");
+
+        // Ls 路径遍历被拒绝
+        let result = tools.list_dir("../");
+        assert!(result.is_err(), "路径遍历应被拒绝");
+
+        // 清理
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
     /// 测试：cap-std 沙箱阻止路径遍历
     #[test]
     fn sandbox_blocks_path_traversal() {
@@ -812,6 +1247,141 @@ mod tests {
         // 不断言 is_ok（在极端情况下可能磁盘确实满了），只确保不 panic
         drop(result);
 
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    // ---- 写保护测试 ----
+
+    /// 测试：is_write_protected 正确识别受保护目录
+    #[test]
+    fn write_protected_paths() {
+        // messages/raw/ 目录受保护（JSONL 原始数据）
+        assert!(is_write_protected("messages/raw"));
+        assert!(is_write_protected("messages/raw/2026-03-10_001.jsonl"));
+        assert!(is_write_protected("Messages/Raw/test.jsonl")); // 大小写不敏感
+
+        // data/ 目录受保护
+        assert!(is_write_protected("data"));
+        assert!(is_write_protected("data/images.db"));
+        assert!(is_write_protected("data/messages.db"));
+        assert!(is_write_protected("Data/test.db")); // 大小写不敏感
+
+        // sessions/ 目录受保护（会话 JSONL 记录文件）
+        assert!(is_write_protected("sessions"));
+        assert!(is_write_protected("sessions/2026-03-13_001.jsonl"));
+        assert!(is_write_protected("Sessions/test.jsonl")); // 大小写不敏感
+
+        // messages/ 下的其他子目录不受保护（MD 格式允许自由修改）
+        assert!(!is_write_protected("messages"));
+        assert!(!is_write_protected("messages/all/2026-03-10_001.md"));
+        assert!(!is_write_protected("messages/master/data.md"));
+        assert!(!is_write_protected("messages/self/2026-03-10_001.md"));
+
+        // 其他路径不受保护
+        assert!(!is_write_protected("MEMORY.md"));
+        assert!(!is_write_protected("AGENTS.md"));
+        assert!(!is_write_protected("skills/test/SKILL.md"));
+        assert!(!is_write_protected("my_data.txt")); // "data" 是前缀但不是目录
+        assert!(!is_write_protected("messages.md")); // "messages" 是前缀但不是目录
+    }
+
+    /// 测试：Write 和 Edit 被写保护拦截
+    #[test]
+    fn write_edit_blocked_on_protected_dirs() {
+        let temp = std::env::temp_dir().join("scapegoat_write_protect_test");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let tools = WorkspaceTools::new(&temp).unwrap();
+        let mut session = WorkspaceToolSession::default();
+
+        // Write 到 messages/raw/ 应被拒绝
+        let result = tools.write_file("messages/raw/test.jsonl", "hacked");
+        assert!(result.is_err(), "Write messages/raw/ 应被写保护拒绝");
+        assert!(
+            result.unwrap_err().to_string().contains("受保护目录"),
+            "错误消息应提及受保护目录"
+        );
+
+        // Write 到 messages/all/ 应允许（MD 格式目录不受保护）
+        let result = tools.write_file("messages/all/test.md", "ok content");
+        assert!(result.is_ok(), "Write messages/all/ 不应被写保护拒绝");
+
+        // Write 到 data/ 应被拒绝
+        let result = tools.write_file("data/test.db", "hacked");
+        assert!(result.is_err(), "Write data/ 应被写保护拒绝");
+
+        // 先创建一个文件用于测试 Edit
+        tools.write_file("normal.txt", "hello").unwrap();
+        let _ = tools.read_file(&mut session, "normal.txt").unwrap();
+        // Edit 正常文件应该成功
+        let result = tools.edit_file(&mut session, "normal.txt", "hello", "world", false);
+        assert!(result.is_ok(), "Edit 正常文件应成功");
+
+        // 清理
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    // ---- Grep 工具测试 ----
+
+    /// 测试：Grep 在工作区中搜索文本
+    #[test]
+    fn grep_basic_search() {
+        let temp = std::env::temp_dir().join("scapegoat_grep_test");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let tools = WorkspaceTools::new(&temp).unwrap();
+
+        // 创建测试文件
+        tools.write_file("readme.md", "Hello World\nThis is a test\nHello Again").unwrap();
+        tools.write_file("notes/todo.txt", "Buy groceries\nHello from notes\nDone").unwrap();
+
+        // 搜索 "Hello"
+        let result = tools.grep("Hello", ".", None, false).unwrap();
+        assert!(result.contains("readme.md:1:"), "应找到 readme.md 第 1 行");
+        assert!(result.contains("readme.md:3:"), "应找到 readme.md 第 3 行");
+        assert!(result.contains("notes/todo.txt:2:"), "应找到 notes/todo.txt 第 2 行");
+        assert!(result.contains("共找到 3 处匹配"), "应报告 3 处匹配");
+
+        // 大小写不敏感搜索
+        let result = tools.grep("hello", ".", None, true).unwrap();
+        assert!(result.contains("共找到 3 处匹配"), "大小写不敏感应找到 3 处");
+
+        // 搜索不存在的文本
+        let result = tools.grep("nonexistent_text_xyz", ".", None, false).unwrap();
+        assert!(result.contains("未找到匹配"), "搜索不到应返回未找到");
+
+        // 清理
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    /// 测试：Grep 文件扩展名过滤
+    #[test]
+    fn grep_file_extension_filter() {
+        let temp = std::env::temp_dir().join("scapegoat_grep_ext_test");
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+
+        let tools = WorkspaceTools::new(&temp).unwrap();
+
+        // 创建不同扩展名的文件
+        tools.write_file("data.md", "search target here").unwrap();
+        tools.write_file("data.txt", "search target here too").unwrap();
+        tools.write_file("data.jsonl", "search target in jsonl").unwrap();
+
+        // 只搜索 .md 文件
+        let result = tools.grep("search target", ".", Some("md"), false).unwrap();
+        assert!(result.contains("data.md"), "应找到 data.md");
+        assert!(!result.contains("data.txt"), "不应找到 data.txt");
+        assert!(!result.contains("data.jsonl"), "不应找到 data.jsonl");
+
+        // 只搜索 .jsonl 文件
+        let result = tools.grep("search target", ".", Some("jsonl"), false).unwrap();
+        assert!(result.contains("data.jsonl"), "应找到 data.jsonl");
+        assert!(!result.contains("data.md"), "不应找到 data.md");
+
+        // 清理
         let _ = std::fs::remove_dir_all(temp);
     }
 }
