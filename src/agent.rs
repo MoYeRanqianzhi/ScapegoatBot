@@ -284,50 +284,82 @@ impl AgentRunner {
             Closed,
         }
 
+        // 标记 cmd_rx 通道是否已关闭
+        // 关闭的 unbounded channel 的 recv() 立即返回 None，如果不加保护会导致
+        // select! 不断选中该分支从而 CPU 100% 空转（busy-spin）
+        let mut cmd_rx_closed = false;
+
         loop {
             // 同时等待 QQ 消息事件或 CLI chat 指令（两者都能唤醒 Agent）
-            let wake = tokio::select! {
-                msg = self.rx.recv() => match msg {
+            // 如果 cmd_rx 已关闭，退化为仅监听 rx，避免空转
+            let wake = if cmd_rx_closed {
+                match self.rx.recv().await {
                     Some(m) => WakeEvent::QqMessage(m),
                     None => WakeEvent::Closed,
-                },
-                cmd = self.cmd_rx.recv() => match cmd {
-                    Some(c) => WakeEvent::ChatCommand(c),
-                    None => {
-                        // cmd 通道关闭（ControlServer 停止），仅记录并继续监听 QQ 消息
-                        tracing::debug!("CLI 指令通道已关闭");
-                        continue;
-                    }
-                },
+                }
+            } else {
+                tokio::select! {
+                    msg = self.rx.recv() => match msg {
+                        Some(m) => WakeEvent::QqMessage(m),
+                        None => WakeEvent::Closed,
+                    },
+                    cmd = self.cmd_rx.recv() => match cmd {
+                        Some(c) => WakeEvent::ChatCommand(c),
+                        None => {
+                            // cmd 通道关闭（ControlServer 停止），
+                            // 设置标志后继续，后续迭代不再 poll cmd_rx
+                            tracing::debug!("CLI 指令通道已关闭");
+                            cmd_rx_closed = true;
+                            continue;
+                        }
+                    },
+                }
             };
 
             match wake {
                 // ===== QQ 消息唤醒：正常去抖 + 批量处理 =====
                 WakeEvent::QqMessage(first) => {
                     // 去抖：等待一小段时间，收集更多 QQ 消息
-                    // 同时也收集去抖期间到达的 CLI 指令
+                    // 同时也收集去抖期间到达的 CLI 指令（如果通道仍开放）
                     let mut batch = vec![first];
                     let mut pending_cmds: Vec<PendingCommand> = Vec::new();
                     let debounce = tokio::time::Duration::from_secs(3);
                     let deadline = tokio::time::Instant::now() + debounce;
 
+                    // 去抖循环：同样需要保护 cmd_rx 关闭后的空转问题
+                    // 使用 cmd_rx_closed 标志条件性地 select cmd_rx 分支
                     loop {
-                        tokio::select! {
-                            // 收集更多 QQ 消息
-                            msg = self.rx.recv() => {
-                                match msg {
-                                    Some(m) => batch.push(m),
-                                    None => break,
+                        if cmd_rx_closed {
+                            // cmd 通道已关闭，仅收集 QQ 消息 + 等超时
+                            tokio::select! {
+                                msg = self.rx.recv() => {
+                                    match msg {
+                                        Some(m) => batch.push(m),
+                                        None => break,
+                                    }
                                 }
+                                _ = tokio::time::sleep_until(deadline) => break,
                             }
-                            // 去抖期间到达的 CLI 指令暂存
-                            cmd = self.cmd_rx.recv() => {
-                                if let Some(c) = cmd {
-                                    pending_cmds.push(c);
+                        } else {
+                            tokio::select! {
+                                // 收集更多 QQ 消息
+                                msg = self.rx.recv() => {
+                                    match msg {
+                                        Some(m) => batch.push(m),
+                                        None => break,
+                                    }
                                 }
+                                // 去抖期间到达的 CLI 指令暂存
+                                cmd = self.cmd_rx.recv() => {
+                                    match cmd {
+                                        Some(c) => pending_cmds.push(c),
+                                        // 通道关闭：设置标志，下次迭代切换到 rx-only 模式
+                                        None => cmd_rx_closed = true,
+                                    }
+                                }
+                                // 去抖超时
+                                _ = tokio::time::sleep_until(deadline) => break,
                             }
-                            // 去抖超时
-                            _ = tokio::time::sleep_until(deadline) => break,
                         }
                     }
 
