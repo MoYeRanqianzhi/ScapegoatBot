@@ -294,10 +294,15 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
     // 创建关闭信号广播通道（容量 1，仅需发送一次关闭信号）
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
-    // 构建控制服务端上下文（持有 Agent 状态和关闭信号发送端）
+    // 创建 CLI chat 指令通道（发送端给 ControlServer，接收端给 Agent）
+    let (cmd_tx, cmd_rx) =
+        tokio::sync::mpsc::unbounded_channel::<agent::PendingCommand>();
+
+    // 构建控制服务端上下文（持有 Agent 状态、关闭信号发送端、CLI 指令转发通道）
     let ctrl_server = Arc::new(control_server::ControlServer {
         agent_state: agent_state.clone(),
         shutdown_tx: shutdown_tx.clone(),
+        cmd_tx,
     });
     // 在后台 tokio 任务中启动控制通道服务端
     // 监听 127.0.0.1:{port}，接收来自 CLI 的控制指令
@@ -345,6 +350,7 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
             tool_ctx.clone(),
             agent_state.clone(),
             agent_rx,
+            cmd_rx,
         ) {
             Ok(runner) => {
                 tokio::spawn(runner.run());
@@ -357,8 +363,9 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
         }
     } else {
         tracing::warn!("LLM 未配置（base_url 或 api_key 为空），Agent 不会启动。消息存储正常工作。");
-        // agent_rx 被丢弃
+        // agent_rx 和 cmd_rx 被丢弃，对应的 send() 后续返回 Err 但无害
         drop(agent_rx);
+        drop(cmd_rx);
     }
 
     // ===== 7. 消息事件监听任务 =====
@@ -725,7 +732,11 @@ fn handle_group_message(
             record.identity,
             record.content,
         );
-        let _ = agent_tx.send(agent::MessageEvent { formatted });
+        let _ = agent_tx.send(agent::MessageEvent {
+            formatted,
+            // 携带群消息来源，Agent 首次 LLM 请求成功后自动标记该群已读
+            source: Some(agent::MessageSource::Group { group_id }),
+        });
     }
 }
 
@@ -844,7 +855,11 @@ fn handle_private_message(
             record.identity,
             record.content,
         );
-        let _ = agent_tx.send(agent::MessageEvent { formatted });
+        let _ = agent_tx.send(agent::MessageEvent {
+            formatted,
+            // 携带私聊来源，Agent 首次 LLM 请求成功后自动标记该私聊已读
+            source: Some(agent::MessageSource::Private { user_id: msg.user_id }),
+        });
     }
 }
 

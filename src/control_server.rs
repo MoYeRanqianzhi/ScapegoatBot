@@ -3,23 +3,27 @@
 // 守护进程在 localhost:port 监听来自 CLI 的控制指令
 // 处理 Shutdown / Status / Ai / Chat 四类请求
 
+use crate::agent;
 use crate::agent_state::AgentState;
 use crate::control::*;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 // ============================================================================
 // 控制服务端上下文
 // ============================================================================
 
 /// 控制服务端共享上下文
-/// 持有 AI Agent 状态和关闭信号发送端
+/// 持有 AI Agent 状态、关闭信号发送端、CLI chat 指令转发通道
 pub struct ControlServer {
     /// AI Agent 状态（活跃/暂停）
     pub agent_state: Arc<AgentState>,
     /// 关闭信号发送端，发送后守护进程主循环退出
     pub shutdown_tx: broadcast::Sender<()>,
+    /// CLI chat 指令发送端 → Agent 接收
+    /// 通过此通道将 `sbot chat` 命令转发给 Agent 循环
+    pub cmd_tx: mpsc::UnboundedSender<agent::PendingCommand>,
 }
 
 // ============================================================================
@@ -98,16 +102,25 @@ async fn handle_control_connection(
             group_filter,
             private_filter,
         } => {
-            // Chat 指令：当前阶段记录并确认收到
-            // 完整实现依赖 LLM Agent 循环（后续任务）
+            // 记录收到的指令内容和白名单过滤条件
             tracing::info!(
                 "收到 chat 指令: {:?} (group_filter={:?}, private_filter={:?})",
                 message,
                 group_filter,
                 private_filter
             );
-            // 返回确认消息，告知 CLI 端指令已被接收
-            ControlResponse::ok(format!("已收到指令: {message}"))
+            // 通过命令通道将指令转发给 Agent 循环
+            // Agent 空闲时立即触发新轮次，agentic 循环中在工具调用之间注入
+            let display = message.clone();
+            match ctx.cmd_tx.send(agent::PendingCommand {
+                message,
+                group_filter,
+                private_filter,
+            }) {
+                Ok(()) => ControlResponse::ok(format!("指令已提交: {display}")),
+                // 发送失败说明 Agent 的 cmd_rx 已被丢弃（Agent 未启动或已退出）
+                Err(_) => ControlResponse::err("Agent 未运行，无法接收指令"),
+            }
         }
     };
     // 将处理结果序列化后通过 TCP 流发送回 CLI

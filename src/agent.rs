@@ -28,12 +28,48 @@ use tokio::sync::mpsc;
 // 消息事件
 // ============================================================================
 
+/// 消息来源类型
+/// 用于 Agent 处理完消息后自动调用对应的已读标记 API
+#[derive(Debug, Clone)]
+pub enum MessageSource {
+    /// 群消息来源
+    Group {
+        /// 群号
+        group_id: i64,
+    },
+    /// 私聊消息来源
+    Private {
+        /// 发送者 QQ 号
+        user_id: i64,
+    },
+}
+
 /// 传递给 Agent 的消息事件通知
 /// 由事件监听器在存储消息后发送
 #[derive(Debug, Clone)]
 pub struct MessageEvent {
     /// 格式化后的消息文本（与存储到 MD 文件的内容一致）
     pub formatted: String,
+    /// 消息来源（群/私聊），Agent 处理完后据此调用 mark_as_read
+    /// CLI 指令转化的 MessageEvent 此字段为 None
+    pub source: Option<MessageSource>,
+}
+
+// ============================================================================
+// CLI 主人指令
+// ============================================================================
+
+/// 来自 CLI `sbot chat` 的待处理主人指令
+/// 通过独立通道传递，与 QQ 消息通道分离
+/// Agent 在空闲时直接触发新轮次，在 agentic 循环中于工具调用之间注入
+#[derive(Debug, Clone)]
+pub struct PendingCommand {
+    /// 自然语言指令内容
+    pub message: String,
+    /// 本轮限定群白名单（空 = 不限定，使用全局）
+    pub group_filter: Vec<i64>,
+    /// 本轮限定私聊白名单（空 = 不限定，使用全局）
+    pub private_filter: Vec<i64>,
 }
 
 // ============================================================================
@@ -110,8 +146,11 @@ pub struct AgentRunner {
     system_prompt: String,
 
     // ----- 通道 -----
-    /// 接收消息事件的通道
+    /// 接收 QQ 消息事件的通道
     rx: mpsc::UnboundedReceiver<MessageEvent>,
+    /// 接收 CLI chat 指令的通道（独立于 QQ 消息通道）
+    /// 空闲时 select 两个通道；agentic 循环中用 try_recv 轮询注入
+    cmd_rx: mpsc::UnboundedReceiver<PendingCommand>,
 
     // ----- 工具定义 -----
     /// LLM 可调用的工具规范列表
@@ -125,12 +164,14 @@ impl AgentRunner {
     /// - `config`: 全局应用配置
     /// - `tool_ctx`: 工具执行上下文
     /// - `agent_state`: Agent 运行状态
-    /// - `rx`: 消息事件接收通道
+    /// - `rx`: QQ 消息事件接收通道
+    /// - `cmd_rx`: CLI chat 指令接收通道
     pub fn new(
         config: Arc<AppConfig>,
         tool_ctx: Arc<ToolContext>,
         agent_state: Arc<AgentState>,
         rx: mpsc::UnboundedReceiver<MessageEvent>,
+        cmd_rx: mpsc::UnboundedReceiver<PendingCommand>,
     ) -> anyhow::Result<Self> {
         // 从配置创建 LLM 提供商（根据 provider 字段选择具体实现）
         // 凭据处理：空字符串视为 None
@@ -221,75 +262,181 @@ impl AgentRunner {
             session,
             system_prompt,
             rx,
+            cmd_rx,
             tool_specs,
         })
     }
 
     /// Agent 主循环
-    /// 持续接收消息事件 → 批量去抖 → 处理轮次
+    /// 持续接收消息事件 / CLI 指令 → 批量去抖 → 处理轮次
+    /// 同时监听两个通道：QQ 消息通道 (rx) 和 CLI chat 指令通道 (cmd_rx)
     /// 直到消息通道关闭
     pub async fn run(mut self) {
         tracing::info!("Agent 循环已启动");
 
+        // 局部枚举：标识唤醒来源
+        enum WakeEvent {
+            /// 收到 QQ 消息事件
+            QqMessage(MessageEvent),
+            /// 收到 CLI chat 主人指令
+            ChatCommand(PendingCommand),
+            /// QQ 消息通道已关闭，应退出循环
+            Closed,
+        }
+
         loop {
-            // 等待第一条消息
-            let first = match self.rx.recv().await {
-                Some(msg) => msg,
-                None => {
+            // 同时等待 QQ 消息事件或 CLI chat 指令（两者都能唤醒 Agent）
+            let wake = tokio::select! {
+                msg = self.rx.recv() => match msg {
+                    Some(m) => WakeEvent::QqMessage(m),
+                    None => WakeEvent::Closed,
+                },
+                cmd = self.cmd_rx.recv() => match cmd {
+                    Some(c) => WakeEvent::ChatCommand(c),
+                    None => {
+                        // cmd 通道关闭（ControlServer 停止），仅记录并继续监听 QQ 消息
+                        tracing::debug!("CLI 指令通道已关闭");
+                        continue;
+                    }
+                },
+            };
+
+            match wake {
+                // ===== QQ 消息唤醒：正常去抖 + 批量处理 =====
+                WakeEvent::QqMessage(first) => {
+                    // 去抖：等待一小段时间，收集更多 QQ 消息
+                    // 同时也收集去抖期间到达的 CLI 指令
+                    let mut batch = vec![first];
+                    let mut pending_cmds: Vec<PendingCommand> = Vec::new();
+                    let debounce = tokio::time::Duration::from_secs(3);
+                    let deadline = tokio::time::Instant::now() + debounce;
+
+                    loop {
+                        tokio::select! {
+                            // 收集更多 QQ 消息
+                            msg = self.rx.recv() => {
+                                match msg {
+                                    Some(m) => batch.push(m),
+                                    None => break,
+                                }
+                            }
+                            // 去抖期间到达的 CLI 指令暂存
+                            cmd = self.cmd_rx.recv() => {
+                                if let Some(c) = cmd {
+                                    pending_cmds.push(c);
+                                }
+                            }
+                            // 去抖超时
+                            _ = tokio::time::sleep_until(deadline) => break,
+                        }
+                    }
+
+                    // 检查 Agent 是否活跃
+                    if !self.agent_state.is_active() {
+                        tracing::debug!("Agent 已暂停，跳过 {} 条消息", batch.len());
+                        continue;
+                    }
+
+                    // 检查 LLM 是否已配置
+                    if !self.config.llm.is_configured() {
+                        tracing::warn!("LLM 未配置（base_url 或 api_key 为空），跳过处理");
+                        continue;
+                    }
+
+                    // 输出消息摘要日志
+                    tracing::info!("Agent 开始处理 {} 条消息", batch.len());
+                    for (i, msg) in batch.iter().enumerate() {
+                        let preview: String = msg.formatted.chars().take(200).collect();
+                        tracing::info!("  消息[{}]: {}", i + 1, preview);
+                    }
+
+                    // 处理 QQ 消息批次
+                    if let Err(e) = self.process_turn(batch).await {
+                        tracing::error!("Agent 处理轮次失败: {}", e);
+                    }
+
+                    // 处理去抖期间到达的 CLI 指令（逐条作为独立轮次）
+                    for cmd in pending_cmds {
+                        tracing::info!("处理去抖期间到达的主人指令: {}", cmd.message);
+                        if let Err(e) = self.process_command_turn(cmd).await {
+                            tracing::error!("主人指令处理失败: {}", e);
+                        }
+                    }
+                }
+
+                // ===== CLI 指令唤醒：不去抖，直接处理 =====
+                WakeEvent::ChatCommand(cmd) => {
+                    // 检查 Agent 是否活跃
+                    if !self.agent_state.is_active() {
+                        tracing::warn!("Agent 已暂停，跳过主人指令: {:?}", cmd.message);
+                        continue;
+                    }
+                    // 检查 LLM 是否已配置
+                    if !self.config.llm.is_configured() {
+                        tracing::warn!("LLM 未配置，跳过主人指令");
+                        continue;
+                    }
+                    // 主人指令直接处理（不去抖，不等待 QQ 消息）
+                    tracing::info!("收到主人指令: {}", cmd.message);
+                    if let Err(e) = self.process_command_turn(cmd).await {
+                        tracing::error!("主人指令处理失败: {}", e);
+                    }
+                }
+
+                // ===== QQ 消息通道关闭 =====
+                WakeEvent::Closed => {
                     tracing::info!("Agent 消息通道已关闭，退出循环");
                     break;
                 }
-            };
-
-            // 去抖：等待一小段时间，收集更多消息
-            let mut batch = vec![first];
-            let debounce = tokio::time::Duration::from_secs(3);
-            let deadline = tokio::time::Instant::now() + debounce;
-
-            loop {
-                tokio::select! {
-                    msg = self.rx.recv() => {
-                        match msg {
-                            Some(m) => batch.push(m),
-                            None => break,
-                        }
-                    }
-                    _ = tokio::time::sleep_until(deadline) => break,
-                }
-            }
-
-            // 检查 Agent 是否活跃
-            if !self.agent_state.is_active() {
-                tracing::debug!("Agent 已暂停，跳过 {} 条消息", batch.len());
-                continue;
-            }
-
-            // 检查 LLM 是否已配置
-            if !self.config.llm.is_configured() {
-                tracing::warn!("LLM 未配置（base_url 或 api_key 为空），跳过处理");
-                continue;
-            }
-
-            tracing::info!("Agent 开始处理 {} 条消息", batch.len());
-        // 输出每条消息的摘要
-        for (i, msg) in batch.iter().enumerate() {
-            // 截取前 200 字符作为预览
-            let preview: String = msg.formatted.chars().take(200).collect();
-            tracing::info!("  消息[{}]: {}", i + 1, preview);
-        }
-
-            // 处理轮次
-            if let Err(e) = self.process_turn(batch).await {
-                tracing::error!("Agent 处理轮次失败: {}", e);
             }
         }
 
         tracing::info!("Agent 循环已退出");
     }
 
+    /// 将 CLI chat 指令格式化为用户消息后作为独立轮次处理
+    /// 指令以 `[主人指令]` 前缀标记，让 LLM 明确这是主人的直接命令
+    async fn process_command_turn(&mut self, cmd: PendingCommand) -> anyhow::Result<()> {
+        // 格式化为带前缀的用户消息
+        let mut content = format!("[主人指令] {}", cmd.message);
+        // 如果指定了白名单限制，附加到消息中供 LLM 参考
+        if !cmd.group_filter.is_empty() {
+            content.push_str(&format!("\n（本轮限定群: {:?}）", cmd.group_filter));
+        }
+        if !cmd.private_filter.is_empty() {
+            content.push_str(&format!("\n（本轮限定私聊: {:?}）", cmd.private_filter));
+        }
+        // 构造一个只含该指令的批次，复用 process_turn
+        // CLI 指令无 QQ 消息来源，source 为 None
+        let event = MessageEvent {
+            formatted: content,
+            source: None,
+        };
+        self.process_turn(vec![event]).await
+    }
+
+    /// 将 CLI chat 指令格式化为用户消息文本
+    /// 提取为独立方法，供 agentic 循环中的注入逻辑复用
+    fn format_command_as_user_message(cmd: &PendingCommand) -> String {
+        let mut content = format!("[主人指令] {}", cmd.message);
+        if !cmd.group_filter.is_empty() {
+            content.push_str(&format!("\n（本轮限定群: {:?}）", cmd.group_filter));
+        }
+        if !cmd.private_filter.is_empty() {
+            content.push_str(&format!("\n（本轮限定私聊: {:?}）", cmd.private_filter));
+        }
+        content
+    }
+
     /// 处理一批消息事件
     /// 将消息批次格式化为用户消息 → 进入 agentic 循环
     async fn process_turn(&mut self, batch: Vec<MessageEvent>) -> anyhow::Result<()> {
+        // 收集本批次的消息来源（群/私聊），用于 LLM 首次成功后标记已读
+        let sources: Vec<MessageSource> = batch
+            .iter()
+            .filter_map(|e| e.source.clone())
+            .collect();
+
         // 将批次中的所有消息格式化为一条 user 消息
         let user_content = if batch.len() == 1 {
             batch[0].formatted.clone()
@@ -325,7 +472,20 @@ impl AgentRunner {
         // （断流可能连续发生成百上千次，如果每次都写入对话，会导致
         //   对话中累积大量重复的系统提醒，浪费 token 并干扰模型理解）
         let mut retry_reminder: Option<ChatMessage> = None;
+        // 已读标记：仅在首次 LLM 请求成功后标记一次
+        // 模拟真人行为——看到消息 → 标记已读 → 慢慢回复
+        let mut read_marked = false;
         loop {
+            // ===== 检查待处理的主人指令（工具调用之间注入） =====
+            // 类似 Codex "Messages to be submitted after next tool call" 模式：
+            // 当前 step（LLM 调用 + 工具执行）完成后，在下一次 LLM 请求前插入
+            // 不等到 Finish — 在循环迭代之间注入，让 LLM 立即看到并响应
+            while let Ok(cmd) = self.cmd_rx.try_recv() {
+                let injected = Self::format_command_as_user_message(&cmd);
+                tracing::info!("插入主人指令到 agentic 循环: {}", cmd.message);
+                self.session.push(ChatMessage::user(injected))?;
+            }
+
             if steps >= self.max_steps {
                 tracing::warn!(
                     "Agent 达到最大步数限制 ({})，强制停止",
@@ -416,6 +576,14 @@ impl AgentRunner {
             );
             let response = self.provider.chat(request, &self.model, 0.7).await?;
 
+            // ===== 首次 LLM 成功后标记消息已读 =====
+            // 模拟真人行为：看到消息 → 标记已读 → 慢慢回复
+            // 仅在首次成功时执行一次，后续 agentic 循环迭代不再重复
+            if !read_marked && !sources.is_empty() {
+                read_marked = true;
+                self.mark_sources_as_read(&sources).await;
+            }
+
             // 处理响应
             if response.has_tool_calls() {
                 // LLM 请求执行工具调用
@@ -499,6 +667,43 @@ impl AgentRunner {
         }
 
         Ok(())
+    }
+
+    /// 将批次中的消息来源标记为已读
+    /// 收集唯一的 group_id / user_id，分别调用 mark_group_msg_as_read / mark_private_msg_as_read
+    /// 任何单个标记失败仅记录警告，不影响整体流程
+    async fn mark_sources_as_read(&self, sources: &[MessageSource]) {
+        // 收集唯一的群号和用户 QQ 号，避免重复调用
+        let mut group_ids = std::collections::HashSet::new();
+        let mut user_ids = std::collections::HashSet::new();
+        for src in sources {
+            match src {
+                MessageSource::Group { group_id } => {
+                    group_ids.insert(*group_id);
+                }
+                MessageSource::Private { user_id } => {
+                    user_ids.insert(*user_id);
+                }
+            }
+        }
+
+        // 标记群消息已读
+        for gid in &group_ids {
+            if let Err(e) = self.tool_ctx.api.message.mark_group_msg_as_read(*gid).await {
+                tracing::warn!("标记群 {} 消息已读失败: {}", gid, e);
+            } else {
+                tracing::debug!("已标记群 {} 消息已读", gid);
+            }
+        }
+
+        // 标记私聊消息已读
+        for uid in &user_ids {
+            if let Err(e) = self.tool_ctx.api.message.mark_private_msg_as_read(*uid).await {
+                tracing::warn!("标记私聊 {} 消息已读失败: {}", uid, e);
+            } else {
+                tracing::debug!("已标记私聊 {} 消息已读", uid);
+            }
+        }
     }
 
     /// 分发工具调用到具体的实现函数
