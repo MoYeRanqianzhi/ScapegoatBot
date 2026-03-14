@@ -14,6 +14,7 @@ mod control;
 mod control_server;
 mod compact;
 mod config;
+mod group_role;
 mod message_format;
 mod prompt;
 mod providers;
@@ -311,6 +312,11 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
         ctrl_server,
     ));
 
+    // ===== 5.5 群身份状态 =====
+
+    // 创建群身份状态（线程安全共享：Agent 读取，事件监听写入，定时同步写入）
+    let group_role_state = Arc::new(group_role::GroupRoleState::new());
+
     // ===== 6. 主人账号配置 =====
 
     // master_qq 的值在收到第一条消息时通过 self_id 解析（如果是 "self" 模式）
@@ -351,6 +357,7 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
             agent_state.clone(),
             agent_rx,
             cmd_rx,
+            group_role_state.clone(),
         ) {
             Ok(runner) => {
                 tokio::spawn(runner.run());
@@ -376,6 +383,7 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
     let master_qq_clone = master_qq.clone();
     let bot_qq_clone = bot_qq.clone();
     let agent_tx_clone = agent_tx.clone();
+    let group_role_clone = group_role_state.clone();
     // 在后台 tokio 任务中运行消息事件监听循环
     tokio::spawn(async move {
         tracing::info!("消息事件监听任务已启动");
@@ -508,9 +516,88 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
                         req.comment
                     );
                 }
+            } else if event_name.starts_with("notice.group_admin") {
+                // ----- 群管理员变更事件（即时更新群身份状态） -----
+                if let Ok(notice) = serde_json::from_value::<
+                    napcat_link::types::event::notice::GroupAdminNotice,
+                >(event.data.clone())
+                {
+                    let bot = bot_qq_clone.load(Ordering::Relaxed);
+                    // 仅关注 Bot 自身的管理员状态变更
+                    if bot != 0 && notice.user_id == bot {
+                        let role = if notice.sub_type == "set" {
+                            group_role::GroupRole::Admin
+                        } else {
+                            group_role::GroupRole::Member
+                        };
+                        group_role_clone.set_role(notice.group_id, role);
+                        tracing::info!(
+                            "群 {} 管理员状态变更: {} → {:?}",
+                            notice.group_id,
+                            notice.sub_type,
+                            role
+                        );
+                    }
+                }
             }
         }
     });
+
+    // ===== 7.5 群身份定时全量同步任务 =====
+
+    {
+        // 克隆共享状态到定时同步任务
+        let sync_state = group_role_state.clone();
+        let sync_api = tool_ctx.api.clone();
+        let sync_bot_qq = bot_qq.clone();
+        let sync_recv_groups: Vec<i64> = config.whitelist.recv_groups.clone();
+
+        tokio::spawn(async move {
+            // ===== 等待 bot_qq 就绪 =====
+            // bot_qq 在收到第一条消息时从 self_id 解析
+            // 轮询等待，每 1 秒检查一次，最多等 300 秒
+            let mut waited = 0u32;
+            loop {
+                let qq = sync_bot_qq.load(Ordering::Relaxed);
+                if qq != 0 {
+                    tracing::info!("群角色同步: bot_qq={} 已就绪", qq);
+                    break;
+                }
+                if waited >= 300 {
+                    tracing::warn!("群角色同步: 等待 bot_qq 超时（300s），放弃首次同步");
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                waited += 1;
+            }
+
+            let bot = sync_bot_qq.load(Ordering::Relaxed);
+
+            // ===== 首次全量同步 =====
+            tracing::info!("群角色同步: 执行首次全量同步...");
+            let roles = group_role::sync_group_roles(&sync_api, bot, &sync_recv_groups).await;
+            sync_state.replace_all(roles);
+
+            // ===== 定时循环：每 12 小时 + 随机 15~1800 秒延迟 =====
+            loop {
+                let base = std::time::Duration::from_secs(12 * 3600);
+                let jitter_secs = rand::random_range(15u64..=1800);
+                let jitter = std::time::Duration::from_secs(jitter_secs);
+                tracing::debug!("群角色同步: 下次同步在 {}h + {}s 后", 12, jitter_secs);
+                tokio::time::sleep(base + jitter).await;
+
+                let bot = sync_bot_qq.load(Ordering::Relaxed);
+                if bot == 0 {
+                    tracing::warn!("群角色同步: bot_qq 为 0，跳过本次同步");
+                    continue;
+                }
+                tracing::info!("群角色同步: 执行定时全量同步...");
+                let roles =
+                    group_role::sync_group_roles(&sync_api, bot, &sync_recv_groups).await;
+                sync_state.replace_all(roles);
+            }
+        });
+    }
 
     // ===== 8. 连接 NapCat 服务器 =====
 

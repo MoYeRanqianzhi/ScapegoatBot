@@ -135,6 +135,35 @@ pub fn update_prompt_session_ref(prompt: &mut String, prev_session_path: Option<
 }
 
 // ============================================================================
+// 群身份段运行时更新
+// ============================================================================
+
+/// 群身份段的标题行，用于定位替换
+const GROUP_ROLES_HEADER: &str = "## 群身份\n";
+
+/// 更新系统提示中的群身份段
+/// 当管理员状态变更时调用（事件驱动或定时同步后），
+/// 定位 `## 群身份` 段并替换为最新内容
+///
+/// # 参数
+/// - `prompt`: 当前系统提示（可变引用）
+/// - `new_section`: GroupRoleState.format_prompt_section() 生成的新段落内容
+pub fn update_prompt_group_roles(prompt: &mut String, new_section: &str) {
+    // 定位已有的 ## 群身份 段
+    if let Some(section_start) = prompt.find(GROUP_ROLES_HEADER) {
+        // 找到该段的结束位置：下一个 ## 标题或文档末尾
+        let after_header = section_start + GROUP_ROLES_HEADER.len();
+        let section_end = prompt[after_header..]
+            .find("\n## ")
+            .map(|offset| after_header + offset + 1) // +1 保留换行
+            .unwrap_or(prompt.len());
+        // 替换整个段落（包含标题）
+        prompt.replace_range(section_start..section_end, new_section);
+    }
+    // 如果找不到该段（不应发生，因为 build 时已注入），静默忽略
+}
+
+// ============================================================================
 // 系统提示构建
 // ============================================================================
 
@@ -167,6 +196,9 @@ pub struct PromptConfig<'a> {
     /// AI 启动时的未处理消息范围（仅 ai_boot=true 时有意义）
     /// 每个元素格式: "messages/group/123456/2026-03-09_001.md 从 ID 789 到最新"
     pub unprocessed_ranges: Vec<String>,
+    /// 群身份状态的 prompt 文本
+    /// 由 GroupRoleState.format_prompt_section() 生成，包含 `## 群身份` 标题
+    pub group_roles_section: &'a str,
 }
 
 /// 构建完整的系统提示词
@@ -391,6 +423,12 @@ pub fn build_system_prompt(cfg: &PromptConfig<'_>) -> String {
         }
     }
 
+    // ===== 第 3.6 节：群身份 =====
+    // 注入 GroupRoleState 生成的群管理员/群主身份信息
+    // 此 section 在运行时通过 update_prompt_group_roles() 动态更新
+    out.push_str(cfg.group_roles_section);
+    out.push('\n');
+
     // ===== 第 4 节：记忆检索 =====
     out.push_str("\
 ## 记忆检索
@@ -591,6 +629,7 @@ mod tests {
             prev_session_path: None,
             ai_boot: false,
             unprocessed_ranges: vec![],
+            group_roles_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         println!("\n========== 完整系统提示词 ==========\n");
@@ -647,6 +686,7 @@ mod tests {
             prev_session_path: None,
             ai_boot: false,
             unprocessed_ranges: vec![],
+            group_roles_section: "",
         };
         let prompt = build_system_prompt(&cfg);
 
@@ -711,6 +751,7 @@ mod tests {
             prev_session_path: None,
             ai_boot: false,
             unprocessed_ranges: vec![],
+            group_roles_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(prompt.contains("Agents.md not found"));
@@ -738,6 +779,7 @@ mod tests {
             prev_session_path: None,
             ai_boot: false,
             unprocessed_ranges: vec![],
+            group_roles_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(prompt.contains("## 附加运行时上下文"));
@@ -766,6 +808,7 @@ mod tests {
             prev_session_path: None,
             ai_boot: false,
             unprocessed_ranges: vec![],
+            group_roles_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(!prompt.contains("## 附加运行时上下文"));
@@ -793,6 +836,7 @@ mod tests {
             prev_session_path: None,
             ai_boot: false,
             unprocessed_ranges: vec![],
+            group_roles_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         // 确认工具列表中没有 Bash 工具定义（`Bash` 加反引号表示工具名）
@@ -827,6 +871,7 @@ mod tests {
             prev_session_path: None,
             ai_boot: true,
             unprocessed_ranges: ranges,
+            group_roles_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(prompt.contains("## 启动检查"));
@@ -856,6 +901,7 @@ mod tests {
             prev_session_path: None,
             ai_boot: false,
             unprocessed_ranges: vec![],
+            group_roles_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(!prompt.contains("## 启动检查"));
@@ -883,6 +929,7 @@ mod tests {
             prev_session_path: Some("sessions/2026-03-13_001.jsonl"),
             ai_boot: false,
             unprocessed_ranges: vec![],
+            group_roles_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(prompt.contains("## 会话记录"));
@@ -912,6 +959,7 @@ mod tests {
             prev_session_path: None,
             ai_boot: false,
             unprocessed_ranges: vec![],
+            group_roles_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(!prompt.contains("## 会话记录"));

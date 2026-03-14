@@ -137,6 +137,8 @@ pub struct AgentRunner {
     workspace_session: WorkspaceToolSession,
     /// Agent 运行状态（活跃/暂停）
     agent_state: Arc<AgentState>,
+    /// 群身份状态（管理员/群主），用于动态更新系统 prompt
+    group_role_state: Arc<crate::group_role::GroupRoleState>,
 
     // ----- 会话 -----
     /// 会话管理器（JSONL 持久化 + 内存缓存 + SQLite 索引）
@@ -166,12 +168,14 @@ impl AgentRunner {
     /// - `agent_state`: Agent 运行状态
     /// - `rx`: QQ 消息事件接收通道
     /// - `cmd_rx`: CLI chat 指令接收通道
+    /// - `group_role_state`: 群身份状态（管理员/群主信息）
     pub fn new(
         config: Arc<AppConfig>,
         tool_ctx: Arc<ToolContext>,
         agent_state: Arc<AgentState>,
         rx: mpsc::UnboundedReceiver<MessageEvent>,
         cmd_rx: mpsc::UnboundedReceiver<PendingCommand>,
+        group_role_state: Arc<crate::group_role::GroupRoleState>,
     ) -> anyhow::Result<Self> {
         // 从配置创建 LLM 提供商（根据 provider 字段选择具体实现）
         // 凭据处理：空字符串视为 None
@@ -242,6 +246,7 @@ impl AgentRunner {
             prev_session_path: session.prev_session_path(),
             ai_boot: true,
             unprocessed_ranges: vec![],
+            group_roles_section: "",  // 初始化为空，启动后由定时同步填充
         };
         let system_prompt = prompt::build_system_prompt(&prompt_config);
 
@@ -259,6 +264,7 @@ impl AgentRunner {
             workspace_tools,
             workspace_session: WorkspaceToolSession::default(),
             agent_state,
+            group_role_state,
             session,
             system_prompt,
             rx,
@@ -485,6 +491,10 @@ impl AgentRunner {
 
         // 刷新系统提示中的日期时间
         prompt::refresh_prompt_datetime(&mut self.system_prompt);
+
+        // 刷新系统提示中的群身份信息（管理员/群主状态可能已通过事件或定时同步变更）
+        let group_roles_text = self.group_role_state.format_prompt_section();
+        prompt::update_prompt_group_roles(&mut self.system_prompt, &group_roles_text);
 
         // 构建系统消息（使用配置的角色名称）
         let system_message = ChatMessage {
@@ -1149,6 +1159,381 @@ impl AgentRunner {
                         tracing::warn!("Grep 失败: {}", e);
                         format!("Grep 失败: {e}")
                     }
+                }
+            }
+
+            // ===== 群管理工具 dispatch（仅管理员/群主） =====
+
+            "SetGroupBan" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                // 提取必需参数：要禁言的用户 QQ 号
+                let user_id = match args.get("user_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: user_id".to_string(),
+                };
+                // 可选参数：禁言时长（秒），None 表示使用默认值
+                let duration = args.get("duration").and_then(|v| v.as_i64());
+                tracing::info!("SetGroupBan(群={}, 用户={}, 时长={:?})", group_id, user_id, duration);
+                // 调用 NapCat API 执行禁言操作
+                match self.tool_ctx.api.group.set_group_ban(group_id, user_id, duration).await {
+                    Ok(_) => {
+                        // 根据 duration 值生成可读描述
+                        let dur_desc = duration
+                            .map(|d| {
+                                if d == 0 { "解除禁言".to_string() } else { format!("{}秒", d) }
+                            })
+                            .unwrap_or("默认时长".to_string());
+                        format!("已对群 {} 用户 {} 执行禁言操作（{}）", group_id, user_id, dur_desc)
+                    }
+                    Err(e) => format!("群 {} 禁言用户 {} 失败: {e}", group_id, user_id),
+                }
+            }
+
+            "SetGroupWholeBan" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                // 可选参数：是否开启全员禁言，None 表示默认开启
+                let enable = args.get("enable").and_then(|v| v.as_bool());
+                tracing::info!("SetGroupWholeBan(群={}, enable={:?})", group_id, enable);
+                // 调用 NapCat API 设置全员禁言
+                match self.tool_ctx.api.group.set_group_whole_ban(group_id, enable).await {
+                    Ok(_) => {
+                        // 根据 enable 值生成描述
+                        let state = if enable.unwrap_or(true) { "开启" } else { "关闭" };
+                        format!("已{}群 {} 全员禁言", state, group_id)
+                    }
+                    Err(e) => format!("群 {} 全员禁言操作失败: {e}", group_id),
+                }
+            }
+
+            "SetGroupKick" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                // 提取必需参数：要踢出的用户 QQ 号
+                let user_id = match args.get("user_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: user_id".to_string(),
+                };
+                // 可选参数：是否拒绝此人再次加群
+                let reject_add_request = args.get("reject_add_request").and_then(|v| v.as_bool());
+                tracing::info!("SetGroupKick(群={}, 用户={}, reject={:?})", group_id, user_id, reject_add_request);
+                // 调用 NapCat API 踢出群成员
+                match self.tool_ctx.api.group.set_group_kick(group_id, user_id, reject_add_request).await {
+                    Ok(_) => {
+                        // 附加是否拒绝再次加群的说明
+                        let reject_desc = if reject_add_request.unwrap_or(false) { "，并拒绝再次加群" } else { "" };
+                        format!("已将用户 {} 踢出群 {}{}", user_id, group_id, reject_desc)
+                    }
+                    Err(e) => format!("踢出群 {} 用户 {} 失败: {e}", group_id, user_id),
+                }
+            }
+
+            "SetGroupName" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                // 提取必需参数：新群名
+                let group_name = match args.get("group_name").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => return "缺少参数: group_name".to_string(),
+                };
+                tracing::info!("SetGroupName(群={}, 名称={})", group_id, group_name);
+                // 调用 NapCat API 设置群名
+                match self.tool_ctx.api.group.set_group_name(group_id, &group_name).await {
+                    Ok(_) => format!("已将群 {} 的名称设置为「{}」", group_id, group_name),
+                    Err(e) => format!("设置群 {} 名称失败: {e}", group_id),
+                }
+            }
+
+            "SetGroupPortrait" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                // 提取必需参数：图片文件路径或 URL
+                let file = match args.get("file").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => return "缺少参数: file".to_string(),
+                };
+                tracing::info!("SetGroupPortrait(群={}, file={})", group_id, file);
+                // 调用 NapCat 文件 API 设置群头像
+                match self.tool_ctx.api.file.set_group_portrait(group_id, &file).await {
+                    Ok(_) => format!("已设置群 {} 的头像", group_id),
+                    Err(e) => format!("设置群 {} 头像失败: {e}", group_id),
+                }
+            }
+
+            "SetEssenceMsg" => {
+                // 提取必需参数：要设为精华的消息 ID
+                let message_id = match args.get("message_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: message_id".to_string(),
+                };
+                tracing::info!("SetEssenceMsg(msg={})", message_id);
+                // 调用 NapCat API 设置精华消息
+                match self.tool_ctx.api.message.set_essence_message(message_id).await {
+                    Ok(_) => format!("已将消息 {} 设为精华消息", message_id),
+                    Err(e) => format!("设置精华消息 {} 失败: {e}", message_id),
+                }
+            }
+
+            "DeleteEssenceMsg" => {
+                // 提取必需参数：要移出精华的消息 ID
+                let message_id = match args.get("message_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: message_id".to_string(),
+                };
+                tracing::info!("DeleteEssenceMsg(msg={})", message_id);
+                // 调用 NapCat API 移出精华消息
+                match self.tool_ctx.api.message.delete_essence_message(message_id).await {
+                    Ok(_) => format!("已将消息 {} 移出精华消息", message_id),
+                    Err(e) => format!("移出精华消息 {} 失败: {e}", message_id),
+                }
+            }
+
+            "GetEssenceMsgList" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                tracing::info!("GetEssenceMsgList(群={})", group_id);
+                // 调用 NapCat API 获取精华消息列表，返回 JSON 数据
+                match self.tool_ctx.api.message.get_essence_message_list(group_id).await {
+                    Ok(result) => serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                    Err(e) => format!("获取群 {} 精华消息列表失败: {e}", group_id),
+                }
+            }
+
+            "GetGroupAtAllRemain" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                tracing::info!("GetGroupAtAllRemain(群={})", group_id);
+                // 调用 NapCat API 获取 @全体成员 剩余次数，返回 JSON 数据
+                match self.tool_ctx.api.message.get_group_at_all_remain(group_id).await {
+                    Ok(result) => serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                    Err(e) => format!("获取群 {} @全体成员剩余次数失败: {e}", group_id),
+                }
+            }
+
+            "GetGroupShutList" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                tracing::info!("GetGroupShutList(群={})", group_id);
+                // 调用 NapCat API 获取禁言列表，返回 JSON 数据
+                match self.tool_ctx.api.napcat.get_group_shut_list(group_id).await {
+                    Ok(result) => serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                    Err(e) => format!("获取群 {} 禁言列表失败: {e}", group_id),
+                }
+            }
+
+            "SendGroupNotice" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                // 提取必需参数：公告内容
+                let content = match args.get("content").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => return "缺少参数: content".to_string(),
+                };
+                // 可选参数：图片 URL，先提取为 Option<String> 以延长生命周期
+                let image_owned: Option<String> = args
+                    .get("image")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                // 将 Option<String> 转为 Option<&str> 传入 API
+                let image = image_owned.as_deref();
+                // 可选参数：是否置顶（从 JSON integer 转为 Option<i32>）
+                let pinned = args
+                    .get("pinned")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32);
+                tracing::info!("SendGroupNotice(群={}, 内容长={}, 图片={:?}, 置顶={:?})",
+                    group_id, content.len(), image, pinned);
+                // 调用 NapCat API 发送群公告，后 4 个参数不使用传 None
+                match self.tool_ctx.api.napcat.send_group_notice(
+                    group_id, &content, image, pinned, None, None, None, None,
+                ).await {
+                    Ok(_) => format!("已向群 {} 发送公告", group_id),
+                    Err(e) => format!("向群 {} 发送公告失败: {e}", group_id),
+                }
+            }
+
+            "DelGroupNotice" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                // 提取必需参数：公告 ID
+                let notice_id = match args.get("notice_id").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => return "缺少参数: notice_id".to_string(),
+                };
+                tracing::info!("DelGroupNotice(群={}, notice_id={})", group_id, notice_id);
+                // 调用 NapCat API 删除群公告
+                match self.tool_ctx.api.napcat.del_group_notice(group_id, &notice_id).await {
+                    Ok(_) => format!("已删除群 {} 的公告 {}", group_id, notice_id),
+                    Err(e) => format!("删除群 {} 公告 {} 失败: {e}", group_id, notice_id),
+                }
+            }
+
+            "SetGroupAdmin" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                // 提取必需参数：目标用户 QQ 号
+                let user_id = match args.get("user_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: user_id".to_string(),
+                };
+                // 可选参数：是否设置为管理员，None 表示默认设置
+                let enable = args.get("enable").and_then(|v| v.as_bool());
+                tracing::info!("SetGroupAdmin(群={}, 用户={}, enable={:?})", group_id, user_id, enable);
+                // 调用 NapCat API 设置/取消管理员
+                match self.tool_ctx.api.group.set_group_admin(group_id, user_id, enable).await {
+                    Ok(_) => {
+                        // 根据 enable 值生成描述
+                        let action = if enable.unwrap_or(true) { "设置为管理员" } else { "取消管理员" };
+                        format!("已将群 {} 用户 {} {}", group_id, user_id, action)
+                    }
+                    Err(e) => format!("群 {} 设置用户 {} 管理员失败: {e}", group_id, user_id),
+                }
+            }
+
+            "SetGroupSpecialTitle" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                // 提取必需参数：目标用户 QQ 号
+                let user_id = match args.get("user_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: user_id".to_string(),
+                };
+                // 提取必需参数：头衔内容（空字符串表示删除）
+                let special_title = match args.get("special_title").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => return "缺少参数: special_title".to_string(),
+                };
+                // 可选参数：有效期（秒），-1 表示永久
+                let duration = args.get("duration").and_then(|v| v.as_i64());
+                tracing::info!("SetGroupSpecialTitle(群={}, 用户={}, 头衔={}, 时长={:?})",
+                    group_id, user_id, special_title, duration);
+                // 调用 NapCat API 设置专属头衔
+                match self.tool_ctx.api.group.set_group_special_title(
+                    group_id, user_id, &special_title, duration,
+                ).await {
+                    Ok(_) => {
+                        // 空头衔表示删除操作
+                        if special_title.is_empty() {
+                            format!("已删除群 {} 用户 {} 的专属头衔", group_id, user_id)
+                        } else {
+                            format!("已将群 {} 用户 {} 的专属头衔设为「{}」", group_id, user_id, special_title)
+                        }
+                    }
+                    Err(e) => format!("设置群 {} 用户 {} 专属头衔失败: {e}", group_id, user_id),
+                }
+            }
+
+            // ===== 群组工具 dispatch（无需管理员权限） =====
+
+            "SetGroupLeave" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                // 可选参数：是否解散群（仅群主有效）
+                let is_dismiss = args.get("is_dismiss").and_then(|v| v.as_bool());
+                tracing::info!("SetGroupLeave(群={}, dismiss={:?})", group_id, is_dismiss);
+                // 调用 NapCat API 退出/解散群组
+                match self.tool_ctx.api.group.set_group_leave(group_id, is_dismiss).await {
+                    Ok(_) => {
+                        // 根据 is_dismiss 判断是退出还是解散
+                        if is_dismiss.unwrap_or(false) {
+                            format!("已解散群 {}", group_id)
+                        } else {
+                            format!("已退出群 {}", group_id)
+                        }
+                    }
+                    Err(e) => format!("退出群 {} 失败: {e}", group_id),
+                }
+            }
+
+            "GetGroupNotice" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                tracing::info!("GetGroupNotice(群={})", group_id);
+                // 调用 NapCat API 获取群公告列表，返回 JSON 数据
+                match self.tool_ctx.api.napcat.get_group_notice(group_id).await {
+                    Ok(result) => serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                    Err(e) => format!("获取群 {} 公告列表失败: {e}", group_id),
+                }
+            }
+
+            "GetGroupHonorInfo" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                // 提取必需参数：荣誉类型
+                let honor_type = match args.get("honor_type").and_then(|v| v.as_str()) {
+                    Some(v) => v.to_string(),
+                    None => return "缺少参数: honor_type".to_string(),
+                };
+                tracing::info!("GetGroupHonorInfo(群={}, 类型={})", group_id, honor_type);
+                // 调用 NapCat API 获取群荣誉信息，返回 JSON 数据
+                match self.tool_ctx.api.message.get_group_honor_info(group_id, &honor_type).await {
+                    Ok(result) => serde_json::to_string_pretty(&result)
+                        .unwrap_or_else(|_| format!("{:?}", result)),
+                    Err(e) => format!("获取群 {} 荣誉信息失败: {e}", group_id),
+                }
+            }
+
+            "SetGroupSign" => {
+                // 提取必需参数：群号
+                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
+                    Some(v) => v,
+                    None => return "缺少参数: group_id".to_string(),
+                };
+                tracing::info!("SetGroupSign(群={})", group_id);
+                // 调用 NapCat API 执行群签到
+                match self.tool_ctx.api.napcat.set_group_sign(group_id).await {
+                    Ok(_) => format!("已在群 {} 完成签到", group_id),
+                    Err(e) => format!("群 {} 签到失败: {e}", group_id),
                 }
             }
 
@@ -1850,6 +2235,332 @@ fn build_tool_specs() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["pattern"]
+            }),
+        },
+        // ===== 群管理工具（仅管理员/群主） =====
+        ToolSpec {
+            name: "SetGroupBan".to_string(),
+            description: "群组单人禁言（仅管理员可用）。设置 duration=0 可解除禁言。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    },
+                    "user_id": {
+                        "type": "integer",
+                        "description": "要禁言的用户 QQ 号"
+                    },
+                    "duration": {
+                        "type": "integer",
+                        "description": "禁言时长，单位秒。默认30分钟(1800)，0=解除禁言"
+                    }
+                },
+                "required": ["group_id", "user_id"]
+            }),
+        },
+        ToolSpec {
+            name: "SetGroupWholeBan".to_string(),
+            description: "群组全员禁言（仅管理员可用）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    },
+                    "enable": {
+                        "type": "boolean",
+                        "description": "true=开启全员禁言，false=关闭全员禁言，默认 true"
+                    }
+                },
+                "required": ["group_id"]
+            }),
+        },
+        ToolSpec {
+            name: "SetGroupKick".to_string(),
+            description: "踢出群成员（仅管理员可用）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    },
+                    "user_id": {
+                        "type": "integer",
+                        "description": "要踢出的用户 QQ 号"
+                    },
+                    "reject_add_request": {
+                        "type": "boolean",
+                        "description": "是否拒绝此人再次加群，默认 false"
+                    }
+                },
+                "required": ["group_id", "user_id"]
+            }),
+        },
+        ToolSpec {
+            name: "SetGroupName".to_string(),
+            description: "设置群名（仅管理员可用）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    },
+                    "group_name": {
+                        "type": "string",
+                        "description": "新群名"
+                    }
+                },
+                "required": ["group_id", "group_name"]
+            }),
+        },
+        ToolSpec {
+            name: "SetGroupPortrait".to_string(),
+            description: "设置群头像（仅管理员可用）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    },
+                    "file": {
+                        "type": "string",
+                        "description": "图片文件路径或 URL"
+                    }
+                },
+                "required": ["group_id", "file"]
+            }),
+        },
+        ToolSpec {
+            name: "SetEssenceMsg".to_string(),
+            description: "设置精华消息（仅管理员可用）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "integer",
+                        "description": "要设为精华的消息 ID"
+                    }
+                },
+                "required": ["message_id"]
+            }),
+        },
+        ToolSpec {
+            name: "DeleteEssenceMsg".to_string(),
+            description: "移出精华消息（仅管理员可用）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message_id": {
+                        "type": "integer",
+                        "description": "要移出精华的消息 ID"
+                    }
+                },
+                "required": ["message_id"]
+            }),
+        },
+        ToolSpec {
+            name: "GetEssenceMsgList".to_string(),
+            description: "获取精华消息列表（仅管理员可用）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    }
+                },
+                "required": ["group_id"]
+            }),
+        },
+        ToolSpec {
+            name: "GetGroupAtAllRemain".to_string(),
+            description: "获取群 @全体成员 剩余次数（仅管理员可用）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    }
+                },
+                "required": ["group_id"]
+            }),
+        },
+        ToolSpec {
+            name: "GetGroupShutList".to_string(),
+            description: "获取群禁言列表（仅管理员可用）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    }
+                },
+                "required": ["group_id"]
+            }),
+        },
+        ToolSpec {
+            name: "SendGroupNotice".to_string(),
+            description: "发送群公告（仅管理员可用）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "公告内容"
+                    },
+                    "image": {
+                        "type": "string",
+                        "description": "图片 URL（可选）"
+                    },
+                    "pinned": {
+                        "type": "integer",
+                        "description": "是否置顶，1=置顶，0=不置顶"
+                    }
+                },
+                "required": ["group_id", "content"]
+            }),
+        },
+        ToolSpec {
+            name: "DelGroupNotice".to_string(),
+            description: "删除群公告（仅管理员可用）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    },
+                    "notice_id": {
+                        "type": "string",
+                        "description": "要删除的公告 ID"
+                    }
+                },
+                "required": ["group_id", "notice_id"]
+            }),
+        },
+        ToolSpec {
+            name: "SetGroupAdmin".to_string(),
+            description: "设置或取消群管理员（仅群主可用）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    },
+                    "user_id": {
+                        "type": "integer",
+                        "description": "目标用户 QQ 号"
+                    },
+                    "enable": {
+                        "type": "boolean",
+                        "description": "true=设置为管理员，false=取消管理员，默认 true"
+                    }
+                },
+                "required": ["group_id", "user_id"]
+            }),
+        },
+        ToolSpec {
+            name: "SetGroupSpecialTitle".to_string(),
+            description: "设置群组专属头衔（仅群主可用）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    },
+                    "user_id": {
+                        "type": "integer",
+                        "description": "目标用户 QQ 号"
+                    },
+                    "special_title": {
+                        "type": "string",
+                        "description": "头衔内容，空字符串表示删除"
+                    },
+                    "duration": {
+                        "type": "integer",
+                        "description": "有效期，单位秒，-1=永久"
+                    }
+                },
+                "required": ["group_id", "user_id", "special_title"]
+            }),
+        },
+        // ===== 群组工具（无需管理员权限） =====
+        ToolSpec {
+            name: "SetGroupLeave".to_string(),
+            description: "退出群组。如果是群主且 is_dismiss=true 则解散群。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    },
+                    "is_dismiss": {
+                        "type": "boolean",
+                        "description": "是否解散群（仅群主有效），默认 false"
+                    }
+                },
+                "required": ["group_id"]
+            }),
+        },
+        ToolSpec {
+            name: "GetGroupNotice".to_string(),
+            description: "获取群公告列表。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    }
+                },
+                "required": ["group_id"]
+            }),
+        },
+        ToolSpec {
+            name: "GetGroupHonorInfo".to_string(),
+            description: "获取群荣誉信息（龙王、群聊之火等）。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    },
+                    "honor_type": {
+                        "type": "string",
+                        "description": "荣誉类型：talkative=龙王, performer=群聊之火, legend=群聊炽焰, strong_newbie=冒尖小春笋, emotion=快乐之源, all=全部"
+                    }
+                },
+                "required": ["group_id", "honor_type"]
+            }),
+        },
+        ToolSpec {
+            name: "SetGroupSign".to_string(),
+            description: "群签到/打卡。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_id": {
+                        "type": "integer",
+                        "description": "群号"
+                    }
+                },
+                "required": ["group_id"]
             }),
         },
         // ===== 流程控制工具 =====
