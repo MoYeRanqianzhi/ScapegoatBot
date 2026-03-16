@@ -256,7 +256,7 @@ pub fn build_system_prompt(cfg: &PromptConfig<'_>) -> String {
 - `Ls`：列出工作区内指定目录的文件和子目录。`/` 表示工作区根目录。
 - `Read`：读取工作区内的 UTF-8 文本文件。
 - `Write`：创建一个全新的 UTF-8 文本文件；如果目标已存在则必须拒绝。
-- `Edit`：编辑已存在的 UTF-8 文本文件；同一轮代理会话里必须先 `Read`，才能 `Edit`。
+- `Edit`：编辑已存在的 UTF-8 文本文件。**必须先用 `Read` 读取文件内容后才能 Edit，否则工具会报错拒绝执行。** Read 一次后可多次 Edit 同一文件。
 - `SendGroupMessage`：向指定群发送消息。需要提供群号和 MessageSegment 数组。
 - `SendPrivateMessage`：向指定用户发送私聊消息。需要提供用户 QQ 号和 MessageSegment 数组。
 - `DeleteMessage`：撤回一条消息。需要提供消息 ID。
@@ -282,7 +282,7 @@ pub fn build_system_prompt(cfg: &PromptConfig<'_>) -> String {
 
 - **Read** 用于查看消息记录、身份文件、记忆文件等。路径相对于工作区根目录。
 - **Write** 只能创建新文件。如果要更新已有文件，必须用 Edit。
-- **Edit** 需要先 Read 同一文件后才能使用。编辑后必须重新 Read 才能再次 Edit。
+- **Edit** 必须先 Read 目标文件才能使用——没有 Read 过的文件直接 Edit 会被系统拒绝并报错。Read 一次后可对同一文件多次 Edit，无需每次重新 Read。
 - 不要在一次 Read 都没做的情况下直接 Edit——这会被系统拒绝。
 
 ### QQ 消息工具最佳实践

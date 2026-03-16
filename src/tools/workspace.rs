@@ -22,6 +22,7 @@
 //    - 单次 Write/Edit 内容上限：MAX_WRITE_CONTENT_BYTES（1 MB）
 //    - 单次 Read 文件上限：MAX_READ_FILE_BYTES（200 KB）
 //    - Edit 必须先 Read → 文件必须 < 200 KB → Edit 结果必须 < 1 MB
+//    - Read 一次后可多次 Edit 同一文件（Claude Code / OpenCode 模式）
 //
 // 3. **磁盘空间保护**（Disk Space Protection）
 //    - 每次写入前检查磁盘可用空间，低于 MIN_FREE_DISK_SPACE 则拒绝写入
@@ -96,34 +97,33 @@ const MAX_PATH_DEPTH: usize = 16;
 // ============================================================================
 
 /// 每次 agent 会话的工具状态
-/// 核心规则：Edit 前必须先 Read，Edit 后必须重新 Read 才能再次 Edit
+/// 核心规则：Edit 前必须先 Read 同一文件（参考 Claude Code / OpenCode 的约束模式）
+/// Read 一次后可对同一文件多次 Edit，直到会话结束
 #[derive(Debug, Default)]
 pub struct WorkspaceToolSession {
     /// 当前会话中已 Read 过的文件路径集合（规范化后的相对路径）
     /// 只有在此集合中的文件才允许 Edit
+    /// 一旦 Read 加入集合，整个会话期间持续有效（不因 Edit 失效）
     readable_for_edit: HashSet<String>,
 }
 
 impl WorkspaceToolSession {
     /// 标记一个文件已被 Read
+    /// 加入集合后在整个会话期间持续有效，允许后续多次 Edit
     fn note_read(&mut self, relative_path: &str) {
         self.readable_for_edit.insert(relative_path.to_string());
     }
 
     /// 检查文件是否已被 Read（Edit 前置条件）
-    fn require_fresh_read(&self, relative_path: &str) -> anyhow::Result<()> {
+    /// 未 Read 过的文件直接 Edit 会被拒绝，返回提示信息
+    fn require_read(&self, relative_path: &str) -> anyhow::Result<()> {
         if self.readable_for_edit.contains(relative_path) {
             return Ok(());
         }
         bail!(
-            "Edit is not allowed until the file has been Read in this session: {}",
+            "该文件尚未被 Read。必须先使用 Read 工具读取文件内容，然后才能 Edit: {}",
             relative_path
         );
-    }
-
-    /// Edit 后清除 Read 标记，要求重新 Read 才能再次 Edit
-    fn invalidate_after_edit(&mut self, relative_path: &str) {
-        self.readable_for_edit.remove(relative_path);
     }
 }
 
@@ -282,8 +282,8 @@ impl WorkspaceTools {
     ///
     /// # 安全保障
     /// - 通过 cap-std Dir 限制，无法编辑 workspace 外的文件
-    /// - 必须在同一会话中先 Read 过该文件才能 Edit
-    /// - Edit 后必须重新 Read 才能再次 Edit（确保模型看到最新内容）
+    /// - 必须在同一会话中先 Read 过该文件才能 Edit（Claude Code / OpenCode 模式）
+    /// - Read 一次后可多次 Edit，无需每次重新 Read
     /// - 编辑后的文件大小不得超过 MAX_WRITE_CONTENT_BYTES
     /// - 写入前检查磁盘可用空间
     /// - 使用精确字符串匹配进行替换，避免误操作
@@ -305,8 +305,8 @@ impl WorkspaceTools {
             );
         }
 
-        // 检查 Edit 前置条件：必须先 Read
-        session.require_fresh_read(&clean_path)?;
+        // 检查 Edit 前置条件：必须先 Read（Claude Code / OpenCode 模式）
+        session.require_read(&clean_path)?;
 
         // old_text 不能为空
         if old_text.is_empty() {
@@ -362,8 +362,7 @@ impl WorkspaceTools {
             format!("写回文件失败: {}", clean_path)
         })?;
 
-        // 清除 Read 标记，要求重新 Read 才能再次 Edit
-        session.invalidate_after_edit(&clean_path);
+        // Read 标记保留，允许后续继续 Edit 同一文件（Claude Code / OpenCode 模式）
 
         Ok(format!(
             "已编辑文件: {} (替换了 {} 处匹配)",
@@ -999,21 +998,23 @@ mod tests {
 
     // ---- Read/Edit 会话规则测试 ----
 
-    /// 测试：Read → Edit 会话规则
+    /// 测试：Read → Edit 会话规则（Claude Code / OpenCode 模式）
     #[test]
     fn session_read_before_edit() {
         let mut session = WorkspaceToolSession::default();
 
         // 未 Read 过的文件不能 Edit
-        assert!(session.require_fresh_read("test.md").is_err());
+        assert!(session.require_read("test.md").is_err());
 
         // Read 后可以 Edit
         session.note_read("test.md");
-        assert!(session.require_fresh_read("test.md").is_ok());
+        assert!(session.require_read("test.md").is_ok());
 
-        // Edit 后需要重新 Read
-        session.invalidate_after_edit("test.md");
-        assert!(session.require_fresh_read("test.md").is_err());
+        // Read 一次后持续有效，允许多次 Edit（不再 invalidate）
+        assert!(session.require_read("test.md").is_ok());
+
+        // 其他文件仍然不能 Edit
+        assert!(session.require_read("other.md").is_err());
     }
 
     // ---- 沙箱集成测试 ----
@@ -1050,7 +1051,7 @@ mod tests {
         );
         assert!(result.is_ok(), "Edit 应该成功: {:?}", result);
 
-        // Edit 后需要重新 Read
+        // Edit 后无需重新 Read，可直接再次 Edit（Claude Code / OpenCode 模式）
         let result = tools.edit_file(
             &mut session,
             "test_file.md",
@@ -1058,11 +1059,11 @@ mod tests {
             "hello",
             false,
         );
-        assert!(result.is_err(), "Edit 后未重新 Read 应该失败");
+        assert!(result.is_ok(), "Read 一次后应能多次 Edit: {:?}", result);
 
-        // 重新 Read 后可以再次 Edit
+        // 验证最终文件内容正确（hello → goodbye → hello）
         let content = tools.read_file(&mut session, "test_file.md").unwrap();
-        assert_eq!(content, "goodbye world");
+        assert_eq!(content, "hello world");
 
         // 清理
         let _ = std::fs::remove_dir_all(temp);

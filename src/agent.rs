@@ -1878,7 +1878,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "Edit".to_string(),
-            description: "编辑已存在的文件。必须先 Read 同一文件后才能 Edit。使用精确字符串替换。"
+            description: "编辑已存在的文件。必须先 Read 同一文件后才能 Edit，否则会报错拒绝。Read 一次后可多次 Edit。使用精确字符串替换。"
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
