@@ -15,6 +15,7 @@ mod control_server;
 mod compact;
 mod config;
 mod group_role;
+mod mcp;
 mod message_format;
 mod prompt;
 mod providers;
@@ -358,7 +359,9 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
             agent_rx,
             cmd_rx,
             group_role_state.clone(),
-        ) {
+        )
+        .await
+        {
             Ok(runner) => {
                 tokio::spawn(runner.run());
                 tracing::info!("Agent 循环已启动（模型: {}）", config.llm.model);

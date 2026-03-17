@@ -86,3 +86,49 @@ min_messages_to_compact = 8
 [control]
 # 控制通道端口（CLI 通过此端口与守护进程通信）
 port = 19800
+
+# ============================================================================
+# MCP 服务器配置（可选）
+# ============================================================================
+# 通过 MCP (Model Context Protocol) 接入外部工具服务器
+# 每个服务器作为子进程启动，通过 stdin/stdout JSON-RPC 通信
+# 工具命名格式：mcp.<服务器名>.<工具名>
+#
+# 示例：接入 Anthropic 官方文件系统 MCP 服务器
+# [mcp_servers.filesystem]
+# command = "npx"
+# args = ["-y", "@anthropic/mcp-filesystem", "/home/user/docs"]
+# env = {}
+# enabled = true        # 是否启用（默认 true）
+# tool_timeout_secs = 30 # 工具调用超时（默认 30 秒）
+#
+# 示例：接入 GitHub MCP 服务器
+# [mcp_servers.github]
+# command = "npx"
+# args = ["-y", "@anthropic/mcp-github"]
+# env = { "GITHUB_TOKEN" = "ghp_xxx" }
+
+# ============================================================================
+# Fetch 工具配置（可选）
+# ============================================================================
+# 启用后 Agent 可以获取网页内容（HTML 自动转换为 Markdown）
+# 默认禁用，需要显式启用以允许 Agent 访问网络
+# 内置 SSRF 防护：自动拦截对内网地址的访问
+
+[fetch]
+# 是否启用 Fetch 工具（默认 false）
+enabled = false
+# 域名过滤模式：
+#   "whitelist" — 仅允许访问 domains 列表中的域名
+#   "blacklist" — 禁止访问 domains 列表中的域名（默认）
+# mode = "blacklist"
+# 域名列表（配合 mode 使用）
+# domains = ["evil.com", "malware.site"]
+# HTTP 请求超时（秒）
+# timeout_secs = 30
+# 最大响应体大小（字节，默认 512 KB）
+# max_response_bytes = 524288
+# 最大输出字符数（默认 50000）
+# max_output_chars = 50000
+# 自定义 User-Agent（可选）
+# user_agent = "Mozilla/5.0 (compatible; ScapegoatBot/0.2)"

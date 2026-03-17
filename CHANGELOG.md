@@ -5,6 +5,34 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- **MCP 支持** — 通过 Model Context Protocol 接入外部工具服务器
+  - Stdio 传输层（子进程 stdin/stdout JSON-RPC）
+  - 工具自动发现，命名格式 `mcp.<server>.<tool>`
+  - 配置: `[mcp_servers.<name>]` 段
+- **Fetch 工具** — Agent 网络访问能力
+  - HTML 自动转换为 Markdown
+  - SSRF 防护：私有 IP 地址拦截
+  - 域名白名单/黑名单过滤
+  - 默认禁用，需在 `[fetch]` 段显式启用
+- **群管理工具** — 18 个群组管理工具（禁言/踢人/公告/精华等）
+- **管理员状态同步** — 启动同步 + 事件驱动 + 定时轮询
+- **开发文档** — architecture.md, tools-reference.md
+
+### 改进
+
+- **Edit 工具** — 改为 Claude Code 模式（Read 一次后可多次 Edit）
+- **CLI 命令注入** — Codex 风格消息插队
+- **消息自动标记已读** — 首次 LLM 请求成功后标记
+- **消息段 Schema** — ToolSpec 详细描述每种消息段类型及其 data 字段
+
+### 修复
+
+- 修复 cmd_rx 通道关闭后 CPU 100% 空转的 busy-spin bug
+
 ## [0.1.0-alpha.1] - 2026-03-10
 
 首个 Alpha 版本，核心架构就绪。

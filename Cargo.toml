@@ -46,6 +46,8 @@ base64 = "0.22"
 # 嵌入式 SQLite 数据库（消息图片注册表等持久化存储）
 rusqlite = { version = "0.32", features = ["bundled"] }
 rand = "0.10.0"
+# HTML 转 Markdown（Fetch 工具将网页内容转为 LLM 友好的 Markdown 格式）
+htmd = "0.5"
 
 [dev-dependencies]
 # 临时目录（用于 ImageStore 等模块的单元测试）

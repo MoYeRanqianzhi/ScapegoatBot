@@ -4,8 +4,8 @@
 // 启动时校验发白名单是收白名单的子集
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
-use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // ============================================================================
@@ -37,6 +37,14 @@ pub struct AppConfig {
     /// 控制通道配置（可选，缺省使用默认端口 19800）
     #[serde(default)]
     pub control: ControlConfig,
+    /// Fetch 工具配置（可选，缺省为禁用）
+    /// 启用后 Agent 可以获取网页内容（HTML 自动转为 Markdown）
+    #[serde(default)]
+    pub fetch: FetchConfig,
+    /// MCP 服务器配置映射表（可选，缺省为空 HashMap）
+    /// 键为服务器名称（用于工具命名 mcp.<name>.<tool>），值为服务器配置
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, McpServerConfig>,
 }
 
 // ============================================================================
@@ -413,6 +421,117 @@ impl Default for ControlConfig {
     fn default() -> Self {
         Self { port: default_control_port() }
     }
+}
+
+// ============================================================================
+// Fetch 工具配置
+// ============================================================================
+
+/// Fetch 工具配置
+/// 控制 Agent 的网络访问能力（获取网页内容并转为 Markdown）
+#[derive(Debug, Clone, Deserialize)]
+pub struct FetchConfig {
+    /// 是否启用 Fetch 工具（默认 false — 需要显式启用以允许 Agent 访问网络）
+    #[serde(default)]
+    pub enabled: bool,
+    /// 域名过滤模式：
+    /// - "whitelist"：仅允许访问 domains 列表中的域名
+    /// - "blacklist"：禁止访问 domains 列表中的域名（默认）
+    #[serde(default = "default_fetch_mode")]
+    pub mode: String,
+    /// 域名列表（与 mode 配合使用）
+    /// 白名单模式：仅这些域名可访问
+    /// 黑名单模式：这些域名被禁止
+    #[serde(default)]
+    pub domains: Vec<String>,
+    /// HTTP 请求超时时间（秒，默认 30）
+    #[serde(default = "default_fetch_timeout")]
+    pub timeout_secs: u64,
+    /// 最大响应体大小（字节，默认 524288 = 512 KB）
+    #[serde(default = "default_fetch_max_size")]
+    pub max_response_bytes: usize,
+    /// 最大输出字符数（截断后返回给 LLM，默认 50000）
+    #[serde(default = "default_fetch_max_output")]
+    pub max_output_chars: usize,
+    /// 自定义 User-Agent（可选，默认为 Chrome-like UA）
+    #[serde(default)]
+    pub user_agent: Option<String>,
+}
+
+impl Default for FetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,                     // 默认禁用，需要显式启用
+            mode: "blacklist".to_string(),      // 默认黑名单模式
+            domains: Vec::new(),                // 默认空域名列表
+            timeout_secs: 30,                   // 默认 30 秒超时
+            max_response_bytes: 524288,         // 默认 512 KB 响应体上限
+            max_output_chars: 50000,            // 默认 50000 字符输出上限
+            user_agent: None,                   // 默认使用内置 Chrome UA
+        }
+    }
+}
+
+/// 默认域名过滤模式：黑名单
+fn default_fetch_mode() -> String {
+    "blacklist".to_string()
+}
+
+/// 默认 HTTP 请求超时时间：30 秒
+fn default_fetch_timeout() -> u64 {
+    30
+}
+
+/// 默认最大响应体大小：512 KB
+fn default_fetch_max_size() -> usize {
+    524288
+}
+
+/// 默认最大输出字符数：50000
+fn default_fetch_max_output() -> usize {
+    50000
+}
+
+// ============================================================================
+// MCP 服务器配置
+// ============================================================================
+
+/// MCP 服务器配置
+/// 每个 MCP 服务器作为子进程启动，通过 stdin/stdout 进行 JSON-RPC 2.0 通信
+/// 配置示例（config.toml）：
+/// ```toml
+/// [mcp_servers.filesystem]
+/// command = "npx"
+/// args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+/// enabled = true
+/// tool_timeout_secs = 30
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// 服务器启动命令（如 "npx", "python", "node" 等）
+    pub command: String,
+    /// 命令行参数列表
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// 额外环境变量（传递给子进程）
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// 是否启用此服务器（默认 true）
+    #[serde(default = "default_mcp_enabled")]
+    pub enabled: bool,
+    /// 工具调用超时时间（秒，默认 30）
+    #[serde(default = "default_mcp_tool_timeout")]
+    pub tool_timeout_secs: u64,
+}
+
+/// MCP 服务器默认启用
+fn default_mcp_enabled() -> bool {
+    true
+}
+
+/// MCP 工具调用默认超时时间：30 秒
+fn default_mcp_tool_timeout() -> u64 {
+    30
 }
 
 // ============================================================================

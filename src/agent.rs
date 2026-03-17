@@ -157,6 +157,11 @@ pub struct AgentRunner {
     // ----- 工具定义 -----
     /// LLM 可调用的工具规范列表
     tool_specs: Vec<ToolSpec>,
+
+    // ----- MCP -----
+    /// MCP 连接管理器（管理外部 MCP 服务器进程和工具）
+    /// None 表示未配置 MCP 或连接失败
+    mcp_manager: Option<crate::mcp::McpConnectionManager>,
 }
 
 impl AgentRunner {
@@ -169,7 +174,7 @@ impl AgentRunner {
     /// - `rx`: QQ 消息事件接收通道
     /// - `cmd_rx`: CLI chat 指令接收通道
     /// - `group_role_state`: 群身份状态（管理员/群主信息）
-    pub fn new(
+    pub async fn new(
         config: Arc<AppConfig>,
         tool_ctx: Arc<ToolContext>,
         agent_state: Arc<AgentState>,
@@ -251,7 +256,59 @@ impl AgentRunner {
         let system_prompt = prompt::build_system_prompt(&prompt_config);
 
         // 构建工具规范
-        let tool_specs = build_tool_specs();
+        let mut tool_specs = build_tool_specs();
+
+        // 条件注册 Fetch 工具（需要在配置中显式启用）
+        if config.fetch.enabled {
+            tool_specs.push(ToolSpec {
+                name: "Fetch".to_string(),
+                description: "获取网页内容并转为 Markdown。支持 HTML 自动转换。\
+                              仅允许 http/https。有 SSRF 防护和域名过滤。"
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "要获取的网页 URL（必须以 http:// 或 https:// 开头）"
+                        }
+                    },
+                    "required": ["url"]
+                }),
+            });
+        }
+
+        // ===== MCP 服务器连接 =====
+        // 如果配置了 MCP 服务器，尝试连接并获取外部工具列表
+        // 连接失败是非致命的，Agent 可以在无 MCP 的情况下正常工作
+        let mcp_manager = if config.mcp_servers.is_empty() {
+            // 未配置任何 MCP 服务器，跳过
+            None
+        } else {
+            match crate::mcp::McpConnectionManager::connect_all(&config.mcp_servers).await {
+                Ok(mgr) => {
+                    // 从已连接的 MCP 服务器收集工具规范
+                    let mcp_tools: Vec<ToolSpec> = mgr.list_all_tool_specs();
+                    // 统计已启用的服务器数量
+                    let server_count = config.mcp_servers.iter()
+                        .filter(|(_, c)| c.enabled)
+                        .count();
+                    tracing::info!(
+                        "MCP 已连接 — {} 个服务器, {} 个工具",
+                        server_count,
+                        mcp_tools.len()
+                    );
+                    // 将 MCP 工具追加到内置工具列表中
+                    tool_specs.extend(mcp_tools);
+                    Some(mgr)
+                }
+                Err(e) => {
+                    // 连接失败，仅记录警告，不影响 Agent 启动
+                    tracing::warn!("MCP 连接失败，将在无 MCP 工具的情况下继续: {e}");
+                    None
+                }
+            }
+        };
 
         Ok(Self {
             provider,
@@ -270,6 +327,7 @@ impl AgentRunner {
             rx,
             cmd_rx,
             tool_specs,
+            mcp_manager,
         })
     }
 
@@ -427,6 +485,13 @@ impl AgentRunner {
                     break;
                 }
             }
+        }
+
+        // ===== 清理 MCP 服务器连接 =====
+        // 在 Agent 循环退出后，关闭所有 MCP 服务器子进程
+        if let Some(ref mut mgr) = self.mcp_manager {
+            mgr.shutdown_all().await;
+            tracing::info!("MCP 服务器已全部关闭");
         }
 
         tracing::info!("Agent 循环已退出");
@@ -1537,6 +1602,56 @@ impl AgentRunner {
                 }
             }
 
+            // ----- 网络工具 -----
+            "Fetch" => {
+                // 检查 Fetch 工具是否已启用（防止配置变更后绕过）
+                if !self.config.fetch.enabled {
+                    return "Fetch 工具未启用。\
+                            请在 config.toml 的 [fetch] 段设置 enabled = true"
+                        .to_string();
+                }
+                // 提取必需参数：url
+                let url = match args.get("url").and_then(|v| v.as_str()) {
+                    Some(u) => u,
+                    None => return "缺少参数: url".to_string(),
+                };
+                tracing::info!("Fetch({})", url);
+                // 调用 Fetch 工具核心逻辑
+                let result =
+                    crate::tools::fetch::fetch_url(url, &self.config.fetch).await;
+                // 失败时记录警告日志
+                if !result.success {
+                    tracing::warn!("Fetch 失败: {}", result.output);
+                }
+                result.output
+            }
+
+            // ===== MCP 外部工具路由 =====
+            // 以 "mcp." 开头的工具名由外部 MCP 服务器提供
+            // 分割工具名为 (服务器名, 工具名) 后委托给 MCP 连接管理器
+            other if other.starts_with("mcp.") => {
+                if let Some(ref mut mgr) = self.mcp_manager {
+                    // 解析 MCP 工具名：mcp.<服务器名>.<工具名>
+                    if let Some((server, tool)) = crate::mcp::manager::split_mcp_tool_name(other) {
+                        tracing::info!("MCP 工具调用: {}.{}", server, tool);
+                        // 委托给 MCP 连接管理器执行工具调用
+                        match mgr.call_tool(server, tool, args.clone()).await {
+                            Ok(result) => result,
+                            Err(e) => {
+                                tracing::warn!("MCP 工具调用失败: {}", e);
+                                format!("MCP 工具调用失败: {e}")
+                            }
+                        }
+                    } else {
+                        // 工具名格式不合法（缺少服务器名或工具名部分）
+                        format!("无效的 MCP 工具名格式: {other}")
+                    }
+                } else {
+                    // MCP 连接管理器未初始化（未配置或连接失败）
+                    format!("MCP 未初始化，无法调用: {other}")
+                }
+            }
+
             _ => format!("未知工具: {name}"),
         }
     }
@@ -1824,6 +1939,23 @@ fn extract_compaction_state(messages: &[ChatMessage]) -> CompactionState {
 // 工具规范定义
 // ============================================================================
 
+/// 消息段数组参数的详细描述（SendGroupMessage / SendPrivateMessage 共用）
+/// 列出每种消息段类型及其 data 字段，让 LLM 能正确构造任意类型的消息
+const MESSAGE_SEGMENTS_DESC: &str = "\
+消息段数组（OneBot 11 格式）。每个元素为 {\"type\": \"<类型>\", \"data\": {<字段>}}。\n\
+支持的类型及其 data 字段：\n\
+- text: {\"text\": \"文本内容\"}\n\
+- at: {\"qq\": \"用户QQ号\"} — @某人，qq 为字符串类型，\"all\" 表示 @全体成员\n\
+- face: {\"id\": \"表情ID\"} — QQ 系统表情\n\
+- reply: {\"id\": \"消息ID\"} — 回复某条消息，必须放在数组第一个位置\n\
+- image: {\"file\": \"图片URL或路径\"} — 可选: summary(描述文本), sub_type(0=普通图片, 1=表情包)\n\
+- record: {\"file\": \"语音URL或路径\"}\n\
+- video: {\"file\": \"视频URL或路径\"}\n\
+- json: {\"data\": \"JSON卡片字符串\"}\n\
+示例（回复+文本）: [{\"type\": \"reply\", \"data\": {\"id\": \"12345\"}}, {\"type\": \"text\", \"data\": {\"text\": \"收到\"}}]\n\
+示例（图片表情包）: [{\"type\": \"image\", \"data\": {\"file\": \"https://example.com/img.jpg\", \"sub_type\": 1}}]\n\
+示例（@+文本）: [{\"type\": \"at\", \"data\": {\"qq\": \"123456\"}}, {\"type\": \"text\", \"data\": {\"text\": \" 你好\"}}]";
+
 /// 构建所有内置工具的 JSON Schema 规范
 /// 这些规范通过 OpenAI function calling 协议传递给 LLM
 fn build_tool_specs() -> Vec<ToolSpec> {
@@ -1916,7 +2048,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
                     },
                     "message": {
                         "type": "array",
-                        "description": "消息段数组，每个元素为 {\"type\": \"...\", \"data\": {...}}",
+                        "description": MESSAGE_SEGMENTS_DESC,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1942,7 +2074,7 @@ fn build_tool_specs() -> Vec<ToolSpec> {
                     },
                     "message": {
                         "type": "array",
-                        "description": "消息段数组",
+                        "description": MESSAGE_SEGMENTS_DESC,
                         "items": {
                             "type": "object",
                             "properties": {

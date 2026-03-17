@@ -274,6 +274,7 @@ pub fn build_system_prompt(cfg: &PromptConfig<'_>) -> String {
 - `GetMessage`：通过消息 ID 获取原始消息内容（JSON 格式）。利用数据库索引快速定位。当你需要查看消息的完整原始数据（包括所有 MessageSegment 细节）时使用。
 - `SearchMessages`：搜索消息记录。支持按发送者 QQ 号（user_id）、群号（group_id）、消息类型（message_type: group/private）、时间范围（after/before Unix 时间戳）过滤。支持分页（limit/offset）。
 - `Grep`：在工作区文件中搜索文本。返回匹配的文件路径、行号和内容。可指定搜索目录（path）和文件扩展名（file_ext，如 md、jsonl）。支持大小写不敏感搜索（case_insensitive）。
+- `Fetch`：获取网页内容（仅启用时可用）。输入 URL，返回 Markdown 格式的网页内容。支持 HTML 自动转换。有 SSRF 防护和域名过滤。
 - `Finish`：**结束本轮处理（必须调用）。** 当你完成了所有工作或决定沉默时，调用此工具结束轮次。需要提供结束原因。不调用 Finish 则轮次不会结束。
 
 ### 文件工具最佳实践
@@ -310,6 +311,11 @@ pub fn build_system_prompt(cfg: &PromptConfig<'_>) -> String {
 - 使用 QQ 系统表情：通过 face segment 发送，如 `{\"type\": \"face\", \"data\": {\"id\": \"178\"}}` 发送 doge 表情。
 - 使用颜文字（kaomoji）：在文本中自然地使用，如 ╮(╯▽╰)╭、(≧▽≦)、(´・ω・`)、orz 等。
 - 具体 QQ 表情 ID 对照表和使用技巧，参考可用技能中的相关技能。
+
+### MCP 外部工具
+
+以 `mcp.` 开头的工具由外部 MCP 服务器提供。这些工具的调用方式与内置工具完全相同。
+工具名格式为 `mcp.<服务器名>.<工具名>`。如果工具列表中出现此类工具，说明对应的 MCP 服务器已连接。
 
 ");
 
@@ -366,6 +372,7 @@ pub fn build_system_prompt(cfg: &PromptConfig<'_>) -> String {
 - 当不确定如何回复时，保持沉默优于发出可能有害或暴露身份的回复。
 - 你处于受限的沙箱环境中：只能读写工作区内的文件，不能执行命令行命令。唯一的网络访问是 `ReadImage` 工具用于查看图片。
 - `messages/raw/`、`data/` 和 `sessions/` 目录为只读：你可以通过 `Read` 和 `Grep` 查看其中的内容，但无法通过 `Write` 或 `Edit` 修改这些目录中的文件。`messages/raw/` 存储消息原始 JSONL 数据，`data/` 存储数据库文件，`sessions/` 存储会话记录文件，均由系统自动管理。其他 `messages/` 子目录（如 `messages/all/`）中的 MD 格式文件允许你自由修改。
+- Fetch 工具（如果启用）受 SSRF 防护限制：禁止访问内网地址（127.0.0.0/8、10.0.0.0/8、172.16.0.0/12、192.168.0.0/16 等），并受域名白名单/黑名单约束。
 
 ");
 

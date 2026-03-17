@@ -4,6 +4,7 @@
 // 在工具执行层进行白名单检查
 // 通过 cap-std 限制文件工具在 workspace 内
 
+pub mod fetch;
 pub mod message;
 pub mod query;
 pub mod search;
