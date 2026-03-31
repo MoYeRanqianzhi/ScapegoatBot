@@ -1051,6 +1051,8 @@ dependencies = [
 [[package]]
 name = "napcat-link"
 version = "0.1.0-alpha.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13478029c206dc1feaca36fe0126e7598345c56ddeac5a179bffa9c95579b9d6"
 dependencies = [
  "base64",
  "dashmap",

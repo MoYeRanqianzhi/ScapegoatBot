@@ -16,8 +16,8 @@ path = "src/main.rs"
 [dependencies]
 # 命令行参数解析（derive 模式）
 clap = { version = "4", features = ["derive"] }
-# NapCatLink SDK — QQ 机器人 WebSocket 客户端
-napcat-link = { path = "../NapCatLink" }
+# NapCatLink SDK — QQ 机器人 WebSocket 客户端（使用 crates.io 已发布版本）
+napcat-link = "0.1.0-alpha.2"
 # 异步运行时
 tokio = { version = "1", features = ["full"] }
 # HTTP 客户端，用于调用 LLM API
