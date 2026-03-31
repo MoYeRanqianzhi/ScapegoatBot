@@ -1,6 +1,6 @@
 // src/tools/query.rs
 // 查询类工具
-// 包含获取好友列表、群列表、群成员列表等查询操作
+// 包含获取好友列表、群列表、群成员列表、待处理好友请求、单向好友列表等查询操作
 // 查询好友/群列表不受白名单约束
 // 查询群成员列表/信息需要在收白名单中
 
@@ -104,5 +104,48 @@ pub async fn get_group_member_info(
             ToolResult::ok(output)
         }
         Err(e) => ToolResult::err(format!("获取群成员信息失败: {e}")),
+    }
+}
+
+// ============================================================================
+// 获取待处理好友请求
+// ============================================================================
+
+/// 从 NapCat 获取当前待处理的好友请求列表
+/// 调用 NapCat 扩展 API `get_doubt_friends_add_request`
+/// 可获取包括历史未处理请求在内的所有待处理好友请求
+/// 无白名单限制
+pub async fn get_friend_requests(ctx: &ToolContext) -> ToolResult {
+    match ctx
+        .api
+        .raw
+        .call_no_params("get_doubt_friends_add_request")
+        .await
+    {
+        Ok(result) => {
+            // 将结果序列化为 JSON 字符串返回
+            let output = serde_json::to_string_pretty(&result)
+                .unwrap_or_else(|_| format!("{result:?}"));
+            ToolResult::ok(output)
+        }
+        Err(e) => ToolResult::err(format!("获取待处理好友请求失败: {e}")),
+    }
+}
+
+// ============================================================================
+// 获取单向好友列表
+// ============================================================================
+
+/// 获取单向好友列表（对方加了你但你没加对方的好友关系）
+/// 调用 NapCat 扩展 API `get_unidirectional_friend_list`
+/// 无白名单限制
+pub async fn get_unidirectional_friend_list(ctx: &ToolContext) -> ToolResult {
+    match ctx.api.napcat.get_unidirectional_friend_list().await {
+        Ok(result) => {
+            let output = serde_json::to_string_pretty(&result)
+                .unwrap_or_else(|_| format!("{result:?}"));
+            ToolResult::ok(output)
+        }
+        Err(e) => ToolResult::err(format!("获取单向好友列表失败: {e}")),
     }
 }

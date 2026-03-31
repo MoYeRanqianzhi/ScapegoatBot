@@ -9,10 +9,27 @@
 
 ### 新增
 
+- **蜂群子代理系统** — 主 Agent 可通过 SpawnAgent 生成子代理并行执行任务
+  - SwarmManager 管理子代理完整生命周期（创建、消息传递、状态查询、等待完成）
+  - SubAgentRunner 轻量级 agentic 循环（独立 tokio 任务，独立 LLM 对话）
+  - 子代理可嵌套 spawn 子代理，深度受 `swarm.max_depth` 限制
+  - 完成通知机制：子代理通过 SwarmNotification 唤醒主代理
+- **4 个蜂群工具** — SpawnAgent / MessageAgent / CheckAgent / WaitAgent
+  - SpawnAgent：生成子代理（支持指定备选模型和额外上下文）
+  - MessageAgent：向运行中子代理发送消息
+  - CheckAgent：查询子代理状态（支持单个或全部列出）
+  - WaitAgent：等待子代理完成并获取结果（支持单个/多个/全部）
+- **备选模型配置** — `[[models]]` 段定义子代理可用的 LLM 模型
+  - 支持不同提供商、API 地址、上下文窗口等独立配置
+  - 可选字段为空时自动继承主 `[llm]` 配置
+- **蜂群配置** — `[swarm]` 段控制子代理系统安全参数
+  - `enabled`: 功能总开关（默认 true）
+  - `max_depth`: 最大嵌套深度（默认 32）
+  - `max_concurrency`: 最大并发子代理数（默认 1024）
 - **MCP 支持** — 通过 Model Context Protocol 接入外部工具服务器
   - Stdio 传输层（子进程 stdin/stdout JSON-RPC）
   - 工具自动发现，命名格式 `mcp.<server>.<tool>`
-  - 配置: `[mcp_servers.<name>]` 段
+  - 配置: `[mcp.<name>]` 段
 - **Fetch 工具** — Agent 网络访问能力
   - HTML 自动转换为 Markdown
   - SSRF 防护：私有 IP 地址拦截
@@ -24,6 +41,7 @@
 
 ### 改进
 
+- **ToolDispatcher 提取重构** — 工具分发逻辑从 AgentRunner 提取为独立的 ToolDispatcher，主 Agent 和子 Agent 共享同一套工具调用能力
 - **Edit 工具** — 改为 Claude Code 模式（Read 一次后可多次 Edit）
 - **CLI 命令注入** — Codex 风格消息插队
 - **消息自动标记已读** — 首次 LLM 请求成功后标记

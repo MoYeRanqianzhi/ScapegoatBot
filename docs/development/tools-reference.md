@@ -2,7 +2,7 @@
 
 本文档列出 ScapegoatBot Agent 可使用的全部工具，包括参数定义、示例调用和安全备注。
 
-工具参数定义来源：`src/agent.rs` 中的 `build_tool_specs()` 函数。
+工具参数定义来源：`src/agent.rs` 中的 `build_tool_specs()` 函数，蜂群工具定义来源：`src/swarm/tools.rs` 中的 `build_swarm_tool_specs()` 函数。
 
 ---
 
@@ -658,11 +658,11 @@ MCP (Model Context Protocol) 工具通过外部服务器动态提供。Agent 启
 
 MCP 工具名称格式：`mcp.<服务器名>.<工具名>`
 
-例如，配置了 `[mcp_servers.filesystem]` 服务器，其提供 `read_file` 工具，则工具名为 `mcp.filesystem.read_file`。
+例如，配置了 `[mcp.filesystem]` 服务器，其提供 `read_file` 工具，则工具名为 `mcp.filesystem.read_file`。
 
 ### 工具发现流程
 
-1. 根据 `[mcp_servers.*]` 配置启动子进程
+1. 根据 `[mcp.*]` 配置启动子进程
 2. 通过 JSON-RPC 发送 `initialize` 请求 + `initialized` 通知完成握手
 3. 调用 `tools/list` 获取服务器提供的所有工具定义
 4. 将 MCP 工具的 `inputSchema` 直接作为 ToolSpec 的 parameters 透传给 LLM
@@ -671,7 +671,7 @@ MCP 工具名称格式：`mcp.<服务器名>.<工具名>`
 ### 配置示例
 
 ```toml
-[mcp_servers.filesystem]
+[mcp.filesystem]
 command = "npx"
 args = ["-y", "@anthropic/mcp-filesystem", "/home/user/docs"]
 env = {}
@@ -683,7 +683,114 @@ tool_timeout_secs = 30
 
 ---
 
-## 11. 控制工具
+## 11. 蜂群工具
+
+蜂群工具用于管理子代理的生命周期和通信。仅当 `config.swarm.enabled = true` 时注册。实现位于 `src/swarm/tools.rs`，分发逻辑位于 `src/swarm/dispatch.rs`。
+
+子代理运行在独立的 tokio 任务中，拥有独立的 LLM 对话和工具访问权限。完成后通过 Finish 工具的 `result` 字段返回结果给父代理。子代理也可以嵌套 spawn 子代理（受 `swarm.max_depth` 限制）。
+
+### SpawnAgent
+
+生成一个子代理来并行执行任务。
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `name` | string | 是 | 子代理名称（必须唯一，用于后续的 MessageAgent / CheckAgent / WaitAgent 引用） |
+| `task` | string | 是 | 分配给子代理的任务描述（尽量详细具体，子代理会作为独立任务执行） |
+| `model` | string | 否 | 使用的模型名称（引用 `[[models]]` 配置中的 `name` 字段，不指定则使用主 `[llm]` 配置） |
+| `context` | string | 否 | 额外上下文信息（帮助子代理理解任务背景） |
+
+```json
+{
+  "name": "searcher",
+  "task": "在工作区中搜索所有包含 TODO 的文件，汇总为清单",
+  "model": "fast"
+}
+```
+
+```json
+{
+  "name": "analyzer",
+  "task": "分析 src/agent.rs 的代码结构，输出模块依赖关系",
+  "context": "项目使用 Rust 2024 edition，异步运行时为 tokio"
+}
+```
+
+**安全备注**：
+- 名称在蜂群中必须唯一，重复名称会被拒绝
+- 嵌套深度受 `swarm.max_depth` 限制（默认 32）
+- 并发数受 `swarm.max_concurrency` 限制（默认 1024）
+- 每个子代理有独立的 `max_steps` 限制（防止无限循环）
+
+### MessageAgent
+
+向指定的运行中子代理发送消息。消息会在子代理下一次 LLM 调用前作为 user 消息注入其对话历史。
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `name` | string | 是 | 目标子代理名称 |
+| `message` | string | 是 | 要发送的消息内容 |
+
+```json
+{
+  "name": "searcher",
+  "message": "请额外关注 workspace.rs 中的安全相关 TODO"
+}
+```
+
+**说明**：消息以 `[父代理消息]` 前缀注入子代理对话历史。只能向运行中的子代理发送消息。
+
+### CheckAgent
+
+查询子代理的当前状态。可查询单个子代理或列出所有子代理状态。
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `name` | string | 否 | 要查询的子代理名称（不指定且 `list_all=true` 时列出所有子代理） |
+| `list_all` | boolean | 否 | 是否列出所有子代理状态（默认 false） |
+
+```json
+{ "name": "searcher" }
+```
+
+```json
+{ "list_all": true }
+```
+
+**返回信息**：子代理名称、模型、运行状态（运行中/已完成/已失败）和已运行时间。
+
+### WaitAgent
+
+阻塞等待子代理完成并返回其结果。可等待单个、多个或全部子代理。
+
+| 参数 | 类型 | 必需 | 说明 |
+|------|------|------|------|
+| `name` | string | 否 | 等待单个子代理的名称 |
+| `names` | array[string] | 否 | 等待多个子代理的名称列表 |
+| `all` | boolean | 否 | 是否等待所有运行中的子代理（默认 false） |
+
+```json
+{ "name": "searcher" }
+```
+
+```json
+{ "names": ["searcher", "analyzer"] }
+```
+
+```json
+{ "all": true }
+```
+
+**说明**：
+- 等待期间当前代理不会处理其他消息
+- 同一个子代理只能 wait 一次（JoinHandle 被消费）
+- 返回子代理 Finish 工具的 result 字段内容
+
+**配置参考**：`[swarm]` 段和 `[[models]]` 段，详见 [config.example.toml](../../config.example.toml)。
+
+---
+
+## 12. 控制工具
 
 ### Finish
 
@@ -718,7 +825,8 @@ tool_timeout_secs = 30
 | 技能工具 | 1 | Skill |
 | 群管理工具-管理员 | 14 | SetGroupBan, SetGroupWholeBan, SetGroupKick, SetGroupName, SetGroupPortrait, SetEssenceMsg, DeleteEssenceMsg, GetEssenceMsgList, GetGroupAtAllRemain, GetGroupShutList, SendGroupNotice, DelGroupNotice, SetGroupAdmin, SetGroupSpecialTitle |
 | 群管理工具-非管理员 | 4 | SetGroupLeave, GetGroupNotice, GetGroupHonorInfo, SetGroupSign |
+| 蜂群工具 | 4 | SpawnAgent, MessageAgent, CheckAgent, WaitAgent |
 | 控制工具 | 1 | Finish |
 | 网络工具 | 1 (即将) | Fetch |
 | MCP 工具 | 动态 | mcp.\<server\>.\<tool\> |
-| **合计** | **39 + 动态** | |
+| **合计** | **43 + 动态** | |

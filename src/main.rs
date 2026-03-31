@@ -21,6 +21,7 @@ mod prompt;
 mod providers;
 mod skills;
 mod storage;
+mod swarm;
 mod tools;
 mod whitelist;
 
@@ -351,7 +352,7 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
     let (agent_tx, agent_rx) = tokio::sync::mpsc::unbounded_channel::<agent::MessageEvent>();
 
     // 创建并启动 Agent 运行器
-    if config.llm.is_configured() {
+    if config.primary_model().is_configured() {
         match agent::AgentRunner::new(
             Arc::new(config.clone()),
             tool_ctx.clone(),
@@ -364,7 +365,7 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
         {
             Ok(runner) => {
                 tokio::spawn(runner.run());
-                tracing::info!("Agent 循环已启动（模型: {}）", config.llm.model);
+                tracing::info!("Agent 循环已启动（模型: {}）", config.primary_model().model);
             }
             Err(e) => {
                 tracing::error!("Agent 初始化失败: {}（消息存储将继续，但不会自动回复）", e);
@@ -496,28 +497,61 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
                     );
                 }
             } else if event_name.starts_with("request.friend") {
-                // ----- 好友请求事件（记录到日志，不主动存储） -----
+                // ----- 好友请求事件（存储到日志 + 转发给 Agent） -----
                 if let Ok(req) =
                     serde_json::from_value::<FriendRequestEvent>(event.data.clone())
                 {
                     tracing::info!(
-                        "收到好友请求: QQ={}, 验证信息={}",
+                        "收到好友请求: QQ={}, 验证信息={}, flag={}",
                         req.user_id,
-                        req.comment
+                        req.comment,
+                        req.flag
                     );
+                    // 格式化为 Agent 可读的事件文本（包含 flag 以便 Agent 直接处理）
+                    let formatted = format!(
+                        "[好友请求] QQ: {} | 验证信息: \"{}\" | flag: {}",
+                        req.user_id, req.comment, req.flag
+                    );
+                    // 发送给 Agent，触发处理流程
+                    let _ = agent_tx_clone.send(agent::MessageEvent {
+                        formatted,
+                        source: Some(agent::MessageSource::FriendRequest {
+                            user_id: req.user_id,
+                        }),
+                    });
                 }
             } else if event_name.starts_with("request.group") {
-                // ----- 群请求事件（记录到日志） -----
+                // ----- 群请求事件（存储到日志 + 转发给 Agent） -----
                 if let Ok(req) =
                     serde_json::from_value::<GroupRequestEvent>(event.data.clone())
                 {
                     tracing::info!(
-                        "收到群请求: 群={}, QQ={}, 类型={}, 验证信息={}",
+                        "收到群请求: 群={}, QQ={}, 类型={}, 验证信息={}, flag={}",
                         req.group_id,
                         req.user_id,
                         req.sub_type,
-                        req.comment
+                        req.comment,
+                        req.flag
                     );
+                    // 描述请求类型（加群 / 群邀请）
+                    let req_type_desc = if req.sub_type == "invite" {
+                        "群邀请"
+                    } else {
+                        "加群请求"
+                    };
+                    // 格式化为 Agent 可读的事件文本
+                    let formatted = format!(
+                        "[群请求] 类型: {} | 群号: {} | QQ: {} | 验证信息: \"{}\" | flag: {}",
+                        req_type_desc, req.group_id, req.user_id, req.comment, req.flag
+                    );
+                    // 发送给 Agent，触发处理流程
+                    let _ = agent_tx_clone.send(agent::MessageEvent {
+                        formatted,
+                        source: Some(agent::MessageSource::GroupRequest {
+                            group_id: req.group_id,
+                            user_id: req.user_id,
+                        }),
+                    });
                 }
             } else if event_name.starts_with("notice.group_admin") {
                 // ----- 群管理员变更事件（即时更新群身份状态） -----
@@ -541,6 +575,26 @@ async fn run_daemon(config_path: &str) -> anyhow::Result<()> {
                             role
                         );
                     }
+                }
+            } else if event_name.starts_with("notice.friend_add") {
+                // ----- 好友添加成功通知（转发给 Agent） -----
+                if let Ok(notice) = serde_json::from_value::<
+                    napcat_link::types::event::notice::FriendAddNotice,
+                >(event.data.clone())
+                {
+                    tracing::info!("好友添加成功: QQ={}", notice.user_id);
+                    // 格式化为 Agent 可读的通知文本
+                    let formatted = format!(
+                        "[好友添加成功] QQ: {} 已成为好友",
+                        notice.user_id
+                    );
+                    // 发送给 Agent，Agent 可据此主动打招呼
+                    let _ = agent_tx_clone.send(agent::MessageEvent {
+                        formatted,
+                        source: Some(agent::MessageSource::FriendAdded {
+                            user_id: notice.user_id,
+                        }),
+                    });
                 }
             }
         }

@@ -1,7 +1,8 @@
 // src/config.rs
 // 配置模块
-// 从 TOML 文件加载 NapCat 连接配置、白名单（收/发分离）和消息存储配置
-// 启动时校验发白名单是收白名单的子集
+// 从 config.toml 加载主配置 + 从 llm.toml 加载 LLM 模型配置
+// 所有 LLM 模型（含主代理模型）统一定义在 llm.toml 中
+// config.toml 的 [llm] 段仅包含文件路径和主模型名称引用
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -25,9 +26,9 @@ pub struct AppConfig {
     /// 身份与提示词配置（可选，缺省使用默认值）
     #[serde(default)]
     pub identity: IdentityConfig,
-    /// LLM 提供商配置（可选，缺省需要在启动前手动配置）
+    /// LLM 配置引用（指向 llm.toml 文件路径 + 主模型名称）
     #[serde(default)]
-    pub llm: LlmConfig,
+    pub llm: LlmRef,
     /// 上下文压缩配置（可选，缺省使用默认值）
     #[serde(default)]
     pub compaction: CompactionConfig,
@@ -42,9 +43,16 @@ pub struct AppConfig {
     #[serde(default)]
     pub fetch: FetchConfig,
     /// MCP 服务器配置映射表（可选，缺省为空 HashMap）
-    /// 键为服务器名称（用于工具命名 mcp.<name>.<tool>），值为服务器配置
+    /// 配置格式: [mcp.<name>]，键为服务器名称（用于工具命名 mcp.<name>.<tool>）
     #[serde(default)]
-    pub mcp_servers: HashMap<String, McpServerConfig>,
+    pub mcp: HashMap<String, McpServerConfig>,
+    /// LLM 模型列表（从 llm.toml 合并 defaults + raw 后加载，不直接从 config.toml 反序列化）
+    #[serde(skip)]
+    pub models: Vec<ModelConfig>,
+    /// 蜂群子代理配置（可选，缺省为默认值）
+    /// 控制子代理的并发上限、嵌套深度等安全参数
+    #[serde(default)]
+    pub swarm: SwarmConfig,
 }
 
 // ============================================================================
@@ -173,143 +181,169 @@ fn default_master() -> String {
 }
 
 // ============================================================================
-// LLM 提供商配置
+// LLM 配置引用（config.toml [llm] 段）
 // ============================================================================
 
-/// LLM 提供商配置
-/// 控制 Agent 使用的语言模型连接参数
+/// config.toml 中的 [llm] 段
+/// 仅包含 llm.toml 文件路径和主代理使用的模型名称
+/// 所有模型定义统一在 llm.toml 中
 #[derive(Debug, Clone, Deserialize)]
-pub struct LlmConfig {
-    /// LLM 提供商类型（默认 "openai"）
-    /// - "openai" — OpenAI 兼容 API（ChatCompletions / Responses 端点）
-    /// - "anthropic" — Anthropic Messages API（Claude 系列模型）
-    #[serde(default = "default_provider")]
-    pub provider: String,
-    /// API 基础 URL
-    /// OpenAI 兼容：如 https://api.openai.com/v1
-    /// Anthropic：如 https://api.anthropic.com（留空时使用此默认值）
-    #[serde(default)]
-    pub base_url: String,
-    /// API 密钥
-    /// OpenAI 兼容：作为 Authorization: Bearer 头部发送
-    /// Anthropic：作为 x-api-key 头部发送（OAuth token 以 sk-ant-oat01- 开头时使用 Bearer）
-    #[serde(default)]
-    pub api_key: String,
-    /// 模型名称（如 gpt-4o、claude-sonnet-4-20250514 等）
-    #[serde(default = "default_llm_model")]
-    pub model: String,
-    /// 最大输出 token 数（可选）
-    /// Anthropic API 强制要求此字段，默认 16384
-    /// OpenAI 可选，不设置时由模型自行决定
-    #[serde(default)]
-    pub max_tokens: Option<u32>,
-    /// 系统指令的角色名称（默认 "system"，某些提供商要求 "developer"）
-    #[serde(default)]
-    pub system_role_name: Option<String>,
-    /// 推理深度/努力程度（可选，传递给支持该参数的模型）
-    /// 常见值：none, minimal, low, medium, high, xhigh
-    #[serde(default)]
-    pub reasoning_effort: Option<String>,
-    /// 每个任务的最大工具调用步数（安全上限）
-    #[serde(default = "default_max_steps")]
-    pub max_steps: u32,
-    /// HTTP 请求超时时间（秒），默认 300 秒（5 分钟）
-    /// 所有 API 请求均使用流式传输，此超时为最后安全网
-    /// 如果 LLM 在此时间内未完成响应，请求将被客户端主动中止
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
-    /// API 协议类型，决定使用哪个端点（仅 OpenAI 提供商使用）
-    /// - "chat_completions"（默认）：使用 /v1/chat/completions 端点，兼容绝大多数渠道
-    /// - "responses"：使用 /v1/responses 端点（OpenAI 新一代 API）
-    /// 某些渠道仅支持其中一种端点，通过此参数切换
-    /// Anthropic 提供商忽略此字段（始终使用 /v1/messages 端点）
-    #[serde(default = "default_wire_api")]
-    pub wire_api: String,
+pub struct LlmRef {
+    /// LLM 配置文件路径（相对于 config.toml 所在目录）
+    #[serde(default = "default_llm_config_file")]
+    pub config_file: String,
+    /// 主代理使用的模型名称（必须对应 llm.toml 中某个 [[models]] 的 name）
+    #[serde(default = "default_primary_model")]
+    pub primary_model: String,
 }
 
-impl Default for LlmConfig {
+impl Default for LlmRef {
     fn default() -> Self {
         Self {
-            provider: default_provider(),
-            base_url: String::new(),
-            api_key: String::new(),
-            model: default_llm_model(),
-            max_tokens: None,
-            system_role_name: None,
-            reasoning_effort: None,
-            max_steps: default_max_steps(),
-            timeout_secs: default_timeout_secs(),
-            wire_api: default_wire_api(),
+            config_file: default_llm_config_file(),
+            primary_model: default_primary_model(),
         }
     }
 }
 
-impl LlmConfig {
-    /// 返回系统指令的有效角色名称
-    /// 缺失或空白 → "system"
-    pub fn effective_system_role_name(&self) -> &str {
-        self.system_role_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("system")
-    }
+/// 默认 LLM 配置文件名
+fn default_llm_config_file() -> String {
+    "llm.toml".to_string()
+}
 
-    /// 返回有效的推理努力（空白视为 None）
-    pub fn effective_reasoning_effort(&self) -> Option<&str> {
-        self.reasoning_effort
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    }
+/// 默认主模型名称
+fn default_primary_model() -> String {
+    "main".to_string()
+}
 
-    /// 返回 Anthropic 的有效 max_tokens 值
-    /// Anthropic API 强制要求此字段，默认 16384
-    pub fn effective_anthropic_max_tokens(&self) -> u32 {
-        self.max_tokens.unwrap_or(16384)
-    }
+// ============================================================================
+// LLM 配置文件结构（llm.toml）
+// ============================================================================
 
-    /// 检查 LLM 配置是否已就绪
-    /// 不同提供商有不同的必填项：
-    /// - OpenAI：base_url 和 api_key 均非空
-    /// - Anthropic：仅 api_key 非空（base_url 有内置默认值 https://api.anthropic.com）
-    pub fn is_configured(&self) -> bool {
-        let has_api_key = !self.api_key.trim().is_empty();
-        match self.provider.to_ascii_lowercase().as_str() {
-            // Anthropic 有内置默认 base_url，仅需 api_key
-            "anthropic" => has_api_key,
-            // OpenAI 及其他提供商需要 base_url 和 api_key
-            _ => !self.base_url.trim().is_empty() && has_api_key,
+/// llm.toml 的完整结构
+/// 包含全局默认值和模型定义列表
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmFileConfig {
+    /// 默认值段（所有模型可继承，减少重复配置）
+    #[serde(default)]
+    pub defaults: ModelDefaults,
+    /// 模型定义列表
+    pub models: Vec<ModelConfigRaw>,
+}
+
+/// 模型默认值（llm.toml [defaults] 段）
+/// 所有字段可选——模型定义中未指定的字段优先使用此处的值，
+/// 此处也未指定时使用硬编码默认值
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ModelDefaults {
+    /// LLM 提供商类型（默认 "openai"）
+    pub provider: Option<String>,
+    /// API 基础 URL
+    pub base_url: Option<String>,
+    /// API 密钥
+    pub api_key: Option<String>,
+    /// HTTP 请求超时时间（秒）
+    pub timeout_secs: Option<u64>,
+    /// API 协议类型（仅 OpenAI 提供商使用）
+    pub wire_api: Option<String>,
+    /// 系统指令的角色名称
+    pub system_role_name: Option<String>,
+    /// 最大输出 token 数
+    pub max_tokens: Option<u32>,
+    /// 每个任务的最大工具调用步数
+    pub max_steps: Option<u32>,
+    /// 上下文窗口大小（token 数）
+    pub context_window: Option<usize>,
+}
+
+/// llm.toml 中的原始模型定义
+/// name, display_name, description, model 为必填字段
+/// 其余可选字段未指定时依次从 defaults → 硬编码默认值 取值
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelConfigRaw {
+    /// 内部引用名（SpawnAgent 工具和 primary_model 使用此名称）
+    pub name: String,
+    /// 人类可读的显示名称（如 "GPT-4o"、"Claude Opus 4.6"）
+    pub display_name: String,
+    /// 一句话性能描述（帮助 LLM 选择合适的模型）
+    pub description: String,
+    /// 模型 ID（如 "gpt-4o"、"claude-opus-4-6-20250514"）
+    pub model: String,
+    /// LLM 提供商类型
+    pub provider: Option<String>,
+    /// API 基础 URL
+    pub base_url: Option<String>,
+    /// API 密钥
+    pub api_key: Option<String>,
+    /// 最大输出 token 数
+    pub max_tokens: Option<u32>,
+    /// 上下文窗口大小（token 数）
+    pub context_window: Option<usize>,
+    /// HTTP 请求超时时间（秒）
+    pub timeout_secs: Option<u64>,
+    /// API 协议类型
+    pub wire_api: Option<String>,
+    /// 系统指令的角色名称
+    pub system_role_name: Option<String>,
+    /// 每个任务的最大工具调用步数
+    pub max_steps: Option<u32>,
+    /// 推理深度/努力程度（可选，传递给支持该参数的模型）
+    pub reasoning_effort: Option<String>,
+}
+
+impl LlmFileConfig {
+    /// 将 defaults + 各 ModelConfigRaw 合并，生成最终的 ModelConfig 列表
+    /// 优先级：raw 字段 > defaults 字段 > 硬编码默认值
+    pub fn resolve_models(&self) -> Result<Vec<ModelConfig>> {
+        let mut result = Vec::with_capacity(self.models.len());
+        for raw in &self.models {
+            // 合并逻辑：优先 raw，其次 defaults，最后硬编码
+            let provider = raw.provider.clone()
+                .or_else(|| self.defaults.provider.clone())
+                .unwrap_or_else(|| "openai".to_string());
+            let base_url = raw.base_url.clone()
+                .or_else(|| self.defaults.base_url.clone())
+                .unwrap_or_default();
+            let api_key = raw.api_key.clone()
+                .or_else(|| self.defaults.api_key.clone())
+                .unwrap_or_default();
+            let max_tokens = raw.max_tokens
+                .or(self.defaults.max_tokens);
+            let context_window = raw.context_window
+                .or(self.defaults.context_window)
+                .unwrap_or(128_000);
+            let timeout_secs = raw.timeout_secs
+                .or(self.defaults.timeout_secs)
+                .unwrap_or(120);
+            let wire_api = raw.wire_api.clone()
+                .or_else(|| self.defaults.wire_api.clone())
+                .unwrap_or_else(|| "chat_completions".to_string());
+            let system_role_name = raw.system_role_name.clone()
+                .or_else(|| self.defaults.system_role_name.clone());
+            let max_steps = raw.max_steps
+                .or(self.defaults.max_steps)
+                .unwrap_or(64);
+            let reasoning_effort = raw.reasoning_effort.clone();
+
+            result.push(ModelConfig {
+                name: raw.name.clone(),
+                display_name: raw.display_name.clone(),
+                description: raw.description.clone(),
+                provider,
+                base_url,
+                api_key,
+                model: raw.model.clone(),
+                max_tokens,
+                context_window,
+                timeout_secs,
+                wire_api,
+                system_role_name,
+                max_steps,
+                reasoning_effort,
+            });
         }
+        Ok(result)
     }
-}
-
-/// 默认 LLM 提供商类型
-fn default_provider() -> String {
-    "openai".to_string()
-}
-
-/// 默认模型名称
-fn default_llm_model() -> String {
-    "unknown".to_string()
-}
-
-/// 默认最大工具调用步数
-/// codex 没有硬性上限，但我们保留安全网防止无限循环
-/// 128 步足够完成复杂的多文件读取 + 回复 + 记忆更新流程
-const fn default_max_steps() -> u32 {
-    128
-}
-
-/// 默认 HTTP 请求超时时间（秒）
-/// 300 秒 = 5 分钟，足够复杂的工具调用请求完成
-const fn default_timeout_secs() -> u64 {
-    300
-}
-
-/// 默认 API 协议类型：chat_completions
-fn default_wire_api() -> String {
-    "chat_completions".to_string()
 }
 
 // ============================================================================
@@ -500,7 +534,7 @@ fn default_fetch_max_output() -> usize {
 /// 每个 MCP 服务器作为子进程启动，通过 stdin/stdout 进行 JSON-RPC 2.0 通信
 /// 配置示例（config.toml）：
 /// ```toml
-/// [mcp_servers.filesystem]
+/// [mcp.filesystem]
 /// command = "npx"
 /// args = ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
 /// enabled = true
@@ -535,25 +569,213 @@ fn default_mcp_tool_timeout() -> u64 {
 }
 
 // ============================================================================
+// 已解析的模型配置（从 llm.toml 合并后产出）
+// ============================================================================
+
+/// 已解析的 LLM 模型配置
+/// 由 LlmFileConfig::resolve_models() 从 ModelConfigRaw + ModelDefaults 合并而来
+/// 所有字段均为必填（已完成合并，不再有 Option fallback）
+///
+/// 主代理和子代理均使用此结构，地位平等
+/// config.toml 的 [llm].primary_model 指定主代理使用哪个模型
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelConfig {
+    /// 内部引用名（SpawnAgent 工具的 model 参数和 primary_model 使用此名称）
+    /// 必须在所有模型中唯一
+    pub name: String,
+    /// 人类可读的显示名称（如 "GPT-4o"、"Claude Opus 4.6"）
+    /// 用于系统提示中的模型列表展示和日志输出
+    pub display_name: String,
+    /// 一句话性能描述（如 "最强大的模型，可解决复杂问题"）
+    /// 帮助 LLM 选择合适的模型用于子代理任务
+    pub description: String,
+    /// LLM 提供商类型: "openai" | "anthropic"
+    pub provider: String,
+    /// API 基础 URL（已解析，不再为 Option）
+    /// OpenAI 兼容：如 "https://api.openai.com/v1"
+    /// Anthropic：留空时 Provider 内部使用默认 "https://api.anthropic.com"
+    pub base_url: String,
+    /// API 密钥（已解析，不再为 Option）
+    pub api_key: String,
+    /// 模型 ID（如 "gpt-4o"、"claude-opus-4-6-20250514"）
+    pub model: String,
+    /// 最大输出 token 数（可选）
+    /// Anthropic API 强制要求此字段
+    /// 为 None 时 Anthropic 使用默认 16384，OpenAI 由模型自行决定
+    pub max_tokens: Option<u32>,
+    /// 该模型的上下文窗口大小（token 数）
+    /// 影响上下文压缩触发阈值（context_window * 3/4）
+    pub context_window: usize,
+    /// HTTP 请求超时时间（秒）
+    pub timeout_secs: u64,
+    /// API 协议类型（仅 OpenAI 提供商使用）
+    /// "chat_completions" | "responses"
+    pub wire_api: String,
+    /// 系统指令的角色名称（可选，缺省 "system"）
+    pub system_role_name: Option<String>,
+    /// 每个任务的最大工具调用步数
+    pub max_steps: u32,
+    /// 推理深度/努力程度（可选，传递给支持该参数的模型）
+    /// 常见值：none, minimal, low, medium, high, xhigh
+    pub reasoning_effort: Option<String>,
+}
+
+impl ModelConfig {
+    /// 检查此模型配置是否已就绪（api_key 非空，OpenAI 还需 base_url 非空）
+    /// 与原 LlmConfig::is_configured() 逻辑一致
+    pub fn is_configured(&self) -> bool {
+        let has_api_key = !self.api_key.trim().is_empty();
+        match self.provider.to_ascii_lowercase().as_str() {
+            // Anthropic 有内置默认 base_url，仅需 api_key
+            "anthropic" => has_api_key,
+            // OpenAI 及其他提供商需要 base_url 和 api_key
+            _ => !self.base_url.trim().is_empty() && has_api_key,
+        }
+    }
+
+    /// 返回有效的系统角色名称（缺省 "system"）
+    pub fn effective_system_role_name(&self) -> &str {
+        self.system_role_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("system")
+    }
+
+    /// 返回有效的推理努力（空白视为 None）
+    pub fn effective_reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// 返回 Anthropic 的有效 max_tokens 值（默认 16384）
+    pub fn effective_anthropic_max_tokens(&self) -> u32 {
+        self.max_tokens.unwrap_or(16384)
+    }
+}
+
+// ============================================================================
+// 蜂群子代理配置
+// ============================================================================
+
+/// 蜂群子代理配置
+/// 控制子代理系统的安全参数和资源上限
+/// 配置示例（config.toml）：
+/// ```toml
+/// [swarm]
+/// enabled = true
+/// max_depth = 32
+/// max_concurrency = 1024
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct SwarmConfig {
+    /// 是否启用蜂群子代理功能（默认 true）
+    /// 禁用时 SpawnAgent 等工具不会注册
+    #[serde(default = "default_swarm_enabled")]
+    pub enabled: bool,
+    /// 最大嵌套深度（默认 32）
+    /// 子代理可以递归 spawn 子代理的最深层数
+    /// 配合 max_concurrency 形成双重安全网
+    #[serde(default = "default_swarm_max_depth")]
+    pub max_depth: u32,
+    /// 最大并发子代理数（默认 1024）
+    /// 所有层级的子代理总数上限，超过时 spawn 被拒绝
+    /// tokio 绿色线程极其轻量，1024 并发仅占用约 50MB 内存
+    /// 此参数是防止失控扇出的主要安全机制
+    #[serde(default = "default_swarm_max_concurrency")]
+    pub max_concurrency: u32,
+}
+
+/// 蜂群默认启用
+fn default_swarm_enabled() -> bool {
+    true
+}
+
+/// 默认最大嵌套深度：32
+fn default_swarm_max_depth() -> u32 {
+    32
+}
+
+/// 默认最大并发子代理数：1024
+fn default_swarm_max_concurrency() -> u32 {
+    1024
+}
+
+impl Default for SwarmConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_swarm_enabled(),
+            max_depth: default_swarm_max_depth(),
+            max_concurrency: default_swarm_max_concurrency(),
+        }
+    }
+}
+
+// ============================================================================
 // 配置加载与校验
 // ============================================================================
 
 impl AppConfig {
     /// 从 TOML 文件加载配置
-    /// 加载后自动执行白名单子集约束校验
+    /// 1. 解析 config.toml → AppConfig（models 为空，由 serde(skip) 跳过）
+    /// 2. 根据 [llm].config_file 加载 llm.toml → LlmFileConfig
+    /// 3. 合并 defaults + raw → Vec<ModelConfig>，写入 config.models
+    /// 4. 校验 primary_model 存在、模型名称唯一、白名单子集约束
     pub fn load(path: &Path) -> Result<Self> {
         // 读取配置文件内容
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("无法读取配置文件: {}", path.display()))?;
 
-        // 解析 TOML
-        let config: AppConfig = toml::from_str(&content)
+        // 解析 config.toml（models 字段被 #[serde(skip)] 跳过，初始为空 Vec）
+        let mut config: AppConfig = toml::from_str(&content)
             .with_context(|| format!("解析配置文件失败: {}", path.display()))?;
+
+        // 解析 llm.toml（路径相对于 config.toml 所在目录）
+        let config_dir = path.parent().unwrap_or(Path::new("."));
+        let llm_path = config_dir.join(&config.llm.config_file);
+        let llm_content = std::fs::read_to_string(&llm_path)
+            .with_context(|| format!("无法读取 LLM 配置文件: {}", llm_path.display()))?;
+        let llm_file: LlmFileConfig = toml::from_str(&llm_content)
+            .with_context(|| format!("解析 LLM 配置文件失败: {}", llm_path.display()))?;
+
+        // 合并 defaults + raw → Vec<ModelConfig>
+        config.models = llm_file.resolve_models()
+            .with_context(|| "合并 LLM 模型配置失败")?;
+
+        // 校验 primary_model 存在
+        if config.find_model(&config.llm.primary_model).is_none() {
+            bail!(
+                "主模型 '{}' 未在 {} 中定义",
+                config.llm.primary_model,
+                llm_path.display()
+            );
+        }
+
+        // 校验模型名称唯一
+        let mut seen_names = HashSet::new();
+        for m in &config.models {
+            if !seen_names.insert(&m.name) {
+                bail!(
+                    "模型名称 '{}' 在 {} 中重复定义",
+                    m.name,
+                    llm_path.display()
+                );
+            }
+        }
 
         // 校验白名单约束
         config.validate_whitelist()?;
 
         Ok(config)
+    }
+
+    /// 获取主代理模型配置
+    /// primary_model 在 load() 中已校验存在，此处使用 expect 安全解包
+    pub fn primary_model(&self) -> &ModelConfig {
+        self.find_model(&self.llm.primary_model)
+            .expect("primary_model 在 load() 中已校验存在")
     }
 
     /// 校验白名单约束：发白名单必须是收白名单的子集
@@ -605,6 +827,12 @@ impl AppConfig {
     /// 获取消息存储的根目录路径
     pub fn messages_dir(&self) -> PathBuf {
         PathBuf::from(&self.storage.workspace_dir).join("messages")
+    }
+
+    /// 按名称查找模型配置
+    /// 返回 None 表示未找到该名称的模型
+    pub fn find_model(&self, name: &str) -> Option<&ModelConfig> {
+        self.models.iter().find(|m| m.name == name)
     }
 }
 
@@ -727,5 +955,194 @@ master = "987654321"
         assert!(!config.identity.is_master_self());
         assert_eq!(config.identity.master_display(), "987654321");
         assert_eq!(config.identity.resolve_master_qq(0), Some(987654321));
+    }
+
+    /// 测试：LlmFileConfig::resolve_models() 合并逻辑
+    /// raw 优先于 defaults，defaults 优先于硬编码默认值
+    #[test]
+    fn resolve_models_merge_priority() {
+        let llm_toml = r#"
+[defaults]
+provider = "anthropic"
+api_key = "default-key"
+timeout_secs = 300
+context_window = 200000
+
+[[models]]
+name = "main"
+display_name = "Test Model"
+description = "测试模型"
+model = "test-model"
+api_key = "override-key"
+"#;
+        let llm_file: LlmFileConfig = toml::from_str(llm_toml).unwrap();
+        let models = llm_file.resolve_models().unwrap();
+        assert_eq!(models.len(), 1);
+        let m = &models[0];
+        // raw.api_key 覆盖 defaults.api_key
+        assert_eq!(m.api_key, "override-key");
+        // raw.provider 为 None → 取 defaults.provider
+        assert_eq!(m.provider, "anthropic");
+        // raw.timeout_secs 为 None → 取 defaults.timeout_secs
+        assert_eq!(m.timeout_secs, 300);
+        // raw.context_window 为 None → 取 defaults.context_window
+        assert_eq!(m.context_window, 200000);
+        // raw.wire_api 和 defaults.wire_api 都为 None → 硬编码默认 "chat_completions"
+        assert_eq!(m.wire_api, "chat_completions");
+        // raw.max_steps 和 defaults.max_steps 都为 None → 硬编码默认 64
+        assert_eq!(m.max_steps, 64);
+        // raw.base_url 和 defaults.base_url 都为 None → 空字符串
+        assert_eq!(m.base_url, "");
+    }
+
+    /// 测试：ModelConfig::is_configured() 各提供商逻辑
+    #[test]
+    fn model_config_is_configured() {
+        // OpenAI：需要 base_url 和 api_key
+        let openai = ModelConfig {
+            name: "test".into(), display_name: "T".into(), description: "d".into(),
+            provider: "openai".into(), base_url: "https://api.openai.com/v1".into(),
+            api_key: "sk-xxx".into(), model: "gpt-4o".into(), max_tokens: None,
+            context_window: 128000, timeout_secs: 120, wire_api: "chat_completions".into(),
+            system_role_name: None, max_steps: 64, reasoning_effort: None,
+        };
+        assert!(openai.is_configured());
+
+        // OpenAI：缺 api_key
+        let no_key = ModelConfig { api_key: "".into(), ..openai.clone() };
+        assert!(!no_key.is_configured());
+
+        // OpenAI：缺 base_url
+        let no_url = ModelConfig { base_url: "".into(), ..openai.clone() };
+        assert!(!no_url.is_configured());
+
+        // Anthropic：仅需 api_key
+        let anthropic = ModelConfig {
+            provider: "anthropic".into(), base_url: "".into(),
+            api_key: "sk-ant-xxx".into(), ..openai.clone()
+        };
+        assert!(anthropic.is_configured());
+
+        // Anthropic：缺 api_key
+        let anthropic_no_key = ModelConfig { api_key: "".into(), ..anthropic.clone() };
+        assert!(!anthropic_no_key.is_configured());
+    }
+
+    /// 测试：AppConfig::load() 完整流程（临时文件）
+    #[test]
+    fn load_with_llm_toml() {
+        // 创建临时目录
+        let dir = std::env::temp_dir().join("sbot_test_load_llm");
+        let _ = std::fs::create_dir_all(&dir);
+
+        // 写入 config.toml
+        let config_toml = r#"
+[napcat]
+ws_url = "ws://127.0.0.1:3001"
+
+[whitelist]
+
+[storage]
+
+[llm]
+config_file = "llm.toml"
+primary_model = "main"
+"#;
+        std::fs::write(dir.join("config.toml"), config_toml).unwrap();
+
+        // 写入 llm.toml
+        let llm_toml = r#"
+[defaults]
+provider = "openai"
+
+[[models]]
+name = "main"
+display_name = "GPT-4o"
+description = "主力模型"
+model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+api_key = "sk-test"
+"#;
+        std::fs::write(dir.join("llm.toml"), llm_toml).unwrap();
+
+        // 加载并验证
+        let config = AppConfig::load(&dir.join("config.toml")).unwrap();
+        assert_eq!(config.models.len(), 1);
+        let pm = config.primary_model();
+        assert_eq!(pm.name, "main");
+        assert_eq!(pm.model, "gpt-4o");
+        assert_eq!(pm.provider, "openai");
+        assert!(pm.is_configured());
+
+        // 清理
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 测试：primary_model 不存在时 load() 应报错
+    #[test]
+    fn load_missing_primary_model_fails() {
+        let dir = std::env::temp_dir().join("sbot_test_missing_primary");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let config_toml = r#"
+[napcat]
+ws_url = "ws://127.0.0.1:3001"
+[whitelist]
+[storage]
+[llm]
+primary_model = "nonexistent"
+"#;
+        std::fs::write(dir.join("config.toml"), config_toml).unwrap();
+
+        let llm_toml = r#"
+[[models]]
+name = "main"
+display_name = "M"
+description = "d"
+model = "m"
+"#;
+        std::fs::write(dir.join("llm.toml"), llm_toml).unwrap();
+
+        let err = AppConfig::load(&dir.join("config.toml")).unwrap_err();
+        assert!(err.to_string().contains("nonexistent"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 测试：模型名称重复时 load() 应报错
+    #[test]
+    fn load_duplicate_model_names_fails() {
+        let dir = std::env::temp_dir().join("sbot_test_dup_names");
+        let _ = std::fs::create_dir_all(&dir);
+
+        let config_toml = r#"
+[napcat]
+ws_url = "ws://127.0.0.1:3001"
+[whitelist]
+[storage]
+[llm]
+primary_model = "main"
+"#;
+        std::fs::write(dir.join("config.toml"), config_toml).unwrap();
+
+        let llm_toml = r#"
+[[models]]
+name = "main"
+display_name = "M1"
+description = "d"
+model = "m1"
+
+[[models]]
+name = "main"
+display_name = "M2"
+description = "d"
+model = "m2"
+"#;
+        std::fs::write(dir.join("llm.toml"), llm_toml).unwrap();
+
+        let err = AppConfig::load(&dir.join("config.toml")).unwrap_err();
+        assert!(err.to_string().contains("重复"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

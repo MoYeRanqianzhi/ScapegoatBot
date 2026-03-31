@@ -6,6 +6,7 @@
 // - 只注入 AGENTS.md，其他文件由模型通过 Read 工具自行读取
 // - 通过 cap-std 将文件工具限制在 workspace 内
 
+use crate::config::AppConfig;
 use crate::skills::SkillListItem;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -199,6 +200,10 @@ pub struct PromptConfig<'a> {
     /// 群身份状态的 prompt 文本
     /// 由 GroupRoleState.format_prompt_section() 生成，包含 `## 群身份` 标题
     pub group_roles_section: &'a str,
+    /// 备选模型列表段落（由 build_models_section() 生成）
+    /// 非空时注入系统提示，让 LLM 知道 SpawnAgent 可用的模型
+    #[allow(dead_code)]
+    pub models_section: &'a str,
 }
 
 /// 构建完整的系统提示词
@@ -269,6 +274,10 @@ pub fn build_system_prompt(cfg: &PromptConfig<'_>) -> String {
 - `GetGroupMemberInfo`：获取指定群成员的详细信息。需要提供群号和用户 QQ 号。
 - `HandleFriendRequest`：处理好友请求。需要提供请求标识和是否同意。
 - `HandleGroupRequest`：处理群请求（加群/邀请）。需要提供请求标识、子类型和是否同意。
+- `GetFriendRequests`：从 NapCat 获取当前待处理的好友请求列表（包括历史未处理的请求）。
+- `SetFriendRemark`：设置好友备注名称。需要提供好友 QQ 号和备注名称。
+- `DeleteFriend`：删除好友（不可撤销）。需要提供好友 QQ 号。
+- `GetUnidirectionalFriendList`：获取单向好友列表（对方加了你但你没加对方）。
 - `Skill`：加载已安装的技能文件。需要提供技能名称（name），可选提供技能内相对路径（path，默认为 SKILL.md）。你不会看到技能在宿主机上的真实安装目录；只能通过技能名和技能内相对路径访问。
 - `ReadImage`：查看消息中的图片。提供消息 ID（MsgID），工具会查找该消息中的图片并返回给你进行视觉分析。可选指定图片索引（index，从 0 开始）查看多图消息中的特定图片。
 - `GetMessage`：通过消息 ID 获取原始消息内容（JSON 格式）。利用数据库索引快速定位。当你需要查看消息的完整原始数据（包括所有 MessageSegment 细节）时使用。
@@ -311,6 +320,17 @@ pub fn build_system_prompt(cfg: &PromptConfig<'_>) -> String {
 - 使用 QQ 系统表情：通过 face segment 发送，如 `{\"type\": \"face\", \"data\": {\"id\": \"178\"}}` 发送 doge 表情。
 - 使用颜文字（kaomoji）：在文本中自然地使用，如 ╮(╯▽╰)╭、(≧▽≦)、(´・ω・`)、orz 等。
 - 具体 QQ 表情 ID 对照表和使用技巧，参考可用技能中的相关技能。
+
+### 好友请求处理
+
+收到好友请求时（消息前缀为 `[好友请求]`），标准流程：
+1. 查看请求的验证信息和来源 QQ 号
+2. 如需查看所有待处理请求，调用 `GetFriendRequests`
+3. 根据主人的偏好决定是否同意——参考 AGENTS.md 或 MEMORY.md 中的策略
+4. 调用 `HandleFriendRequest` 处理请求（flag 已包含在事件消息中）
+5. 同意后如需设置备注，调用 `SetFriendRemark`
+
+收到好友添加成功通知时（消息前缀为 `[好友添加成功]`），可以主动发私聊消息打招呼。
 
 ### MCP 外部工具
 
@@ -538,6 +558,11 @@ Wrapped 状态的正文使用 `<message>` 标签包裹，内部使用类 XML 的
         out.push('\n');
     }
 
+    // ===== 第 7.6 节：可用模型列表（仅有备选模型时注入）=====
+    if !cfg.models_section.is_empty() {
+        out.push_str(cfg.models_section);
+    }
+
     // ===== 第 8 节：当前日期与时间 =====
     let _ = writeln!(
         out,
@@ -596,6 +621,52 @@ Wrapped 状态的正文使用 `<message>` 标签包裹，内部使用类 XML 的
 }
 
 // ============================================================================
+// 备选模型列表段落构建
+// ============================================================================
+
+/// 构建模型列表的 prompt 段落
+/// 当 config.models 非空时，生成一个 Markdown 表格列出所有模型
+/// 主模型会被标注为 "（主模型）"，用于系统提示中让 LLM 了解 SpawnAgent 可选的模型
+///
+/// # 参数
+/// - `config`: 全局应用配置
+///
+/// # 返回
+/// 非空时返回包含 `## 可用模型` 段落的字符串，空时返回空字符串
+pub fn build_models_section(config: &AppConfig) -> String {
+    // 未配置任何模型时返回空字符串
+    if config.models.is_empty() {
+        return String::new();
+    }
+
+    // 获取主模型名称用于标注
+    let primary_name = &config.llm.primary_model;
+
+    let mut out = String::new();
+    out.push_str("## 可用模型\n\n");
+    out.push_str("以下模型可在 `SpawnAgent` 工具的 `model` 参数中引用：\n\n");
+    // Markdown 表格头部
+    out.push_str("| 名称 | 显示名 | 说明 | 上下文窗口 |\n");
+    out.push_str("|------|--------|------|------------|\n");
+    // 逐行列出模型，主模型标注 "（主模型）"
+    for m in &config.models {
+        let name_display = if m.name == *primary_name {
+            format!("`{}`（主模型）", m.name)
+        } else {
+            format!("`{}`", m.name)
+        };
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} |",
+            name_display, m.display_name, m.description, m.context_window
+        );
+    }
+    out.push('\n');
+
+    out
+}
+
+// ============================================================================
 // 单元测试
 // ============================================================================
 
@@ -637,6 +708,7 @@ mod tests {
             ai_boot: false,
             unprocessed_ranges: vec![],
             group_roles_section: "",
+            models_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         println!("\n========== 完整系统提示词 ==========\n");
@@ -694,6 +766,7 @@ mod tests {
             ai_boot: false,
             unprocessed_ranges: vec![],
             group_roles_section: "",
+            models_section: "",
         };
         let prompt = build_system_prompt(&cfg);
 
@@ -759,6 +832,7 @@ mod tests {
             ai_boot: false,
             unprocessed_ranges: vec![],
             group_roles_section: "",
+            models_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(prompt.contains("Agents.md not found"));
@@ -787,6 +861,7 @@ mod tests {
             ai_boot: false,
             unprocessed_ranges: vec![],
             group_roles_section: "",
+            models_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(prompt.contains("## 附加运行时上下文"));
@@ -816,6 +891,7 @@ mod tests {
             ai_boot: false,
             unprocessed_ranges: vec![],
             group_roles_section: "",
+            models_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(!prompt.contains("## 附加运行时上下文"));
@@ -844,6 +920,7 @@ mod tests {
             ai_boot: false,
             unprocessed_ranges: vec![],
             group_roles_section: "",
+            models_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         // 确认工具列表中没有 Bash 工具定义（`Bash` 加反引号表示工具名）
@@ -879,6 +956,7 @@ mod tests {
             ai_boot: true,
             unprocessed_ranges: ranges,
             group_roles_section: "",
+            models_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(prompt.contains("## 启动检查"));
@@ -909,6 +987,7 @@ mod tests {
             ai_boot: false,
             unprocessed_ranges: vec![],
             group_roles_section: "",
+            models_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(!prompt.contains("## 启动检查"));
@@ -937,6 +1016,7 @@ mod tests {
             ai_boot: false,
             unprocessed_ranges: vec![],
             group_roles_section: "",
+            models_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(prompt.contains("## 会话记录"));
@@ -967,6 +1047,7 @@ mod tests {
             ai_boot: false,
             unprocessed_ranges: vec![],
             group_roles_section: "",
+            models_section: "",
         };
         let prompt = build_system_prompt(&cfg);
         assert!(!prompt.contains("## 会话记录"));

@@ -13,14 +13,13 @@ use crate::agent_state::AgentState;
 use crate::compact::{self, CompactionState};
 use crate::config::AppConfig;
 use crate::prompt::{self, AgentsMd, PromptConfig};
-use crate::providers::anthropic::AnthropicProvider;
-use crate::providers::openai::OpenAiProvider;
-use crate::providers::traits::{ChatMessage, ChatRequest, ImageData, Provider, ToolSpec};
+use crate::providers::traits::{ChatMessage, ChatRequest, Provider, ToolSpec};
 use crate::storage::session::SessionManager;
+use crate::swarm::dispatch::{ToolDispatcher, ToolResult};
+use crate::swarm::SwarmManager;
 use crate::tools::ToolContext;
 use crate::tools::workspace::{WorkspaceToolSession, WorkspaceTools};
-use napcat_link::MessageSegment;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -40,6 +39,23 @@ pub enum MessageSource {
     /// 私聊消息来源
     Private {
         /// 发送者 QQ 号
+        user_id: i64,
+    },
+    /// 好友请求事件来源
+    FriendRequest {
+        /// 请求者 QQ 号
+        user_id: i64,
+    },
+    /// 群请求事件来源（加群 / 群邀请）
+    GroupRequest {
+        /// 群号
+        group_id: i64,
+        /// 请求者 QQ 号
+        user_id: i64,
+    },
+    /// 好友添加成功通知来源
+    FriendAdded {
+        /// 新好友 QQ 号
         user_id: i64,
     },
 }
@@ -73,38 +89,6 @@ pub struct PendingCommand {
 }
 
 // ============================================================================
-// 工具执行结果
-// ============================================================================
-
-/// 工具执行的结构化结果
-/// 支持纯文本和多模态（文本 + 图片）两种返回形式
-/// ReadImage 等多模态工具返回带图片的结果，其他工具返回纯文本
-struct ToolResult {
-    /// 文本输出（所有工具都会产生文本输出）
-    text: String,
-    /// 附带的图片列表（为空表示纯文本结果）
-    images: Vec<ImageData>,
-}
-
-impl ToolResult {
-    /// 创建纯文本结果（大多数工具使用此方法）
-    fn text(s: impl Into<String>) -> Self {
-        Self {
-            text: s.into(),
-            images: Vec::new(),
-        }
-    }
-
-    /// 创建带图片的多模态结果
-    fn with_images(s: impl Into<String>, images: Vec<ImageData>) -> Self {
-        Self {
-            text: s.into(),
-            images,
-        }
-    }
-}
-
-// ============================================================================
 // Agent 运行器
 // ============================================================================
 
@@ -131,14 +115,15 @@ pub struct AgentRunner {
     // ----- 上下文 -----
     /// 工具执行上下文（API + 白名单 + Skill）
     tool_ctx: Arc<ToolContext>,
-    /// 工作区文件工具（cap-std 沙箱）
-    workspace_tools: WorkspaceTools,
-    /// 工作区工具会话状态（Read/Edit 前置条件追踪）
-    workspace_session: WorkspaceToolSession,
     /// Agent 运行状态（活跃/暂停）
     agent_state: Arc<AgentState>,
     /// 群身份状态（管理员/群主），用于动态更新系统 prompt
     group_role_state: Arc<crate::group_role::GroupRoleState>,
+
+    // ----- 工具分发器 -----
+    /// 工具分发器（持有 workspace_tools、workspace_session、mcp_manager 等）
+    /// 从 AgentRunner 提取，使工具分发逻辑可在多个 Agent 之间复用
+    dispatcher: ToolDispatcher,
 
     // ----- 会话 -----
     /// 会话管理器（JSONL 持久化 + 内存缓存 + SQLite 索引）
@@ -158,10 +143,12 @@ pub struct AgentRunner {
     /// LLM 可调用的工具规范列表
     tool_specs: Vec<ToolSpec>,
 
-    // ----- MCP -----
-    /// MCP 连接管理器（管理外部 MCP 服务器进程和工具）
-    /// None 表示未配置 MCP 或连接失败
-    mcp_manager: Option<crate::mcp::McpConnectionManager>,
+    // ----- 蜂群子代理 -----
+    /// 蜂群管理器（协调子代理的生命周期）
+    /// 通过 Arc 在主代理和子代理之间共享
+    swarm: Arc<SwarmManager>,
+    /// 接收子代理完成通知的通道
+    swarm_rx: mpsc::UnboundedReceiver<crate::swarm::types::SwarmNotification>,
 }
 
 impl AgentRunner {
@@ -182,33 +169,18 @@ impl AgentRunner {
         cmd_rx: mpsc::UnboundedReceiver<PendingCommand>,
         group_role_state: Arc<crate::group_role::GroupRoleState>,
     ) -> anyhow::Result<Self> {
-        // 从配置创建 LLM 提供商（根据 provider 字段选择具体实现）
-        // 凭据处理：空字符串视为 None
-        let credential: Option<&str> = if config.llm.api_key.is_empty() {
-            None
-        } else {
-            Some(&config.llm.api_key)
-        };
+        // 获取主代理模型配置
+        let pm = config.primary_model();
 
-        // 工厂构造：根据 provider 配置选择 OpenAI 或 Anthropic
-        let provider: Box<dyn Provider> =
-            match config.llm.provider.to_ascii_lowercase().as_str() {
-                // Anthropic Messages API（Claude 系列模型）
-                "anthropic" => Box::new(AnthropicProvider::new(
-                    Some(&config.llm.base_url),
-                    credential,
-                    config.llm.effective_anthropic_max_tokens(),
-                    config.llm.timeout_secs,
-                )),
-                // OpenAI 兼容 API（默认，含 ChatCompletions / Responses 双协议）
-                _ => Box::new(OpenAiProvider::new(
-                    Some(&config.llm.base_url),
-                    credential,
-                    config.llm.max_tokens, // 从配置读取（之前硬编码 None）
-                    config.llm.timeout_secs,
-                    &config.llm.wire_api,
-                )),
-            };
+        // 使用统一的 Provider 工厂创建 LLM 提供商
+        let provider = crate::providers::create_provider(
+            &pm.provider,
+            &pm.base_url,
+            &pm.api_key,
+            pm.max_tokens,
+            pm.timeout_secs,
+            &pm.wire_api,
+        );
 
         // 同步加载 AGENTS.md
         let agents_md_path =
@@ -236,10 +208,13 @@ impl AgentRunner {
         // 获取 Skill 列表用于系统提示
         let skill_items = tool_ctx.skills.list();
 
+        // 构建备选模型列表段落（用于系统提示中展示 SpawnAgent 可选模型）
+        let models_section = prompt::build_models_section(&config);
+
         // 构建系统提示（含前一个会话引用）
         let prompt_config = PromptConfig {
             workspace_dir,
-            model_name: &config.llm.model,
+            model_name: &pm.model,
             agents_md: &agents_md,
             extra_system_prompt: None,
             master_display: config.identity.master_display(),
@@ -252,6 +227,7 @@ impl AgentRunner {
             ai_boot: true,
             unprocessed_ranges: vec![],
             group_roles_section: "",  // 初始化为空，启动后由定时同步填充
+            models_section: &models_section,
         };
         let system_prompt = prompt::build_system_prompt(&prompt_config);
 
@@ -281,16 +257,16 @@ impl AgentRunner {
         // ===== MCP 服务器连接 =====
         // 如果配置了 MCP 服务器，尝试连接并获取外部工具列表
         // 连接失败是非致命的，Agent 可以在无 MCP 的情况下正常工作
-        let mcp_manager = if config.mcp_servers.is_empty() {
+        let mcp_manager = if config.mcp.is_empty() {
             // 未配置任何 MCP 服务器，跳过
             None
         } else {
-            match crate::mcp::McpConnectionManager::connect_all(&config.mcp_servers).await {
+            match crate::mcp::McpConnectionManager::connect_all(&config.mcp).await {
                 Ok(mgr) => {
                     // 从已连接的 MCP 服务器收集工具规范
                     let mcp_tools: Vec<ToolSpec> = mgr.list_all_tool_specs();
                     // 统计已启用的服务器数量
-                    let server_count = config.mcp_servers.iter()
+                    let server_count = config.mcp.iter()
                         .filter(|(_, c)| c.enabled)
                         .count();
                     tracing::info!(
@@ -310,24 +286,55 @@ impl AgentRunner {
             }
         };
 
-        Ok(Self {
-            provider,
-            model: config.llm.model.clone(),
-            system_role_name: config.llm.effective_system_role_name().to_string(),
-            reasoning_effort: config.llm.effective_reasoning_effort().map(str::to_string),
-            max_steps: config.llm.max_steps,
-            config,
-            tool_ctx,
+        // 将 MCP 管理器包装为 Arc<tokio::sync::Mutex<>> 以支持跨 Agent 共享
+        let mcp_manager_shared = mcp_manager
+            .map(|mgr| Arc::new(tokio::sync::Mutex::new(mgr)));
+
+        // ===== 蜂群子代理系统初始化 =====
+        // 追加蜂群工具规范（SpawnAgent / MessageAgent / CheckAgent / WaitAgent）
+        // 必须在创建 SwarmManager 之前完成，因为 tool_specs Arc 会传给 SwarmManager
+        tool_specs.extend(crate::swarm::tools::build_swarm_tool_specs(&config));
+
+        // 创建蜂群通知通道（子代理完成 → 主代理）
+        let (notify_tx, swarm_rx) = mpsc::unbounded_channel();
+
+        // 创建蜂群管理器
+        let swarm = Arc::new(SwarmManager::new(
+            config.clone(),
+            tool_ctx.clone(),
+            PathBuf::from(&config.storage.workspace_dir),
+            mcp_manager_shared.clone(),
+            Arc::new(tool_specs.clone()),
+            notify_tx,
+        ));
+
+        // 创建工具分发器（持有 workspace_tools、workspace_session、mcp_manager 等）
+        let dispatcher = ToolDispatcher {
+            tool_ctx: tool_ctx.clone(),
             workspace_tools,
             workspace_session: WorkspaceToolSession::default(),
+            config: config.clone(),
+            mcp_manager: mcp_manager_shared,
+        };
+
+        Ok(Self {
+            provider,
+            model: pm.model.clone(),
+            system_role_name: pm.effective_system_role_name().to_string(),
+            reasoning_effort: pm.effective_reasoning_effort().map(str::to_string),
+            max_steps: pm.max_steps,
+            config,
+            tool_ctx,
             agent_state,
             group_role_state,
+            dispatcher,
             session,
             system_prompt,
             rx,
             cmd_rx,
             tool_specs,
-            mcp_manager,
+            swarm,
+            swarm_rx,
         })
     }
 
@@ -344,6 +351,8 @@ impl AgentRunner {
             QqMessage(MessageEvent),
             /// 收到 CLI chat 主人指令
             ChatCommand(PendingCommand),
+            /// 收到子代理完成通知
+            SwarmNotification(crate::swarm::types::SwarmNotification),
             /// QQ 消息通道已关闭，应退出循环
             Closed,
         }
@@ -352,16 +361,48 @@ impl AgentRunner {
         // 关闭的 unbounded channel 的 recv() 立即返回 None，如果不加保护会导致
         // select! 不断选中该分支从而 CPU 100% 空转（busy-spin）
         let mut cmd_rx_closed = false;
+        // 标记 swarm_rx 通道是否已关闭（SwarmManager 被 drop 时关闭）
+        let mut swarm_rx_closed = false;
 
         loop {
-            // 同时等待 QQ 消息事件或 CLI chat 指令（两者都能唤醒 Agent）
-            // 如果 cmd_rx 已关闭，退化为仅监听 rx，避免空转
-            let wake = if cmd_rx_closed {
+            // 同时等待 QQ 消息事件、CLI chat 指令或子代理通知（三者都能唤醒 Agent）
+            // 关闭的通道设标志后不再 poll，避免空转
+            let wake = if cmd_rx_closed && swarm_rx_closed {
+                // cmd 和 swarm 通道都已关闭，仅监听 rx
                 match self.rx.recv().await {
                     Some(m) => WakeEvent::QqMessage(m),
                     None => WakeEvent::Closed,
                 }
+            } else if cmd_rx_closed {
+                // cmd 通道关闭，监听 rx + swarm
+                tokio::select! {
+                    msg = self.rx.recv() => match msg {
+                        Some(m) => WakeEvent::QqMessage(m),
+                        None => WakeEvent::Closed,
+                    },
+                    notif = self.swarm_rx.recv() => match notif {
+                        Some(n) => WakeEvent::SwarmNotification(n),
+                        None => { swarm_rx_closed = true; continue; }
+                    },
+                }
+            } else if swarm_rx_closed {
+                // swarm 通道关闭，监听 rx + cmd
+                tokio::select! {
+                    msg = self.rx.recv() => match msg {
+                        Some(m) => WakeEvent::QqMessage(m),
+                        None => WakeEvent::Closed,
+                    },
+                    cmd = self.cmd_rx.recv() => match cmd {
+                        Some(c) => WakeEvent::ChatCommand(c),
+                        None => {
+                            tracing::debug!("CLI 指令通道已关闭");
+                            cmd_rx_closed = true;
+                            continue;
+                        }
+                    },
+                }
             } else {
+                // 三个通道都开放
                 tokio::select! {
                     msg = self.rx.recv() => match msg {
                         Some(m) => WakeEvent::QqMessage(m),
@@ -374,6 +415,15 @@ impl AgentRunner {
                             // 设置标志后继续，后续迭代不再 poll cmd_rx
                             tracing::debug!("CLI 指令通道已关闭");
                             cmd_rx_closed = true;
+                            continue;
+                        }
+                    },
+                    notif = self.swarm_rx.recv() => match notif {
+                        Some(n) => WakeEvent::SwarmNotification(n),
+                        None => {
+                            // swarm 通知通道关闭（SwarmManager 被 drop）
+                            tracing::debug!("蜂群通知通道已关闭");
+                            swarm_rx_closed = true;
                             continue;
                         }
                     },
@@ -434,7 +484,7 @@ impl AgentRunner {
                     }
 
                     // 检查 LLM 是否已配置
-                    if !self.config.llm.is_configured() {
+                    if !self.config.primary_model().is_configured() {
                         tracing::warn!("LLM 未配置（base_url 或 api_key 为空），跳过处理");
                         continue;
                     }
@@ -468,7 +518,7 @@ impl AgentRunner {
                         continue;
                     }
                     // 检查 LLM 是否已配置
-                    if !self.config.llm.is_configured() {
+                    if !self.config.primary_model().is_configured() {
                         tracing::warn!("LLM 未配置，跳过主人指令");
                         continue;
                     }
@@ -476,6 +526,30 @@ impl AgentRunner {
                     tracing::info!("收到主人指令: {}", cmd.message);
                     if let Err(e) = self.process_command_turn(cmd).await {
                         tracing::error!("主人指令处理失败: {}", e);
+                    }
+                }
+
+                // ===== 子代理完成通知唤醒 =====
+                WakeEvent::SwarmNotification(notif) => {
+                    // 检查 Agent 是否活跃，不活跃时丢弃通知
+                    if !self.agent_state.is_active() || !self.config.primary_model().is_configured() {
+                        continue;
+                    }
+                    // 格式化通知为用户消息
+                    let status_text = if notif.success { "完成" } else { "失败" };
+                    let formatted = format!(
+                        "[子代理{}] {}（{}）:\n{}",
+                        status_text, notif.agent_name, notif.model_display, notif.result
+                    );
+                    tracing::info!("子代理通知: {} — {}", notif.agent_name, status_text);
+                    // 作为主人指令处理（触发 Agent 新轮次来处理子代理结果）
+                    let cmd = PendingCommand {
+                        message: formatted,
+                        group_filter: vec![],
+                        private_filter: vec![],
+                    };
+                    if let Err(e) = self.process_command_turn(cmd).await {
+                        tracing::error!("子代理通知处理失败: {}", e);
                     }
                 }
 
@@ -487,10 +561,13 @@ impl AgentRunner {
             }
         }
 
+        // ===== 关闭所有运行中的子代理 =====
+        self.swarm.shutdown_all().await;
+
         // ===== 清理 MCP 服务器连接 =====
         // 在 Agent 循环退出后，关闭所有 MCP 服务器子进程
-        if let Some(ref mut mgr) = self.mcp_manager {
-            mgr.shutdown_all().await;
+        if let Some(ref mgr_arc) = self.dispatcher.mcp_manager {
+            mgr_arc.lock().await.shutdown_all().await;
             tracing::info!("MCP 服务器已全部关闭");
         }
 
@@ -590,6 +667,18 @@ impl AgentRunner {
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 let injected = Self::format_command_as_user_message(&cmd);
                 tracing::info!("插入主人指令到 agentic 循环: {}", cmd.message);
+                self.session.push(ChatMessage::user(injected))?;
+            }
+
+            // ===== 检查子代理完成通知（工具调用之间注入） =====
+            // 子代理完成后通过 swarm_rx 发送通知，在此处注入到对话历史
+            while let Ok(notif) = self.swarm_rx.try_recv() {
+                let status_text = if notif.success { "完成" } else { "失败" };
+                let injected = format!(
+                    "[子代理{}] {}（{}）:\n{}",
+                    status_text, notif.agent_name, notif.model_display, notif.result
+                );
+                tracing::info!("注入子代理通知: {}", notif.agent_name);
                 self.session.push(ChatMessage::user(injected))?;
             }
 
@@ -791,6 +880,10 @@ impl AgentRunner {
                 MessageSource::Private { user_id } => {
                     user_ids.insert(*user_id);
                 }
+                // 请求事件和通知事件没有关联的消息 ID，无需标记已读
+                MessageSource::FriendRequest { .. }
+                | MessageSource::GroupRequest { .. }
+                | MessageSource::FriendAdded { .. } => {}
             }
         }
 
@@ -814,1096 +907,25 @@ impl AgentRunner {
     }
 
     /// 分发工具调用到具体的实现函数
-    /// 解析 JSON 参数，路由到对应的工具处理函数
-    /// 返回 ToolResult 支持纯文本和多模态（文本 + 图片）两种结果
+    /// 先检查是否为蜂群工具（SpawnAgent / MessageAgent / CheckAgent / WaitAgent），
+    /// 如果是则路由到 SwarmManager，否则委托给 ToolDispatcher
     async fn dispatch_tool(&mut self, name: &str, arguments: &str) -> ToolResult {
-        // 解析参数 JSON
-        let args: serde_json::Value = match serde_json::from_str(arguments) {
-            Ok(v) => v,
-            Err(e) => {
-                // 输出原始参数字符串，方便诊断 SSE 累积问题
-                tracing::error!(
-                    "工具 {} 参数解析失败: {}\n  原始参数: {:?}",
-                    name, e, arguments
-                );
-                return ToolResult::text(format!("参数解析失败: {e}"));
-            }
-        };
-
-        match name {
-            // ReadImage 特殊处理：返回多模态结果（文本 + 图片）
-            "ReadImage" => self.dispatch_read_image(&args).await,
-            // 其他所有工具：委托给纯文本分发函数
-            _ => ToolResult::text(self.dispatch_tool_text(name, &args).await),
+        // 检查是否为蜂群工具
+        if matches!(name, "SpawnAgent" | "MessageAgent" | "CheckAgent" | "WaitAgent") {
+            // 解析参数 JSON
+            let args: serde_json::Value = match serde_json::from_str(arguments) {
+                Ok(v) => v,
+                Err(e) => return ToolResult::text(format!("参数解析失败: {e}")),
+            };
+            // 调用蜂群工具分发函数（主代理深度为 0）
+            let result = crate::swarm::tools::dispatch_swarm_tool(
+                &self.swarm, name, &args, 0,
+            ).await;
+            return ToolResult::text(result);
         }
+        // 委托给 ToolDispatcher 处理所有其他工具
+        self.dispatcher.dispatch_tool(name, arguments).await
     }
-
-    /// 分发纯文本工具调用（内部实现）
-    /// 所有只返回文本结果的工具在此路由
-    async fn dispatch_tool_text(&mut self, name: &str, args: &serde_json::Value) -> String {
-        match name {
-            // ----- 文件工具 -----
-            "Ls" => {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("/");
-                match self.workspace_tools.list_dir(path) {
-                    Ok(listing) => {
-                        let line_count = listing.lines().count();
-                        tracing::info!("Ls({})\n  └ {} 个条目", path, line_count);
-                        listing
-                    }
-                    Err(e) => {
-                        tracing::warn!("Ls({}) 失败: {}", path, e);
-                        format!("Ls 失败: {e}")
-                    }
-                }
-            }
-
-            "Read" => {
-                let path = match args.get("path").and_then(|v| v.as_str()) {
-                    Some(p) => p,
-                    None => return "缺少参数: path".to_string(),
-                };
-                match self
-                    .workspace_tools
-                    .read_file(&mut self.workspace_session, path)
-                {
-                    Ok(content) => {
-                        // codex 风格: Read(path) → 行数/字节
-                        tracing::info!(
-                            "Read({})\n  └ {} 行, {} 字节",
-                            path, content.lines().count(), content.len()
-                        );
-                        content
-                    }
-                    Err(e) => {
-                        tracing::warn!("Read({})\n  └ 失败: {}", path, e);
-                        format!("Read 失败: {e}")
-                    }
-                }
-            }
-
-            "Write" => {
-                let path = match args.get("path").and_then(|v| v.as_str()) {
-                    Some(p) => p,
-                    None => return "缺少参数: path".to_string(),
-                };
-                let content = match args.get("content").and_then(|v| v.as_str()) {
-                    Some(c) => c,
-                    None => return "缺少参数: content".to_string(),
-                };
-                // codex 风格: Write(path) 换行跟内容预览
-                let preview_lines = format_content_preview(content, 8);
-                tracing::info!("Write({})\n{}", path, preview_lines);
-                match self.workspace_tools.write_file(path, content) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        tracing::warn!("Write({}) 失败: {}", path, e);
-                        format!("Write 失败: {e}")
-                    }
-                }
-            }
-
-            "Edit" => {
-                let path = match args.get("path").and_then(|v| v.as_str()) {
-                    Some(p) => p,
-                    None => return "缺少参数: path".to_string(),
-                };
-                let old_text = match args.get("old_text").and_then(|v| v.as_str()) {
-                    Some(t) => t,
-                    None => return "缺少参数: old_text".to_string(),
-                };
-                let new_text = match args.get("new_text").and_then(|v| v.as_str()) {
-                    Some(t) => t,
-                    None => return "缺少参数: new_text".to_string(),
-                };
-                let replace_all = args
-                    .get("replace_all")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                // codex 风格: Edit(path) 换行跟 -/+ 差异
-                let diff = format_edit_diff(old_text, new_text, 6);
-                tracing::info!(
-                    "Edit({}{})\n{}",
-                    path,
-                    if replace_all { ", all" } else { "" },
-                    diff
-                );
-                match self.workspace_tools.edit_file(
-                    &mut self.workspace_session,
-                    path,
-                    old_text,
-                    new_text,
-                    replace_all,
-                ) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        tracing::warn!("Edit({}) 失败: {}", path, e);
-                        format!("Edit 失败: {e}")
-                    }
-                }
-            }
-
-            // ----- 消息工具 -----
-            "SendGroupMessage" => {
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(id) => id,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                let segments = match parse_message_segments(&args, "message") {
-                    Ok(s) => s,
-                    Err(e) => return e,
-                };
-                let preview = format_segments_preview(&segments);
-                tracing::info!("SendGroupMessage(群 {})\n  └ {}", group_id, preview);
-                let result =
-                    crate::tools::message::send_group_message(&self.tool_ctx, group_id, segments)
-                        .await;
-                if !result.success {
-                    tracing::warn!("  └ 失败: {}", result.output);
-                }
-                result.output
-            }
-
-            "SendPrivateMessage" => {
-                let user_id = match args.get("user_id").and_then(|v| v.as_i64()) {
-                    Some(id) => id,
-                    None => return "缺少参数: user_id".to_string(),
-                };
-                let segments = match parse_message_segments(&args, "message") {
-                    Ok(s) => s,
-                    Err(e) => return e,
-                };
-                let preview = format_segments_preview(&segments);
-                tracing::info!("SendPrivateMessage(用户 {})\n  └ {}", user_id, preview);
-                let result = crate::tools::message::send_private_message(
-                    &self.tool_ctx,
-                    user_id,
-                    segments,
-                )
-                .await;
-                if !result.success {
-                    tracing::warn!("  └ 失败: {}", result.output);
-                }
-                result.output
-            }
-
-            "DeleteMessage" => {
-                let message_id = match args.get("message_id").and_then(|v| v.as_i64()) {
-                    Some(id) => id,
-                    None => return "缺少参数: message_id".to_string(),
-                };
-                tracing::info!("DeleteMessage({})", message_id);
-                let result =
-                    crate::tools::message::delete_message(&self.tool_ctx, message_id).await;
-                result.output
-            }
-
-            "SetMsgEmojiLike" => {
-                let message_id = match args.get("message_id").and_then(|v| v.as_i64()) {
-                    Some(id) => id,
-                    None => return "缺少参数: message_id".to_string(),
-                };
-                let emoji_id = match args.get("emoji_id").and_then(|v| v.as_i64()) {
-                    Some(id) => id,
-                    None => return "缺少参数: emoji_id".to_string(),
-                };
-                tracing::info!("SetMsgEmojiLike(msg={}, emoji={})", message_id, emoji_id);
-                let result = crate::tools::message::set_msg_emoji_like(
-                    &self.tool_ctx,
-                    message_id,
-                    emoji_id,
-                )
-                .await;
-                result.output
-            }
-
-            "GroupPoke" => {
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(id) => id,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                let user_id = match args.get("user_id").and_then(|v| v.as_i64()) {
-                    Some(id) => id,
-                    None => return "缺少参数: user_id".to_string(),
-                };
-                tracing::info!("GroupPoke(群 {}, 用户 {})", group_id, user_id);
-                let result =
-                    crate::tools::message::group_poke(&self.tool_ctx, group_id, user_id).await;
-                result.output
-            }
-
-            "FriendPoke" => {
-                let user_id = match args.get("user_id").and_then(|v| v.as_i64()) {
-                    Some(id) => id,
-                    None => return "缺少参数: user_id".to_string(),
-                };
-                tracing::info!("FriendPoke(用户 {})", user_id);
-                let result = crate::tools::message::friend_poke(&self.tool_ctx, user_id).await;
-                result.output
-            }
-
-            // ----- 查询工具 -----
-            "GetFriendList" => {
-                tracing::info!("GetFriendList()");
-                let result = crate::tools::query::get_friend_list(&self.tool_ctx).await;
-                result.output
-            }
-
-            "GetGroupList" => {
-                tracing::info!("GetGroupList()");
-                let result = crate::tools::query::get_group_list(&self.tool_ctx).await;
-                result.output
-            }
-
-            "GetGroupMemberList" => {
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(id) => id,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                tracing::info!("GetGroupMemberList(群 {})", group_id);
-                let result =
-                    crate::tools::query::get_group_member_list(&self.tool_ctx, group_id).await;
-                result.output
-            }
-
-            "GetGroupMemberInfo" => {
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(id) => id,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                let user_id = match args.get("user_id").and_then(|v| v.as_i64()) {
-                    Some(id) => id,
-                    None => return "缺少参数: user_id".to_string(),
-                };
-                tracing::info!("GetGroupMemberInfo(群 {}, 用户 {})", group_id, user_id);
-                let result = crate::tools::query::get_group_member_info(
-                    &self.tool_ctx,
-                    group_id,
-                    user_id,
-                )
-                .await;
-                result.output
-            }
-
-            // ----- 社交工具 -----
-            "HandleFriendRequest" => {
-                let flag = match args.get("flag").and_then(|v| v.as_str()) {
-                    Some(f) => f,
-                    None => return "缺少参数: flag".to_string(),
-                };
-                let approve = match args.get("approve").and_then(|v| v.as_bool()) {
-                    Some(a) => a,
-                    None => return "缺少参数: approve".to_string(),
-                };
-                let remark = args.get("remark").and_then(|v| v.as_str());
-                let action = if approve { "同意" } else { "拒绝" };
-                tracing::info!("HandleFriendRequest({}, {})", flag, action);
-                let result = crate::tools::social::handle_friend_request(
-                    &self.tool_ctx,
-                    flag,
-                    approve,
-                    remark,
-                )
-                .await;
-                result.output
-            }
-
-            "HandleGroupRequest" => {
-                let flag = match args.get("flag").and_then(|v| v.as_str()) {
-                    Some(f) => f,
-                    None => return "缺少参数: flag".to_string(),
-                };
-                let sub_type = match args.get("sub_type").and_then(|v| v.as_str()) {
-                    Some(s) => s,
-                    None => return "缺少参数: sub_type".to_string(),
-                };
-                let approve = match args.get("approve").and_then(|v| v.as_bool()) {
-                    Some(a) => a,
-                    None => return "缺少参数: approve".to_string(),
-                };
-                let reason = args.get("reason").and_then(|v| v.as_str());
-                let action = if approve { "同意" } else { "拒绝" };
-                tracing::info!("HandleGroupRequest({}, {}, {})", flag, sub_type, action);
-                let result = crate::tools::social::handle_group_request(
-                    &self.tool_ctx,
-                    flag,
-                    sub_type,
-                    approve,
-                    reason,
-                )
-                .await;
-                result.output
-            }
-
-            // ----- Skill 工具 -----
-            "Skill" => {
-                let skill_name = match args.get("name").and_then(|v| v.as_str()) {
-                    Some(n) => n,
-                    None => return "缺少参数: name".to_string(),
-                };
-                let skill_path = args.get("path").and_then(|v| v.as_str());
-                tracing::info!(
-                    "Skill({}{})",
-                    skill_name,
-                    skill_path.map(|p| format!(", {}", p)).unwrap_or_default()
-                );
-                let result =
-                    crate::tools::skill::execute_skill(&self.tool_ctx, skill_name, skill_path);
-                result.output
-            }
-
-            // ----- 搜索工具 -----
-            "GetMessage" => {
-                let message_id = match args.get("message_id").and_then(|v| v.as_i64()) {
-                    Some(id) => id,
-                    None => return "缺少参数: message_id".to_string(),
-                };
-                tracing::info!("GetMessage({})", message_id);
-                let result =
-                    crate::tools::search::get_message(&self.tool_ctx, message_id);
-                if !result.success {
-                    tracing::warn!("GetMessage({}) 失败: {}", message_id, result.output);
-                }
-                result.output
-            }
-
-            "SearchMessages" => {
-                let user_id = args.get("user_id").and_then(|v| v.as_i64());
-                let group_id = args.get("group_id").and_then(|v| v.as_i64());
-                let message_type = args
-                    .get("message_type")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let after = args.get("after").and_then(|v| v.as_i64());
-                let before = args.get("before").and_then(|v| v.as_i64());
-                let limit = args.get("limit").and_then(|v| v.as_u64()).map(|l| l as u32);
-                let offset = args.get("offset").and_then(|v| v.as_u64()).map(|o| o as u32);
-                tracing::info!(
-                    "SearchMessages(user={:?}, group={:?}, type={:?}, after={:?}, before={:?})",
-                    user_id, group_id, message_type, after, before
-                );
-                let result = crate::tools::search::search_messages(
-                    &self.tool_ctx,
-                    user_id,
-                    group_id,
-                    message_type,
-                    after,
-                    before,
-                    limit,
-                    offset,
-                );
-                result.output
-            }
-
-            "Grep" => {
-                let pattern = match args.get("pattern").and_then(|v| v.as_str()) {
-                    Some(p) => p,
-                    None => return "缺少参数: pattern".to_string(),
-                };
-                let path = args
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(".");
-                let file_ext = args.get("file_ext").and_then(|v| v.as_str());
-                let case_insensitive = args
-                    .get("case_insensitive")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                tracing::info!(
-                    "Grep(\"{}\", path={}, ext={:?}, ci={})",
-                    pattern, path, file_ext, case_insensitive
-                );
-                match self.workspace_tools.grep(pattern, path, file_ext, case_insensitive) {
-                    Ok(output) => {
-                        // 统计匹配数用于日志
-                        let match_count = output.lines().count().saturating_sub(2);
-                        tracing::info!("  └ {} 处匹配", match_count);
-                        output
-                    }
-                    Err(e) => {
-                        tracing::warn!("Grep 失败: {}", e);
-                        format!("Grep 失败: {e}")
-                    }
-                }
-            }
-
-            // ===== 群管理工具 dispatch（仅管理员/群主） =====
-
-            "SetGroupBan" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                // 提取必需参数：要禁言的用户 QQ 号
-                let user_id = match args.get("user_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: user_id".to_string(),
-                };
-                // 可选参数：禁言时长（秒），None 表示使用默认值
-                let duration = args.get("duration").and_then(|v| v.as_i64());
-                tracing::info!("SetGroupBan(群={}, 用户={}, 时长={:?})", group_id, user_id, duration);
-                // 调用 NapCat API 执行禁言操作
-                match self.tool_ctx.api.group.set_group_ban(group_id, user_id, duration).await {
-                    Ok(_) => {
-                        // 根据 duration 值生成可读描述
-                        let dur_desc = duration
-                            .map(|d| {
-                                if d == 0 { "解除禁言".to_string() } else { format!("{}秒", d) }
-                            })
-                            .unwrap_or("默认时长".to_string());
-                        format!("已对群 {} 用户 {} 执行禁言操作（{}）", group_id, user_id, dur_desc)
-                    }
-                    Err(e) => format!("群 {} 禁言用户 {} 失败: {e}", group_id, user_id),
-                }
-            }
-
-            "SetGroupWholeBan" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                // 可选参数：是否开启全员禁言，None 表示默认开启
-                let enable = args.get("enable").and_then(|v| v.as_bool());
-                tracing::info!("SetGroupWholeBan(群={}, enable={:?})", group_id, enable);
-                // 调用 NapCat API 设置全员禁言
-                match self.tool_ctx.api.group.set_group_whole_ban(group_id, enable).await {
-                    Ok(_) => {
-                        // 根据 enable 值生成描述
-                        let state = if enable.unwrap_or(true) { "开启" } else { "关闭" };
-                        format!("已{}群 {} 全员禁言", state, group_id)
-                    }
-                    Err(e) => format!("群 {} 全员禁言操作失败: {e}", group_id),
-                }
-            }
-
-            "SetGroupKick" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                // 提取必需参数：要踢出的用户 QQ 号
-                let user_id = match args.get("user_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: user_id".to_string(),
-                };
-                // 可选参数：是否拒绝此人再次加群
-                let reject_add_request = args.get("reject_add_request").and_then(|v| v.as_bool());
-                tracing::info!("SetGroupKick(群={}, 用户={}, reject={:?})", group_id, user_id, reject_add_request);
-                // 调用 NapCat API 踢出群成员
-                match self.tool_ctx.api.group.set_group_kick(group_id, user_id, reject_add_request).await {
-                    Ok(_) => {
-                        // 附加是否拒绝再次加群的说明
-                        let reject_desc = if reject_add_request.unwrap_or(false) { "，并拒绝再次加群" } else { "" };
-                        format!("已将用户 {} 踢出群 {}{}", user_id, group_id, reject_desc)
-                    }
-                    Err(e) => format!("踢出群 {} 用户 {} 失败: {e}", group_id, user_id),
-                }
-            }
-
-            "SetGroupName" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                // 提取必需参数：新群名
-                let group_name = match args.get("group_name").and_then(|v| v.as_str()) {
-                    Some(v) => v.to_string(),
-                    None => return "缺少参数: group_name".to_string(),
-                };
-                tracing::info!("SetGroupName(群={}, 名称={})", group_id, group_name);
-                // 调用 NapCat API 设置群名
-                match self.tool_ctx.api.group.set_group_name(group_id, &group_name).await {
-                    Ok(_) => format!("已将群 {} 的名称设置为「{}」", group_id, group_name),
-                    Err(e) => format!("设置群 {} 名称失败: {e}", group_id),
-                }
-            }
-
-            "SetGroupPortrait" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                // 提取必需参数：图片文件路径或 URL
-                let file = match args.get("file").and_then(|v| v.as_str()) {
-                    Some(v) => v.to_string(),
-                    None => return "缺少参数: file".to_string(),
-                };
-                tracing::info!("SetGroupPortrait(群={}, file={})", group_id, file);
-                // 调用 NapCat 文件 API 设置群头像
-                match self.tool_ctx.api.file.set_group_portrait(group_id, &file).await {
-                    Ok(_) => format!("已设置群 {} 的头像", group_id),
-                    Err(e) => format!("设置群 {} 头像失败: {e}", group_id),
-                }
-            }
-
-            "SetEssenceMsg" => {
-                // 提取必需参数：要设为精华的消息 ID
-                let message_id = match args.get("message_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: message_id".to_string(),
-                };
-                tracing::info!("SetEssenceMsg(msg={})", message_id);
-                // 调用 NapCat API 设置精华消息
-                match self.tool_ctx.api.message.set_essence_message(message_id).await {
-                    Ok(_) => format!("已将消息 {} 设为精华消息", message_id),
-                    Err(e) => format!("设置精华消息 {} 失败: {e}", message_id),
-                }
-            }
-
-            "DeleteEssenceMsg" => {
-                // 提取必需参数：要移出精华的消息 ID
-                let message_id = match args.get("message_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: message_id".to_string(),
-                };
-                tracing::info!("DeleteEssenceMsg(msg={})", message_id);
-                // 调用 NapCat API 移出精华消息
-                match self.tool_ctx.api.message.delete_essence_message(message_id).await {
-                    Ok(_) => format!("已将消息 {} 移出精华消息", message_id),
-                    Err(e) => format!("移出精华消息 {} 失败: {e}", message_id),
-                }
-            }
-
-            "GetEssenceMsgList" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                tracing::info!("GetEssenceMsgList(群={})", group_id);
-                // 调用 NapCat API 获取精华消息列表，返回 JSON 数据
-                match self.tool_ctx.api.message.get_essence_message_list(group_id).await {
-                    Ok(result) => serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                    Err(e) => format!("获取群 {} 精华消息列表失败: {e}", group_id),
-                }
-            }
-
-            "GetGroupAtAllRemain" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                tracing::info!("GetGroupAtAllRemain(群={})", group_id);
-                // 调用 NapCat API 获取 @全体成员 剩余次数，返回 JSON 数据
-                match self.tool_ctx.api.message.get_group_at_all_remain(group_id).await {
-                    Ok(result) => serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                    Err(e) => format!("获取群 {} @全体成员剩余次数失败: {e}", group_id),
-                }
-            }
-
-            "GetGroupShutList" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                tracing::info!("GetGroupShutList(群={})", group_id);
-                // 调用 NapCat API 获取禁言列表，返回 JSON 数据
-                match self.tool_ctx.api.napcat.get_group_shut_list(group_id).await {
-                    Ok(result) => serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                    Err(e) => format!("获取群 {} 禁言列表失败: {e}", group_id),
-                }
-            }
-
-            "SendGroupNotice" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                // 提取必需参数：公告内容
-                let content = match args.get("content").and_then(|v| v.as_str()) {
-                    Some(v) => v.to_string(),
-                    None => return "缺少参数: content".to_string(),
-                };
-                // 可选参数：图片 URL，先提取为 Option<String> 以延长生命周期
-                let image_owned: Option<String> = args
-                    .get("image")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                // 将 Option<String> 转为 Option<&str> 传入 API
-                let image = image_owned.as_deref();
-                // 可选参数：是否置顶（从 JSON integer 转为 Option<i32>）
-                let pinned = args
-                    .get("pinned")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as i32);
-                tracing::info!("SendGroupNotice(群={}, 内容长={}, 图片={:?}, 置顶={:?})",
-                    group_id, content.len(), image, pinned);
-                // 调用 NapCat API 发送群公告，后 4 个参数不使用传 None
-                match self.tool_ctx.api.napcat.send_group_notice(
-                    group_id, &content, image, pinned, None, None, None, None,
-                ).await {
-                    Ok(_) => format!("已向群 {} 发送公告", group_id),
-                    Err(e) => format!("向群 {} 发送公告失败: {e}", group_id),
-                }
-            }
-
-            "DelGroupNotice" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                // 提取必需参数：公告 ID
-                let notice_id = match args.get("notice_id").and_then(|v| v.as_str()) {
-                    Some(v) => v.to_string(),
-                    None => return "缺少参数: notice_id".to_string(),
-                };
-                tracing::info!("DelGroupNotice(群={}, notice_id={})", group_id, notice_id);
-                // 调用 NapCat API 删除群公告
-                match self.tool_ctx.api.napcat.del_group_notice(group_id, &notice_id).await {
-                    Ok(_) => format!("已删除群 {} 的公告 {}", group_id, notice_id),
-                    Err(e) => format!("删除群 {} 公告 {} 失败: {e}", group_id, notice_id),
-                }
-            }
-
-            "SetGroupAdmin" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                // 提取必需参数：目标用户 QQ 号
-                let user_id = match args.get("user_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: user_id".to_string(),
-                };
-                // 可选参数：是否设置为管理员，None 表示默认设置
-                let enable = args.get("enable").and_then(|v| v.as_bool());
-                tracing::info!("SetGroupAdmin(群={}, 用户={}, enable={:?})", group_id, user_id, enable);
-                // 调用 NapCat API 设置/取消管理员
-                match self.tool_ctx.api.group.set_group_admin(group_id, user_id, enable).await {
-                    Ok(_) => {
-                        // 根据 enable 值生成描述
-                        let action = if enable.unwrap_or(true) { "设置为管理员" } else { "取消管理员" };
-                        format!("已将群 {} 用户 {} {}", group_id, user_id, action)
-                    }
-                    Err(e) => format!("群 {} 设置用户 {} 管理员失败: {e}", group_id, user_id),
-                }
-            }
-
-            "SetGroupSpecialTitle" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                // 提取必需参数：目标用户 QQ 号
-                let user_id = match args.get("user_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: user_id".to_string(),
-                };
-                // 提取必需参数：头衔内容（空字符串表示删除）
-                let special_title = match args.get("special_title").and_then(|v| v.as_str()) {
-                    Some(v) => v.to_string(),
-                    None => return "缺少参数: special_title".to_string(),
-                };
-                // 可选参数：有效期（秒），-1 表示永久
-                let duration = args.get("duration").and_then(|v| v.as_i64());
-                tracing::info!("SetGroupSpecialTitle(群={}, 用户={}, 头衔={}, 时长={:?})",
-                    group_id, user_id, special_title, duration);
-                // 调用 NapCat API 设置专属头衔
-                match self.tool_ctx.api.group.set_group_special_title(
-                    group_id, user_id, &special_title, duration,
-                ).await {
-                    Ok(_) => {
-                        // 空头衔表示删除操作
-                        if special_title.is_empty() {
-                            format!("已删除群 {} 用户 {} 的专属头衔", group_id, user_id)
-                        } else {
-                            format!("已将群 {} 用户 {} 的专属头衔设为「{}」", group_id, user_id, special_title)
-                        }
-                    }
-                    Err(e) => format!("设置群 {} 用户 {} 专属头衔失败: {e}", group_id, user_id),
-                }
-            }
-
-            // ===== 群组工具 dispatch（无需管理员权限） =====
-
-            "SetGroupLeave" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                // 可选参数：是否解散群（仅群主有效）
-                let is_dismiss = args.get("is_dismiss").and_then(|v| v.as_bool());
-                tracing::info!("SetGroupLeave(群={}, dismiss={:?})", group_id, is_dismiss);
-                // 调用 NapCat API 退出/解散群组
-                match self.tool_ctx.api.group.set_group_leave(group_id, is_dismiss).await {
-                    Ok(_) => {
-                        // 根据 is_dismiss 判断是退出还是解散
-                        if is_dismiss.unwrap_or(false) {
-                            format!("已解散群 {}", group_id)
-                        } else {
-                            format!("已退出群 {}", group_id)
-                        }
-                    }
-                    Err(e) => format!("退出群 {} 失败: {e}", group_id),
-                }
-            }
-
-            "GetGroupNotice" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                tracing::info!("GetGroupNotice(群={})", group_id);
-                // 调用 NapCat API 获取群公告列表，返回 JSON 数据
-                match self.tool_ctx.api.napcat.get_group_notice(group_id).await {
-                    Ok(result) => serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                    Err(e) => format!("获取群 {} 公告列表失败: {e}", group_id),
-                }
-            }
-
-            "GetGroupHonorInfo" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                // 提取必需参数：荣誉类型
-                let honor_type = match args.get("honor_type").and_then(|v| v.as_str()) {
-                    Some(v) => v.to_string(),
-                    None => return "缺少参数: honor_type".to_string(),
-                };
-                tracing::info!("GetGroupHonorInfo(群={}, 类型={})", group_id, honor_type);
-                // 调用 NapCat API 获取群荣誉信息，返回 JSON 数据
-                match self.tool_ctx.api.message.get_group_honor_info(group_id, &honor_type).await {
-                    Ok(result) => serde_json::to_string_pretty(&result)
-                        .unwrap_or_else(|_| format!("{:?}", result)),
-                    Err(e) => format!("获取群 {} 荣誉信息失败: {e}", group_id),
-                }
-            }
-
-            "SetGroupSign" => {
-                // 提取必需参数：群号
-                let group_id = match args.get("group_id").and_then(|v| v.as_i64()) {
-                    Some(v) => v,
-                    None => return "缺少参数: group_id".to_string(),
-                };
-                tracing::info!("SetGroupSign(群={})", group_id);
-                // 调用 NapCat API 执行群签到
-                match self.tool_ctx.api.napcat.set_group_sign(group_id).await {
-                    Ok(_) => format!("已在群 {} 完成签到", group_id),
-                    Err(e) => format!("群 {} 签到失败: {e}", group_id),
-                }
-            }
-
-            // ----- 网络工具 -----
-            "Fetch" => {
-                // 检查 Fetch 工具是否已启用（防止配置变更后绕过）
-                if !self.config.fetch.enabled {
-                    return "Fetch 工具未启用。\
-                            请在 config.toml 的 [fetch] 段设置 enabled = true"
-                        .to_string();
-                }
-                // 提取必需参数：url
-                let url = match args.get("url").and_then(|v| v.as_str()) {
-                    Some(u) => u,
-                    None => return "缺少参数: url".to_string(),
-                };
-                tracing::info!("Fetch({})", url);
-                // 调用 Fetch 工具核心逻辑
-                let result =
-                    crate::tools::fetch::fetch_url(url, &self.config.fetch).await;
-                // 失败时记录警告日志
-                if !result.success {
-                    tracing::warn!("Fetch 失败: {}", result.output);
-                }
-                result.output
-            }
-
-            // ===== MCP 外部工具路由 =====
-            // 以 "mcp." 开头的工具名由外部 MCP 服务器提供
-            // 分割工具名为 (服务器名, 工具名) 后委托给 MCP 连接管理器
-            other if other.starts_with("mcp.") => {
-                if let Some(ref mut mgr) = self.mcp_manager {
-                    // 解析 MCP 工具名：mcp.<服务器名>.<工具名>
-                    if let Some((server, tool)) = crate::mcp::manager::split_mcp_tool_name(other) {
-                        tracing::info!("MCP 工具调用: {}.{}", server, tool);
-                        // 委托给 MCP 连接管理器执行工具调用
-                        match mgr.call_tool(server, tool, args.clone()).await {
-                            Ok(result) => result,
-                            Err(e) => {
-                                tracing::warn!("MCP 工具调用失败: {}", e);
-                                format!("MCP 工具调用失败: {e}")
-                            }
-                        }
-                    } else {
-                        // 工具名格式不合法（缺少服务器名或工具名部分）
-                        format!("无效的 MCP 工具名格式: {other}")
-                    }
-                } else {
-                    // MCP 连接管理器未初始化（未配置或连接失败）
-                    format!("MCP 未初始化，无法调用: {other}")
-                }
-            }
-
-            _ => format!("未知工具: {name}"),
-        }
-    }
-
-    /// 执行 ReadImage 工具：通过消息 ID 查找并下载图片，返回多模态结果
-    /// 图片 URL 从接收消息时注册的安全注册表中查找，LLM 无法注入任意 URL
-    ///
-    /// # 安全保障
-    /// - URL 来源：仅从已接收消息的 MessageSegment::Image 中提取
-    /// - LLM 只能提供 message_id 和 index，无法直接指定 URL
-    /// - 图片大小限制 20 MB，防止内存溢出
-    /// - 下载超时 30 秒，防止阻塞 Agent 循环
-    async fn dispatch_read_image(&self, args: &serde_json::Value) -> ToolResult {
-        // 提取 message_id 参数
-        let message_id = match args.get("message_id").and_then(|v| v.as_i64()) {
-            Some(id) => id,
-            None => return ToolResult::text("缺少参数: message_id"),
-        };
-
-        // 图片索引，默认 0（第一张图片）
-        let index = args
-            .get("index")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-
-        // 从安全注册表中查找图片 URL
-        let url = match self.tool_ctx.get_image_url(message_id, index) {
-            Some(u) => u,
-            None => {
-                // 区分"消息无图片"和"索引越界"两种情况
-                let count = self.tool_ctx.get_image_count(message_id);
-                if count == 0 {
-                    return ToolResult::text(format!(
-                        "消息 {} 中没有已注册的图片。只能查看当前会话期间接收到的消息中的图片。",
-                        message_id
-                    ));
-                } else {
-                    return ToolResult::text(format!(
-                        "索引超出范围：消息 {} 共有 {} 张图片（索引 0~{}），请求的索引为 {}",
-                        message_id,
-                        count,
-                        count - 1,
-                        index
-                    ));
-                }
-            }
-        };
-
-        tracing::info!("ReadImage(msg={}, index={}, url={})", message_id, index, url);
-
-        // 构建带超时的 HTTP 客户端（每次调用独立创建，ReadImage 调用频率低）
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-        {
-            Ok(c) => c,
-            Err(e) => return ToolResult::text(format!("创建 HTTP 客户端失败: {e}")),
-        };
-
-        // 从已验证的 URL 下载图片
-        let response = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("ReadImage(msg={}) 下载失败: {}", message_id, e);
-                return ToolResult::text(format!("图片下载失败: {e}"));
-            }
-        };
-
-        // 检查 HTTP 响应状态
-        if !response.status().is_success() {
-            return ToolResult::text(format!(
-                "图片下载失败: HTTP {}",
-                response.status()
-            ));
-        }
-
-        // 从 Content-Type 头推断 MIME 类型，回退到 URL 扩展名推断
-        let mime = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|ct| ct.to_str().ok())
-            .map(|ct| ct.split(';').next().unwrap_or(ct).trim().to_string())
-            .unwrap_or_else(|| guess_image_mime(&url));
-
-        // 读取图片字节
-        let bytes = match response.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("ReadImage(msg={}) 读取响应体失败: {}", message_id, e);
-                return ToolResult::text(format!("图片数据读取失败: {e}"));
-            }
-        };
-
-        // 图片大小限制（20 MB），防止下载超大图片撑爆上下文
-        const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
-        if bytes.len() > MAX_IMAGE_BYTES {
-            return ToolResult::text(format!(
-                "图片过大（{:.1} MB，上限 20 MB）",
-                bytes.len() as f64 / (1024.0 * 1024.0)
-            ));
-        }
-
-        // Base64 编码
-        use base64::Engine as _;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-
-        let size_kb = bytes.len() as f64 / 1024.0;
-        tracing::info!(
-            "ReadImage(msg={}, index={})\n  └ {} ({:.1} KB)",
-            message_id, index, mime, size_kb
-        );
-
-        // 构造多模态结果（文本描述 + 图片数据）
-        ToolResult::with_images(
-            format!(
-                "已加载图片: 消息 {} 第 {} 张 ({}, {:.1} KB)",
-                message_id, index, mime, size_kb
-            ),
-            vec![ImageData {
-                mime,
-                base64: encoded,
-            }],
-        )
-    }
-}
-
-// ============================================================================
-// 辅助函数
-// ============================================================================
-
-/// 从 URL 路径扩展名推断图片 MIME 类型
-/// 用于 Content-Type 响应头缺失时的回退判断
-fn guess_image_mime(url: &str) -> String {
-    // 取 URL 路径部分（去掉查询参数和 fragment）
-    let path = url.split('?').next().unwrap_or(url);
-    let path = path.split('#').next().unwrap_or(path);
-    // 取最后一个 '.' 之后的扩展名
-    if let Some(ext) = path.rsplit('.').next() {
-        match ext.to_ascii_lowercase().as_str() {
-            "jpg" | "jpeg" => return "image/jpeg".to_string(),
-            "png" => return "image/png".to_string(),
-            "gif" => return "image/gif".to_string(),
-            "webp" => return "image/webp".to_string(),
-            "bmp" => return "image/bmp".to_string(),
-            "svg" => return "image/svg+xml".to_string(),
-            _ => {}
-        }
-    }
-    // 默认假设 JPEG（QQ 图片最常见的格式）
-    "image/jpeg".to_string()
-}
-
-/// 格式化文件内容预览（用于 Write 日志）
-/// 每行前加 `  │ ` 前缀，最多显示 max_lines 行，超出部分用省略号
-fn format_content_preview(content: &str, max_lines: usize) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let total = lines.len();
-    let mut out = String::new();
-    for (i, line) in lines.iter().take(max_lines).enumerate() {
-        // 截断过长的行
-        let display: String = line.chars().take(120).collect();
-        let ellipsis = if line.chars().count() > 120 { "..." } else { "" };
-        if i + 1 == max_lines && total > max_lines {
-            out.push_str(&format!("  │ {}{}\n", display, ellipsis));
-            out.push_str(&format!("  … +{} 行", total - max_lines));
-        } else {
-            out.push_str(&format!("  │ {}{}\n", display, ellipsis));
-        }
-    }
-    // 去掉末尾换行
-    out.trim_end_matches('\n').to_string()
-}
-
-/// 格式化编辑差异（用于 Edit 日志）
-/// 删除行前加 `  - `，新增行前加 `  + `，最多各显示 max_lines 行
-fn format_edit_diff(old_text: &str, new_text: &str, max_lines: usize) -> String {
-    let mut out = String::new();
-    let old_lines: Vec<&str> = old_text.lines().collect();
-    let new_lines: Vec<&str> = new_text.lines().collect();
-    // 删除部分
-    for (i, line) in old_lines.iter().take(max_lines).enumerate() {
-        let display: String = line.chars().take(120).collect();
-        out.push_str(&format!("  - {}\n", display));
-        if i + 1 == max_lines && old_lines.len() > max_lines {
-            out.push_str(&format!("  … +{} 行删除\n", old_lines.len() - max_lines));
-            break;
-        }
-    }
-    // 新增部分
-    for (i, line) in new_lines.iter().take(max_lines).enumerate() {
-        let display: String = line.chars().take(120).collect();
-        out.push_str(&format!("  + {}\n", display));
-        if i + 1 == max_lines && new_lines.len() > max_lines {
-            out.push_str(&format!("  … +{} 行新增\n", new_lines.len() - max_lines));
-            break;
-        }
-    }
-    out.trim_end_matches('\n').to_string()
-}
-
-/// 从工具参数 JSON 中解析消息段数组
-/// `field` 为包含消息段数组的字段名（通常为 "message"）
-fn parse_message_segments(
-    args: &serde_json::Value,
-    field: &str,
-) -> Result<Vec<MessageSegment>, String> {
-    let array = match args.get(field) {
-        Some(v) => v,
-        None => return Err(format!("缺少参数: {field}")),
-    };
-    serde_json::from_value::<Vec<MessageSegment>>(array.clone())
-        .map_err(|e| format!("解析消息段数组失败: {e}"))
-}
-
-/// 将消息段数组格式化为人类可读的预览字符串
-/// 用于日志输出，展示发送消息的具体内容
-fn format_segments_preview(segments: &[MessageSegment]) -> String {
-    if segments.is_empty() {
-        return "(空消息)".to_string();
-    }
-    let mut parts = Vec::new();
-    for seg in segments {
-        match seg {
-            // 文本消息段：直接输出文本内容
-            MessageSegment::Text { text } => {
-                parts.push(text.clone());
-            }
-            // @消息段
-            MessageSegment::At { qq, .. } => {
-                parts.push(format!("[@{}]", qq));
-            }
-            // 回复消息段
-            MessageSegment::Reply { id, .. } => {
-                let id_str = id.as_deref().unwrap_or("?");
-                parts.push(format!("[回复:{}]", id_str));
-            }
-            // 表情消息段
-            MessageSegment::Face { id, .. } => {
-                parts.push(format!("[表情:{}]", id));
-            }
-            // 其他类型：利用 serde 序列化获取类型名
-            other => {
-                if let Ok(v) = serde_json::to_value(other) {
-                    let type_name = v.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
-                    parts.push(format!("[{}]", type_name));
-                } else {
-                    parts.push("[?]".to_string());
-                }
-            }
-        }
-    }
-    parts.join("")
 }
 
 // ============================================================================
@@ -1958,7 +980,7 @@ const MESSAGE_SEGMENTS_DESC: &str = "\
 
 /// 构建所有内置工具的 JSON Schema 规范
 /// 这些规范通过 OpenAI function calling 协议传递给 LLM
-fn build_tool_specs() -> Vec<ToolSpec> {
+pub(crate) fn build_tool_specs() -> Vec<ToolSpec> {
     vec![
         // ===== 文件工具 =====
         ToolSpec {
@@ -2250,6 +1272,60 @@ fn build_tool_specs() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["flag", "sub_type", "approve"]
+            }),
+        },
+        // ===== 好友请求查询工具 =====
+        ToolSpec {
+            name: "GetFriendRequests".to_string(),
+            description: "从 NapCat 获取当前待处理的好友请求列表。包括历史未处理的好友请求。"
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        // ===== 好友管理工具 =====
+        ToolSpec {
+            name: "SetFriendRemark".to_string(),
+            description: "设置好友备注名称。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "integer",
+                        "description": "好友 QQ 号"
+                    },
+                    "remark": {
+                        "type": "string",
+                        "description": "备注名称"
+                    }
+                },
+                "required": ["user_id", "remark"]
+            }),
+        },
+        ToolSpec {
+            name: "DeleteFriend".to_string(),
+            description: "删除好友。此操作不可撤销。".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "integer",
+                        "description": "要删除的好友 QQ 号"
+                    }
+                },
+                "required": ["user_id"]
+            }),
+        },
+        ToolSpec {
+            name: "GetUnidirectionalFriendList".to_string(),
+            description: "获取单向好友列表。单向好友是指对方加了你但你没有加对方的好友关系。"
+                .to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {},
+                "required": []
             }),
         },
         // ===== Skill 工具 =====

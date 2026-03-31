@@ -7,13 +7,14 @@
 ## 功能概览
 
 - **拟人回复** — 通过 AGENTS.md / SOUL.md 等工作区文件塑造 AI 人格，模拟真人语气
-- **39+ 内置工具** — 文件读写、消息收发、群管理、搜索查询、表情回应、图片识别等
+- **43+ 内置工具** — 文件读写、消息收发、群管理、搜索查询、表情回应、图片识别、蜂群子代理等
 - **MCP 动态扩展** — 通过 [Model Context Protocol](https://modelcontextprotocol.io/) 接入外部工具服务器，无限扩展能力
 - **多 Provider 支持** — OpenAI 兼容 API（ChatCompletions / Responses 端点）+ Anthropic Messages API
 - **群管理** — 18 个群组管理工具（禁言/踢人/公告/精华/头衔等），管理员状态自动同步
 - **安全沙箱** — [cap-std](https://github.com/bytecodealliance/cap-std) 文件隔离 + 零执行能力 + SSRF 防护
 - **网络访问** — Fetch 工具获取网页内容（HTML 自动转 Markdown），内置 SSRF 防护
 - **上下文压缩** — 对话过长时自动将历史压缩为摘要，保持最近消息原样
+- **蜂群子代理** — 主 Agent 可生成子代理并行执行任务，支持嵌套 spawn、跨代理通信和多模型调度
 - **Skill 系统** — 可扩展的技能包，通过 SKILL.md 文件注入专业知识
 - **白名单控制** — 收发分离的群/私聊白名单，精确控制 AI 的可见范围和发言范围
 - **守护进程模式** — `sbot start` 后台运行，`sbot stop` / `sbot status` CLI 管理
@@ -103,6 +104,13 @@ ScapegoatBot/
 │   ├── mcp/                 # MCP 客户端
 │   │   ├── mod.rs           #   JSON-RPC 2.0 类型定义
 │   │   └── transport.rs     #   Stdio 传输层（子进程通信）
+│   ├── swarm/               # 蜂群子代理系统
+│   │   ├── mod.rs           #   SwarmManager（子代理生命周期管理）
+│   │   ├── types.rs         #   核心类型（SpawnConfig/AgentStatus/AgentHandle）
+│   │   ├── runner.rs        #   SubAgentRunner（子代理 agentic 循环）
+│   │   ├── dispatch.rs      #   ToolDispatcher（工具分发器）
+│   │   ├── tools.rs         #   蜂群工具定义与分发
+│   │   └── prompt.rs        #   子代理系统提示构建器
 │   ├── storage/             # 持久化存储
 │   │   ├── session.rs       #   会话管理（JSONL + SQLite 双写）
 │   │   ├── images.rs        #   图片存储（SQLite 索引）
@@ -146,8 +154,10 @@ ScapegoatBot 的设计目标是 **"即使 Agent 完全被攻击者控制，也�
 | `[compaction]` | 上下文压缩的触发阈值和保留策略 |
 | `[skills]` | Skill 技能包扫描目录 |
 | `[control]` | CLI 与守护进程通信端口 |
-| `[mcp_servers.<name>]` | MCP 外部工具服务器配置 |
+| `[mcp.<name>]` | MCP 外部工具服务器配置 |
 | `[fetch]` | 网页获取工具开关和安全策略 |
+| `[swarm]` | 蜂群子代理功能开关和安全限制（深度、并发） |
+| `[[models]]` | 备选 LLM 模型配置（供子代理使用不同模型） |
 
 ## 技术栈
 

@@ -1,0 +1,143 @@
+# ScapegoatBot LLM 模型配置文件
+# 定义所有可用的 LLM 模型，config.toml 通过 [llm].primary_model 指定主代理模型
+# 子代理通过 SpawnAgent 的 model 参数引用
+#
+# 合并优先级：模型字段 > [defaults] 字段 > 硬编码默认值
+# 硬编码默认值：provider="openai", base_url="", api_key="", timeout_secs=120,
+#               wire_api="chat_completions", max_steps=64, context_window=128000
+
+# ============================================================================
+# 默认值（所有模型可继承，减少重复配置）
+# ============================================================================
+# 模型定义中未指定的字段会使用这里的值
+# 适合多个模型共享同一提供商、API 密钥等场景
+[defaults]
+# LLM 提供商类型
+# "openai" — OpenAI 兼容 API（ChatCompletions / Responses 端点）
+#            支持 OpenAI、DeepSeek、Moonshot、本地 Ollama 等任何兼容服务
+# "anthropic" — Anthropic Messages API（Claude 系列模型）
+provider = "openai"
+# API 基础 URL
+# OpenAI 兼容：如 https://api.openai.com/v1
+# Anthropic：如 https://api.anthropic.com（留空时自动使用此默认值）
+# base_url = "https://api.openai.com/v1"
+# API 密钥
+# OpenAI 兼容：作为 Authorization: Bearer 头部发送
+# Anthropic：常规 API key 通过 x-api-key 头部发送
+#            OAuth setup token（sk-ant-oat01- 开头）通过 Authorization: Bearer 发送
+# api_key = ""
+# 最大输出 token 数（可选）
+# Anthropic API 强制要求此字段，默认 16384
+# OpenAI 可选，不设置时由模型自行决定
+# max_tokens = 16384
+# HTTP 请求超时时间（秒，默认 120）
+# 所有 API 请求使用流式传输以避免网关超时，此超时为最后安全网
+# timeout_secs = 120
+# 每个任务的最大工具调用步数（安全上限，防止无限循环，默认 64）
+# max_steps = 64
+# 上下文窗口大小（token 数，默认 128000）
+# 影响上下文压缩触发阈值（context_window * 3/4）
+# context_window = 128000
+# API 协议类型（仅 OpenAI 提供商使用，默认 "chat_completions"）
+# "chat_completions" — 经典 /v1/chat/completions 端点，兼容大多数渠道
+# "responses" — 新一代 /v1/responses 端点（某些渠道仅支持此端点）
+# Anthropic 提供商忽略此字段（始终使用 /v1/messages 端点）
+# wire_api = "chat_completions"
+# 系统指令的角色名称（默认 "system"，某些提供商如 OpenAI o 系列要求 "developer"）
+# system_role_name = "system"
+
+# ============================================================================
+# 模型定义
+# ============================================================================
+# 每个 [[models]] 定义一个可用模型
+# 必填字段：name, display_name, description, model
+# 可选字段未指定时依次从 [defaults] 和硬编码默认值取值
+#
+# name          — 内部引用名，必须唯一（SpawnAgent 的 model 参数、config.toml 的 primary_model 使用此名称）
+# display_name  — 人类可读的显示名称（日志和系统提示中使用）
+# description   — 一句话性能描述（帮助 AI 选择合适模型用于子代理任务）
+# model         — 模型 ID（如 gpt-4o、claude-opus-4-6-20250514 等，发送到 API 的模型名）
+#
+# 可选字段（覆盖 [defaults]）：
+# provider          — 提供商: "openai" | "anthropic"
+# base_url          — API 基础 URL
+# api_key           — API 密钥
+# max_tokens        — 最大输出 token 数
+# context_window    — 上下文窗口大小（token 数）
+# timeout_secs      — HTTP 超时（秒）
+# wire_api          — API 协议: "chat_completions" | "responses"
+# system_role_name  — 系统角色名: "system" | "developer"
+# max_steps         — 最大工具调用步数
+# reasoning_effort  — 推理深度/努力程度（可选，传递给支持该参数的模型）
+#                     常见值：none, minimal, low, medium, high, xhigh
+
+# 主力模型（config.toml 中 primary_model = "main" 引用此模型）
+[[models]]
+name = "main"
+display_name = "GPT-4o"
+description = "OpenAI 旗舰模型，平衡性能与成本"
+model = "gpt-4o"
+base_url = "https://api.openai.com/v1"
+api_key = ""
+# max_tokens = 16384
+# context_window = 128000
+# timeout_secs = 300
+# max_steps = 128
+# reasoning_effort = "medium"
+# system_role_name = "system"
+# wire_api = "chat_completions"
+
+# ---- 以下为备选模型示例（取消注释以启用）----
+
+# 快速模型 — 适合简单重复性任务，节约成本
+# [[models]]
+# name = "fast"
+# display_name = "DeepSeek V3"
+# description = "快速推理模型，适合简单重复性任务"
+# provider = "openai"
+# base_url = "https://api.deepseek.com/v1"
+# api_key = "sk-xxx"
+# model = "deepseek-chat"
+# context_window = 64000
+# max_steps = 64
+
+# 强力模型 — 适合复杂分析、代码审查等高难度任务
+# [[models]]
+# name = "strong"
+# display_name = "Claude Opus 4.6"
+# description = "最强大的模型，百万上下文，可解决复杂问题"
+# provider = "anthropic"
+# base_url = "https://api.anthropic.com"
+# api_key = "sk-ant-xxx"
+# model = "claude-opus-4-6-20250514"
+# max_tokens = 16384
+# context_window = 1000000
+# timeout_secs = 300
+# max_steps = 128
+
+# 平衡模型 — 性能与成本的平衡选择
+# [[models]]
+# name = "balanced"
+# display_name = "Claude Sonnet 4"
+# description = "平衡性能与成本的推理模型"
+# provider = "anthropic"
+# base_url = "https://api.anthropic.com"
+# api_key = "sk-ant-xxx"
+# model = "claude-sonnet-4-20250514"
+# max_tokens = 16384
+# context_window = 200000
+# timeout_secs = 300
+
+# 轻量模型 — 最低成本，适合格式转换、简单查询等
+# [[models]]
+# name = "cheap"
+# display_name = "Claude Haiku 4.5"
+# description = "最便宜的模型，适合简单重复性任务"
+# provider = "anthropic"
+# base_url = "https://api.anthropic.com"
+# api_key = "sk-ant-xxx"
+# model = "claude-haiku-4-5-20251001"
+# max_tokens = 8192
+# context_window = 200000
+# timeout_secs = 120
+# max_steps = 32
