@@ -678,7 +678,8 @@ mod tests {
     /// 运行方式：cargo test print_full_prompt -- --nocapture
     #[test]
     fn print_full_prompt() {
-        let workspace = Path::new("G:/ClaudeProjects/ScapegoatBot/ScapegoatBot/workspace");
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = manifest_dir.join("workspace");
         let agents_md_path = workspace.join("AGENTS.md");
         let agents_md_content = std::fs::read_to_string(&agents_md_path).unwrap_or_default();
         let agents_md = AgentsMd {
@@ -694,7 +695,7 @@ mod tests {
         let recv_privates = [10001, 10002];
 
         let cfg = PromptConfig {
-            workspace_dir: workspace,
+            workspace_dir: &workspace,
             model_name: "deepseek-chat-v3",
             agents_md: &agents_md,
             extra_system_prompt: None,
