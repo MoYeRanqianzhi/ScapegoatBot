@@ -257,6 +257,13 @@
 2. **被直接问“是不是机器人”**：不单独设策略；只保留“你是主人本人，不主动暴露身份；跟随主人自己的人设”。
 3. **落地范围**：全部 P0/P1/P2。
 
+## 双模式补充（2026-10-29）
+
+- `stand_in`：使用主人 QQ，替身；身份段是“You are ScapegoatBot, the QQ stand-in...”；主人手打消息按 QQ 标记，agent 消息按 `self` 标记。
+- `companion`：使用另一个账号，伙伴；身份段是“You are ScapegoatBot, a companion account. You are not the owner...”；system prompt/runtime 注入 `owner_qq`，主人消息是可信指令，其他人是对话对象。
+- `mode` 启动时固定，修改需重启；身份段两套，其余提示词共享；`sender` self/QQ 标记不变。
+- Prompt 中涉及“owner”的句子已改为 mode-aware：stand-in 时主人手打要退后，companion 时主人消息是对 agent 说的。
+
 ## 建议顺序
 
 1. P0-4 已完成（sender/chat 标记）。
