@@ -48,3 +48,18 @@ Desktop.ini
 *.bak
 *.tmp
 *.orig
+
+# ---- Agent 本地记录与工作树 ----
+# .agents/ 下名字中含 `.local` 段的记录属于用户/机器私有，不进入共享历史：
+# MEMORY.local.md、TODO.local.md、memory/<name>.local.md、plan/<name>.local.md。
+# 这里按 `.local` 段精确匹配，不使用更宽松的 `*.local*`，以免误伤
+# i18n.locale.md 这类名字中恰好含 "local" 的共享文件。
+/.agents/**/*.local.*
+# 无扩展名的 `.local` 文件和目录同样属于本地记录。
+/.agents/**/*.local
+
+# 工作树拥有自己独立的 Git 状态，不能进入主检出的历史。
+# Agent 默认把工作树建在 .worktrees/；Claude Code 的工作树工具则使用
+# .claude/worktrees/。
+/.worktrees/
+/.claude/worktrees/
