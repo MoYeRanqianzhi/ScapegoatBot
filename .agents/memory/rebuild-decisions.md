@@ -16,6 +16,7 @@ ScapegoatBot 正在完全重构为全新项目，完整设计见 `.agents/plan/2
 - IPC：Windows named pipe / Unix domain socket，无 TCP。
 - VFS：`/AGENTS.md` 在根且默认空；`/friends/<qq>/`、`/groups/<gid>/` 动态目录；`/trash` 回收站；`/config` 配置视图；二进制 blob 分块加密。
 - 加密：内容加密、索引明文（不加密路径）；主密钥首次初始化时自动生成到 `~/.sbot/key`，无口令、无 keychain、无解锁步骤；所有状态统一放在 `~/.sbot`，复制该目录即完成迁移；威胁边界见设计文档 6.6。
+- Prompt：以 `You are ScapegoatBot` 开头；所有模型面文本英文；静态前缀与 `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` 动态上下文分离；QQ 回复跟随会话语言；工具描述、错误、压缩/摘要与子代理提示英文；指令优先级为内置 > owner context > skill > QQ/网络数据。
 - 历史存储：transcript 每次压缩成功后轮转新分段；摘要块含 `previous_session`，system prompt 含 `current_session`；`/sessions` 只读映射分段并提供 `index.jsonl` 链式索引；内容只存加密 JSONL，视图由 VFS 动态生成，索引仅为可重建缓存。
 - 消息存储：按群/私聊、月、日写入加密 JSONL（`messages/<scope>/<peer>/<YYYY-MM>/<DD>.jsonl`）；VFS `/messages` 动态渲染，磁盘不生成派生文件；索引可重建；记录全部消息，媒体只存 URL/引用。
 - 增长控制：VFS / 消息 / transcript 三类独立配额（默认 10 GB / 10 GB / 2 GB，0 不限制）与可选年龄保留（默认不按年龄删）；超限清理最旧完整月份/关闭分段，绝不删除当前；墓碑与用量可见。
