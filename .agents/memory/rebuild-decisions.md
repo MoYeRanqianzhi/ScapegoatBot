@@ -15,6 +15,7 @@ ScapegoatBot 正在完全重构为全新项目，完整设计见 `.agents/plan/2
 - 单 agent、全局 transcript（类 OpenClaw）；不按群/私聊拆分；不设 `/identity`、`/memory`。
 - IPC：Windows named pipe / Unix domain socket，无 TCP。
 - VFS：`/AGENTS.md` 在根且默认空；`/friends/<qq>/`、`/groups/<gid>/` 动态目录；`/trash` 回收站；`/config` 配置视图；二进制 blob 分块加密。
+- 加密：内容加密、索引明文（不加密路径）；主密钥首次初始化时自动生成到 `~/.sbot/key`，无口令、无 keychain、无解锁步骤；所有状态统一放在 `~/.sbot`，复制该目录即完成迁移；威胁边界见设计文档 6.6。
 - 工具 PascalCase：`Read`、`Write`、`Edit`、`LS`、`Grep`、`Glob`、`RM`、`MV`、`CP`、`Mkdir`、`Stat`、`API`、`Download`、`Skill`、`WebSearch`、`WebFetch`、`Agent`、`MCP`。
 - 配置：`sbot.toml` + `models.json` + `auth.json`；TOML/JSON 键 snake_case；`auth.json` 不挂载 VFS，`config.toml` 零凭据。
 - 事件 hook：`SessionStart`、`SessionEnd`、`PreCompact`、`PostCompact`、`MessageReceived`、`BeforeSend`、`Stop`、`ConfigChange`；无 `start_turn`。
@@ -26,10 +27,9 @@ ScapegoatBot 正在完全重构为全新项目，完整设计见 `.agents/plan/2
 
 ## 待定
 
-- 加密方案仍为草案（XChaCha20-Poly1305 + Argon2id/OS keychain），待用户最终确认。
 - `[gate].llm_review` 默认值待定（当前 false）。
 
 **Evidence:** 设计文档 `.agents/plan/2026-10-28-rebuild-design.md` 与 2026-10-28 的对话结论。
-**Recheck when:** 用户确认加密与 `llm_review` 默认值，或 Phase 0 开始后设计发生变化。
+**Recheck when:** 用户确认 `llm_review` 默认值，或 Phase 0 开始后设计发生变化。
 **Why:** 上下文压缩或新会话后需要快速恢复重构决策，避免重新讨论已定项。
 **How to apply:** 实施前先读设计文档；按 Phase 0 → Phase 7 推进，不恢复旧代码结构。

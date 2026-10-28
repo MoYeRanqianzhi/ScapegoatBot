@@ -286,12 +286,12 @@ action 分类由 action 元数据提供：`query`（只读）、`message`（发�
 ### 6.4 节点与存储
 
 - 后端：SQLite（`data.db`），表：
-  - `vfs_nodes(id, parent_id, name_ciphertext, name_nonce, kind, content_ciphertext, content_nonce, key_version, size, mime, mode, version, created_at, updated_at, hash)`
-  - `vfs_chunks(node_id, idx, ciphertext, nonce, key_version)`：二进制按 64 KiB 分块，`vfs_nodes.size` 记录总大小。
+  - `vfs_nodes(id, parent_id, name, kind, content_enc, size, mime, mode, version, created_at, updated_at, hash)`：`name` 为明文虚拟路径段（目录索引需要）；`content_enc` 存放 `nonce || ciphertext`，非文本节点为空。
+  - `vfs_chunks(node_id, idx, offset, length, hash)`：二进制分块索引；密文存 `blobs/` 下的独立文件，不存 SQLite。`vfs_nodes.size` 记录总大小。
   - `vfs_reads(node_id, version, content_hash, is_partial, read_at)`：支撑 Read-before-Edit（全局单 agent，无会话维度）。
 - 原子写入：单事务更新内容与版本号；每次写入 `version + 1`。
 - 节点类型：text、binary、image、audio、video、file；按扩展名与内容检测 MIME。
-- 二进制内容不存 SQLite：写入 `~/.sbot/blobs/<node_id>/`，按 1 MiB 分块 AEAD 加密；SQLite 只存元数据、hash 与块索引，支持流式读取。
+- 二进制内容不存 SQLite：写入 `<storage.path>/blobs/<node_id>/<idx>`，按 1 MiB 分块 AEAD 加密（`nonce || ciphertext`，AAD 绑定 `node_id` 与块序号）；SQLite 只存元数据、hash 与块索引，支持流式读取。
 - 单文件上限 512 MB（可配置）；文本仍存 SQLite，上限 1 MB。
 - `Read` 对文本返回正文；图片返回多模态内容；其他二进制只返回元信息，不把 base64 塞进上下文。
 - `Download` 写入二进制；`API` 发送文件时流式解密到临时文件，交给 NapCat 后立即删除。
@@ -334,29 +334,63 @@ action 分类由 action 元数据提供：`query`（只读）、`message`（发�
 - 未读编辑、部分读编辑、读后版本变化、并发双写、old_text 多处匹配、跨会话读取状态隔离。
 
 
-### 6.5 外部不可见
+### 6.6 外部不可见与静态加密
 
-- 存储位置：Windows `%LOCALAPPDATA%\ScapegoatBot\`，Unix `~/.local/share/scapegoat-bot/`；目录权限 0700 / 仅当前用户 ACL。
-- 数据库文件不放在项目目录或 `workspace/` 明文目录。
-- 日志不打印文件内容，仅路径、大小、hash。
-- 路径与内容加密：`vfs_nodes` 的 `name` 与文本 `content` 以 XChaCha20-Poly1305（AEAD）加密，每节点独立随机 nonce；二进制 blob 按 1 MiB 分块 AEAD 加密；`vfs_reads` 等索引只保留 node_id 与 hash。
-- 内存索引：启动时解密节点元数据，建立内存路径索引；此后 `LS` / `Glob` 走内存，`Read` 才解密内容。10 万节点冷启动约几十毫秒。
-- 密钥封装：随机 256-bit DEK 加密数据；KEK 由 Argon2id（64 MiB、t=3、p=4）从启动口令派生，或由 OS keychain / Windows DPAPI 生成并保护；有 TPM 2.0 时可选密封。配置文件只存盐与 KDF 参数，不存密钥。
-- 解锁不依赖单一平台：首次启动设置主口令，KEK 由 Argon2id 派生；`unlock = "keychain"` 只是把口令存入当前 OS 凭据管理器以便自动解锁，`"passphrase"` 每次启动输入。迁移到其他 OS 或机器时输入同一口令即可；`sbot key export` 生成加密恢复文件，`sbot key import` 恢复。OS keychain/TPM 是便利层，不是唯一密钥来源。
-- 内存保护：密钥仅驻留内存，`zeroize` 清零，`mlock` / `VirtualLock` 防换页；日志、status、崩溃输出脱敏。
-- 轮换：DEK 轮换只需重新包装，不重写全部数据。
-- 可选关闭：`[storage] encryption = "none"` 时路径与内容明文存储，仅用于本地调试；启动时打印警告，`status` 标记为未加密。
-- 威胁边界：磁盘/备份泄露无法解密；同用户下能读取进程内存、注入进程或调试的攻击者，纯软件无法完全防御；TPM/口令双因素用于提高门槛，README 如实说明。
-- 导出命令需显式授权。
+**单一存储根目录**
+
+- 所有状态只放在一个目录：`~/.sbot/`（Windows 为 `%USERPROFILE%\.sbot\`）；可用环境变量 `SBOT_HOME` 整体重定向，用于便携与迁移场景。
+- 目录内容固定：
+  - `sbot.toml`、`models.json`、`auth.json`
+  - `key`：主密钥文件
+  - `data/`：`data.db` 与 `blobs/`（`[storage].path` 默认 `./data`）
+  - `sessions/`：session JSONL
+  - `skills/`：宿主共享技能
+- 权限：Unix 目录 0700、文件 0600；Windows 依赖用户目录 ACL（管理员与 SYSTEM 仍可读取，见威胁边界）。
+- 持久化数据只保存相对路径与虚拟路径，绝不写入宿主绝对路径；整个目录可以原样移动到其他目录、机器或操作系统。
+- 数据库不放在项目目录，也不存在 `workspace/` 明文目录。
+- 日志不打印文件内容，只记录路径、大小、hash。
+- 备份与迁移：停止进程后复制整个 `~/.sbot`（或 `SBOT_HOME` 指向的目录）即可；`key` 必须与数据一起备份，丢失 `key` 等于数据不可恢复。不提供导出/导入命令，也不需要解锁步骤。若显式把 `storage.path`、`models_file`、`auth_file` 指到根目录之外，迁移时需要一并复制这些位置。
+
+**Agent 可见性**
+
 - 消息/会话数据由系统写入，Agent 只读；身份/记忆文件可写但受挂载点与大小限制。
+- `key`、`auth.json`、`data.db`、`blobs/`、`sessions/` 的宿主路径不在 VFS 中；Agent 只能通过 VFS 视图访问其中允许的部分。
 
-### 6.6 种子与初始化
+**加密范围**
+
+- 加密内容，不加密索引：
+  - 加密：VFS 文本内容、二进制 blob 分块、session JSONL 每行、消息正文。
+  - 明文：VFS 路径与文件名、节点 id、大小、hash、时间戳、会话与消息索引及其元数据（发送者、群号、时间）、配置、审计日志。
+- 原因：`LS` / `Glob` / `Grep` 与 SQL 查询依赖明文索引；主密钥与数据位于同一根目录时，加密路径的边际保护很小，却会显著增加启动、搜索与迁移的复杂度。
+- `auth.json` 不加密（用户需要直接编辑），依靠文件权限保护；它和 `key` 都不挂载到 VFS，Agent 不可见。
+
+**算法与密钥**
+
+- AEAD 使用 XChaCha20-Poly1305；每条记录/每个分块使用 24 字节随机 nonce，存储为 `nonce || ciphertext`；AAD 绑定域标签与记录标识（`vfs:<node_id>:<version>`、`blob:<node_id>:<idx>`、`session:<file_id>:<line_no>`、`message:<id>`），防止密文跨记录替换。
+- 启动时用 HKDF-SHA256 从主密钥派生 `vfs-text`、`vfs-blob`、`session`、`message` 四个域密钥，避免跨用途 nonce 复用。
+- 主密钥在首次初始化时由 OS CSPRNG 生成 32 字节，写入 `~/.sbot/key`（`SBOTKEY` 魔数 + 格式版本 + 密钥）；不设口令、不调用 OS keychain / DPAPI / TPM，不产生任何解锁提示。
+- 启动校验：数据库 `meta` 保存一段用校验域密钥加密的 canary；启动时解密验证。数据库存在但 `key` 缺失或不匹配时直接报错退出，提示从备份恢复 `key`，绝不自动生成新密钥。
+- 内存：密钥只驻留进程内存，`zeroize` 清零；`status`、日志、错误输出只显示文件路径与大小，不显示密钥或内容。
+- 密钥轮换：v1 不提供在线轮换；`key` 泄露时备份后重建存储（后续版本可提供离线重加密命令）。
+
+**配置与模式固定**
+
+- `[storage].encryption = "xchacha20poly1305"`（默认）或 `"none"`（仅调试）。
+- 加密模式在存储首次初始化时写入 SQLite `meta`，之后固定；配置与数据库不一致时启动报错，不做静默转换。`"none"` 启动时打印警告，`status` 标记为未加密。
+
+**威胁边界**
+
+- 能防：只获得 `data.db`、`blobs/` 或 `sessions/` 文件而没有 `key` 的人；用 SQLite 浏览器等外部工具直接查看；意外分享单个数据文件或部分备份。
+- 不能防：能读取整个 `~/.sbot`（含 `key`）或控制当前用户账户的攻击者；进程内存读取与调试注入；管理员 / SYSTEM / root。此类场景依赖操作系统账户隔离与全盘加密（BitLocker / FileVault / LUKS）。
+- README 必须如实写明以上边界，不宣称"数据库泄露也无法解密"。
+
+### 6.7 种子与初始化
 
 - 全新项目，不迁移旧 `workspace/` 或旧会话数据；首次启动只创建空的 `/AGENTS.md`；核心规则内置在 system prompt；不预置 `SOUL.md`、`IDENTITY.md`、`MASTER.md` 与记忆目录，由 Agent 自行决定记录方式。
 - `/skills` 以 overlay 方式组合宿主 `~/.sbot/skills`（只读）与 VFS 本地层（可写）；可选导出本地技能到宿主。
 - 不提供旧数据导入命令。
 
-### 6.7 配置视图
+### 6.8 配置视图
 
 - `/config.toml` 映射 `sbot.toml` 原文，可读写；写入触发整文件解析、校验、应用与持久化。
 - `/config/<section>/<key>` 映射每个配置项，叶子文件内容为当前生效值（TOML 字面量）。未显式配置的项也存在于虚拟树中，显示默认值；默认值为空时显示空字符串，避免"文件不存在"的歧义。
@@ -364,13 +398,13 @@ action 分类由 action 元数据提供：`query`（只读）、`message`（发�
 - 写入流程：解析 → 校验 → 应用可热更项 → `toml_edit` 原子写回 `sbot.toml` → 失败回滚并保持原值。
 - 热更新项：模型、effort、压缩参数、工具开关、技能目录、swarm 参数；需重启项：napcat、storage、control 等，写入时接受但提示重启。
 - 敏感项只读或不可见：
-- `auth.json` 不挂载，模型不可见；`/config/models.json` 只读暴露模型定义。
-  - storage 加密密钥、napcat token、control 端点不可由 Agent 修改；过滤器可修改。
+  - `auth.json` 不挂载，模型不可见；`/config/models.json` 只读暴露模型定义。
+  - `[storage]` 的路径与加密模式、napcat token、control 端点不可由 Agent 修改；过滤器可修改。
   - `models.json` 只读；可用模型列表在 `/config/agent/available_models` 中修改。
 - 配置树只能修改 schema 已定义的项，不能创建新项；未知路径返回错误。例外：`/config/hooks/context/<name>/...` 允许创建新的 context hook。
 - 所有写入记录审计日志（路径、旧值、新值，密钥类值脱敏）。
 
-### 6.8 动态节点与回收站
+### 6.9 动态节点与回收站
 
 `/friends/<qq>/` 结构：
 
@@ -494,10 +528,10 @@ enabled = true
 - 消息来源只用于已读标记与来源标注，不用于拆分上下文。
 - 持久化：session 写入本地 `~/.sbot/sessions/<timestamp>-<seq>.jsonl`，每行一条内部消息（含工具调用与结果）；SQLite 只做索引。
 - VFS `/sessions` 只读映射当前与归档文件；压缩轮转时新建文件，旧文件保留。
-- 加密模式下 JSONL 每行 AEAD 加密，VFS 读取时解密；`encryption = "none"` 时明文。
+- 加密模式下 JSONL 每行用 session 域密钥 AEAD 加密，存储为 `{"nonce":"<base64>","ciphertext":"<base64>"}`，AAD 绑定 `session:<file_id>:<line_no>`；VFS 读取时解密。`encryption = "none"` 时每行为明文 JSON。
 - 保留策略：按总大小或天数清理旧文件（可配置）。
 - `/inbox` 由系统维护：每个未处理会话一个 Markdown 文件，外加 `index.jsonl`；记录会话 ID、类型、最早/最新消息 ID、未读数、更新时间；标记已读或处理后移除。
-- session JSONL 行格式：`{role, content, tool_calls?, tool_call_id?, images?, usage?, ts}`；加密时每行为 `{nonce, ciphertext, key_version}`；文件头记录 `{version, session_id, created_at}`；SQLite `sessions(id, file, prev_id, started_at, message_count)` 只做索引。
+- session JSONL 行格式：明文内容为 `{role, content, tool_calls?, tool_call_id?, images?, usage?, ts}`；加密时外层为 `{nonce, ciphertext}`；文件头为明文 `{version, file_id, session_id, created_at, encryption}`；SQLite `sessions(id, file, prev_id, started_at, message_count)` 只做索引。
 - 触发：`context_tokens > context_window - reserve_tokens`（默认 `reserve_tokens = 16384`）；连续失败达到 `max_failures`（默认 3）后停止自动压缩并告警。
 - 保留：按 `keep_recent_tokens`（默认 20000）从最新消息向前保留；切割点落在 turn 边界，不拆开工具调用与结果；单个工具结果超预算时保留其所属 turn。
 - 摘要：结构化检查点，包含目标、关键决定及理由、已完成进展、关键事实/路径/名称/错误、未决问题、下一步；已有摘要时使用增量更新 prompt，保留旧信息。
@@ -548,9 +582,8 @@ ignore_patterns = []
 require_mention = false
 
 [storage]
-path = "./data"
-encryption = "xchacha20poly1305"   # 或 "none"（仅调试）
-unlock = "keychain"                # keychain | passphrase
+path = "./data"                    # 相对 ~/.sbot；密钥固定为 ~/.sbot/key
+encryption = "xchacha20poly1305"   # 或 "none"（仅调试）；首次初始化后固定
 max_blob_bytes = 536870912         # 单文件 512 MB
 max_total_bytes = 10737418240      # 总量 10 GB
 
@@ -693,15 +726,12 @@ action = "log"
   "tools": {
     "web_search": { "api_key": "$SBOT_SEARCH_KEY" },
     "web_fetch": { "api_key": "$SBOT_FETCH_KEY" }
-  },
-  "storage": {
-    "key": { "keyring": "scapegoat-bot" }
   }
 }
 ```
 
 - `sbot.toml` 与 `/config` 中完全不出现凭据字段；所有 key/token 只在这里。
-- 值支持 `"$ENV_NAME"` 环境变量插值、字面量或 `{ "keyring": "service/account" }`。
+- 值支持 `"$ENV_NAME"` 环境变量插值或字面量；不集成 OS keychain（存储密钥由 `~/.sbot/key` 承担）。
 - `auth.json` 不挂载到 VFS，模型无法读取；日志与 `status` 不显示 key。
 - 未在 `auth.json` 中提供 key 的 provider 不可用；启动时只对 `available_models` 引用到的 provider 校验。
 - 文件缺失时，允许全部凭据来自环境变量；启动时打印缺失项。
@@ -730,7 +760,7 @@ action = "log"
 - `[tools.web_*].backend = "tool"` 时 URL 与 key 必须同时存在；未填 key 不注册对应工具。
 - `[tools.download].max_bytes` 必须为正数；域名列表合法。
 - `[gate].mode` 只能是 `trusted` / `auto` / `approve`；`max_per_minute` 必须为正数；`llm_review = true` 时审查模型必须可用。
-- `[storage].unlock` 只能是 `keychain` / `passphrase`；`[storage].encryption = "xchacha20poly1305"` 时密钥必须可解析；`"none"` 启动时警告。
+- `[storage].encryption` 只能是 `xchacha20poly1305` / `none`，且必须与数据库 `meta` 中记录的模式一致；加密模式下 `~/.sbot/key` 必须存在、格式正确且 canary 校验通过；`none` 启动时警告。
 - `[compaction]` 的 `reserve_tokens` / `keep_recent_tokens` / `max_failures` 必须为正数。
 - `[swarm].max_depth` / `max_concurrency` 必须为正数。
 - 未知字段、未知协议、越界数值一次性列出全部错误，启动失败。
@@ -813,6 +843,7 @@ src/
   skills/
   storage/
     mod.rs             SQLite 连接与迁移
+    crypto.rs          主密钥加载/生成、HKDF 域密钥、AEAD 封装
     messages.rs
 ```
 
@@ -843,7 +874,7 @@ src/
 已定：
 
 - 整个 QQ 号只有一个 agent、一份全局 transcript，不按群/私聊拆分（类 OpenClaw）。
-- VFS 默认加密路径与内容（XChaCha20-Poly1305 + Argon2id/OS keychain）；`encryption = "none"` 可关闭；路径解密到内存索引，配额 10 万节点。
+- 加密：内容加密、索引明文（路径不加密）；主密钥在首次初始化时自动生成到 `~/.sbot/key`，无口令、无 keychain、无解锁步骤；复制整个 `~/.sbot` 即完成迁移；威胁边界见 6.6。
 - 不 fork NapCatLink：它是项目自有代码，直接修改并提交；重构期间继续用 `=0.1.0-alpha.2`，修复后发 alpha.3 升级。
 - `WebSearch` / `WebFetch` 的 `tool` 后端由用户填写 URL 与 key 启用；不填则不注册工具，不假定官方地址。
 - DeepSeek 兼容服务的 5 QPS 与计费可接受；不足由服务方限制决定。
@@ -865,7 +896,6 @@ src/
 
 待定：
 
-- 加密方案仍为草案（XChaCha20-Poly1305 + Argon2id/OS keychain），待最终确认。
 - `[gate].llm_review` 默认值待定（当前 false）。
 - 其余实现细节在 Phase 0–4 中确定。
 
