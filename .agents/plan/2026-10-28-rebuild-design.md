@@ -97,7 +97,7 @@ AgentEvent = agent_start | turn_start | message_start | message_update
 NapCat 事件
   → 归一化（群/私聊/请求/通知）
   → 过滤器判断（忽略的群/用户/关键词不注入 Agent，但消息仍写入存储）
-  → 写入消息存储（正文 + 原始 JSON + 索引）
+  → 写入消息存储（按群/私聊、月、日分区 JSONL：正文 + 原始 JSON；索引可重建）
   → 去抖窗口（默认 3s）合并为一条 user 消息
   → Agent steering/follow-up 队列
   → LLM 循环
@@ -109,6 +109,7 @@ NapCat 事件
 - 系统提示明确：纯文本输出不会发送给任何人；要说话必须调用发送工具。
 - 整个 QQ 号只有一个 agent、一份全局 transcript；群聊、私聊、请求事件按时间进入同一上下文（类 OpenClaw）。
 - 入站消息去重：按 `message_id` 幂等写入；`message_sent` 事件同样去重。
+- 消息存储与 transcript 分离：消息是完整归档，transcript 只保存进入模型上下文的内容；两者都加密，分区、轮转与清理见 8.2 / 8.3。
 - 已读标记：首次成功请求后按来源标记，模拟真人。
 
 ## 5. 工具链
@@ -130,7 +131,7 @@ NapCat 事件
 | `Write` | 本地 | 创建/覆盖文件；覆盖需先读 | `path, content` |
 | `Edit` | 本地 | 精确字符串替换，需先读 | `path, old_text, new_text, replace_all?` |
 | `LS` | 本地 | 列目录（可选递归） | `path, recursive?` |
-| `Grep` | 本地 | 文件内容搜索 | `pattern, path?, file_ext?, case_insensitive?` |
+| `Grep` | 本地 | 文件内容搜索；大目录预算与部分结果见 5.7 | `pattern, path?, file_ext?, case_insensitive?` |
 | `Glob` | 本地 | 按文件名/路径模式匹配 | `pattern, path?` |
 | `RM` | 本地 | 删除文件或目录 | `path, recursive?` |
 | `MV` | 本地 | 移动或重命名 | `from, to` |
@@ -226,7 +227,7 @@ NapCat 事件
 - 工具执行位置用 `ToolKind::Local | Server | ToolBackend` 标记。
 - provider trait 增加服务端工具声明：工具类型、可用模型、参数映射；响应解析补充 `server_tool_use` / `web_search_tool_result` / `web_fetch_tool_result` / `pause_turn`。
 - 文件工具各自一个模块；`API` / `Agent` / `Skill` 内部用 enum 分派 action，参数反序列化到各 action 的强类型结构并校验。
-- 工具 description 列出本工具的 action 与常用参数；错误信息说明失败原因和修正方式。
+- 工具 description 列出本工具的 action 与常用参数；错误信息说明失败原因和修正方式；`Grep` description 必须包含 5.7 的预算与部分结果规则。
 - 工具结果统一为文本 + 可选图片 + `is_error`；NapCat 返回的 JSON 转为简洁文本。
 - 测试覆盖每个本地工具/action 的正常路径、权限拒绝与参数错误；服务端工具用 fake provider 验证三种协议声明与结果解析；工具后端用 mock HTTP 验证请求与归一化。
 
@@ -248,6 +249,17 @@ action 分类由 action 元数据提供：`query`（只读）、`message`（发�
 - 所有调用与被拦截记录写审计日志；`/system/gate` 只读展示当前模式与最近记录。
 - `approve` 模式需要可用的主人通知通道。
 
+### 5.7 Grep 扫描预算与部分结果
+
+`Grep` 的 description 必须写明以下行为，运行时按此执行：
+
+- `/messages`、`/sessions` 等大目录按请求路径下的每个直属子目录/文件分别计量扫描预算（默认每项 100 MB / 10 万行；单次调用总预算 500 MB / 50 万行或 30 秒）。
+- 某个目录超预算时：跳过该目录或只扫描已读前缀，继续处理其他目录/文件；单目录超预算不导致整个调用失败。
+- 工具结果末尾单独列出超预算路径，只列这些路径，并标注 `skipped`（未扫描）或 `partial`（已扫描部分）以及触发原因（字节/行数/总预算）；其他目录的正常结果照常返回。
+- 提示是信息性的：若已有答案可忽略；需要这些范围时，缩小到子目录或单日再搜。不得表述为“必须继续搜索”。
+- 同一路径只提示一次；多个超预算路径按路径排序。总预算耗尽时，剩余未处理路径同样在末尾标注。
+- `/sessions` 额外限制单次最多 8 个分段（从最新开始）；`/messages` 建议按群/私聊 + 月/日缩小。
+
 ## 6. 虚拟文件系统（VFS）
 
 ### 6.1 目标
@@ -255,6 +267,7 @@ action 分类由 action 元数据提供：`query`（只读）、`message`（发�
 - Agent 只使用虚拟路径（如 `/AGENTS.md`、`/notes/MEMORY.md`），永远拿不到宿主真实路径。
 - 越权（`..`、绝对路径、盘符、符号链接）在 VFS 层被消除，而不是依赖路径字符串过滤。
 - 宿主磁盘上不出现 Agent 可浏览的明文工作区；数据集中在一个受 ACL 保护的存储中。
+- 视图与存储分离：`/messages`、`/sessions`、`/config`、`/friends` 等均为 VFS 动态视图，磁盘不生成派生副本；事实来源分别是 JSONL、配置文件与实时 API。
 
 ### 6.2 挂载点
 
@@ -262,8 +275,8 @@ action 分类由 action 元数据提供：`query`（只读）、`message`（发�
 |----------|------|------|
 | `/AGENTS.md` | rw | 默认空文件；内容自动加载进上下文；用户/Agent 可写 |
 | `/` 下其他普通路径 | rw | Agent 自主创建：身份资料、记忆、笔记、下载的文件；程序不规定格式 |
-| `/messages` | ro | 系统写入的聊天记录（按群/私聊分区存储） |
-| `/sessions` | ro | 本地 session JSONL 的只读视图（当前 + 归档） |
+| `/messages` | ro | 全部 QQ 消息的只读视图：按群/私聊、月、日分区，从 JSONL 动态渲染；媒体只保留引用 |
+| `/sessions` | ro | transcript 分段只读视图（当前 + 归档）；`index.jsonl` 提供链式索引；当前分段路径见 system prompt |
 | `/inbox` | ro | 未处理消息、待处理好友/群请求的只读视图 |
 | `/friends` | 混合（动态） | `/friends/<qq>/profile.md`、`info.json` 实时查询；`notes.md` 本地可写 |
 | `/groups` | 混合（动态） | `/groups/<gid>/profile.md`、`info.json`、`members/<qq>.md` 实时查询；`notes.md` 本地可写 |
@@ -295,7 +308,7 @@ action 分类由 action 元数据提供：`query`（只读）、`message`（发�
 - 单文件上限 512 MB（可配置）；文本仍存 SQLite，上限 1 MB。
 - `Read` 对文本返回正文；图片返回多模态内容；其他二进制只返回元信息，不把 base64 塞进上下文。
 - `Download` 写入二进制；`API` 发送文件时流式解密到临时文件，交给 NapCat 后立即删除。
-- 配额：单文件 512 MB、总量 10 GB / 100000 节点；写入前检查磁盘剩余（≥ 1 GB）。
+- 配额：单文件 `max_blob_bytes`（默认 512 MB）、VFS 总量 `max_vfs_bytes`（默认 10 GB）/ 100000 节点；写入前检查磁盘剩余（≥ 1 GB）。消息存储与 transcript 使用独立配额，见 8.3。
 - 目录与文件均为虚拟节点，删除目录递归软删除（保留审计）。
 
 ### 6.5 编辑前阅读（Read-before-Edit）
@@ -343,7 +356,8 @@ action 分类由 action 元数据提供：`query`（只读）、`message`（发�
   - `sbot.toml`、`models.json`、`auth.json`
   - `key`：主密钥文件
   - `data/`：`data.db` 与 `blobs/`（`[storage].path` 默认 `./data`）
-  - `sessions/`：session JSONL
+  - `messages/`：按月/群/日分区的 JSONL 消息归档
+  - `sessions/`：transcript 分段 JSONL
   - `skills/`：宿主共享技能
 - 权限：Unix 目录 0700、文件 0600；Windows 依赖用户目录 ACL（管理员与 SYSTEM 仍可读取，见威胁边界）。
 - 持久化数据只保存相对路径与虚拟路径，绝不写入宿主绝对路径；整个目录可以原样移动到其他目录、机器或操作系统。
@@ -359,8 +373,8 @@ action 分类由 action 元数据提供：`query`（只读）、`message`（发�
 **加密范围**
 
 - 加密内容，不加密索引：
-  - 加密：VFS 文本内容、二进制 blob 分块、session JSONL 每行、消息正文。
-  - 明文：VFS 路径与文件名、节点 id、大小、hash、时间戳、会话与消息索引及其元数据（发送者、群号、时间）、配置、审计日志。
+  - 加密：VFS 文本内容、二进制 blob 分块、transcript 分段 JSONL 每行、消息正文。
+  - 明文：VFS 路径与文件名、节点 id、大小、hash、时间戳、会话与消息索引及其元数据（发送者 ID、群号、时间）、配置、审计日志。
 - 原因：`LS` / `Glob` / `Grep` 与 SQL 查询依赖明文索引；主密钥与数据位于同一根目录时，加密路径的边际保护很小，却会显著增加启动、搜索与迁移的复杂度。
 - `auth.json` 不加密（用户需要直接编辑），依靠文件权限保护；它和 `key` 都不挂载到 VFS，Agent 不可见。
 
@@ -443,14 +457,16 @@ action 分类由 action 元数据提供：`query`（只读）、`message`（发�
 6. **安全**：过滤器、身份保密、提示注入防护、群管理操作谨慎、不可执行命令。
 7. **记忆**：不规定目录；提示词说明何时写、如何组织、写入前先读；记忆文件由 Agent 在根目录自行创建。
 8. **决策**：沉默优于错误回复；不过时补发；不确定先查记录。
-9. **运行时上下文**：当前时间、模型、可发送/接收范围、群身份、未处理消息、前一会话引用。
-10. **附加指令**：会话开始与压缩后自动读取 `/AGENTS.md`；非空时注入到上下文开头，空文件跳过；内置规则优先于文件内容。
+9. **历史检索**：`/messages` 按群/私聊、月、日分区；`/sessions` 按压缩分段；当前分段路径在运行时上下文，摘要中的 `previous_session` 指向上一分段；先 `LS` / `Stat` 缩小范围，再 `Grep` / `Read`，不要无差别扫描全部历史；`Grep` 末尾的 `skipped` / `partial` 提示只说明未扫完的范围，需要时再缩小，不要求继续搜索。
+10. **运行时上下文**：当前时间、模型、可发送/接收范围、群身份、未处理消息、当前 session 文件路径（`current_session`）。
+11. **附加指令**：会话开始与压缩后自动读取 `/AGENTS.md`；非空时注入到上下文开头，空文件跳过；内置规则优先于文件内容。
 
 ### 7.2 风格
 
 - 短句、命令式、一条规则一句；删除口号式重复。
 - 每段只回答“做什么、为什么、边界在哪”。
 - 工具描述与系统提示分工：工具参数细节放工具 description，提示词只讲策略。
+- 运行时字段（时间、模型、`current_session`）在每次请求前刷新；压缩轮转后重建系统提示，静态 section 不变。
 - `/AGENTS.md` 上限 64 KB，超出截断并告警；只在会话开始与压缩后读取，Agent 自己修改无需重注入。
 - 提示词内容版本化并配单元测试（关键 section 存在、动态字段正确）。
 
@@ -522,23 +538,69 @@ enabled = true
 - 错误只记录日志，不中断主流程；同一事件最多执行 16 个 hook。
 - `ConfigChange` 在配置写入并应用后触发。
 
-## 8. 上下文
+## 8. 上下文与历史存储
 
 - 整个 QQ 号只有一个 agent、一份全局 transcript；群聊、私聊、请求事件按时间进入同一上下文（类 OpenClaw）。
 - 消息来源只用于已读标记与来源标注，不用于拆分上下文。
-- 持久化：session 写入本地 `~/.sbot/sessions/<timestamp>-<seq>.jsonl`，每行一条内部消息（含工具调用与结果）；SQLite 只做索引。
-- VFS `/sessions` 只读映射当前与归档文件；压缩轮转时新建文件，旧文件保留。
-- 加密模式下 JSONL 每行用 session 域密钥 AEAD 加密，存储为 `{"nonce":"<base64>","ciphertext":"<base64>"}`，AAD 绑定 `session:<file_id>:<line_no>`；VFS 读取时解密。`encryption = "none"` 时每行为明文 JSON。
-- 保留策略：按总大小或天数清理旧文件（可配置）。
-- `/inbox` 由系统维护：每个未处理会话一个 Markdown 文件，外加 `index.jsonl`；记录会话 ID、类型、最早/最新消息 ID、未读数、更新时间；标记已读或处理后移除。
-- session JSONL 行格式：明文内容为 `{role, content, tool_calls?, tool_call_id?, images?, usage?, ts}`；加密时外层为 `{nonce, ciphertext}`；文件头为明文 `{version, file_id, session_id, created_at, encryption}`；SQLite `sessions(id, file, prev_id, started_at, message_count)` 只做索引。
-- 触发：`context_tokens > context_window - reserve_tokens`（默认 `reserve_tokens = 16384`）；连续失败达到 `max_failures`（默认 3）后停止自动压缩并告警。
+- 记忆（VFS）与 transcript 分离：记忆长期保存，transcript 可压缩/轮转。
+
+### 8.1 Transcript 分段
+
+- `/sessions` 中的文件是 transcript 分段（segment），不是会话实体；整个 QQ 号仍然只有一份逻辑 transcript。
+- 文件：`~/.sbot/sessions/<YYYYMMDDTHHMMSSZ>-<seq>.jsonl`（UTC），名称按字典序即时间序；虚拟路径为 `/sessions/<file>`。
+- 启动：存在未关闭的当前分段时继续追加；否则创建新分段。当前分段路径以 VFS 路径写入 system prompt 的运行时上下文（`current_session`）。
+- 轮转：每次压缩成功后立即换新文件：
+  1. 生成检查点摘要并写入 `compaction_checkpoints`；
+  2. 关闭当前分段（记录 `ended_at`）；
+  3. 创建下一分段，文件头之后的第一条记录是摘要；
+  4. fsync 后更新 SQLite 索引的 `prev_id`，并刷新 system prompt 中的 `current_session`。
+- 摘要块固定包含 `previous_session: /sessions/<上一个分段>`；当前分段路径只出现在 system prompt。这样每个分段都能通过摘要回溯到被它替换的文件，形成历史搜索链。
+- 崩溃恢复：摘要先写入 `data.db` 的 `compaction_checkpoints`（加密），再关闭旧分段、创建新分段并 fsync，最后切换当前指针；启动时选择最新的完整分段，若其已关闭则用最近检查点创建新分段。
+- `compaction_checkpoints(id, from_file, summary_enc, created_at)` 只保留最近若干条，用于崩溃恢复与审计。
+- 文件头（明文）：`{version, file_id, prev_file?, created_at, encryption}`，header 行不参与 `Grep`；行格式：明文内容为 `{role, content, tool_calls?, tool_call_id?, images?, usage?, ts}`；加密时外层为 `{nonce, ciphertext}`，AAD 绑定 `session:<file_id>:<line_no>`；`encryption = "none"` 时为明文 JSON。
+- 图片不写入 JSONL：只记录 VFS 路径或消息 ID 引用，避免 transcript 复制二进制。
+- SQLite `transcript_files(id, file, prev_id, started_at, ended_at, message_count, bytes, pruned_at)` 只做可重建索引；`/sessions/index.jsonl` 是它的只读投影，列出 `file`、`prev`、`started_at`、`ended_at`、`message_count`、`bytes`、`pruned`，供从最新分段向历史遍历。
+- 内容只存加密 JSONL 分段；`/sessions`、`/sessions/index.jsonl` 与任何渲染/搜索结果都由 VFS 动态生成，不产生派生文件。
+- 压缩触发：`context_tokens > context_window - reserve_tokens`（默认 `reserve_tokens = 16384`）；连续失败达到 `max_failures`（默认 3）后停止自动压缩并告警。
 - 保留：按 `keep_recent_tokens`（默认 20000）从最新消息向前保留；切割点落在 turn 边界，不拆开工具调用与结果；单个工具结果超预算时保留其所属 turn。
 - 摘要：结构化检查点，包含目标、关键决定及理由、已完成进展、关键事实/路径/名称/错误、未决问题、下一步；已有摘要时使用增量更新 prompt，保留旧信息。
 - 摘要请求：不提供工具、只允许纯文本输出；预留输出 token；`<analysis>` 草稿块在写入上下文前剥离。
-- 轮转：压缩成功后新建 session JSONL，旧文件保留；`PostCompact` hook 注入到新上下文开头（摘要之前）。
+- `PostCompact` hook 注入到新上下文开头（摘要之前）；摘要本身在 hook 注入之后、保留消息之前。
 - 预算：`context_window` 减去系统提示、工具定义、输出预留；超限先压缩再请求。
-- 记忆（VFS）与 transcript 分离：记忆长期保存，transcript 可压缩/轮转。
+
+### 8.2 消息存储
+
+- 过滤只影响是否注入，不影响写入：所有入站与发送消息都记录。
+- 物理格式：加密 JSONL，按月/群/日分区；磁盘只存 JSONL 与可重建的索引缓存，不生成 Markdown、日视图或其他派生文件。
+- 目录（与 VFS 路径一一对应）：
+  - `~/.sbot/messages/groups/<gid>/<YYYY-MM>/<DD>.jsonl`
+  - `~/.sbot/messages/private/<qq>/<YYYY-MM>/<DD>.jsonl`
+- 文件头（明文）：`{v, scope, peer_id, date, encryption, created_at}`；header 行不参与渲染与 `Grep`。
+- 行：`{v, id, ts, scope, peer_id, sender_id, kind, nonce, ct}`；`ct` 是正文、原始 JSON、发送者名、回复信息等的 AEAD 密文；AAD 绑定 `message:<scope>:<peer_id>:<id>:<file_id>:<line_no>`。
+- 追加写：一条消息一行；撤回等事件向原消息所在文件追加 tombstone 行（`{op:"delete", id}`），不重写历史；原文件已清理时记录审计后忽略。按行 flush，崩溃最多丢失最后一小段未 fsync 的数据，启动时以 JSONL 为准重建索引。
+- 幂等：`data.db` 的 `message_index(scope, peer_id, qq_msg_id, file, line_no, ts, sender_id)` 提供唯一键 `(scope, peer_id, qq_msg_id)` 与去重；它只是可重建缓存，损坏或缺失时扫描 JSONL 重建，不作为事实来源。
+- 媒体不自动下载、不复制进消息库：密文中保留 URL 与消息段引用；需要时由 Agent 用 `Download` 存入 VFS。
+- VFS 视图（只读、动态渲染，磁盘无对应文件）：
+  - `/messages/groups/<gid>/<YYYY-MM>/<DD>.md`
+  - `/messages/private/<qq>/<YYYY-MM>/<DD>.md`
+- `LS` 直接读目录结构，不解密消息正文；`message_index` 只用于去重与检索加速，不参与路径枚举。`Read` 解密并只渲染请求范围；单日文件过大时分段读取。
+- `Grep` 在指定日期/月份内解密扫描；扫描预算、部分结果与末尾提示规则见 5.7，并写入 `Grep` 工具 description。
+- 分区按消息 `ts` 的本地日期；目标日期已清理的迟到消息写入当前日文件并标记 `late`，渲染时标注原始时间。
+- 启动时校验目录与索引：索引可重建；JSONL 缺失或损坏时标记并告警，不伪造空消息。
+
+### 8.3 保留、配额与清理
+
+- 三类独立计量：VFS（`max_vfs_bytes`）、消息（`max_message_bytes`）、transcript（`max_session_bytes`）；字节配额为 0 表示不限制。
+- 年龄保留：`message_retention_days` / `session_retention_days`，0 表示不按年龄删除。
+- 清理顺序：先按年龄，再按配额；消息删除各群/私聊下的完整月份目录（`messages/*/*/<YYYY-MM>/`），transcript 删除完整的已关闭分段；绝不删除当前月/当前分段。
+- 清理写审计日志（`data.db` 的 `retention_log`）；`transcript_files` 的 `pruned_at` 与 `/sessions/index.jsonl` 标记已清理分段，`message_index` 删除对应缓存行；读取已清理数据返回明确错误。
+- 清理会截断历史搜索链：摘要中的 `previous_session` 可能指向已清理分段；遇到该错误时依赖摘要与 VFS 记忆，不假装读过。
+- `sbot status` 与 `/system/storage` 显示三类用量、最旧/最新数据时间、清理阈值与最近一次清理。
+- 磁盘剩余低于 1 GB：先触发清理；仍不足时拒绝新的消息/分段写入并告警，已有数据保持可读。
+
+### 8.4 收件箱
+
+- `/inbox` 由系统维护：每个未处理来源（群/私聊）一个 Markdown 文件，外加 `index.jsonl`；记录来源类型、ID、最早/最新消息 ID、未读数、更新时间；标记已读或处理后移除。
 
 ## 9. 配置
 
@@ -585,7 +647,11 @@ require_mention = false
 path = "./data"                    # 相对 ~/.sbot；密钥固定为 ~/.sbot/key
 encryption = "xchacha20poly1305"   # 或 "none"（仅调试）；首次初始化后固定
 max_blob_bytes = 536870912         # 单文件 512 MB
-max_total_bytes = 10737418240      # 总量 10 GB
+max_vfs_bytes = 10737418240        # VFS 总量 10 GB；0 = 不限制
+max_message_bytes = 10737418240    # 消息 JSONL 总量 10 GB；0 = 不限制
+max_session_bytes = 2147483648     # transcript 总量 2 GB；0 = 不限制
+message_retention_days = 0         # 0 = 不按年龄删除
+session_retention_days = 0         # 0 = 不按年龄删除
 
 [tools.web_search]
 backend = "auto"               # auto | server | tool | off
@@ -761,6 +827,7 @@ action = "log"
 - `[tools.download].max_bytes` 必须为正数；域名列表合法。
 - `[gate].mode` 只能是 `trusted` / `auto` / `approve`；`max_per_minute` 必须为正数；`llm_review = true` 时审查模型必须可用。
 - `[storage].encryption` 只能是 `xchacha20poly1305` / `none`，且必须与数据库 `meta` 中记录的模式一致；加密模式下 `~/.sbot/key` 必须存在、格式正确且 canary 校验通过；`none` 启动时警告。
+- `[storage].max_*_bytes` 必须为非负整数（0 = 不限制）；`message_retention_days` / `session_retention_days` 必须为非负整数（0 = 不按年龄删除）；`storage.path` 必须可创建且可写。
 - `[compaction]` 的 `reserve_tokens` / `keep_recent_tokens` / `max_failures` 必须为正数。
 - `[swarm].max_depth` / `max_concurrency` 必须为正数。
 - 未知字段、未知协议、越界数值一次性列出全部错误，启动失败。
@@ -824,16 +891,16 @@ src/
     mod.rs             Vfs trait、路径规范化
     path.rs
     sqlite.rs          SQLite 后端（文本/二进制分块）
-    dynamic.rs         /friends 等实时节点
+    dynamic.rs         /friends、/messages、/sessions 等动态节点
     quota.rs
   qq/
     client.rs          NapCatLink 封装
     event.rs           事件归一化
     format.rs          消息段 ↔ 文本
   session/
-    mod.rs             全局 transcript 与轮转
-    jsonl.rs           session JSONL 写入/读取/加密
-    compaction.rs
+    mod.rs             transcript 分段、轮转与索引
+    jsonl.rs           分段 JSONL 写入/读取/加密
+    compaction.rs      压缩与摘要（含 previous_session）
   prompt/
     mod.rs             组装器
     hooks.rs           上下文注入 hook
@@ -844,7 +911,8 @@ src/
   storage/
     mod.rs             SQLite 连接与迁移
     crypto.rs          主密钥加载/生成、HKDF 域密钥、AEAD 封装
-    messages.rs
+    messages.rs        JSONL 月/日分区写入、索引缓存、VFS 渲染
+    retention.rs       用量统计、年龄/配额清理
 ```
 
 ## 11. 实施阶段
@@ -852,20 +920,25 @@ src/
 1. **Phase 0**：新 crate 脚手架、配置、SQLite 迁移框架、IPC、单实例、CLI。
 2. **Phase 1**：VFS（路径、SQLite 后端、二进制分块、配额、Read-before-Edit、种子、`/friends` 动态节点）。
 3. **Phase 2**：Provider trait + `chat` / `openai` / `anthropic` 三协议流式、服务端工具声明与结果解析、Agent loop 状态机、事件流、测试用 fake provider。
-4. **Phase 3**：NapCat 接入、事件归一化、消息持久化、过滤器、去抖、session JSONL 与 `/sessions` 映射。
+4. **Phase 3**：NapCat 接入、事件归一化、消息按月/群/日 JSONL 分区持久化、消息 VFS 视图、索引缓存与重建、配额与清理、过滤器、去抖、transcript 分段与 `/sessions` 映射。
 5. **Phase 4**：工具注册表、权限、全部文件工具、`API`、`Skill`、`Download`、`WebSearch` / `WebFetch`（含用户配置的 HTTP 后端）。
-6. **Phase 5**：提示词组装、上下文注入 hook、记忆策略、会话压缩。
+6. **Phase 5**：提示词组装、上下文注入 hook、记忆策略、压缩与 transcript 轮转/历史链（`previous_session`、`current_session`）。
 7. **Phase 6**：Swarm、MCP。
-8. **Phase 7**：端到端测试、NapCat 兼容性验证、文档、发布 tag。
+8. **Phase 7**：端到端测试、百万级消息与清理负载测试、NapCat 兼容性验证、文档、发布 tag。
 
 每个阶段独立提交并可运行测试；旧实现保留在同一仓库的历史中，不在新代码中保留兼容层。
 
 ## 12. 测试策略
 
 - 单元：VFS 路径与权限、配额、循环状态机（工具批次、终止、截断）、压缩触发。
+- 历史存储：transcript 轮转链（摘要 `previous_session`、system prompt `current_session`、崩溃恢复、已清理链错误）；消息 JSONL 日文件边界、tombstone、幂等去重、索引重建、日视图分页。
+- 保留与清理：按年龄与配额删除最旧完整月份/关闭分段，绝不删除当前；墓碑、`/sessions/index.jsonl` 标记、用量统计与审计日志。
+- Grep 部分结果：多目录中一个超预算时其他目录结果照常返回，末尾只列超预算路径并标 `skipped` / `partial`；提示不构成强制继续搜索；`Grep` description 快照包含 5.7 规则。
+- 加密：消息/transcript 内容为密文、索引明文；错误或缺失 key 时拒绝打开；`none` 模式警告。
+- 负载：百万级消息 JSONL 的追加写入、索引重建、`LS`/`Read`/`Grep` 响应时间，清理后目录大小与索引一致。
 - 集成：fake provider + 内存 VFS + fake QQ transport，覆盖一轮完整对话与工具调用。
 - IPC：真实命名管道/UDS 端到端（Windows/Unix 条件编译）。
-- 提示词：快照测试关键 section 与动态字段。
+- 提示词：快照测试关键 section 与动态字段（含 `current_session` 与历史检索段）。
 - NapCat 实机冒烟：连接、版本探测、群/成员查询、文本与组合消息、`message_sent` 开关、禁言权限、解散群、公告、文件、已读、断线重连。
 - NapCat：协议层静态兼容已确认；上线前必须完成一次 v4.18.41 实机冒烟。
 
@@ -884,10 +957,13 @@ src/
 - 事件 hook 首版支持 `SessionStart` / `SessionEnd` / `PreCompact` / `PostCompact` / `MessageReceived` / `BeforeSend` / `Stop` / `ConfigChange`；动作为声明式，不执行脚本。
 - 消息白名单改为模型可控的过滤器；过滤只影响是否提示，不影响存储。
 - 身份：只创建空的 `/AGENTS.md`；核心内容内置 system prompt；文件内容自动加载为附加指令；`SOUL.md`、`IDENTITY.md`、`MASTER.md` 不预置，由 Agent 自行决定记录方式；不设 `/identity` 与 `/memory`。
-- VFS 支持二进制：blob 分块加密、单文件 512 MB、总量 10 GB；下载与发送文件流式处理。
+- VFS 支持二进制：blob 分块加密、单文件 512 MB、`max_vfs_bytes` 默认 10 GB；下载与发送文件流式处理。
 - `/friends/<qq>/` 为多层动态节点（`profile.md`、`info.json` 实时查询，`notes.md` 本地可写）。
 - `/trash` 回收站：`RM` 默认移入，可用 `MV` 恢复，`permanent = true` 彻底删除；30 天或 10% 配额自动清理。
-- session 以本地加密 JSONL 落盘，VFS `/sessions` 只读映射当前与归档记录。
+- transcript 每次压缩成功后轮转新文件；摘要块固定包含 `previous_session`，system prompt 运行时上下文包含 `current_session`；`/sessions` 只读映射全部分段，`index.jsonl` 提供链式索引。内容只存加密 JSONL，视图全部由 VFS 动态生成，索引仅为可重建缓存。
+- 消息按群/私聊、月、日写入加密 JSONL（`messages/<scope>/<peer>/<YYYY-MM>/<DD>.jsonl`）；VFS `/messages` 动态渲染 `.md`，磁盘不生成派生文件；媒体只存 URL/引用，不自动下载。记录全部消息（过滤不影响写入），仅在达到 8.3 的保留/配额策略时清理最旧月份。
+- 增长控制：VFS / 消息 / transcript 三类独立配额（默认 10 GB / 10 GB / 2 GB，0 = 不限制）与可选年龄保留（默认 0 = 不按年龄删除）；超限从最旧完整月份/关闭分段清理，绝不删除当前；墓碑与 `status` 用量可见。
+- `Grep` 大目录按目录/文件分别计量预算；超预算目录只跳过或截断该目录，其他目录结果照常返回；末尾只列超预算路径并标 `skipped` / `partial`，提示可忽略；规则写入 `Grep` 工具 description。
 - 默认模型 `anthropic/claude-opus-5-5`，默认 effort `high`；示例模型组生效。
 - Swarm 子代理保留，默认开启（`[swarm] enabled = true`）。
 - `API` 暴露全部 NapCat action；每个调用经过可配置门禁：`trusted` / `auto`（规则 + 可选 LLM 审查）/ `approve`。
