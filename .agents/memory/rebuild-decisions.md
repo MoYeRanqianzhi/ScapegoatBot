@@ -34,6 +34,7 @@ ScapegoatBot 正在完全重构为全新项目，完整设计见 `.agents/plan/2
 ## 待定
 
 - `[gate].llm_review` 默认值待定（当前 false）。
+- Prompt 评审（2026-10-29）：21 项见 `.agents/plan/2026-10-29-prompt-review.md`；P0-4 sender/chat 已落地，P0-1/P1-15 待产品决策，其余待应用。
 
 **Evidence:** 设计文档 `.agents/plan/2026-10-28-rebuild-design.md` 与 2026-10-28 的对话结论。
 **Recheck when:** 用户确认 `llm_review` 默认值，或 Phase 0 开始后设计发生变化。
