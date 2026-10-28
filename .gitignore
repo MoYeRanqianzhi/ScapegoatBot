@@ -49,6 +49,11 @@ Desktop.ini
 *.tmp
 *.orig
 
+# ---- 外部参考仓库 ----
+# .ref/ 只放用于对照的上游项目（Claude Code、Codex、pi、Hermes 等），
+# 体积大、不参与构建，也不应进入本仓库历史。
+/.ref/
+
 # ---- Agent 本地记录与工作树 ----
 # .agents/ 下名字中含 `.local` 段的记录属于用户/机器私有，不进入共享历史：
 # MEMORY.local.md、TODO.local.md、memory/<name>.local.md、plan/<name>.local.md。

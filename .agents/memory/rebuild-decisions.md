@@ -16,13 +16,14 @@ ScapegoatBot 正在完全重构为全新项目，完整设计见 `.agents/plan/2
 - IPC：Windows named pipe / Unix domain socket，无 TCP。
 - VFS：`/AGENTS.md` 在根且默认空；`/friends/<qq>/`、`/groups/<gid>/` 动态目录；`/trash` 回收站；`/config` 配置视图；二进制 blob 分块加密。
 - 加密：内容加密、索引明文（不加密路径）；主密钥首次初始化时自动生成到 `~/.sbot/key`，无口令、无 keychain、无解锁步骤；所有状态统一放在 `~/.sbot`，复制该目录即完成迁移；威胁边界见设计文档 6.6。
-- Prompt：以 `You are ScapegoatBot` 开头；所有模型面文本英文；静态前缀与 `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` 动态上下文分离；QQ 回复跟随会话语言；默认纯文本，话题需要或主人人设明显使用 Markdown 时跟随；不用 Unicode emoji、用 QQ 表情；owner 通知走 master QQ 私聊；不单独设“是不是机器人”策略，跟随主人自己的人设；工具描述、错误、压缩/摘要与子代理提示英文；指令优先级为内置 > owner context > skill > QQ/网络数据。
+- Prompt：以 `You are ScapegoatBot` 开头；所有模型面文本英文；静态前缀与 `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` 动态上下文分离；动态段顺序 owner context → memory → skills → runtime（易变字段最后）；system prompt 会话内只构建一次、压缩后重建；QQ 回复跟随会话语言；默认纯文本，话题需要或主人人设明显使用 Markdown 时跟随；不用 Unicode emoji、用 QQ 表情；owner 通知走 master QQ 私聊；不单独设“是不是机器人”策略，跟随主人自己的人设；工具描述、错误、压缩/摘要与子代理提示英文；指令优先级为内置 > owner context > skill > QQ/网络数据。当前 v4，静态约 2,968–3,361 tokens（上限 10k），含注入总量上限 30k。
+- 长期运行（参考 Hermes Agent，见 `.agents/plan/2026-10-29-hermes-review.md`）：记忆用声明式陈述句、字符预算、满了合并；`<memory_context>` 与 `<owner_context>` 分标签，记忆永不作为 owner guidance；技能承载“这类任务怎么做”，用户纠正是一等信号；后台复盘默认空闲触发（`[memory].review = idle`）；技能 curator 只归档不删除；压缩摘要有 `## Corrections`、日期化过去式、密钥 `[REDACTED]`；`~/.sbot/ESTOP` 暂停/恢复；内部标签发送前与流式中剥离。
 - 历史存储：transcript 每次压缩成功后轮转新分段；摘要块含 `previous_session`，system prompt 含 `current_session`；`/sessions` 只读映射分段并提供 `index.jsonl` 链式索引；内容只存加密 JSONL，视图由 VFS 动态生成，索引仅为可重建缓存。
 - 消息存储：按群/私聊、月、日写入加密 JSONL（`messages/<scope>/<peer>/<YYYY-MM>/<DD>.jsonl`）；VFS `/messages` 动态渲染，磁盘不生成派生文件；索引可重建；记录全部消息，媒体只存 URL/引用。
 - 消息发送者：agent 发送标记 `self`，主人手动发送与其他用户标记 QQ 号；每条消息携带 `chat_id`；runtime 注入 `owner_qq` 与 `self_sender`。
 - 增长控制：VFS / 消息 / transcript 三类独立配额（默认 10 GB / 10 GB / 2 GB，0 不限制）与可选年龄保留（默认不按年龄删）；超限清理最旧完整月份/关闭分段，绝不删除当前；墓碑与用量可见。
 - Grep：大目录按目录/文件分别计量预算；超预算时只跳过或截断该目录，其他目录照常返回；结果末尾只列超预算路径并标 `skipped` / `partial`，提示可忽略；规则写入 `Grep` 工具 description。
-- 工具 PascalCase：`Read`、`Write`、`Edit`、`LS`、`Grep`、`Glob`、`RM`、`MV`、`CP`、`Mkdir`、`Stat`、`API`、`Download`、`Skill`、`WebSearch`、`WebFetch`、`Agent`、`MCP`。
+- 工具 PascalCase：`Read`、`Write`、`Edit`、`LS`、`Grep`、`Glob`、`RM`、`MV`、`CP`、`Mkdir`、`Stat`、`API`、`Download`、`Memory`、`Skill`、`WebSearch`、`WebFetch`、`Agent`、`MCP`；`Memory` 是 `/MEMORY.md` 的唯一写入口。
 - 配置：`sbot.toml` + `models.json` + `auth.json`；TOML/JSON 键 snake_case；`auth.json` 不挂载 VFS，`config.toml` 零凭据。
 - 事件 hook：`SessionStart`、`SessionEnd`、`PreCompact`、`PostCompact`、`MessageReceived`、`BeforeSend`、`Stop`、`ConfigChange`；无 `start_turn`。
 - API 门禁：`trusted` / `auto` / `approve`，覆盖所有 API 调用；`auto` 默认每条消息做规则检查。
@@ -34,9 +35,10 @@ ScapegoatBot 正在完全重构为全新项目，完整设计见 `.agents/plan/2
 ## 待定
 
 - `[gate].llm_review` 默认值待定（当前 false）。
-- Prompt catalog（2026-10-29）：工具 description、压缩、子代理、门禁、错误/提示文本见 `.agents/plan/2026-10-29-prompt-catalog.md`；system prompt 本体见设计文档 7.3。
+- Prompt catalog（2026-10-29）：工具 description、压缩、子代理、门禁、复盘/curator、错误/提示文本见 `.agents/plan/2026-10-29-prompt-catalog.md`；system prompt 本体见设计文档 7.3（v4）。
 - 双模式：`stand_in`（使用主人 QQ，替身）/ `companion`（使用另一个账号，伙伴）；`mode` 启动时固定，修改需重启；companion 在 system prompt/runtime 注入 `owner_qq`；身份段两套，其余共享。
-- Prompt 评审（2026-10-29）：21 项见 `.agents/plan/2026-10-29-prompt-review.md`；P0-4 sender/chat 已落地；owner 通知=master QQ 私聊；P1-15 不单独设策略；按全部 P0/P1/P2 落地中。
+- Prompt 评审（2026-10-29）：21 项见 `.agents/plan/2026-10-29-prompt-review.md`；第二轮 4 处 P0 矛盾与 N1–N15 已并入 v4；owner 通知=master QQ 私聊；不单独设“是不是机器人”策略。
+- Hermes 参考（2026-10-29）：`.agents/plan/2026-10-29-hermes-review.md`；已采纳分层 prompt、声明式记忆、技能学习回路、空闲复盘、curator、压缩纠错、ESTOP。
 
 **Evidence:** 设计文档 `.agents/plan/2026-10-28-rebuild-design.md` 与 2026-10-28 的对话结论。
 **Recheck when:** 用户确认 `llm_review` 默认值，或 Phase 0 开始后设计发生变化。
