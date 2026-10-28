@@ -120,7 +120,7 @@ ScapegoatBot/
 │   │   └── cursor.rs        #   文件游标管理
 │   └── skills/              # Skill 注册表（cap-std 沙箱隔离）
 ├── workspace/               # AI 工作区（运行时数据，不提交）
-├── docs/development/        # 开发文档
+├── .agents/                 # Agent 共享记忆与计划
 ├── config.example.toml      # 配置模板
 ├── LICENSE                  # MIT 许可证
 └── Cargo.toml
