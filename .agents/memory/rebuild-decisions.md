@@ -34,6 +34,7 @@ ScapegoatBot 正在完全重构为全新项目，完整设计见 `.agents/plan/2
 ## 待定
 
 - `[gate].llm_review` 默认值待定（当前 false）。
+- Prompt catalog（2026-10-29）：工具 description、压缩、子代理、门禁、错误/提示文本见 `.agents/plan/2026-10-29-prompt-catalog.md`；system prompt 本体见设计文档 7.3。
 - 双模式：`stand_in`（使用主人 QQ，替身）/ `companion`（使用另一个账号，伙伴）；`mode` 启动时固定，修改需重启；companion 在 system prompt/runtime 注入 `owner_qq`；身份段两套，其余共享。
 - Prompt 评审（2026-10-29）：21 项见 `.agents/plan/2026-10-29-prompt-review.md`；P0-4 sender/chat 已落地；owner 通知=master QQ 私聊；P1-15 不单独设策略；按全部 P0/P1/P2 落地中。
 

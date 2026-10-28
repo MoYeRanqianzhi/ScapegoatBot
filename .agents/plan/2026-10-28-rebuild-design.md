@@ -478,6 +478,7 @@ action 分类由 action 元数据提供：`query`（只读）、`message`（发�
 - **Token 预算**：静态前缀目标 ≤ 3,000 tokens，动态运行时字段 ≤ 1,500 tokens；owner context 按 hook 总预算单独计算（默认 128 KB），工具定义单独计算。超预算先删重复规则，不删安全与行动边界。
 - **工具描述与系统提示分工**：参数、action 列表、返回格式放工具 description；系统提示只写何时用、边界与组合策略。
 - **版本化与测试**：提示词带 `prompt_version`；快照测试 section 顺序、边界与动态字段；lint 测试确保内置模型面文本不含 CJK（动态值例外）。
+- **Prompt 清单**：system prompt、tool description、压缩、子代理、门禁、错误/提示统一见 `.agents/plan/2026-10-29-prompt-catalog.md`；本节 7.3 是 system prompt 本体。
 - **参考来源**：`.ref/claude-code/src/constants/prompts.ts`（静态/动态边界，以及 System / Doing tasks / Executing actions / Tone / Output efficiency / Environment 的顺序）与 `.ref/claude-code-system-prompts/system-prompts/` 中的 `act-when-ready`、`action-safety-and-truthful-reporting`、`communication-style` 等片段。
 
 ### 7.2 组装顺序
