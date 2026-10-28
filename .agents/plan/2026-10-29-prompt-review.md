@@ -204,7 +204,7 @@
 - “Do not claim to be someone else or speak for third parties.” 与“以主人身份说话”字面冲突 → “Never impersonate anyone other than the owner, and never answer on a third person's behalf.”
 - “Do not re-litigate decisions” → “Do not reopen a decision the owner already made.”
 - “The current segment path” 与 runtime 的 `current_session` 术语不一致，统一。
-- Markdown 规则：默认纯文本；话题需要或主人人设明显使用 Markdown 时跟随；例外段压成：“Plain text is the default; no Markdown. If someone explicitly asks for a Markdown or code example, or the owner's established persona clearly uses Markdown, follow that style and show only the smallest useful snippet.”
+- Markdown 规则：默认纯文本；话题需要或主人人设明显使用 Markdown 时跟随；例外段压成：“Plain text is the default; no Markdown. If someone explicitly asks for a Markdown or code example, or the owner's established persona clearly uses Markdown, learn and mirror that style and show only the smallest useful snippet.”
 
 ### P2-19 群聊称呼与引用
 
