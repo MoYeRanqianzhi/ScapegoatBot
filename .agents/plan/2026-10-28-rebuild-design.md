@@ -1,0 +1,878 @@
+# ScapegoatBot 彻底重构设计
+
+> 状态：设计草案（未实现）
+> 日期：2026-10-28
+> 参考：`.ref/pi`（agent loop）、`.ref/claude-code`（流程）、`.ref/claude-code-system-prompts`（提示词）
+
+## 1. 目标与原则
+
+- 完全重写现有实现，不保留模块划分与数据结构，只保留产品行为：以主人身份在 QQ 上像真人一样收发消息。
+- Agent loop 参考 pi：显式状态机 + 事件流 + steering/follow-up 队列 + 工具执行钩子。
+- 流程与提示词参考 Claude Code：模块化提示、工具即行动、权限前置检查、上下文压缩、子代理。
+- 文件系统采用虚拟文件系统（VFS）：Agent 只见虚拟路径，不接触宿主路径；数据集中存储并受 OS 权限保护。
+- 本地进程通信不走 TCP：Windows 命名管道 / Unix domain socket。
+- 工具链：无 Bash，文件工具覆盖读/写/编辑/删除/移动/复制/建目录/信息；QQ 合并为 `API`；`Skill` 管理共享与 VFS 本地技能；`WebSearch` / `WebFetch` 支持三种协议服务端工具与用户配置的 HTTP 工具后端；`MCP` 可选默认关闭。
+- 安全边界前置：消息过滤器、群管理能力、网络访问、写入配额都由运行时控制，而非仅靠提示词。
+
+## 2. 进程模型与 IPC
+
+### 2.1 形态
+
+- 单实例守护进程承载 NapCat 连接、Agent、VFS、SQLite。
+- CLI 作为独立客户端：`start`、`stop`、`restart`、`status`、`ai start|stop|restart`、`chat`。
+- 不监听任何网络端口。
+
+### 2.2 传输
+
+| 平台 | 传输 | 端点 |
+|------|------|------|
+| Windows | Named Pipe | `\\.\pipe\scapegoat-bot`（可由配置覆盖） |
+| Unix | Unix Domain Socket | `$XDG_RUNTIME_DIR/scapegoat-bot.sock`，回退临时目录 |
+
+- tokio 内置：`tokio::net::windows::named_pipe`（cfg(windows)）、`UnixListener/UnixStream`（cfg(unix)）。
+- 帧格式：4 字节大端长度 + JSON（与旧协议相同，传输层泛化为 `AsyncRead + AsyncWrite`）。
+- 请求类型：`Status`、`Shutdown`、`Ai { action }`、`Chat { message, scope }`、`SetModel { model }`、`SetEffort { level }`；响应：`{ ok, message }`。
+- Unix socket 启动时 unlink 陈旧文件并设置 0600；Windows 管道默认 ACL 仅当前用户。
+- 单实例：Windows 用 `first_pipe_instance(true)`；Unix 先探测 socket 是否可连接，再 bind。
+
+### 2.3 CLI 与运行时的关系
+
+- `chat` 指令进入 Agent 的 steering 队列，不等当前轮次结束。
+- `ai stop` 只暂停 LLM 调用；消息接收、存储、风格样本积累继续。
+
+## 3. Agent Loop（参考 pi）
+
+### 3.1 核心类型
+
+```
+AgentMessage = System | User | Assistant | ToolResult
+AssistantMessage { content: [Text | Thinking | ToolCall], stop_reason, usage }
+ToolResultMessage { tool_call_id, tool_name, content: [Text | Image], is_error, terminate }
+AgentEvent = agent_start | turn_start | message_start | message_update
+           | message_end | tool_execution_start | tool_execution_update
+           | tool_execution_end | turn_end | agent_end
+```
+
+### 3.2 循环结构
+
+- `run_agent(prompts, context, config)`：追加初始消息，进入 `run_loop`。
+- `continue_agent(context, config)`：不追加新消息，用于重试/后续运行。
+- 外层循环：内层结束后检查 follow-up 队列；有则继续。
+- 内层循环：只要还有工具调用或 steering 消息就继续：
+  1. `prepare_next_turn`：可替换 context/model，执行压缩等长操作。
+  2. 追加 prepared + steering 消息。
+  3. `prepare_request`：请求级变换。
+  4. `convert_to_llm`：把内部消息转换为 provider 消息。
+  5. 流式调用 LLM，发出 `message_start/update/end`。
+  6. 工具调用：本地工具走参数准备 → schema 校验 → `before_tool_call`（权限）→ 执行 → `after_tool_call` → 结果消息；服务端工具由 provider 执行，结果块直接进入响应。
+  7. `pause_turn`：服务端工具暂停时，追加响应内容并继续请求。
+  8. `finish_turn`：返回 `End` 或 `Continue`。
+- 错误/取消：`stop_reason = Error | Aborted` 直接结束本轮并发出 `agent_end`。
+- `stop_reason = MaxTokens` 且存在工具调用时：所有调用失败，不执行（参数可能被截断）。
+
+### 3.3 工具执行
+
+- `Tool` trait：
+  ```
+  name() / description() / parameters_schema()
+  execute(ctx, args, cancel) -> ToolResult
+  execution_mode() -> Sequential | Parallel
+  required_permissions() -> &[Permission]
+  ```
+- 执行模式：同一批工具调用可并行，声明 `Sequential` 的工具强制整批串行。
+- `ToolResult { content, structured, is_error, terminate, usage }`。
+- 未知工具、参数校验失败、被权限阻断都返回错误结果，不 panic、不中断循环。
+- 只有当一批结果全部 `terminate = true` 时才提前终止。
+- 服务端工具（`WebSearch` / `WebFetch`）不在本地执行，也不经过 `before_tool_call`；其参数与结果块由 provider 适配层转换。
+
+### 3.4 输入队列
+
+- **Steering**：轮次运行中到达的新消息/CLI 指令，在下一次 LLM 请求前注入。
+- **Follow-up**：轮次自然结束后到达的消息，开启新轮次。
+- 入队模式可配置：全部注入或一次一条。
+
+## 4. 消息流程（参考 Claude Code）
+
+```
+NapCat 事件
+  → 归一化（群/私聊/请求/通知）
+  → 过滤器判断（忽略的群/用户/关键词不注入 Agent，但消息仍写入存储）
+  → 写入消息存储（正文 + 原始 JSON + 索引）
+  → 去抖窗口（默认 3s）合并为一条 user 消息
+  → Agent steering/follow-up 队列
+  → LLM 循环
+  → 工具（发送消息 / VFS / 群管理 / MCP / Swarm）
+  → LLM 无工具调用 → 轮次结束
+```
+
+- 终止条件：LLM 返回 `end_turn`（无工具调用）即结束。移除强制 `Finish` 工具。
+- 系统提示明确：纯文本输出不会发送给任何人；要说话必须调用发送工具。
+- 整个 QQ 号只有一个 agent、一份全局 transcript；群聊、私聊、请求事件按时间进入同一上下文（类 OpenClaw）。
+- 入站消息去重：按 `message_id` 幂等写入；`message_sent` 事件同样去重。
+- 已读标记：首次成功请求后按来源标记，模拟真人。
+
+## 5. 工具链
+
+### 5.1 设计原则
+
+- 文件工具按 Claude Code 的粒度独立。没有 Bash，必须补齐日常文件操作：`Read` / `Write` / `Edit` / `LS` / `Grep` / `Glob` / `RM` / `MV` / `CP` / `Mkdir` / `Stat`。
+- QQ 接口数量多、形态同质，合并为单一 `API` 工具，用 `action` 分派。
+- 技能统一放在 `/skills`：宿主 `~/.sbot/skills` 只读层与 Agent 自建 VFS 层混合；`Skill` 工具只负责加载。
+- 网络工具固定为 `WebSearch` / `WebFetch` 两个名字；执行后端可选 provider 服务端或用户配置的 HTTP 工具接口。
+- `MCP` 可选，默认关闭。
+- 本地工具 15 个（MCP 关闭时 14 个）；`WebSearch` / `WebFetch` 按后端决定本地或服务端执行。
+
+### 5.2 工具集
+
+| 工具 | 执行位置 | 职责 | 参数 |
+|------|----------|------|------|
+| `Read` | 本地 | 读取 VFS 文本/图片；二进制返回元信息 | `path, offset?, limit?` |
+| `Write` | 本地 | 创建/覆盖文件；覆盖需先读 | `path, content` |
+| `Edit` | 本地 | 精确字符串替换，需先读 | `path, old_text, new_text, replace_all?` |
+| `LS` | 本地 | 列目录（可选递归） | `path, recursive?` |
+| `Grep` | 本地 | 文件内容搜索 | `pattern, path?, file_ext?, case_insensitive?` |
+| `Glob` | 本地 | 按文件名/路径模式匹配 | `pattern, path?` |
+| `RM` | 本地 | 删除文件或目录 | `path, recursive?` |
+| `MV` | 本地 | 移动或重命名 | `from, to` |
+| `CP` | 本地 | 复制文件或目录 | `from, to, recursive?` |
+| `Mkdir` | 本地 | 创建目录 | `path, parents?` |
+| `Stat` | 本地 | 元信息：类型/大小/版本/时间/子项数/hash | `path` |
+| `API` | 本地 | 全部 QQ 操作（含发送文件） | `action` + `params` |
+| `Download` | 本地 | URL 下载到 VFS（支持二进制） | `url, path, max_bytes?` |
+| `Skill` | 本地 | 加载技能全文 | `name, args?` |
+| `WebSearch` | 服务端或工具后端 | 网页搜索 | `query, count?, domains?` |
+| `WebFetch` | 服务端或工具后端 | 抓取网页为 Markdown | `url, max_content_tokens?` |
+| `Agent` | 本地 | 子代理管理 | `action: spawn \| message \| check \| wait \| list` |
+| `MCP` | 本地（可选） | 外部 MCP 工具 | `server, tool, args` |
+
+没有 Bash 时补齐的文件能力：
+
+- `RM`：删除文件或目录；目录删除必须 `recursive: true`。VFS 为软删除，保留审计与恢复能力。
+- `MV` / `CP`：整理记忆、技能与工作区文件；源与目标都做挂载点权限检查。
+- `Mkdir`：显式建目录；`Write` 也会自动创建父目录。
+- `Stat`：返回类型、大小、版本、修改时间、子项数、hash，供编辑前判断与调试。
+- 不提供 `Write.mode = append`：Write 只做创建/覆盖，与 pi、Claude Code 一致；追加内容用 `Edit`（在末尾锚点替换）完成。
+- 不提供：`ln`（符号链接可绕过 VFS 边界）、`chmod`（权限由挂载点固定）、`bash` / `exec`（零执行）。
+
+技能机制（参考 pi 与 Claude Code）：
+
+- `/skills` 是单一技能根，宿主 `~/.sbot/skills` 以只读层映射，Agent 自建技能写入 VFS 本地层，两者混合展示。
+- 目录结构遵循 Agent Skills 规范：`/skills/<name>/SKILL.md`，可附带 `scripts/`、`references/`、`assets/`。
+- `SKILL.md` frontmatter：`name`、`description`（必填），可选 `license`、`compatibility`、`metadata`、`allowed-tools`、`disable-model-invocation`。
+- 名称：小写字母、数字、连字符，不超过 64 字符；description 不超过 1024 字符。
+- 系统提示只列技能名称、描述与来源（共享/本地），完整内容由 `Skill` 工具或 `Read` 加载。
+- 同名冲突：VFS 本地层优先，启动时打印警告；共享层始终只读。
+- 创建/修改技能用 `Write` / `Edit` 写 `/skills/<name>/...`；无 Bash，技能内脚本不能执行，只能作为文本资源读取。
+
+`API` 的 action 覆盖：发送消息、撤回、表情回应、戳一戳、好友/群/成员查询、消息记录查询、群管理、好友/群请求处理。description 按类别列出。
+
+### 5.3 网络工具后端
+
+参考 DSH 的 `ctx.web` 能力接缝：模型侧的 `WebSearch` / `WebFetch` 工具名与 schema 固定，执行器是可替换的 `WebSearchProvider` / `WebFetchProvider`。协议决定工具如何送达模型，不决定能力是否存在。
+
+| 后端 | 说明 |
+|------|------|
+| `server` | 由 LLM provider 在服务端执行（原生 server tool） |
+| `tool` | 作为普通 function calling 工具注入，由用户配置的 Search/Fetch 端点或 HTTP fetch 执行 |
+| `auto` | provider 有原生 server tool 时用 `server`，否则用 `tool` |
+| `off` | 不注册该工具 |
+
+三种协议：
+
+| 协议 | `WebSearch` | `WebFetch` |
+|------|--------------|-------------|
+| `chat`（OpenAI Chat Completions） | 搜索模型可用 `web_search_options`；其余模型以 function calling 注入 `WebSearch` 工具 | 始终以 function calling 注入 `WebFetch` 工具，执行器为配置端点/HTTP |
+| `openai`（OpenAI Responses） | `tools: [{ "type": "web_search" }]`，支持域名 filters | 以 function calling 注入 `WebFetch` 工具 |
+| `anthropic`（Messages，默认） | `web_search_20260209`（旧模型 `web_search_20250305`） | `web_fetch_20260209`（旧模型 `web_fetch_20250910`） |
+
+本地执行器（`tool` 模式，所有协议可用）：
+
+- 端点由用户配置：`search_url` / `fetch_url`（完整 URL）或 `base_url` + `/v1/tools/search`、`/v1/tools/fetch`。不预置官方地址，可接 DeepSeek 官方、代理或兼容实现。
+- Search 请求字段 `query`、`count`（1–50）、`ori_question`、`localization`、`need_content`；返回 title/url/snippet/summary/content/date/rerank_score/authority。
+- Fetch 请求字段 `url`；返回页面 title 与 Markdown content。
+- 认证 `Authorization: Bearer <api_key>`；URL 或 key 未填写时不注册对应工具。
+- 以 DeepSeek 官方为例：约 5 元/千次成功请求，每端点 5 QPS，429 需退避；其他服务按各自限制。
+- 可选通用 HTTP fetch 执行器：HTML→Markdown、SSRF 防护、域名过滤、响应大小限制，不依赖任何 provider。
+- 结果归一化为统一结构：搜索 `{title, url, snippet, date?}` 列表；抓取 `{title, url, content}`。
+
+工具结果处理：
+
+- `server` 模式下服务端工具不进入本地 dispatch，结果作为 content block 在同一响应中返回；错误以结果块返回（如 `max_uses_exceeded`），不抛异常；`pause_turn` 需要追加内容后继续请求。
+- `tool` 模式下与其他本地工具相同：参数校验 → 权限/限制检查 → 执行 → 结果消息。
+- 不支持的 provider 不注册对应服务端工具；`auto` 自动切换到 `tool`。
+- 启用后查询内容与 URL 会发送给 provider 或用户配置的搜索服务，需在 README 与提示词中说明。
+
+### 5.4 权限
+
+本地工具由 `before_tool_call` 按工具与 action 检查：
+
+- `API` 暴露全部 NapCat action；发送消息/文件、戳一戳受发送门禁（5.6）约束；不再有发送白名单。
+- 危险 action（退群、解散、踢人、全员禁言、删好友）标记为高风险，仍受群身份与发送门禁约束。
+- `API` 的群管理 action → Bot 在该群为管理员/群主（能力限制，不是白名单）。
+- `API` 的成员/群查询 action → 模型自主；查询结果用于提示。
+- `Download` → 域名过滤 + SSRF 防护 + 大小限制。
+- 消息过滤器：`[filter]` 规则决定哪些消息注入 Agent；规则可由 Agent 通过 `/config/filter` 修改；消息始终写入存储。
+- `Write` / `Edit` / `RM` / `MV` / `CP` / `Mkdir` → 源与目标挂载点可写 + 配额；`RM` 为软删除。
+- `/config` 写入 → 仅限可热更/可修改项；敏感项拒绝并记录审计。
+- `/skills` 的共享层只读、本地层可写；同名技能本地优先。
+- `Agent` 的 spawn → swarm 开关、深度、并发。
+- `MCP` → 服务器启用 + 工具存在。
+
+`WebSearch` / `WebFetch` 的启用与限制在请求构造时决定：`backend`、`max_uses`、`allowed_domains` / `blocked_domains`、`max_content_tokens`。拒绝时返回可读错误并记录审计日志。群身份由 `GroupRoleState` 维护：启动全量同步 + 事件驱动 + 周期同步。
+
+### 5.5 实现
+
+- `Tool` trait：`name / description / parameters_schema / execute / execution_mode / required_permissions`。
+- 工具执行位置用 `ToolKind::Local | Server | ToolBackend` 标记。
+- provider trait 增加服务端工具声明：工具类型、可用模型、参数映射；响应解析补充 `server_tool_use` / `web_search_tool_result` / `web_fetch_tool_result` / `pause_turn`。
+- 文件工具各自一个模块；`API` / `Agent` / `Skill` 内部用 enum 分派 action，参数反序列化到各 action 的强类型结构并校验。
+- 工具 description 列出本工具的 action 与常用参数；错误信息说明失败原因和修正方式。
+- 工具结果统一为文本 + 可选图片 + `is_error`；NapCat 返回的 JSON 转为简洁文本。
+- 测试覆盖每个本地工具/action 的正常路径、权限拒绝与参数错误；服务端工具用 fake provider 验证三种协议声明与结果解析；工具后端用 mock HTTP 验证请求与归一化。
+
+### 5.6 API 门禁
+
+`API` 暴露全部 NapCat action；门禁作用于每一次 API 调用，而不只是发送消息。Claude Code / Codex 的 auto 模式会对 Bash 等工具调用做检查，这里对应 `API` 工具。
+
+| 模式 | 行为 |
+|------|------|
+| `trusted` | 直接执行，只保留可选速率统计 |
+| `auto`（默认） | 每次调用按 action 分类做规则检查；发送消息逐条检查频率、重复、跨群群发、@全体、链接/文件异常；`llm_review = true` 时每条发送与高风险 action 追加一次 LLM 审查；结果 allow / block / ask |
+| `approve` | 变更类 action（发送、群管理、删除好友、退群等）需主人确认；只读查询直接放行 |
+
+action 分类由 action 元数据提供：`query`（只读）、`message`（发送）、`admin`（群管理）、`destructive`（退群/解散/踢人/删好友等）。
+
+- 门禁在 `BeforeSend` hook 之后执行；hook 的 `block` 直接拒绝。
+- `auto` 默认对每条消息做规则检查；`llm_review` 默认关闭，打开后每条发送都审查，失败/超时按 fail-closed（默认 ask）。
+- 群发判定：同一内容在短时间内发送到多个群/用户；@全体、批量 @、管理员操作单独标记。
+- 所有调用与被拦截记录写审计日志；`/system/gate` 只读展示当前模式与最近记录。
+- `approve` 模式需要可用的主人通知通道。
+
+## 6. 虚拟文件系统（VFS）
+
+### 6.1 目标
+
+- Agent 只使用虚拟路径（如 `/AGENTS.md`、`/notes/MEMORY.md`），永远拿不到宿主真实路径。
+- 越权（`..`、绝对路径、盘符、符号链接）在 VFS 层被消除，而不是依赖路径字符串过滤。
+- 宿主磁盘上不出现 Agent 可浏览的明文工作区；数据集中在一个受 ACL 保护的存储中。
+
+### 6.2 挂载点
+
+| 虚拟路径 | 权限 | 内容 |
+|----------|------|------|
+| `/AGENTS.md` | rw | 默认空文件；内容自动加载进上下文；用户/Agent 可写 |
+| `/` 下其他普通路径 | rw | Agent 自主创建：身份资料、记忆、笔记、下载的文件；程序不规定格式 |
+| `/messages` | ro | 系统写入的聊天记录（按群/私聊分区存储） |
+| `/sessions` | ro | 本地 session JSONL 的只读视图（当前 + 归档） |
+| `/inbox` | ro | 未处理消息、待处理好友/群请求的只读视图 |
+| `/friends` | 混合（动态） | `/friends/<qq>/profile.md`、`info.json` 实时查询；`notes.md` 本地可写 |
+| `/groups` | 混合（动态） | `/groups/<gid>/profile.md`、`info.json`、`members/<qq>.md` 实时查询；`notes.md` 本地可写 |
+| `/trash` | rw | 回收站：`RM` 默认移入，可恢复或彻底删除 |
+| `/skills` | 混合 | 技能根：宿主 `~/.sbot/skills` 只读层 + VFS 本地可写层；同名本地优先 |
+| `/config.toml` | rw | `sbot.toml` 原文；不含任何凭据 |
+| `/config` | rw（受限） | 每项一个虚拟文件；未配置项显示默认值；敏感项只读 |
+| `/system` | ro | 过滤器、模型、运行时状态等只读信息 |
+| `/tmp` | rw | 单次任务临时文件，定期清理 |
+
+不再设置 `/identity` 与 `/memory`：`/AGENTS.md` 按规范放在根目录并自动加载；核心内容内置在 system prompt，不写进文件；`SOUL.md`、`IDENTITY.md`、`MASTER.md` 不预置，身份与主人资料由 Agent 自行决定记录方式；记忆由 Agent 自定文件名与结构，提示词只说明策略。`/friends` 是动态节点，`LS` / `Read` 触发实时 API 查询，离线时返回错误。
+
+### 6.3 路径规则
+
+- 统一 POSIX 风格：`/` 分隔，根为 `/`；不接受盘符、反斜杠、空段、`.`、`..`、null 字节。
+- 长度上限 255，深度上限 16；超出返回错误。
+- 路径先做 Unicode NFC 规范化，再按段校验。
+- 工具层不存在任何真实路径参数；错误信息只回显虚拟路径。
+
+### 6.4 节点与存储
+
+- 后端：SQLite（`data.db`），表：
+  - `vfs_nodes(id, parent_id, name_ciphertext, name_nonce, kind, content_ciphertext, content_nonce, key_version, size, mime, mode, version, created_at, updated_at, hash)`
+  - `vfs_chunks(node_id, idx, ciphertext, nonce, key_version)`：二进制按 64 KiB 分块，`vfs_nodes.size` 记录总大小。
+  - `vfs_reads(node_id, version, content_hash, is_partial, read_at)`：支撑 Read-before-Edit（全局单 agent，无会话维度）。
+- 原子写入：单事务更新内容与版本号；每次写入 `version + 1`。
+- 节点类型：text、binary、image、audio、video、file；按扩展名与内容检测 MIME。
+- 二进制内容不存 SQLite：写入 `~/.sbot/blobs/<node_id>/`，按 1 MiB 分块 AEAD 加密；SQLite 只存元数据、hash 与块索引，支持流式读取。
+- 单文件上限 512 MB（可配置）；文本仍存 SQLite，上限 1 MB。
+- `Read` 对文本返回正文；图片返回多模态内容；其他二进制只返回元信息，不把 base64 塞进上下文。
+- `Download` 写入二进制；`API` 发送文件时流式解密到临时文件，交给 NapCat 后立即删除。
+- 配额：单文件 512 MB、总量 10 GB / 100000 节点；写入前检查磁盘剩余（≥ 1 GB）。
+- 目录与文件均为虚拟节点，删除目录递归软删除（保留审计）。
+
+### 6.5 编辑前阅读（Read-before-Edit）
+
+参考 Claude Code 的 `readFileState` 与 pi 的 per-file mutation queue，映射到 VFS：
+
+**读取记录**
+
+- `fs.read` 成功后写入/更新 `vfs_reads`：`node_id`、`version`、`content_hash`、`is_partial`、`read_at`。
+- 只有 **全文读取**（未指定 offset/limit）才把 `is_partial` 置 false；分段读取不满足编辑前置条件。
+- 读取记录是全局的（整个 QQ 号一个 agent），不按群/私聊拆分。
+
+**写入前置检查（顺序固定）**
+
+1. 目标节点不存在：`fs.write` 允许创建；`fs.edit` 报错。
+2. 节点存在但当前 agent 没有读取记录 → 拒绝：`File has not been read yet. Read it first.`
+3. 读取记录为部分读取 → 拒绝：`Only part of the file was read. Read the full file before editing.`
+4. 读取记录的 `version` 与节点当前 `version` 不一致（或 `content_hash` 不匹配）→ 拒绝：`File has been modified since it was read. Read it again.`
+5. `fs.edit` 的 `old_text` 不存在或匹配不唯一（未开 `replace_all`）→ 拒绝并说明匹配数。
+6. 全部通过后，在事务内写入并递增版本；`vfs_reads` 中该节点的记录同步更新为新版本（本次写入视为已读）。
+
+**并发**
+
+- 同一节点的写操作按 `node_id` 串行化（进程内 keyed async mutex），事务提交后再释放。
+- 不同节点的写可以并行；SQLite 使用单写连接或 `BEGIN IMMEDIATE`，避免写写冲突。
+- 版本冲突返回可读错误，由 LLM 重新 Read 后再试，不自动合并。
+
+**与参考实现的差异**
+
+- Claude Code 依赖文件 mtime + 内容比对规避 Windows 时间戳误报；VFS 以节点 `version` 为权威，不依赖 mtime。
+- pi 只做 per-file 写串行化，不做读取状态检查；本设计两者都采用。
+- `fs.write` 覆盖已存在节点时同样要求先读（与 Claude Code 的 Write 对齐）；新建不要求。
+
+**测试**
+
+- 未读编辑、部分读编辑、读后版本变化、并发双写、old_text 多处匹配、跨会话读取状态隔离。
+
+
+### 6.5 外部不可见
+
+- 存储位置：Windows `%LOCALAPPDATA%\ScapegoatBot\`，Unix `~/.local/share/scapegoat-bot/`；目录权限 0700 / 仅当前用户 ACL。
+- 数据库文件不放在项目目录或 `workspace/` 明文目录。
+- 日志不打印文件内容，仅路径、大小、hash。
+- 路径与内容加密：`vfs_nodes` 的 `name` 与文本 `content` 以 XChaCha20-Poly1305（AEAD）加密，每节点独立随机 nonce；二进制 blob 按 1 MiB 分块 AEAD 加密；`vfs_reads` 等索引只保留 node_id 与 hash。
+- 内存索引：启动时解密节点元数据，建立内存路径索引；此后 `LS` / `Glob` 走内存，`Read` 才解密内容。10 万节点冷启动约几十毫秒。
+- 密钥封装：随机 256-bit DEK 加密数据；KEK 由 Argon2id（64 MiB、t=3、p=4）从启动口令派生，或由 OS keychain / Windows DPAPI 生成并保护；有 TPM 2.0 时可选密封。配置文件只存盐与 KDF 参数，不存密钥。
+- 解锁不依赖单一平台：首次启动设置主口令，KEK 由 Argon2id 派生；`unlock = "keychain"` 只是把口令存入当前 OS 凭据管理器以便自动解锁，`"passphrase"` 每次启动输入。迁移到其他 OS 或机器时输入同一口令即可；`sbot key export` 生成加密恢复文件，`sbot key import` 恢复。OS keychain/TPM 是便利层，不是唯一密钥来源。
+- 内存保护：密钥仅驻留内存，`zeroize` 清零，`mlock` / `VirtualLock` 防换页；日志、status、崩溃输出脱敏。
+- 轮换：DEK 轮换只需重新包装，不重写全部数据。
+- 可选关闭：`[storage] encryption = "none"` 时路径与内容明文存储，仅用于本地调试；启动时打印警告，`status` 标记为未加密。
+- 威胁边界：磁盘/备份泄露无法解密；同用户下能读取进程内存、注入进程或调试的攻击者，纯软件无法完全防御；TPM/口令双因素用于提高门槛，README 如实说明。
+- 导出命令需显式授权。
+- 消息/会话数据由系统写入，Agent 只读；身份/记忆文件可写但受挂载点与大小限制。
+
+### 6.6 种子与初始化
+
+- 全新项目，不迁移旧 `workspace/` 或旧会话数据；首次启动只创建空的 `/AGENTS.md`；核心规则内置在 system prompt；不预置 `SOUL.md`、`IDENTITY.md`、`MASTER.md` 与记忆目录，由 Agent 自行决定记录方式。
+- `/skills` 以 overlay 方式组合宿主 `~/.sbot/skills`（只读）与 VFS 本地层（可写）；可选导出本地技能到宿主。
+- 不提供旧数据导入命令。
+
+### 6.7 配置视图
+
+- `/config.toml` 映射 `sbot.toml` 原文，可读写；写入触发整文件解析、校验、应用与持久化。
+- `/config/<section>/<key>` 映射每个配置项，叶子文件内容为当前生效值（TOML 字面量）。未显式配置的项也存在于虚拟树中，显示默认值；默认值为空时显示空字符串，避免"文件不存在"的歧义。
+- 数组/表按叶子路径展开：`/config/agent/available_models`、`/config/tools/web_search/backend`、`/config/models/main/max_tokens`。
+- 写入流程：解析 → 校验 → 应用可热更项 → `toml_edit` 原子写回 `sbot.toml` → 失败回滚并保持原值。
+- 热更新项：模型、effort、压缩参数、工具开关、技能目录、swarm 参数；需重启项：napcat、storage、control 等，写入时接受但提示重启。
+- 敏感项只读或不可见：
+- `auth.json` 不挂载，模型不可见；`/config/models.json` 只读暴露模型定义。
+  - storage 加密密钥、napcat token、control 端点不可由 Agent 修改；过滤器可修改。
+  - `models.json` 只读；可用模型列表在 `/config/agent/available_models` 中修改。
+- 配置树只能修改 schema 已定义的项，不能创建新项；未知路径返回错误。例外：`/config/hooks/context/<name>/...` 允许创建新的 context hook。
+- 所有写入记录审计日志（路径、旧值、新值，密钥类值脱敏）。
+
+### 6.8 动态节点与回收站
+
+`/friends/<qq>/` 结构：
+
+- `profile.md`：实时生成昵称、备注、分组、在线状态；只读。
+- `info.json`：`get_friend_list` 返回的原始数据；只读。
+- `notes.md`：VFS 本地可写笔记，不实时查询。
+- 离线或 API 失败时 `profile.md` / `info.json` 返回错误，`notes.md` 仍可读写。
+
+`/groups/<gid>/` 结构：
+
+- `profile.md`：实时群资料（群名、人数、群主、公告摘要）；只读。
+- `info.json`：`get_group_list` 返回的原始数据；只读。
+- `members/<qq>.md`：实时成员资料（昵称、群名片、角色、加入时间）；只读。
+- `notes.md`：VFS 本地可写群笔记/群规记录。
+- 离线或 API 失败时实时文件返回错误，`notes.md` 仍可读写。
+
+回收站：
+
+- `RM` 默认移动到 `/trash/<timestamp>-<原路径>`，保留原路径、删除时间、大小、hash；`/trash/index.jsonl` 记录。
+- `RM` 参数 `permanent = true` 彻底删除；对 `/trash` 内条目执行 `RM` 也是永久删除。
+- 恢复：`MV /trash/... /原路径`。
+- 自动清理：超过 30 天或 `/trash` 超过总配额 10% 时清理最旧条目。
+- `/trash` 写入受 VFS 配额与权限约束，不计入 Agent 常驻上下文。
+
+## 7. 提示词设计（参考 Claude Code）
+
+### 7.1 结构
+
+提示词由独立 section 组装，按当前模型、过滤器、群身份、技能动态裁剪：
+
+1. **身份**：你是主人的 QQ 替身，一切言行以主人身份呈现；身份资料与主人信息由你自行记录，不强制固定文件或格式。
+2. **行动方式**：没有直接输出通道，文本不会发送；说话必须调用消息工具。
+3. **工作流程**：读上下文 → 判断是否回复 → 发送 → 必要时更新记忆。
+4. **工具规范**：文件工具独立、QQ 能力统一走 `API.action`、`WebSearch` / `WebFetch` 由服务端执行；VFS 路径语义、二进制下载与发送、`/friends` 实时查询、消息段格式、群管理能力；MCP 默认关闭。
+5. **拟人准则**：模仿主人用词与节奏；一条消息只说一件事；不用 Unicode emoji；使用 QQ 表情/颜文字。
+6. **安全**：过滤器、身份保密、提示注入防护、群管理操作谨慎、不可执行命令。
+7. **记忆**：不规定目录；提示词说明何时写、如何组织、写入前先读；记忆文件由 Agent 在根目录自行创建。
+8. **决策**：沉默优于错误回复；不过时补发；不确定先查记录。
+9. **运行时上下文**：当前时间、模型、可发送/接收范围、群身份、未处理消息、前一会话引用。
+10. **附加指令**：会话开始与压缩后自动读取 `/AGENTS.md`；非空时注入到上下文开头，空文件跳过；内置规则优先于文件内容。
+
+### 7.2 风格
+
+- 短句、命令式、一条规则一句；删除口号式重复。
+- 每段只回答“做什么、为什么、边界在哪”。
+- 工具描述与系统提示分工：工具参数细节放工具 description，提示词只讲策略。
+- `/AGENTS.md` 上限 64 KB，超出截断并告警；只在会话开始与压缩后读取，Agent 自己修改无需重注入。
+- 提示词内容版本化并配单元测试（关键 section 存在、动态字段正确）。
+
+### 7.3 上下文注入 Hook
+
+用 hook 决定哪些文件内容在**会话开始时**与**压缩后**自动进入上下文；`/AGENTS.md` 只是默认 hook 的一个实例。参考 Claude Code：压缩完成后执行 SessionStart hook（来源 `compact`），重新注入 CLAUDE.md 等上下文。
+
+```toml
+[[hooks.context]]
+name = "soul"
+path = "/SOUL.md"
+when = ["SessionStart", "PostCompact"]
+inject = "system"        # system | user_prefix
+max_bytes = 32768
+enabled = true
+
+[[hooks.context]]
+name = "memory"
+path = "/MEMORY.md"
+when = ["SessionStart", "PostCompact"]
+inject = "user_prefix"
+```
+
+行为：
+
+- `when` 只支持 `SessionStart`（进程启动/新会话）与 `PostCompact`（压缩成功后重建上下文），可同时启用。
+- 不监听文件变化：Agent 自己写入/编辑文件时，工具结果已在上下文中，知道自己改了什么；不做 `onChange` 重注入。
+- `PostCompact` 注入位置在新上下文开头（压缩摘要之前），确保身份与记忆先于摘要出现。
+- `path` 支持单个文件或 glob（如 `/memories/*.md`）；文件不存在时静默跳过；每次触发重新读取当前内容。
+- 多个文件按 hook 顺序与路径排序拼接；单 hook 与总注入预算（默认 128 KB）都可配置。
+- 注入内容带来源标记（如 `<context path="/SOUL.md">`）；系统提示声明内置规则优先于注入内容。
+- 注入计入上下文 token 预算；压缩后 hook 注入仍然保留。
+- 默认 hook：`/AGENTS.md` → `inject = "system"`、`when = ["SessionStart", "PostCompact"]`、64 KB。
+- 安全：hook 只能读取 VFS 中可读文件，不能读取 `auth.json`（不在 VFS）、不能执行命令、不能改变工具权限。
+- `/system/hooks` 展示当前 hook、最近触发来源（startup/compact）与字节数。
+- Agent 可通过 `/config/hooks/context/<name>/...` 创建或修改 hook，下一次会话开始或压缩后生效。
+
+### 7.4 事件 Hook
+
+首版支持以下事件；事件名保持 Claude Code 的 PascalCase 风格，配置键与枚举值使用 snake_case：
+
+| 事件 | 触发点 | 可用动作 |
+|------|--------|----------|
+| `SessionStart` | 进程启动/新会话 | `inject_context`, `log` |
+| `SessionEnd` | 进程退出 | `log`, `notify` |
+| `PreCompact` | 压缩前 | `log`, `inject_context` |
+| `PostCompact` | 压缩后 | `inject_context`, `log` |
+| `MessageReceived` | 消息归一化后、过滤前 | `inject_context`, `log`, `block` |
+| `BeforeSend` | `API` 发送前 | `block`, `rewrite`, `log` |
+| `Stop` | 轮次结束 | `log` |
+| `ConfigChange` | `/config` 写入后 | `log` |
+
+```toml
+[[hooks.events]]
+event = "BeforeSend"
+action = "log"             # log | block | rewrite | inject_context | notify
+match = { group_id = 123 }  # 可选：group_id / user_id / message_type / tool_name
+enabled = true
+```
+
+- 动作是声明式的，不执行 shell 或任意脚本。
+- `block` 需要 `reason`；`rewrite` 使用内置正则替换（`pattern` / `replacement`）；`inject_context` 需要 `path` 或 `text`。
+- `notify` 默认只写日志；`notify_channel = "owner"` 时才给主人发私聊，必须显式开启，且这条通知不触发 hook。
+- `match` 支持精确标量、数组（任一匹配）、字符串 glob（含 `*`）；字段为 `group_id` / `user_id` / `message_type` / `tool_name`。
+- `rewrite` 使用 Rust `regex`：`pattern` + `replacement`（支持 `$1`），只作用于文本消息，超长输入拒绝。
+- 不提供 `start_turn` 动作：hook 不能主动开启新轮次，避免自激循环与会话成本失控；主动行为应由主人指令或定时功能触发。
+- `BeforeSend` 的 `block` / `rewrite` 默认 `scope = "model"`，只作用于模型发送的消息；`scope = "all"` 才影响主人消息。
+- 事件按数组顺序执行；任一 `block` 中止后续动作。
+- 错误只记录日志，不中断主流程；同一事件最多执行 16 个 hook。
+- `ConfigChange` 在配置写入并应用后触发。
+
+## 8. 上下文
+
+- 整个 QQ 号只有一个 agent、一份全局 transcript；群聊、私聊、请求事件按时间进入同一上下文（类 OpenClaw）。
+- 消息来源只用于已读标记与来源标注，不用于拆分上下文。
+- 持久化：session 写入本地 `~/.sbot/sessions/<timestamp>-<seq>.jsonl`，每行一条内部消息（含工具调用与结果）；SQLite 只做索引。
+- VFS `/sessions` 只读映射当前与归档文件；压缩轮转时新建文件，旧文件保留。
+- 加密模式下 JSONL 每行 AEAD 加密，VFS 读取时解密；`encryption = "none"` 时明文。
+- 保留策略：按总大小或天数清理旧文件（可配置）。
+- `/inbox` 由系统维护：每个未处理会话一个 Markdown 文件，外加 `index.jsonl`；记录会话 ID、类型、最早/最新消息 ID、未读数、更新时间；标记已读或处理后移除。
+- session JSONL 行格式：`{role, content, tool_calls?, tool_call_id?, images?, usage?, ts}`；加密时每行为 `{nonce, ciphertext, key_version}`；文件头记录 `{version, session_id, created_at}`；SQLite `sessions(id, file, prev_id, started_at, message_count)` 只做索引。
+- 触发：`context_tokens > context_window - reserve_tokens`（默认 `reserve_tokens = 16384`）；连续失败达到 `max_failures`（默认 3）后停止自动压缩并告警。
+- 保留：按 `keep_recent_tokens`（默认 20000）从最新消息向前保留；切割点落在 turn 边界，不拆开工具调用与结果；单个工具结果超预算时保留其所属 turn。
+- 摘要：结构化检查点，包含目标、关键决定及理由、已完成进展、关键事实/路径/名称/错误、未决问题、下一步；已有摘要时使用增量更新 prompt，保留旧信息。
+- 摘要请求：不提供工具、只允许纯文本输出；预留输出 token；`<analysis>` 草稿块在写入上下文前剥离。
+- 轮转：压缩成功后新建 session JSONL，旧文件保留；`PostCompact` hook 注入到新上下文开头（摘要之前）。
+- 预算：`context_window` 减去系统提示、工具定义、输出预留；超限先压缩再请求。
+- 记忆（VFS）与 transcript 分离：记忆长期保存，transcript 可压缩/轮转。
+
+## 9. 配置
+
+### 9.1 设计原则
+
+- 单一文件 `sbot.toml`（默认 `~/.sbot/sbot.toml`），不再有 `llm.toml`。
+- 严格 schema：`version = 1`，未知字段报错，所有字段有显式默认。
+- 配置文件中不出现任何凭据字段（`api_key`、`token`、`key`）；全部凭据在 `auth.json`，该文件不挂载 VFS。
+- 环境变量覆盖：`SBOT__SECTION__KEY`（双下划线表示层级）。
+- 相对路径按配置文件所在目录解析并规范化。
+- 配置对 Agent 可见：`/config.toml` 与 `/config/**` 可读；敏感项不可见或只读。
+- 可热更项通过指令或 `/config` 立即生效；需重启项在写入时提示。
+
+### 9.2 完整结构
+
+```toml
+version = 1
+models_file = "~/.sbot/models.json"   # 可选，默认该路径
+auth_file = "~/.sbot/auth.json"       # 可选，默认该路径
+
+[agent]
+name = "ScapegoatBot"
+available_models = [
+  "anthropic/claude-opus-5-5",
+  "anthropic/claude-haiku-5-5",
+  "deepseek/deepseek-chat",
+]
+model = "anthropic/claude-opus-5-5"
+thinking_level = "high"
+compaction_model = "anthropic/claude-haiku-5-5"
+master = "self"                # 或 QQ 号
+max_steps = 64
+
+[napcat]
+url = "ws://127.0.0.1:3001"
+
+[filter]
+ignore_groups = []
+ignore_users = []
+ignore_patterns = []
+require_mention = false
+
+[storage]
+path = "./data"
+encryption = "xchacha20poly1305"   # 或 "none"（仅调试）
+unlock = "keychain"                # keychain | passphrase
+max_blob_bytes = 536870912         # 单文件 512 MB
+max_total_bytes = 10737418240      # 总量 10 GB
+
+[tools.web_search]
+backend = "auto"               # auto | server | tool | off
+base_url = ""                  # tool 后端由用户填写
+count = 10
+
+[tools.web_fetch]
+backend = "auto"
+base_url = ""
+max_content_tokens = 20000
+
+[tools.download]
+max_bytes = 536870912
+allowed_domains = []
+blocked_domains = []
+
+[mcp]
+enabled = false
+
+[skills]
+shared_dir = "~/.sbot/skills"
+
+[swarm]
+enabled = true
+max_depth = 8
+max_concurrency = 16
+
+[gate]
+mode = "auto"                  # trusted | auto | approve
+max_per_minute = 20
+llm_review = false             # auto 模式下逐条审查发送与高风险 action
+
+[compaction]
+reserve_tokens = 16384
+keep_recent_tokens = 20000
+max_failures = 3
+
+[[hooks.context]]
+name = "soul"
+path = "/SOUL.md"
+when = ["SessionStart", "PostCompact"]
+inject = "system"
+max_bytes = 32768
+
+[[hooks.context]]
+name = "memory"
+path = "/MEMORY.md"
+when = ["SessionStart", "PostCompact"]
+inject = "user_prefix"
+
+[[hooks.events]]
+event = "BeforeSend"
+action = "log"
+```
+
+### 9.3 模型定义（models.json）
+
+`models.json` 只描述 provider 与模型参数，不包含任何密钥：
+
+```json
+{
+  "providers": {
+    "anthropic": {
+      "name": "Anthropic",
+      "api": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "timeout_secs": 120,
+      "max_retries": 2,
+      "models": [
+        {
+          "id": "claude-opus-5-5",
+          "name": "Claude Opus 5.5",
+          "reasoning": true,
+          "thinking_levels": ["low", "medium", "high", "xhigh", "max"],
+          "default_thinking_level": "high",
+          "input": ["text", "image"],
+          "context_window": 1000000,
+          "max_tokens": 128000,
+          "capabilities": ["tools", "server_tools.web_search", "server_tools.web_fetch"],
+          "cost": { "input": 4.0, "output": 20.0 }
+        },
+        {
+          "id": "claude-haiku-5-5",
+          "name": "Claude Haiku 5.5",
+          "reasoning": true,
+          "thinking_levels": ["low", "medium", "high", "max"],
+          "default_thinking_level": "medium",
+          "input": ["text", "image"],
+          "context_window": 200000,
+          "max_tokens": 16384,
+          "capabilities": ["tools", "vision"]
+        }
+      ]
+    },
+    "deepseek": {
+      "name": "DeepSeek",
+      "api": "chat",
+      "base_url": "https://api.deepseek.com/v1",
+      "models": [
+        {
+          "id": "deepseek-chat",
+          "name": "DeepSeek Chat",
+          "reasoning": false,
+          "input": ["text"],
+          "context_window": 64000,
+          "max_tokens": 8192,
+          "capabilities": ["tools"]
+        }
+      ]
+    }
+  }
+}
+```
+
+字段说明：
+
+- 顶层 `providers`；provider 的 `API` 取 `anthropic` | `openai` | `chat`，即三种协议。
+- 模型 `id` 必填（API model ID）；引用形式为 `provider/id`，例如 `anthropic/claude-opus-5-5`。
+- `thinking_levels` 是模型支持的 effort 列表；`default_thinking_level` 是默认值；`thinking_level_map` 可选，把统一级别映射到供应商特定值（缺省同名）。
+- `capabilities`：`tools`、`vision`、`server_tools.web_search`、`server_tools.web_fetch`；用于决定是否注册对应工具与发送多模态内容。
+- `input`：`text` / `image`。
+- `context_window`、`max_tokens`、`cost`、`samplingParams`、`compat` 可选。
+- 内置 `models.json` 随二进制发布；用户 `~/.sbot/models.json` 按 provider + id 覆盖/追加。
+
+### 9.4 凭据（auth.json）
+
+`auth.json` 保存所有凭据，与配置分离，权限 0600（Windows 仅当前用户 ACL），不进入版本控制：
+
+```json
+{
+  "providers": {
+    "anthropic": { "api_key": "$SBOT_ANTHROPIC_KEY" },
+    "deepseek": { "api_key": "$DEEPSEEK_API_KEY" }
+  },
+  "napcat": {
+    "access_token": "$NAPCAT_TOKEN"
+  },
+  "tools": {
+    "web_search": { "api_key": "$SBOT_SEARCH_KEY" },
+    "web_fetch": { "api_key": "$SBOT_FETCH_KEY" }
+  },
+  "storage": {
+    "key": { "keyring": "scapegoat-bot" }
+  }
+}
+```
+
+- `sbot.toml` 与 `/config` 中完全不出现凭据字段；所有 key/token 只在这里。
+- 值支持 `"$ENV_NAME"` 环境变量插值、字面量或 `{ "keyring": "service/account" }`。
+- `auth.json` 不挂载到 VFS，模型无法读取；日志与 `status` 不显示 key。
+- 未在 `auth.json` 中提供 key 的 provider 不可用；启动时只对 `available_models` 引用到的 provider 校验。
+- 文件缺失时，允许全部凭据来自环境变量；启动时打印缺失项。
+
+### 9.5 可用模型与热切换
+
+- `[agent].available_models` 是白名单：只有列表中的模型可用于主模型、压缩模型和 `Agent` 工具 spawn；`models.json` 中存在但未列入的模型不可用。
+- `[agent].model`、`compaction_model`、`thinking_level` 是当前选择；启动时校验模型存在、effort 受支持。
+- 热切换指令：
+  - `sbot model set <provider/id>`
+  - `sbot effort set <level>`
+  - 控制协议新增 `SetModel { model }` / `SetEffort { level }`。
+- 生效时机：当前 LLM 请求结束后、下一次请求前；不中断正在执行的工具。
+- 切换后重建 provider（协议/key 可能不同）、重新计算 `context_window` 与压缩阈值；新窗口更小时先压缩。
+- 持久化：用 `toml_edit` 原子写回 `sbot.toml`，保留注释；写回失败则运行时生效并告警。
+- 校验：模型必须在 `available_models`，effort 必须在模型 `thinking_levels` 中；否则拒绝并返回可用值。
+- `sbot status` 显示当前模型、effort、可用模型及各自的 effort 列表。
+
+### 9.6 启动校验
+
+- `version` 必须为 1。
+- `agent.model` / `compaction_model` 必须存在于 `available_models`；`thinking_level` 必须在所选模型的 `thinking_levels` 中。
+- `filter.ignore_patterns` 中的正则必须可编译；群/用户 ID 必须为非零整数。
+- `hooks.context` 的 `name` 唯一，`path` 必须是 VFS 可读路径或合法 glob，`when` 只能是 `SessionStart` / `PostCompact`，`inject` 只能是 `system` / `user_prefix`。
+- `hooks.events` 的 `event` / `action` 必须为枚举值，`event` 只能是 `SessionStart` / `SessionEnd` / `PreCompact` / `PostCompact` / `MessageReceived` / `BeforeSend` / `Stop` / `ConfigChange`；`match` 字段合法，每个事件最多 16 条。
+- `[tools.web_*].backend = "tool"` 时 URL 与 key 必须同时存在；未填 key 不注册对应工具。
+- `[tools.download].max_bytes` 必须为正数；域名列表合法。
+- `[gate].mode` 只能是 `trusted` / `auto` / `approve`；`max_per_minute` 必须为正数；`llm_review = true` 时审查模型必须可用。
+- `[storage].unlock` 只能是 `keychain` / `passphrase`；`[storage].encryption = "xchacha20poly1305"` 时密钥必须可解析；`"none"` 启动时警告。
+- `[compaction]` 的 `reserve_tokens` / `keep_recent_tokens` / `max_failures` 必须为正数。
+- `[swarm].max_depth` / `max_concurrency` 必须为正数。
+- 未知字段、未知协议、越界数值一次性列出全部错误，启动失败。
+- 子代理的 `model` / `thinking_level` 在 spawn 时校验；模型不存在则拒绝，级别不支持则 clamp 到最近级别并警告。
+
+### 9.7 NapCat 兼容性（2026-10-28 调查）
+
+- 目标版本：NapCatQQ **v4.18.41**（2026-10-21）；解散群功能要求 ≥ v4.18.34。不跟随 `main`。
+- NapCatLink 是项目自有代码（`../NapCatLink`），不 fork：先同步到上游发布提交 `c5ca56f`，再直接修改并提交；修复 token URL 编码、补 17 个新 action 强类型、补 `onlinefile` / `flashtransfer` 段，并修正本地 tag 指向。重构期间继续依赖 `=0.1.0-alpha.2`，修复后发布 alpha.3 再升级。
+- 协议面：v4.17.52 → v4.18.41 的 36 个事件、消息段 schema、公共返回 schema、WebSocket 服务端与鉴权 SHA 一致；action 只增不删。
+- 行为差异：`set_group_ban` 在 v4.18.0+ 禁止非群主禁言管理员；`set_group_leave(is_dismiss)` 在 v4.18.34+ 才真正解散；TypeBox 校验失败返回 `retcode=1400`；`Value.Clean` 会删除 schema 未声明字段（如 `duration`、`result_id`/`chain_count`）。
+- 配置硬要求：
+  - `messagePostFormat = "array"`，否则 NapCatLink 的 `Vec<MessageSegment>` 反序列化失败。
+  - 依赖 `message_sent` 事件时设置 `reportSelfMessage = true`。
+  - WebSocket URL 不要使用 `/api` 路径（仅 API 连接，不推送事件）。
+- 启动时调用 `get_version_info` 记录 NapCat 版本，低于最低版本时告警并继续。
+- 新 action 通过 NapCatLink 的 `api.raw.call(...)` 调用，不等待 NapCatLink 封装；`API` 工具按 action 表透传。
+- 上层将 `retcode=1400` 映射为参数错误；群管理错误映射为可读提示（如 `cannot ban admin`、`user not in group`）。
+
+## 10. 模块布局
+
+```
+src/
+  main.rs              CLI 路由
+  app.rs               依赖装配与生命周期
+  ipc/
+    mod.rs             帧协议
+    windows.rs         Named Pipe
+    unix.rs            UDS
+  config/
+    mod.rs             SbotConfig、加载、校验
+    models.rs          models.json 加载、合并、校验
+    auth.rs            auth.json 凭据加载
+    secret.rs          Secret（literal/env/keyring）
+  agent/
+    loop.rs            run_agent / continue_agent / 事件
+    runner.rs          会话调度、队列、轮次
+    message.rs         AgentMessage、转换
+    event.rs           AgentEvent
+  providers/
+    mod.rs             Provider trait、工厂、服务端工具能力声明
+    chat.rs            OpenAI Chat Completions（protocol=chat）
+    openai.rs          OpenAI Responses（protocol=openai）
+    anthropic.rs       Anthropic Messages（protocol=anthropic，默认）
+    server_tools.rs    三种协议的服务端工具声明与结果归一化
+  web/
+    mod.rs             WebSearch / WebFetch 工具与后端选择
+    provider.rs        WebSearchProvider / WebFetchProvider trait
+    remote.rs          用户配置的 Search/Fetch HTTP 后端
+    http_fetch.rs      可选通用 HTTP fetch（SSRF/域名过滤）
+  tools/
+    registry.rs        ToolRegistry
+    permission.rs      权限模型与工具/action 级检查
+    fs/                Read / Write / Edit / LS / Grep / Glob / RM / MV / CP / Mkdir / Stat
+    api.rs             API 工具（NapCat action 分派）
+    download.rs        Download 工具（URL → VFS）
+    skill.rs           Skill 工具（加载技能；清单在系统提示）
+    agent.rs           Agent 工具（Swarm）
+    mcp.rs             MCP 工具（可选，默认关闭）
+  vfs/
+    mod.rs             Vfs trait、路径规范化
+    path.rs
+    sqlite.rs          SQLite 后端（文本/二进制分块）
+    dynamic.rs         /friends 等实时节点
+    quota.rs
+  qq/
+    client.rs          NapCatLink 封装
+    event.rs           事件归一化
+    format.rs          消息段 ↔ 文本
+  session/
+    mod.rs             全局 transcript 与轮转
+    jsonl.rs           session JSONL 写入/读取/加密
+    compaction.rs
+  prompt/
+    mod.rs             组装器
+    hooks.rs           上下文注入 hook
+    sections/*.rs      各提示段
+  swarm/
+  mcp/
+  skills/
+  storage/
+    mod.rs             SQLite 连接与迁移
+    messages.rs
+```
+
+## 11. 实施阶段
+
+1. **Phase 0**：新 crate 脚手架、配置、SQLite 迁移框架、IPC、单实例、CLI。
+2. **Phase 1**：VFS（路径、SQLite 后端、二进制分块、配额、Read-before-Edit、种子、`/friends` 动态节点）。
+3. **Phase 2**：Provider trait + `chat` / `openai` / `anthropic` 三协议流式、服务端工具声明与结果解析、Agent loop 状态机、事件流、测试用 fake provider。
+4. **Phase 3**：NapCat 接入、事件归一化、消息持久化、过滤器、去抖、session JSONL 与 `/sessions` 映射。
+5. **Phase 4**：工具注册表、权限、全部文件工具、`API`、`Skill`、`Download`、`WebSearch` / `WebFetch`（含用户配置的 HTTP 后端）。
+6. **Phase 5**：提示词组装、上下文注入 hook、记忆策略、会话压缩。
+7. **Phase 6**：Swarm、MCP。
+8. **Phase 7**：端到端测试、NapCat 兼容性验证、文档、发布 tag。
+
+每个阶段独立提交并可运行测试；旧实现保留在同一仓库的历史中，不在新代码中保留兼容层。
+
+## 12. 测试策略
+
+- 单元：VFS 路径与权限、配额、循环状态机（工具批次、终止、截断）、压缩触发。
+- 集成：fake provider + 内存 VFS + fake QQ transport，覆盖一轮完整对话与工具调用。
+- IPC：真实命名管道/UDS 端到端（Windows/Unix 条件编译）。
+- 提示词：快照测试关键 section 与动态字段。
+- NapCat 实机冒烟：连接、版本探测、群/成员查询、文本与组合消息、`message_sent` 开关、禁言权限、解散群、公告、文件、已读、断线重连。
+- NapCat：协议层静态兼容已确认；上线前必须完成一次 v4.18.41 实机冒烟。
+
+## 13. 已定与待定
+
+已定：
+
+- 整个 QQ 号只有一个 agent、一份全局 transcript，不按群/私聊拆分（类 OpenClaw）。
+- VFS 默认加密路径与内容（XChaCha20-Poly1305 + Argon2id/OS keychain）；`encryption = "none"` 可关闭；路径解密到内存索引，配额 10 万节点。
+- 不 fork NapCatLink：它是项目自有代码，直接修改并提交；重构期间继续用 `=0.1.0-alpha.2`，修复后发 alpha.3 升级。
+- `WebSearch` / `WebFetch` 的 `tool` 后端由用户填写 URL 与 key 启用；不填则不注册工具，不假定官方地址。
+- DeepSeek 兼容服务的 5 QPS 与计费可接受；不足由服务方限制决定。
+- 模型与凭据分离：`models.json` 只定义模型参数，`auth.json` 只存所有凭据（不挂载 VFS，模型不可见）；`sbot.toml` 不含任何凭据，维护 `available_models`、当前 `model` 与 `thinking_level`，可通过指令热切换。
+- Agent 可通过 `/config.toml` 与 `/config/**` 查看并修改自己的配置；敏感项与 `auth.json` 除外。
+- 上下文注入由 `[[hooks.context]]` 决定（AGENTS.md 是默认 hook），只在会话开始与压缩后触发；Agent 可自行增删。
+- 事件 hook 首版支持 `SessionStart` / `SessionEnd` / `PreCompact` / `PostCompact` / `MessageReceived` / `BeforeSend` / `Stop` / `ConfigChange`；动作为声明式，不执行脚本。
+- 消息白名单改为模型可控的过滤器；过滤只影响是否提示，不影响存储。
+- 身份：只创建空的 `/AGENTS.md`；核心内容内置 system prompt；文件内容自动加载为附加指令；`SOUL.md`、`IDENTITY.md`、`MASTER.md` 不预置，由 Agent 自行决定记录方式；不设 `/identity` 与 `/memory`。
+- VFS 支持二进制：blob 分块加密、单文件 512 MB、总量 10 GB；下载与发送文件流式处理。
+- `/friends/<qq>/` 为多层动态节点（`profile.md`、`info.json` 实时查询，`notes.md` 本地可写）。
+- `/trash` 回收站：`RM` 默认移入，可用 `MV` 恢复，`permanent = true` 彻底删除；30 天或 10% 配额自动清理。
+- session 以本地加密 JSONL 落盘，VFS `/sessions` 只读映射当前与归档记录。
+- 默认模型 `anthropic/claude-opus-5-5`，默认 effort `high`；示例模型组生效。
+- Swarm 子代理保留，默认开启（`[swarm] enabled = true`）。
+- `API` 暴露全部 NapCat action；每个调用经过可配置门禁：`trusted` / `auto`（规则 + 可选 LLM 审查）/ `approve`。
+- 压缩参考 Claude Code 与 pi：`reserve_tokens = 16384`、`keep_recent_tokens = 20000`、turn 边界切割、结构化检查点摘要、增量更新、PostCompact 重注入。
+- 全新项目，不迁移旧数据、不兼容旧 workspace。
+
+待定：
+
+- 加密方案仍为草案（XChaCha20-Poly1305 + Argon2id/OS keychain），待最终确认。
+- `[gate].llm_review` 默认值待定（当前 false）。
+- 其余实现细节在 Phase 0–4 中确定。
+
+## 14. 工程约定
+
+- 包名/二进制：`scapegoat-bot` / `sbot` 延续；旧 0.1 归档，不迁移。
+- 新版本线：`0.2.0-alpha.1` 起步；Phase 完成后打 tag。
+- 实施从 Phase 0 开始；新代码就位后删除旧 `src/`、旧示例配置与旧文档。
+- 服务自启动：Phase 7 可选 `sbot service install`（Windows 服务 / systemd）；首版用任务计划或文档说明。
+- 文档：README、CHANGELOG、开发文档在 Phase 7 重建。
