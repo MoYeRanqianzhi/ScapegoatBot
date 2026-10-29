@@ -390,6 +390,55 @@ impl MessageStore {
         Ok(rows.iter().filter_map(|chat| ChatId::parse(chat)).collect())
     }
 
+    /// 某 chat 有数据的月份（升序）。
+    pub fn months(&self, chat: ChatId) -> Result<Vec<String>> {
+        let (scope, peer) = scope_peer(chat);
+        let conn = self.db.lock();
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT month FROM message_files
+             WHERE scope = ?1 AND peer = ?2 ORDER BY month ASC",
+        )?;
+        Ok(statement
+            .query_map(params![scope, peer as i64], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 某 chat 某月有数据的日子（`DD`，升序）。
+    pub fn days(&self, chat: ChatId, month: &str) -> Result<Vec<String>> {
+        let (scope, peer) = scope_peer(chat);
+        let conn = self.db.lock();
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT day FROM message_files
+             WHERE scope = ?1 AND peer = ?2 AND month = ?3 ORDER BY day ASC",
+        )?;
+        Ok(statement
+            .query_map(params![scope, peer as i64, month], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 某个 scope（groups / private）下出现过的 peer。
+    pub fn peers(&self, scope: &str) -> Result<Vec<u64>> {
+        let conn = self.db.lock();
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT peer FROM message_files WHERE scope = ?1 ORDER BY peer ASC",
+        )?;
+        Ok(statement
+            .query_map(params![scope], |row| row.get::<_, u64>(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 读取某天某 chat 的收件箱条目（带状态）。
+    pub fn inbox_for_chat(&self, chat: ChatId, state: InboxState) -> Result<Vec<QqMessage>> {
+        self.load_indexed(
+            "SELECT m.file_path, m.line_no FROM messages m
+             JOIN inbox_state s ON s.chat = m.chat AND s.message_id = m.message_id
+             WHERE m.chat = ?1 AND s.state = ?2 ORDER BY m.ts ASC",
+            params![chat.to_string(), state.as_str()],
+        )
+    }
+
     /// 发送账本：登记意图（发送前）。
     pub fn begin_send(&self, id: &str, chat: ChatId, intent: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
@@ -621,10 +670,11 @@ impl MessageStore {
     /// 确保文件头存在，返回 `file_id`。
     fn ensure_header(&self, path: &Path, scope: &str, peer: u64, date: &str) -> Result<String> {
         if path.exists()
-            && let Some(file_id) = read_file_id(path)? {
-                return Ok(file_id);
-            }
-            // 空文件或残行：补写文件头。
+            && let Some(file_id) = read_file_id(path)?
+        {
+            return Ok(file_id);
+        }
+        // 空文件或残行：补写文件头。
 
         let file_id = new_file_id();
         let header = json!({

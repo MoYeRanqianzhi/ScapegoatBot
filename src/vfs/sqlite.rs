@@ -272,6 +272,140 @@ impl VfsStore {
             .map_err(VfsError::from)
     }
 
+    /// 按行读取文本；`offset` / `limit` 单位是行。
+    ///
+    /// 与 [`Vfs::read`] 的区别：这里直接给出模型习惯的行号语义。
+    /// 带 offset/limit 的读取仍记为 partial，不满足编辑前置条件。
+    pub fn read_lines(
+        &self,
+        path: &VfsPath,
+        offset: Option<u64>,
+        limit: Option<u64>,
+    ) -> Result<FileContent, VfsError> {
+        let conn = self.db.lock();
+        let row = self
+            .lookup(&conn, path)?
+            .ok_or_else(|| VfsError::NotFound(path.to_string()))?;
+        if row.kind == NodeKind::Dir {
+            return Err(VfsError::IsADirectory(path.to_string()));
+        }
+        if row.kind != NodeKind::Text {
+            self.record_read(&conn, row.id, row.version, row.hash.as_deref(), false)?;
+            return Ok(FileContent::Metadata(self.meta(path, &row)));
+        }
+
+        let text = self.open_text(&row)?;
+        let total_bytes = text.len() as u64;
+        let is_partial = offset.is_some() || limit.is_some();
+        let sliced = if is_partial {
+            let start = offset.unwrap_or(0) as usize;
+            let take = limit.unwrap_or(u64::MAX) as usize;
+            let lines: Vec<&str> = text.lines().collect();
+            if start > lines.len() {
+                return Err(VfsError::RangeOutOfBounds);
+            }
+            let end = start.saturating_add(take).min(lines.len());
+            lines[start..end].join(
+                "
+",
+            )
+        } else {
+            text
+        };
+
+        self.record_read(&conn, row.id, row.version, row.hash.as_deref(), is_partial)?;
+        Ok(FileContent::Text {
+            text: sliced,
+            total_bytes,
+            is_partial,
+        })
+    }
+
+    /// 编辑并返回替换次数。
+    pub fn edit_text_count(
+        &self,
+        path: &VfsPath,
+        old_text: &str,
+        new_text: &str,
+        replace_all: bool,
+    ) -> Result<(NodeMeta, usize), VfsError> {
+        if old_text.is_empty() {
+            return Err(VfsError::EditNotFound);
+        }
+        let mut conn = self.db.lock();
+        let tx = conn.transaction()?;
+        let row = self
+            .lookup(&tx, path)?
+            .ok_or_else(|| VfsError::NotFound(path.to_string()))?;
+        if row.kind != NodeKind::Text {
+            return Err(VfsError::Storage(format!("{path} is not a text file")));
+        }
+        self.check_read_before_edit(&tx, &row)?;
+        let current = self.open_text(&row)?;
+        let count = current.matches(old_text).count();
+        if count == 0 {
+            return Err(VfsError::EditNotFound);
+        }
+        if count > 1 && !replace_all {
+            return Err(VfsError::EditNotUnique { count });
+        }
+        let updated = if replace_all {
+            current.replace(old_text, new_text)
+        } else {
+            current.replacen(old_text, new_text, 1)
+        };
+        let replaced = if replace_all { count } else { 1 };
+        let meta = self.write_text_tx(&tx, path, &updated, None)?;
+        tx.commit()?;
+        Ok((meta, replaced))
+    }
+
+    /// 解密文本但不记录“读过”。
+    ///
+    /// `Grep` 扫描用：只有真正出现在结果里的条目才应被标记已读（设计 §6.3）。
+    pub fn read_text_unrecorded(&self, path: &VfsPath) -> Result<String, VfsError> {
+        let conn = self.db.lock();
+        let row = self
+            .lookup(&conn, path)?
+            .ok_or_else(|| VfsError::NotFound(path.to_string()))?;
+        if row.kind != NodeKind::Text {
+            return Err(VfsError::Storage(format!("{path} is not a text file")));
+        }
+        self.open_text(&row)
+    }
+
+    /// 把某个文本节点标记为“全文读过”。
+    pub fn record_read_full(&self, path: &VfsPath) -> Result<(), VfsError> {
+        let conn = self.db.lock();
+        let row = self
+            .lookup(&conn, path)?
+            .ok_or_else(|| VfsError::NotFound(path.to_string()))?;
+        self.record_read(&conn, row.id, row.version, row.hash.as_deref(), false)
+    }
+
+    /// 仅供测试：清空 Read-before-Edit 记录，模拟“外部已存在、本进程没读过”的文件。
+    #[cfg(test)]
+    pub fn clear_reads(&self) {
+        let conn = self.db.lock();
+        let _ = conn.execute("DELETE FROM vfs_reads", []);
+    }
+
+    /// 递归列出某目录下的所有节点（不含自身）。
+    pub fn list_recursive(&self, path: &VfsPath) -> Result<Vec<NodeMeta>, VfsError> {
+        let mut result = Vec::new();
+        let mut stack = vec![path.clone()];
+        while let Some(current) = stack.pop() {
+            for child in self.list(&current)? {
+                if child.kind == NodeKind::Dir {
+                    stack.push(child.path.clone());
+                }
+                result.push(child);
+            }
+        }
+        result.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(result)
+    }
+
     /// 读取某个二进制分块（供 Phase 4 的 `Download` / 发送文件流式使用）。
     #[allow(dead_code)]
     pub fn read_blob_chunk(&self, path: &VfsPath, idx: u64) -> Result<Vec<u8>, VfsError> {

@@ -87,10 +87,11 @@ impl ChatQueue {
 
         // 回合进行中：steer 模式直接注入。
         if let Some(steering) = &state.active
-            && self.config.mode == QueueMode::Steer {
-                let _ = steering.send(AgentMessage::user(render_inbound(&message)));
-                return;
-            }
+            && self.config.mode == QueueMode::Steer
+        {
+            let _ = steering.send(AgentMessage::user(render_inbound(&message)));
+            return;
+        }
 
         self.push_with_caps(state, message);
         state.token = self.counter.fetch_add(1, Ordering::Relaxed) + 1;

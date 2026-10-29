@@ -14,6 +14,7 @@ pub mod agent_loop;
 pub mod event;
 pub mod message;
 pub mod queue;
+pub mod runner;
 
 pub use agent_loop::{AgentLoop, LoopConfig, LoopOutcome, SteeringQueue};
 pub use event::{AgentEvent, DeltaKind, SecurityCheckpoint};

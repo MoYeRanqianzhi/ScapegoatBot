@@ -241,9 +241,10 @@ pub fn normalize(name: &str, data: &Value) -> QqEvent {
         .unwrap_or_default();
 
     if (post_type == "message" || post_type == "message_sent" || name.starts_with("message."))
-        && let Some(message) = parse_message(data, post_type == "message_sent") {
-            return QqEvent::Message(message);
-        }
+        && let Some(message) = parse_message(data, post_type == "message_sent")
+    {
+        return QqEvent::Message(message);
+    }
     if post_type == "notice" || name.starts_with("notice.") {
         return QqEvent::Notice(parse_notice(name, data));
     }

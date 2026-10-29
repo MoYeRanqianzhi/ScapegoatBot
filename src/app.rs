@@ -1,34 +1,59 @@
 //! 运行时装配与生命周期。
 //!
-//! 设计依据：设计 §2.1 / §2.3 / §10。
+//! 设计依据：设计 §2.1 / §2.3 / §4 / §10。
 //!
-//! Phase 0 提供可运行的最小闭环：
-//! 配置与模型加载 → 单实例锁 → 主密钥与数据库 → IPC 服务 → 优雅退出。
+//! 启动闭环：
+//! 配置与模型加载 → 单实例锁 → 主密钥与数据库 → VFS / 消息 / transcript →
+//! 安全闸 → NapCat → 工具 → 回合执行器 → IPC。
 //!
-//! 之后各阶段把 agent loop、VFS、NapCat、工具、监视器等挂到同一个运行时上；
-//! 本模块只做**装配**，不承载业务逻辑。
+//! 本模块只做**装配**；业务在 `agent`、`tools`、`qq` 等模块。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde_json::json;
-use tokio::sync::watch;
-use tracing::{info, warn};
+use tokio::sync::{Mutex, watch};
+use tracing::{debug, info, warn};
 
-use crate::config::{AuthFile, EncryptionMode, LoadedConfig, ModelsFile, SbotConfig};
+use crate::agent::queue::ChatQueue;
+use crate::agent::runner::{Runner, RunnerConfig, RuntimeOps};
+use crate::config::{
+    AgentMode, AuthFile, EncryptionMode, LoadedConfig, ModelsFile, SbotConfig, SessionScope,
+};
 use crate::ipc::{self, AiAction, Handler, Request, RequestBody, Response};
 use crate::paths::SbotPaths;
+use crate::providers::{Provider, ThinkingOptions, build_provider};
+use crate::qq::event::QqEvent;
+use crate::qq::filter::MessageFilter;
+use crate::qq::{LoginInfo, QqClient};
+use crate::security::gate::Gate;
+use crate::session::SessionStore;
+use crate::session::turn_buffer::TurnBufferStore;
 use crate::storage::Database;
 use crate::storage::crypto::MasterKey;
+use crate::storage::messages::MessageStore;
+use crate::tools::ToolRegistry;
+use crate::tools::api::{AgentOps, ApiTool, NapcatGateway};
+use crate::tools::views::Views;
 use crate::vfs::Vfs;
 use crate::vfs::sqlite::VfsStore;
 
 /// 内置模型清单：随二进制发布，用户 `models.json` 覆盖/追加（设计 §9.3）。
 const EMBEDDED_MODELS: &str = include_str!("../assets/models.default.json");
+
+/// 回合执行所需的组件。
+struct AgentRuntime {
+    runner: Arc<Runner>,
+    queue: Arc<ChatQueue>,
+    ops: Arc<RuntimeOps>,
+    self_id: u64,
+    filter: MessageFilter,
+    filtered: AtomicU64,
+}
 
 /// 守护进程运行时。
 pub struct Runtime {
@@ -37,18 +62,26 @@ pub struct Runtime {
     /// 已校验的配置；`SetModel` / `SetEffort` 会就地更新。
     config: RwLock<LoadedConfig>,
     /// 模型清单（内置 + 用户覆盖）。
-    pub models: ModelsFile,
-    /// 凭据（只读，不挂载 VFS）。Phase 2 起被 provider 使用。
+    models: ModelsFile,
+    /// 凭据（只读，不挂载 VFS）；`sbot doctor` 会读取。
     #[allow(dead_code)]
-    pub auth: AuthFile,
+    auth: AuthFile,
     /// SQLite。
-    pub db: Arc<Database>,
-    /// 主密钥；VFS 与后续阶段共用。
-    pub key: Arc<MasterKey>,
-    /// 虚拟文件系统。Phase 4 的工具层从这里读写。
-    pub vfs: Arc<VfsStore>,
+    db: Arc<Database>,
+    /// 主密钥。
+    key: Arc<MasterKey>,
+    /// 虚拟文件系统。
+    vfs: Arc<VfsStore>,
+    /// 消息归档。
+    messages: Arc<MessageStore>,
+    /// transcript。
+    sessions: Arc<SessionStore>,
+    /// 安全闸。
+    gate: Arc<Gate>,
     /// LLM 调用开关（`sbot ai stop` 只停 LLM，不收消息）。
-    ai_enabled: AtomicBool,
+    ai_enabled: Arc<AtomicBool>,
+    /// 回合执行器与队列；provider 未配置时为 `None`。
+    agent: RwLock<Option<Arc<AgentRuntime>>>,
     /// 启动时间用于 uptime。
     started_at: chrono::DateTime<chrono::Utc>,
     /// 关闭信号。
@@ -58,7 +91,7 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// 启动运行时：准备目录、加载配置与密钥、打开数据库、启动 IPC。
+    /// 启动运行时。
     pub async fn start(config_path: Option<PathBuf>) -> Result<()> {
         let paths = SbotPaths::discover()?;
         paths.ensure_layout()?;
@@ -68,7 +101,6 @@ impl Runtime {
 
         let loaded = SbotConfig::load(&config_path)?;
         let models = load_models(&paths, &loaded)?;
-
         loaded
             .config
             .validate_with_models(&models)
@@ -78,9 +110,7 @@ impl Runtime {
         let auth = AuthFile::load_optional(&auth_path)?;
         report_missing_credentials(&loaded.config, &auth);
 
-        // 单实例锁必须早于数据库与 IPC：否则第二个进程会在打开 WAL 时才失败。
         let instance_lock = InstanceLock::acquire(&paths.instance_lock())?;
-
         let key = Arc::new(MasterKey::load_or_create(paths.key_file())?);
         let data_dir = paths.resolve(&loaded.config.storage.path, &loaded.dir);
         std::fs::create_dir_all(&data_dir)
@@ -88,15 +118,83 @@ impl Runtime {
         let db = Arc::new(Database::open(data_dir.join("data.db"))?);
         db.ensure_key(&key)?;
 
+        if loaded.config.storage.encryption == EncryptionMode::None {
+            warn!("storage.encryption = \"none\": data is stored in plaintext (debug only)");
+        }
+
         let vfs = Arc::new(VfsStore::from_config(
             Arc::clone(&db),
             Arc::clone(&key),
             data_dir.clone(),
             &loaded.config.storage,
         )?);
+        let messages = Arc::new(MessageStore::open(
+            Arc::clone(&db),
+            Arc::clone(&key),
+            data_dir.clone(),
+            loaded.config.storage.max_message_bytes,
+            loaded.config.storage.encryption,
+        )?);
+        let sessions = Arc::new(SessionStore::open(
+            Arc::clone(&db),
+            Arc::clone(&key),
+            data_dir.clone(),
+            loaded.config.storage.max_session_bytes,
+            loaded.config.storage.encryption,
+        )?);
+        let turn_buffer = Arc::new(TurnBufferStore::new(
+            Arc::clone(&db),
+            Arc::clone(&key),
+            loaded.config.storage.encryption,
+        ));
 
-        if loaded.config.storage.encryption == EncryptionMode::None {
-            warn!("storage.encryption = \"none\": data is stored in plaintext (debug only)");
+        let gate = Arc::new(Gate::from_config(
+            &loaded.config.security.guard,
+            auth.guard_key().and_then(|secret| secret.value()),
+            Some(Arc::clone(&db)),
+            paths.security_hold_file(),
+        ));
+        gate.restore_hold();
+        if gate.hold_active() {
+            warn!("starting while SECURITY_HOLD is active; outbound chat stays disabled");
+        }
+
+        let ai_enabled = Arc::new(AtomicBool::new(true));
+        let qq = connect_qq(&loaded.config, &auth).await;
+        let self_id = qq.as_ref().map(|(_, info)| info.user_id).unwrap_or(0);
+        if let Some((client, info)) = &qq {
+            info!(qq = info.user_id, nickname = %info.nickname, "connected to NapCat");
+            if let Err(error) = client.version_info().await {
+                warn!(%error, "cannot read the NapCat version");
+            }
+        } else {
+            warn!("NapCat is not connected; QQ tools will fail until it is");
+        }
+
+        let (owner_qq, master_qq) = resolve_principals(&loaded.config, self_id)?;
+        let agent = build_agent(
+            &loaded,
+            &models,
+            &auth,
+            Arc::clone(&db),
+            Arc::clone(&vfs),
+            Arc::clone(&messages),
+            Arc::clone(&sessions),
+            turn_buffer,
+            Arc::clone(&gate),
+            qq.as_ref().map(|(client, _)| Arc::clone(client)),
+            self_id,
+            owner_qq,
+            master_qq,
+            Arc::clone(&ai_enabled),
+            paths.estop_file(),
+        )
+        .await?;
+
+        if agent.is_some() {
+            info!("agent runtime ready");
+        } else {
+            warn!("no usable provider; the daemon runs but cannot answer");
         }
 
         let (shutdown, shutdown_rx) = watch::channel(false);
@@ -108,61 +206,62 @@ impl Runtime {
             db,
             key,
             vfs,
-            ai_enabled: AtomicBool::new(true),
+            messages,
+            sessions,
+            gate,
+            ai_enabled,
+            agent: RwLock::new(agent.clone()),
             started_at: chrono::Utc::now(),
             shutdown,
             _instance_lock: instance_lock,
         });
+
+        // NapCat 事件循环。
+        if let (Some(agent), Some((client, info))) = (agent, qq) {
+            spawn_qq_pipeline(
+                agent,
+                client,
+                info,
+                Arc::clone(&runtime.messages),
+                shutdown_rx.clone(),
+            );
+        }
 
         let endpoint = {
             let config = runtime.config();
             ipc::Endpoint::resolve(&paths, &config.config.ipc)
         };
         info!(endpoint = %endpoint.display(), "starting IPC server");
-
         let server = tokio::spawn({
             let handler: Arc<dyn Handler> = runtime.clone();
             let endpoint = endpoint.clone();
             async move { ipc::serve(&endpoint, handler, shutdown_rx).await }
         });
 
-        // 等待关闭信号：IPC `Shutdown`、Ctrl-C 或 SIGTERM。
         let mut wait_shutdown = runtime.shutdown.subscribe();
         tokio::select! {
             _ = wait_shutdown.changed() => {}
-            _ = tokio::signal::ctrl_c() => {
-                info!("received Ctrl-C, shutting down");
-            }
-            _ = terminate_signal() => {
-                info!("received termination signal, shutting down");
-            }
+            _ = tokio::signal::ctrl_c() => info!("received Ctrl-C, shutting down"),
+            _ = terminate_signal() => info!("received termination signal, shutting down"),
         }
-
         let _ = runtime.shutdown.send(true);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
         info!("sbot stopped");
         Ok(())
     }
 
-    /// 读取配置快照。配置很小，读锁即可；需要长期持有时克隆。
-    pub fn config(&self) -> std::sync::RwLockReadGuard<'_, LoadedConfig> {
+    fn config(&self) -> std::sync::RwLockReadGuard<'_, LoadedConfig> {
         self.config.read().expect("config lock poisoned")
     }
 
-    /// 当前 `hold` 状态：`SECURITY_HOLD` 存在即为真（设计 §5.9 / §5.10）。
-    fn hold_active(&self) -> bool {
-        self.paths.security_hold_file().exists()
-    }
-
-    /// `ESTOP` 哨兵：存在即暂停新回合；空文件或损坏内容同样视为暂停（fail safe）。
     fn estop_active(&self) -> bool {
         self.paths.estop_file().exists()
     }
 
-    /// 状态响应。
     fn status_payload(&self) -> serde_json::Value {
         let loaded = self.config();
         let config = &loaded.config;
+        let agent = self.agent.read().expect("agent lock poisoned").clone();
         json!({
             "version": env!("CARGO_PKG_VERSION"),
             "pid": std::process::id(),
@@ -177,17 +276,27 @@ impl Runtime {
             "available_models": config.agent.available_models,
             "ai_enabled": self.ai_enabled.load(Ordering::Relaxed),
             "estop": self.estop_active(),
-            "hold": self.hold_active(),
+            "hold": self.gate.hold_active(),
             "session_scope": config.session.scope,
-            // VFS 用量：活跃与回收站分开，方便 `sbot status` 直接看出配额压力。
-            "vfs": self.vfs.usage().ok().map(|usage| {
-                json!({
-                    "active_bytes": usage.active_bytes,
-                    "trash_bytes": usage.trash_bytes,
-                    "nodes": usage.nodes,
-                    "trash_nodes": usage.trash_nodes,
-                })
-            }),
+            "agent": {
+                "available": agent.is_some(),
+                "self_id": agent.as_ref().map(|agent| agent.self_id),
+                "filtered_messages": agent.as_ref().map(|agent| agent.filtered.load(Ordering::Relaxed)),
+            },
+            "vfs": self.vfs.usage().ok().map(|usage| json!({
+                "active_bytes": usage.active_bytes,
+                "trash_bytes": usage.trash_bytes,
+                "nodes": usage.nodes,
+                "trash_nodes": usage.trash_nodes,
+            })),
+            "messages": self.messages.usage().ok().map(|(bytes, count)| json!({
+                "bytes": bytes,
+                "count": count,
+            })),
+            "sessions": self.sessions.usage().ok().map(|(bytes, count)| json!({
+                "bytes": bytes,
+                "count": count,
+            })),
             "guard": {
                 "enabled": config.security.guard.enabled,
                 "mode": config.security.guard.mode,
@@ -196,11 +305,9 @@ impl Runtime {
         })
     }
 
-    /// 热切换模型：校验 → 写回 `sbot.toml` → 更新内存。
     fn set_model(&self, model: &str) -> Result<serde_json::Value> {
         let mut loaded = self.config.write().expect("config lock poisoned");
         let config = &mut loaded.config;
-
         if !config
             .agent
             .available_models
@@ -215,26 +322,22 @@ impl Runtime {
         let Some(reference) = self.models.find(model) else {
             anyhow::bail!("model {model:?} is not defined in models.json");
         };
-
         let previous = std::mem::replace(&mut config.agent.model, model.to_owned());
         if let Err(error) = persist_agent_setting(&loaded.path, "model", model) {
-            // 写失败时运行时仍然生效（设计 §9.5）。
             warn!(%error, "cannot persist agent.model; change is runtime-only");
         }
         info!(from = %previous, to = model, "primary model switched");
-
         Ok(json!({
             "model": model,
             "context_window": reference.model.context_window,
             "thinking_levels": reference.model.thinking_levels,
+            "note": "takes effect on the next request",
         }))
     }
 
-    /// 热切换 effort。
     fn set_effort(&self, level: &str) -> Result<serde_json::Value> {
         let mut loaded = self.config.write().expect("config lock poisoned");
         let config = &mut loaded.config;
-
         let model_name = config.agent.model.clone();
         let Some(reference) = self.models.find(&model_name) else {
             anyhow::bail!("current model {model_name:?} is not defined in models.json");
@@ -251,7 +354,6 @@ impl Runtime {
                 reference.model.thinking_levels
             );
         }
-
         config.agent.thinking_level = level.to_owned();
         if let Err(error) = persist_agent_setting(&loaded.path, "thinking_level", level) {
             warn!(%error, "cannot persist agent.thinking_level; change is runtime-only");
@@ -259,14 +361,11 @@ impl Runtime {
         Ok(json!({ "thinking_level": level }))
     }
 
-    /// 处理一次请求；幂等在外层 `handle` 完成。
     async fn dispatch(&self, request: Request) -> Response {
         let id = request.id.clone();
         match request.body {
             RequestBody::Status => Response::ok(id, self.status_payload()),
-
             RequestBody::Shutdown => {
-                // 先让响应发出去，再触发关闭。
                 let shutdown = self.shutdown.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -274,7 +373,6 @@ impl Runtime {
                 });
                 Response::ok(id, json!({ "stopping": true }))
             }
-
             RequestBody::Ai { action } => match action {
                 AiAction::Start => {
                     self.ai_enabled.store(true, Ordering::Relaxed);
@@ -289,12 +387,10 @@ impl Runtime {
                     Response::ok(id, json!({ "ai_enabled": true, "restarted": true }))
                 }
             },
-
             RequestBody::Chat { message, scope } => {
                 if message.trim().is_empty() {
                     return Response::error(id, "bad_request", "message must not be empty");
                 }
-                // 控制通道输入加密落库，作为 `control:<id>` 来源注入（设计 §2.3）。
                 let sealed =
                     match self
                         .key
@@ -309,68 +405,89 @@ impl Runtime {
                             );
                         }
                     };
-                match self.db.insert_control_input(&sealed, "cli") {
-                    Ok(control_id) => Response::ok(
-                        id,
-                        json!({
-                            "accepted": true,
-                            "control_id": control_id,
-                            "scope": scope,
-                        }),
-                    ),
+                let control_id = match self.db.insert_control_input(&sealed, "cli") {
+                    Ok(control_id) => control_id,
                     Err(error) => {
-                        Response::error(id, "internal", format!("cannot store input: {error}"))
+                        return Response::error(
+                            id,
+                            "internal",
+                            format!("cannot store input: {error}"),
+                        );
                     }
-                }
+                };
+                let agent = self.agent.read().expect("agent lock poisoned").clone();
+                let Some(agent) = agent else {
+                    return Response::error(
+                        id,
+                        "not_ready",
+                        "no provider is configured; control input was stored but not run",
+                    );
+                };
+                let runner = Arc::clone(&agent.runner);
+                tokio::spawn(async move {
+                    match runner.run_control(&message, control_id).await {
+                        Ok(outcome) => info!(
+                            stop = ?outcome.stop_reason,
+                            turns = outcome.turns,
+                            "control turn finished"
+                        ),
+                        Err(error) => warn!(%error, "control turn failed"),
+                    }
+                });
+                Response::ok(
+                    id,
+                    json!({ "accepted": true, "control_id": control_id, "scope": scope }),
+                )
             }
-
             RequestBody::SetModel { model } => match self.set_model(&model) {
                 Ok(payload) => Response::ok(id, payload),
                 Err(error) => Response::error(id, "invalid_model", error.to_string()),
             },
-
             RequestBody::SetEffort { level } => match self.set_effort(&level) {
                 Ok(payload) => Response::ok(id, payload),
                 Err(error) => Response::error(id, "invalid_effort", error.to_string()),
             },
-
             RequestBody::Pause => match write_sentinel(&self.paths.estop_file()) {
                 Ok(()) => Response::ok(id, json!({ "paused": true })),
                 Err(error) => Response::error(id, "internal", error.to_string()),
             },
-
             RequestBody::Resume => match remove_sentinel(&self.paths.estop_file()) {
                 Ok(()) => Response::ok(id, json!({ "paused": false })),
                 Err(error) => Response::error(id, "internal", error.to_string()),
             },
-
-            RequestBody::SecurityStatus => Response::ok(
-                id,
-                json!({
-                    "hold": self.hold_active(),
-                    "estop": self.estop_active(),
-                    "events": [],
-                }),
-            ),
-
+            RequestBody::SecurityStatus => {
+                let events = crate::security::events::recent(&self.db, 20).unwrap_or_default();
+                Response::ok(
+                    id,
+                    json!({
+                        "hold": self.gate.hold_active(),
+                        "estop": self.estop_active(),
+                        "events": events,
+                    }),
+                )
+            }
             RequestBody::SecurityResume => {
-                if self.hold_active() {
-                    Response::error(
+                if !self.gate.hold_active() {
+                    return Response::ok(id, json!({ "hold": false }));
+                }
+                let agent = self.agent.read().expect("agent lock poisoned").clone();
+                let Some(agent) = agent else {
+                    return Response::error(
                         id,
                         "not_ready",
-                        "clearing a security hold requires the input/output gate (Phase 5)",
-                    )
-                } else {
-                    Response::ok(id, json!({ "hold": false }))
+                        "no agent runtime is available to re-check the context",
+                    );
+                };
+                match agent.ops.resume().await {
+                    Ok(payload) => Response::ok(id, payload),
+                    Err(error) => Response::error(id, "hold", error),
                 }
             }
-
             RequestBody::Backup { output } => Response::error(
                 id,
                 "not_ready",
                 format!("sbot backup arrives in Phase 7 (requested output: {output:?})"),
             ),
-
             RequestBody::Doctor => {
                 Response::error(id, "not_ready", "sbot doctor arrives in Phase 7")
             }
@@ -378,16 +495,308 @@ impl Runtime {
     }
 }
 
+impl AgentRuntime {
+    fn filter_and_count(&self, message: &crate::qq::event::QqMessage) -> bool {
+        let accept = self.filter.check(message, self.self_id).is_accept();
+        if !accept {
+            self.filtered.fetch_add(1, Ordering::Relaxed);
+        }
+        accept
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Agent 装配
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn build_agent(
+    loaded: &LoadedConfig,
+    models: &ModelsFile,
+    auth: &AuthFile,
+    db: Arc<Database>,
+    vfs: Arc<VfsStore>,
+    messages: Arc<MessageStore>,
+    sessions: Arc<SessionStore>,
+    turn_buffer: Arc<TurnBufferStore>,
+    gate: Arc<Gate>,
+    qq: Option<Arc<QqClient>>,
+    self_id: u64,
+    owner_qq: u64,
+    master_qq: u64,
+    ai_enabled: Arc<AtomicBool>,
+    estop_file: PathBuf,
+) -> Result<Option<Arc<AgentRuntime>>> {
+    let config = &loaded.config;
+    let provider: Arc<dyn Provider> = match build_provider(models, auth, &config.agent.model) {
+        Ok(provider) => provider,
+        Err(error) => {
+            warn!(%error, model = %config.agent.model, "cannot build a provider");
+            return Ok(None);
+        }
+    };
+    let Some(model_ref) = models.find(&config.agent.model) else {
+        anyhow::bail!("model {} disappeared from models.json", config.agent.model);
+    };
+    let thinking = ThinkingOptions {
+        enabled: model_ref.model.reasoning,
+        effort: if model_ref.model.reasoning && !config.agent.thinking_level.is_empty() {
+            Some(config.agent.thinking_level.clone())
+        } else {
+            None
+        },
+    };
+
+    let history = Arc::new(Mutex::new(Vec::new()));
+    let ops = Arc::new(RuntimeOps {
+        gate: Arc::clone(&gate),
+        vfs: Arc::clone(&vfs),
+        sessions: Arc::clone(&sessions),
+        messages: Arc::clone(&messages),
+        db: Some(Arc::clone(&db)),
+        history: Arc::clone(&history),
+        model: config.agent.model.clone(),
+        owner_qq,
+        master_qq,
+        receive_scopes: config.agent.receive_scopes.clone(),
+        send_scopes: config.agent.send_scopes.clone(),
+        estop_file: estop_file.clone(),
+    });
+
+    let views = Arc::new(Views::new(
+        Arc::clone(&vfs),
+        Arc::clone(&messages),
+        Arc::clone(&sessions),
+        qq.clone(),
+    ));
+    let mut tools = ToolRegistry::new(Arc::clone(&vfs), Some(views));
+    crate::tools::fs::register(&mut tools);
+    let gateway: Option<Arc<dyn NapcatGateway>> = qq
+        .as_ref()
+        .map(|client| Arc::clone(client) as Arc<dyn NapcatGateway>);
+    tools.register(Arc::new(ApiTool::new(
+        gateway,
+        Some(ops.clone() as Arc<dyn AgentOps>),
+        owner_qq,
+        master_qq,
+        Some(Arc::clone(&gate)),
+        config.agent.send_scopes.clone(),
+        Some(Arc::clone(&messages)),
+    )));
+    let tools = Arc::new(tools);
+
+    let runner = Runner::new(
+        provider,
+        tools,
+        Arc::clone(&gate),
+        Arc::clone(&vfs),
+        Arc::clone(&messages),
+        Arc::clone(&sessions),
+        turn_buffer,
+        qq,
+        RunnerConfig {
+            model: config.agent.model.clone(),
+            mode: config.agent.mode,
+            account_qq: self_id,
+            owner_qq,
+            master_qq,
+            owner_name: config.agent.owner_name.clone(),
+            session_scope: match config.session.scope {
+                SessionScope::Shared => "shared".to_owned(),
+                SessionScope::PerChat => "per_chat".to_owned(),
+            },
+            receive_scopes: config.agent.receive_scopes.clone(),
+            send_scopes: config.agent.send_scopes.clone(),
+            gate_mode: config.gate.mode,
+            max_tokens: config.agent.max_output_tokens,
+            thinking,
+            max_steps: config.agent.max_steps,
+            retry: crate::agent::agent_loop::RetryPolicy {
+                attempts: config.agent.retry_attempts,
+                base_ms: config.agent.retry_base_ms,
+                max_ms: config.agent.retry_max_ms,
+            },
+            chat_history_limit: 20,
+            hooks: config.hooks.context.clone(),
+        },
+        history,
+        Arc::clone(&ai_enabled),
+        estop_file,
+    )
+    .await?;
+
+    let filter = MessageFilter::from_config(&config.filter);
+    let queue = ChatQueue::new(
+        config.queue.clone(),
+        Arc::clone(&runner) as Arc<dyn crate::agent::queue::TurnHandler>,
+    );
+
+    Ok(Some(Arc::new(AgentRuntime {
+        runner,
+        queue,
+        ops,
+        self_id,
+        filter,
+        filtered: AtomicU64::new(0),
+    })))
+}
+
+/// 连接 NapCat；失败不阻止守护进程启动。
+async fn connect_qq(config: &SbotConfig, auth: &AuthFile) -> Option<(Arc<QqClient>, LoginInfo)> {
+    let token = auth.napcat.access_token.value();
+    let client = match QqClient::new(&config.napcat.url, token.as_deref()) {
+        Ok(client) => Arc::new(client),
+        Err(error) => {
+            warn!(%error, "cannot build the NapCat client");
+            return None;
+        }
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(10), client.connect()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(%error, url = %config.napcat.url, "cannot connect to NapCat");
+            return None;
+        }
+        Err(_) => {
+            warn!(url = %config.napcat.url, "NapCat connection timed out");
+            return None;
+        }
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(10), client.login_info()).await {
+        Ok(Ok(info)) => Some((client, info)),
+        Ok(Err(error)) => {
+            warn!(%error, "cannot read NapCat login info");
+            None
+        }
+        Err(_) => {
+            warn!("NapCat login info timed out");
+            None
+        }
+    }
+}
+
+/// 解析 owner/master。
+fn resolve_principals(config: &SbotConfig, self_id: u64) -> Result<(u64, u64)> {
+    let agent = &config.agent;
+    let owner_qq = match agent.mode {
+        AgentMode::StandIn => {
+            if agent.owner_qq != 0 {
+                agent.owner_qq
+            } else {
+                self_id
+            }
+        }
+        AgentMode::Companion => {
+            if agent.owner_qq == 0 {
+                anyhow::bail!("companion mode requires a non-zero owner_qq");
+            }
+            if self_id != 0 && agent.owner_qq == self_id {
+                anyhow::bail!("companion mode requires owner_qq to differ from the account");
+            }
+            agent.owner_qq
+        }
+    };
+    let master_qq = if agent.master == "self" {
+        self_id
+    } else {
+        agent
+            .master
+            .parse()
+            .map_err(|_| anyhow::anyhow!("agent.master must be \"self\" or a QQ number"))?
+    };
+    Ok((owner_qq, master_qq))
+}
+
+/// NapCat 事件循环。
+fn spawn_qq_pipeline(
+    agent: Arc<AgentRuntime>,
+    client: Arc<QqClient>,
+    info: LoginInfo,
+    messages: Arc<MessageStore>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let mut subscription = client.subscribe();
+        info!(qq = info.user_id, "listening for QQ events");
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                }
+                event = subscription.recv() => {
+                    match event {
+                        Some(data) => {
+                            handle_qq_event(
+                                &agent,
+                                &messages,
+                                &data.name,
+                                &data.data,
+                                info.user_id,
+                            )
+                            .await;
+                        }
+                        None => {
+                            warn!("NapCat event subscription ended");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn handle_qq_event(
+    agent: &AgentRuntime,
+    messages: &MessageStore,
+    name: &str,
+    data: &serde_json::Value,
+    _self_id: u64,
+) {
+    match crate::qq::event::normalize(name, data) {
+        QqEvent::Message(message) => {
+            if !agent.filter_and_count(&message) {
+                debug!(chat = %message.chat, "message rejected by the admission filter");
+                return;
+            }
+            match messages.append(&message) {
+                Ok(true) => {
+                    if !message.is_self && !message.backfilled {
+                        agent.queue.ingest(message).await;
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => warn!(%error, "cannot store an inbound message"),
+            }
+        }
+        QqEvent::Notice(notice) => {
+            debug!(kind = %notice.kind, "QQ notice");
+        }
+        QqEvent::Request(request) => {
+            debug!(kind = %request.kind, actor = ?request.actor, "QQ request");
+        }
+        QqEvent::Meta { kind } => debug!(kind, "meta event"),
+        QqEvent::Connection { connected, reason } => {
+            debug!(connected, %reason, "connection state");
+        }
+        QqEvent::Unknown { name, .. } => debug!(name, "unknown QQ event"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
+
 #[async_trait::async_trait]
 impl Handler for Runtime {
     async fn handle(&self, request: Request) -> Response {
-        // 幂等：只对声明了幂等键的写请求生效，命中即原样返回上次结果。
         let idempotency_key = if request.wants_idempotency() {
             request.idempotency_key.clone()
         } else {
             None
         };
-
         if let Some(key) = idempotency_key.as_deref() {
             match self.db.idempotency_get(key) {
                 Ok(Some(stored)) => {
@@ -403,10 +812,7 @@ impl Handler for Runtime {
                 Err(error) => warn!(%error, "idempotency lookup failed"),
             }
         }
-
         let response = self.dispatch(request).await;
-
-        // 只缓存成功结果：失败允许客户端重试。
         if response.ok
             && let Some(key) = idempotency_key
             && let Ok(serialized) = serde_json::to_string(&response)
@@ -414,7 +820,6 @@ impl Handler for Runtime {
         {
             warn!(%error, "cannot store idempotent response");
         }
-
         response
     }
 }
@@ -423,10 +828,6 @@ impl Handler for Runtime {
 // 启动辅助
 // ---------------------------------------------------------------------------
 
-/// 首次启动时写出带默认值的 `sbot.toml`。
-///
-/// 用 `create_new` 保证不覆盖用户文件；竞态下第二个进程会拿到 `AlreadyExists`，
-/// 按“文件已存在”处理即可。
 fn ensure_default_config(path: &Path) -> Result<()> {
     if path.exists() {
         return Ok(());
@@ -453,17 +854,13 @@ fn ensure_default_config(path: &Path) -> Result<()> {
     }
 }
 
-/// 加载模型清单：内置清单 + 用户文件覆盖。
 fn load_models(paths: &SbotPaths, loaded: &LoadedConfig) -> Result<ModelsFile> {
     let mut models =
         ModelsFile::parse(EMBEDDED_MODELS).context("embedded models.default.json is invalid")?;
-
     let user_path = paths.resolve(&loaded.config.models_file, &loaded.dir);
     if user_path.exists() {
-        let overlay = ModelsFile::load(&user_path)?;
-        models.merge(overlay);
+        models.merge(ModelsFile::load(&user_path)?);
     }
-
     if let Err(errors) = models.validate() {
         anyhow::bail!(
             "models.json validation failed:\n  - {}",
@@ -473,7 +870,6 @@ fn load_models(paths: &SbotPaths, loaded: &LoadedConfig) -> Result<ModelsFile> {
     Ok(models)
 }
 
-/// 启动时打印缺失凭据；只检查 `available_models` 引用到的 provider。
 fn report_missing_credentials(config: &SbotConfig, auth: &AuthFile) {
     let referenced = config
         .agent
@@ -484,7 +880,6 @@ fn report_missing_credentials(config: &SbotConfig, auth: &AuthFile) {
                 .split_once('/')
                 .map(|(provider, _)| provider.to_owned())
         });
-
     let missing = auth.missing_providers(referenced);
     if !missing.is_empty() {
         warn!(
@@ -494,14 +889,12 @@ fn report_missing_credentials(config: &SbotConfig, auth: &AuthFile) {
     }
 }
 
-/// 单实例锁。
 struct InstanceLock {
     file: std::fs::File,
     path: PathBuf,
 }
 
 impl InstanceLock {
-    /// 尝试独占锁；失败时读取文件里的 pid，给出可直接行动的提示。
     fn acquire(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -514,12 +907,9 @@ impl InstanceLock {
             .truncate(false)
             .open(path)
             .with_context(|| format!("cannot open lock file {}", path.display()))?;
-
         let pid_path = path.with_file_name("instance.pid");
 
         if let Err(error) = file.try_lock_exclusive() {
-            // 锁被占用时不能读锁文件本身（Windows 会报共享冲突），
-            // 因此 pid 放在旁边一个独立文件里，只用于提示。
             let existing = std::fs::read_to_string(&pid_path).unwrap_or_default();
             anyhow::bail!(
                 "another sbot instance is already running (lock {} held{}): {error}",
@@ -531,12 +921,9 @@ impl InstanceLock {
                 }
             );
         }
-
-        // 锁文件本身不写内容：它只承担互斥，内容随时可能被截断。
         let _ = write!(file, "{}", std::process::id());
         let _ = file.flush();
         let _ = std::fs::write(&pid_path, std::process::id().to_string());
-
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -547,20 +934,16 @@ impl InstanceLock {
 impl Drop for InstanceLock {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
-        // 删除锁文件不是必须的（文件本身不再持锁也能重新获取），
-        // 但能让 `~/.sbot/run` 保持干净；删除失败不影响正确性。
         let _ = std::fs::remove_file(&self.path);
         let _ = std::fs::remove_file(self.path.with_file_name("instance.pid"));
     }
 }
 
-/// 写哨兵文件：存在即生效。
 fn write_sentinel(path: &Path) -> Result<()> {
     std::fs::write(path, chrono::Utc::now().to_rfc3339())
         .with_context(|| format!("cannot create {}", path.display()))
 }
 
-/// 删除哨兵文件；不存在视为成功。
 fn remove_sentinel(path: &Path) -> Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -569,21 +952,18 @@ fn remove_sentinel(path: &Path) -> Result<()> {
     }
 }
 
-/// 用 `toml_edit` 原子写回 `[agent]` 下的一个字符串，保留注释与其它内容。
 fn persist_agent_setting(path: &Path, key: &str, value: &str) -> Result<()> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     let mut document: toml_edit::DocumentMut = text
         .parse()
         .with_context(|| format!("cannot parse {}", path.display()))?;
-
     let agent = document
         .entry("agent")
         .or_insert(toml_edit::table())
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("[agent] in {} is not a table", path.display()))?;
     agent[key] = toml_edit::value(value);
-
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, document.to_string())
         .with_context(|| format!("cannot write {}", tmp.display()))?;
@@ -591,7 +971,6 @@ fn persist_agent_setting(path: &Path, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Unix 上等待 SIGTERM；Windows 上永远挂起（Ctrl-C 已覆盖）。
 #[cfg(unix)]
 async fn terminate_signal() {
     use tokio::signal::unix::{SignalKind, signal};

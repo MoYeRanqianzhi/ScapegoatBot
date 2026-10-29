@@ -62,14 +62,15 @@ impl QqClient {
             .with_context(|| format!("NapCat action {action} failed"))?;
         // OneBot 11 公共返回：`retcode != 0` 表示失败。
         if let Some(retcode) = response.get("retcode").and_then(Value::as_i64)
-            && retcode != 0 {
-                let message = response
-                    .get("message")
-                    .or_else(|| response.get("wording"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown NapCat error");
-                bail!("NapCat action {action} returned retcode {retcode}: {message}");
-            }
+            && retcode != 0
+        {
+            let message = response
+                .get("message")
+                .or_else(|| response.get("wording"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown NapCat error");
+            bail!("NapCat action {action} returned retcode {retcode}: {message}");
+        }
         Ok(response)
     }
 

@@ -12,6 +12,9 @@ pub mod cli;
 pub mod config;
 pub mod ipc;
 pub mod paths;
+// 提示词在 Phase 5 由 runner 使用；Phase 4 已完成组装与测试。
+#[allow(dead_code)]
+pub mod prompt;
 // Provider 在 Phase 3 由 runner 构造；Phase 2 已完成三协议与流解析。
 #[allow(dead_code)]
 pub mod providers;
@@ -19,6 +22,9 @@ pub mod providers;
 #[allow(dead_code)]
 pub mod security;
 pub mod storage;
+// 工具层在 Phase 5 由 runner 注册；Phase 4 已完成实现与测试。
+#[allow(dead_code)]
+pub mod tools;
 // QQ 接入与消息队列在 Phase 4/5 接上运行时；Phase 3 已完成实现与单元测试。
 #[allow(dead_code)]
 pub mod qq;

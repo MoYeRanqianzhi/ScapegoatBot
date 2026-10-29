@@ -76,11 +76,12 @@ impl MessageFilter {
         }
 
         if let Some(qq) = message.sender.qq
-            && self.ignore_users.contains(&qq) {
-                return FilterVerdict::Reject {
-                    rule: "ignore_users",
-                };
-            }
+            && self.ignore_users.contains(&qq)
+        {
+            return FilterVerdict::Reject {
+                rule: "ignore_users",
+            };
+        }
 
         let text = message.plain_text();
         if self.patterns.iter().any(|pattern| pattern.is_match(&text)) {

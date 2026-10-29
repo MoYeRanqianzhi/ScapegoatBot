@@ -154,6 +154,22 @@ impl AgentLoop {
         steering: &mut SteeringQueue,
         events: &mpsc::Sender<AgentEvent>,
     ) -> LoopOutcome {
+        self.run_with_steering(history, prompts, steering, None, events)
+            .await
+    }
+
+    /// 与 [`AgentLoop::run`] 相同，但额外接受一个实时 steering 通道。
+    ///
+    /// 队列在回合运行期间把同 chat 的新消息送进来；每个请求边界都会被排空，
+    /// 对应设计 §3.4 的 `steer` 语义。
+    pub async fn run_with_steering(
+        &self,
+        history: &mut Vec<AgentMessage>,
+        prompts: Vec<AgentMessage>,
+        steering: &mut SteeringQueue,
+        mut incoming: Option<&mut mpsc::UnboundedReceiver<AgentMessage>>,
+        events: &mpsc::Sender<AgentEvent>,
+    ) -> LoopOutcome {
         let mut total_usage = Usage::default();
         let mut turns = 0u32;
         let mut pending = prompts;
@@ -169,6 +185,7 @@ impl AgentLoop {
             }
 
             loop {
+                drain_incoming(steering, &mut incoming);
                 turns += 1;
                 if turns > self.config.max_steps {
                     send(
@@ -350,6 +367,7 @@ impl AgentLoop {
                 }
 
                 // 工具之后注入 steering，下一次请求前生效。
+                drain_incoming(steering, &mut incoming);
                 for message in steering.drain() {
                     input_delta.push_str(&render_message(&message));
                     history.push(message);
@@ -665,6 +683,18 @@ impl AgentLoop {
             tool_name: call.name.clone(),
             content: result.content,
             is_error: result.is_error,
+        }
+    }
+}
+
+/// 把实时通道里的消息搬进 steering 队列。
+fn drain_incoming(
+    steering: &mut SteeringQueue,
+    incoming: &mut Option<&mut mpsc::UnboundedReceiver<AgentMessage>>,
+) {
+    if let Some(receiver) = incoming {
+        while let Ok(message) = receiver.try_recv() {
+            steering.push(message);
         }
     }
 }
