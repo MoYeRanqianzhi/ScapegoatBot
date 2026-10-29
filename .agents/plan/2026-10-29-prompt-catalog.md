@@ -48,7 +48,7 @@
 
 > Read a VFS file. `path` is an absolute VFS path. For text files, returns the content; `offset` and `limit` select lines. For images, returns multimodal content. For other binary files, returns metadata only. A full text read (no `offset`/`limit`) is required before `Edit` or overwriting with `Write`. Errors: not found, directory, permission denied, too large, unsupported binary.
 >
-> Dynamic views accept query parameters: `/inbox?filter=from:10001&limit=20`, `/messages/group/123/2026-10?filter=contains("活动")&order=desc`. `filter` uses the same expression language as a monitor's `when`; `limit` defaults to 50 (max 500); `order` is `asc` or `desc`. A query is read-only: it never marks anything as read, moved, or deleted. Filtering is seeing, not reading.
+> Dynamic views accept query parameters: `/inbox?filter=from:10001&limit=20`, `/messages/group/123/2026-10?filter=contains("活动")&order=desc`. `filter` uses the same expression language as a monitor's `when`; `limit` defaults to 50 (max 500); `order` is `asc` or `desc`. Whatever this call returns is marked read, including the subset a filter selects: you looked at it, so it counts. Items beyond `limit` stay unread. Use `LS` or `Stat` when you only want names and counts without reading.
 
 参数：`path`, `offset?`, `limit?`。
 
@@ -68,7 +68,7 @@
 
 > List a VFS directory. `recursive` includes descendants. Returns type, size, mtime, and path; does not return file content. Errors: not found, not a directory.
 >
-> Accepts the same query parameters as `Read` (`?filter=`, `limit`, `offset`, `order`) on dynamic views, and is likewise read-only: listing `/inbox?filter=...` does not mark anything read.
+> Accepts the same query parameters as `Read` (`?filter=`, `limit`, `offset`, `order`) on dynamic views, Listing never marks anything read; it only returns names and metadata.
 
 参数：`path`, `recursive?`。
 
@@ -171,6 +171,8 @@
 > Silence is not success. A monitor that only matches the happy path stays quiet through a failure. Before adding one, ask: if the thing I am watching failed right now, would this monitor deliver anything? If not, widen `when`.
 >
 > A monitor belongs to whoever created it. One you create delivers to you by default; you cannot point it at your parent or a sibling, and it is removed when you end. If you need events in the parent, report them yourself instead.
+>
+> `Grep` on `/inbox` marks what it matched as read, like `Read`.
 >
 > `list` shows name, source, remaining quota and next fire time. `fire` triggers one immediately. A monitor delivers messages; it never executes anything on its own.
 
