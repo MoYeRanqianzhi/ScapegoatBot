@@ -15,6 +15,10 @@ use crate::config::{IpcConfig, LoadedConfig, SbotConfig};
 use crate::ipc::{self, AiAction, Request, RequestBody, Response};
 use crate::paths::SbotPaths;
 
+/// 本地子命令模块：备份与诊断。
+pub mod backup;
+pub mod doctor;
+
 /// `sbot` 命令行。
 #[derive(Debug, Parser)]
 #[command(
@@ -121,18 +125,31 @@ pub enum EffortAction {
 /// 入口：解析参数并分派。
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
-
-    // `start` 是守护进程本身；其余子命令都是客户端。
-    if matches!(cli.command, Command::Start) {
-        return crate::app::Runtime::start(cli.config).await;
-    }
-
     let paths = SbotPaths::discover()?;
-    let loaded = load_config_lenient(&paths, cli.config.clone());
-    let endpoint = ipc::Endpoint::resolve(&paths, &loaded.name);
 
     match cli.command {
-        Command::Start => unreachable!("handled above"),
+        // `start` 是守护进程本身，不连接 IPC。
+        Command::Start => crate::app::Runtime::start(cli.config).await,
+        // 备份与诊断直接读本地文件：守护进程没运行时也必须可用，
+        // 尤其是 `doctor`——它正是用来排查“守护进程起不来”的。
+        Command::Backup { output } => {
+            backup::run(cli.config, output)?;
+            Ok(())
+        }
+        Command::Doctor => doctor::run(cli.config),
+        command => run_remote(command, &paths, cli.config).await,
+    }
+}
+
+/// 通过 IPC 与控制通道执行的子命令。
+async fn run_remote(command: Command, paths: &SbotPaths, config: Option<PathBuf>) -> Result<()> {
+    let loaded = load_config_lenient(paths, config);
+    let endpoint = ipc::Endpoint::resolve(paths, &loaded.name);
+
+    match command {
+        Command::Start | Command::Backup { .. } | Command::Doctor => {
+            unreachable!("local commands are handled before the daemon connection")
+        }
         Command::Status => request(&endpoint, Request::new(RequestBody::Status)).await,
         Command::Stop => request(&endpoint, Request::new(RequestBody::Shutdown)).await,
         Command::Restart => restart(&endpoint).await,
@@ -191,18 +208,6 @@ pub async fn run() -> Result<()> {
                 Ok(())
             }
         },
-
-        Command::Backup { output } => {
-            request(
-                &endpoint,
-                Request::new(RequestBody::Backup {
-                    output: output.map(|path| path.display().to_string()),
-                }),
-            )
-            .await
-        }
-
-        Command::Doctor => request(&endpoint, Request::new(RequestBody::Doctor)).await,
     }
 }
 

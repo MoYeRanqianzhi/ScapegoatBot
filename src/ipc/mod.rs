@@ -75,13 +75,6 @@ pub enum RequestBody {
     SecurityStatus,
     /// agent 请求解除 `hold`：runtime 用当前上下文重新过闸。
     SecurityResume,
-    /// 备份（SQLite 快照 + 文件）。
-    Backup {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        output: Option<String>,
-    },
-    /// 一致性自检。
-    Doctor,
 }
 
 /// `ai` 子命令。

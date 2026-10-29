@@ -497,6 +497,25 @@ impl MessageStore {
         Ok((bytes, count))
     }
 
+    /// 磁盘 JSONL 文件数与索引里的文件数。
+    ///
+    /// 启动时用于决定是否需要重建索引（设计 §8.2：索引只是可重建缓存）。
+    /// 只遍历文件名，不解析内容，百万级消息下也是 O(文件数)。
+    pub fn index_file_counts(&self) -> Result<(u64, u64)> {
+        let messages_dir = self.root.join("messages");
+        let disk = if messages_dir.exists() {
+            walk_files(&messages_dir)?.len() as u64
+        } else {
+            0
+        };
+        let indexed: u64 = self.db.lock().query_row(
+            "SELECT COUNT(*) FROM message_files",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((disk, indexed))
+    }
+
     /// 从 JSONL 重建索引（设计 §8.2：索引是可重建缓存）。
     ///
     /// 只补缺失行，不修改已有状态；用于崩溃后或索引损坏时。

@@ -52,6 +52,16 @@ impl MasterKey {
         }
     }
 
+    /// 只读取已存在的密钥文件；不存在时报错而不是生成。
+    ///
+    /// `sbot doctor` 用这个：诊断不应该顺手创建新密钥。
+    pub fn load_existing(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read key file {}", path.display()))?;
+        Self::parse(&text, path)
+    }
+
     /// 解析密钥文件内容。
     fn parse(text: &str, path: &Path) -> Result<Self> {
         let trimmed = text.trim();

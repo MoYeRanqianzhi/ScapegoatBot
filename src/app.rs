@@ -165,6 +165,18 @@ impl Runtime {
             loaded.config.storage.max_message_bytes,
             loaded.config.storage.encryption,
         )?);
+        // 启动校验：索引文件数与磁盘不一致时重建（索引只是缓存）。
+        match messages.index_file_counts() {
+            Ok((disk, indexed)) if disk != indexed => {
+                warn!(disk, indexed, "message index file count mismatch; rebuilding");
+                match messages.rebuild_index() {
+                    Ok(repaired) => info!(repaired, "message index rebuilt"),
+                    Err(error) => warn!(%error, "message index rebuild failed"),
+                }
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "cannot compare the message index with the JSONL files"),
+        }
         let sessions = Arc::new(SessionStore::open(
             Arc::clone(&db),
             Arc::clone(&key),
@@ -512,14 +524,6 @@ impl Runtime {
                     Ok(payload) => Response::ok(id, payload),
                     Err(error) => Response::error(id, "hold", error),
                 }
-            }
-            RequestBody::Backup { output } => Response::error(
-                id,
-                "not_ready",
-                format!("sbot backup arrives in Phase 7 (requested output: {output:?})"),
-            ),
-            RequestBody::Doctor => {
-                Response::error(id, "not_ready", "sbot doctor arrives in Phase 7")
             }
         }
     }

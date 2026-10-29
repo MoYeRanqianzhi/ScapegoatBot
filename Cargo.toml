@@ -40,7 +40,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 时间处理：消息分区、审计时间戳、定时器。
 chrono = { version = "0.4", features = ["serde"] }
 # 嵌入式 SQLite 数据库：VFS、索引、账本、审计。
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 # 内容加密：XChaCha20-Poly1305（设计 §6.6）。
 chacha20poly1305 = "0.10"
 # 从主密钥派生分域密钥。
