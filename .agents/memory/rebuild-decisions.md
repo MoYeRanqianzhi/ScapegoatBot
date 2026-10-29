@@ -31,7 +31,7 @@ ScapegoatBot 正在完全重构为全新项目，完整设计见 `.agents/plan/2
 - Swarm 保留，默认开启；默认模型 `anthropic/claude-opus-5-5` + `high`。
 - 默认协议 anthropic；chat/openai 同样实现 web 工具适配。
 - 消息白名单改为模型可控的 `[filter]`；过滤只影响提示，不影响存储。
-- 监视器 monitor（2026-10-30 定稿）：统一为 `{source, when?, deliver, lifecycle?}` 的事件订阅，**不设独立 ScheduleCron**（timer 是 source 的一种，投递产物同样是“一条消息进入上下文”）。source 分 `qq` / `timer` / `stream` / `internal`；`when` 是谓词表达式；`deliver` 决定投给谁与形式（event / prompt），批量窗口 200ms；`lifecycle` 管空闲触发、冷却、上限、过期、一次性、错过合并。定时语义沿用 Claude Code：本地 5 字段 cron、避开整点半点、抖动、recurring 默认 30 天过期、错过只补一次。`Monitor` 独立成工具（`add` / `remove` / `list` / `fire`），不塞进 `API`；运行时创建默认有界且不能创建 `stream` 源。投递即输入、照常过输入闸；源断开/谓词失败/被停用都发系统通知。
+- 监视器 monitor（2026-10-30 定稿）：统一为 `{source, when?, deliver, lifecycle?}` 的事件订阅，**不设独立 ScheduleCron**（timer 是 source 的一种，投递产物同样是“一条消息进入上下文”）。source 分 `qq` / `timer` / `stream` / `internal`；`when` 是谓词表达式；`deliver` 决定投给谁与形式（event / prompt），批量窗口 200ms；`lifecycle` 管空闲触发、冷却、上限、过期、一次性、错过合并。定时语义沿用 Claude Code：本地 5 字段 cron、避开整点半点、抖动、recurring 默认 30 天过期、错过只补一次。`Monitor` 独立成工具（`add` / `remove` / `list` / `fire`），不塞进 `API`；运行时创建默认有界且不能创建 `stream` 源。**归属**：子代理自建的 monitor 只投给自己，不能投给父或兄弟；父代理可代建，子代理结束即删除；匹配范围用创建者的 `receive_scopes`（子代理为 spawn 快照）。投递即输入、照常过输入闸；源断开/谓词失败/被停用都发系统通知。
 - 内置 `docs` 子代理（2026-10-30 记录）：类似 `explore`，只读，工具集仅 `api.list` / `api.help` / `Read`，专门回答 action 用法，回结论与可复制的 `params` 样例；Phase 4 随工具注册表落地。
 
 ## 待定

@@ -240,7 +240,7 @@ api.help {"action":"napcat.set_group_ban"}           → 参数、返回、示�
 
 子代理（参考 Grok Build / OpenClaw）：
 
-- `type` 决定工具集：`explore` 只读（无 `Write`/`Edit`/`RM`/`API` 发送），`plan` 只读且输出计划，`general` 拥有完整本地工具但默认无 `API` 发送，`docs` 只读且只给 `api.list` / `api.help` / `Read`。是否允许发送由 runtime 依据父回合的 owner 证据与子代理定义决定；模型不能通过 spawn 参数打开。
+- `type` 决定工具集：`explore` 只读（无 `Write`/`Edit`/`RM`/`API` 发送），`plan` 只读且输出计划，`general` 拥有完整本地工具但默认无 `API` 发送，`docs` 只读且只给 `api.list` / `api.help` / `Read`。`Monitor` 只给 `general` 与自定义 agent——一次性子代理（`explore` / `plan` / `docs`）不该被事件唤醒。是否允许发送由 runtime 依据父回合的 owner 证据与子代理定义决定；模型不能通过 spawn 参数打开。
 - `docs` 是内置的类型化查文档代理（规划中，Phase 4 落地）：父代理问“群禁言该怎么调”“有哪些查成员的动作”，它在自己的上下文里翻注册表，只把结论、可复制的 `params` 样例与门禁约束回给父代理。这样枚举六十多个 action 的成本落在子代理身上，主上下文只收一段几十行的答案。
 - 子代理使用**精简 system prompt**（身份 + 任务 + 工具规则），默认不注入 owner context / USER / memory / 技能索引；任务显式需要时才注入指定文件。
 - 子代理有独立上下文；spawn 时 runtime 冻结 `{origin_chat, owner_evidence, receive_scopes, send_scopes, gate_mode, turn_id}` 快照并附加到子代理会话。子代理每次发送沿用该快照与门禁实例，`turn_id` 把子代理的发送归并到父回合审计。`Agent message` 只改任务文本，不改变快照。结果以摘要回父代理，不直接进群；父代理对子代理的行为负责。
@@ -647,6 +647,18 @@ lifecycle = { max_events = 100, expires = "1h" }
 **专用子代理**
 
 `deliver.to = "agent:<name>"`，或 `Agent spawn` 的 `monitor` 参数绑定 → 子代理常驻，只吃它订阅到的事件。父代理只在子代理主动汇报、`check`、或 `cc = true` 时拿到内容。发送仍受门禁与 `allow_send` 约束。
+
+**监视器归属于创建者（触发主体不能错）**
+
+子代理也能建监视器，所以必须写清楚“谁的事件投给谁”：
+
+- 每条 monitor 都有 `owner`：主代理，或某个子代理**实例**。名字只在 owner 内唯一，两个 agent 可以各有一个 `at-me`。
+- 子代理创建的 monitor，`deliver.to` 缺省就是**它自己的实例**。它不能把事件投给父代理或兄弟子代理——否则子代理可以往主上下文注入内容，等于绕过了层级。
+- 主代理可以给子代理建：`Agent spawn` 的 `monitor` 参数，或 `Monitor add` 时指定 `to = <spawn_id>`。这类 monitor 的生命周期绑定该子代理，子代理结束即删除。
+- 子代理结束时，它名下的 monitor 一并删除；若还有未投递的事件，给它的父代理写一条系统通知，不静默丢。
+- `Monitor list` 只列自己名下的。父代理要看子代理的，走 `Agent check` 或等子代理汇报。
+- 匹配范围受**创建者**的 `receive_scopes` 约束；子代理用的是 spawn 时冻结的快照，不能靠 monitor 变相扩大接收范围。
+- 子代理的投递照常走它自己的门禁与快照（`origin_chat`、`allow_send`），不借用父代理的 owner 证据。
 
 **安全与边界**
 
@@ -1847,7 +1859,7 @@ src/
 - 提示词：12 个静态 section 的快照与顺序、动态边界、动态段顺序（owner context → USER → memory → STYLE → skills → runtime）；快照包含纯文本/无 Markdown/QQ 表情规则；两套身份各自快照；相同配置下静态前缀字节一致，runtime 字段变化不影响前缀；内置 prompt/tool description 不含 CJK；owner context 不能覆盖内置规则；`<memory_context>` 不被当成 owner guidance；英文 prompt 下 QQ 回复仍跟随会话语言（fake provider 断言）。
 - 记忆：`Memory` 工具按最终状态检查预算、拒绝清空、精确命中条目；文件工具写入 `/MEMORY.md` 被拒绝；会话中写入不重建 system prompt，压缩后重载；后台复盘只在 `idle`/`every_turn` 配置下触发，不发送 QQ 消息。
 - 记忆来源：`owner`/`agent` 可自动注入；`untrusted` 不进入 `<memory_context>`，显式读取时标注来源；群成员声称“我是主人”不改变来源；CLI 控制输入以 `control:<id>` 作为来源并反查 `control_inputs`；召回内容不会被再次提取；非交互会话不产生候选。
-- 监视器：`when = "event.mentions_self"` 的常驻监视器在群内 @ 时立即投递；`timer` 源按 `every` / `cron` / `at` 触发，`every < 60s` 被拒；`one_shot` 首次投递后自动删除；`idle_only` 在回合进行中不投递；重启后错过的定时触发合并成一次（fake clock）；`batch_window_ms` 内多事件合并为一条消息；`as = prompt` 的模板占位符正确渲染；`expires` / `max_events` 到期或超限自动停用并产生系统通知；谓词求值失败产生告警而不是静默；`stream` 源在 `Monitor` 工具的 `add` 中被拒绝；`Monitor` 在各模式下都与 `agent.*` 同权（不产生对外影响，`hold` 期间可用）；绑定子代理后只有订阅到的事件进入该子代理；monitor 投递的事件照常过输入闸。
+- 监视器：`when = "event.mentions_self"` 的常驻监视器在群内 @ 时立即投递；`timer` 源按 `every` / `cron` / `at` 触发，`every < 60s` 被拒；`one_shot` 首次投递后自动删除；`idle_only` 在回合进行中不投递；重启后错过的定时触发合并成一次（fake clock）；`batch_window_ms` 内多事件合并为一条消息；`as = prompt` 的模板占位符正确渲染；`expires` / `max_events` 到期或超限自动停用并产生系统通知；谓词求值失败产生告警而不是静默；`stream` 源在 `Monitor` 工具的 `add` 中被拒绝；`Monitor` 在各模式下都与 `agent.*` 同权（不产生对外影响，`hold` 期间可用）；绑定子代理后只有订阅到的事件进入该子代理；子代理自建的 monitor 只投递给自身，向父代理或兄弟投递被拒；子代理结束时其 monitor 一并删除并对父代理发通知；子代理 monitor 匹配范围受 spawn 快照的 `receive_scopes` 约束；monitor 投递的事件照常过输入闸。
 
 - 会话并发：同一 chat 的连发合并；不同 chat 各自成回合但共享 transcript；回合回复默认落在 `origin_chat`；跨 chat 发送触发 n-gram 检查与门禁；队列溢出按 `summarize`/`old`/`new` 处理。
 - 长期运行：ESTOP 暂停新回合与发送、不打断进行中回合；崩溃恢复不重发已确认消息；断线重连后按最后 `message_id` 补齐并去重，缺口写入 `[gap]`；provider 429/超时按退避重试并走回退链，完成后不重放已完成工具；内部标签在流式与非流式发送前均被剥离。
@@ -1902,7 +1914,7 @@ src/
 待定：
 
 - `[gate].llm_review` 默认值待定（当前 false）。
-- 监视器 monitor（2026-10-30 定稿）：统一为 `{source, when?, deliver, lifecycle?}` 的事件订阅，不设独立的 ScheduleCron。source 分 `qq` / `timer` / `stream` / `internal`；`when` 是谓词表达式，访问 `event.*` 与只读 `ctx.*`，求值失败告警而非静默；`deliver` 决定投给谁（main / 子代理）与形式（event / prompt），批量窗口 200ms；`lifecycle` 管空闲触发、冷却、上限、过期、一次性与错过的合并。定时任务沿用 Claude Code 的经验：本地 5 字段 cron、避开整点半点、抖动、recurring 默认 30 天过期、错过只补一次。`Monitor` 独立成工具（不塞进 `API`），支持 `add` / `remove` / `list` / `fire`；运行时创建默认有界且不允许 `stream` 源，`hold` 期间照常可用。投递即输入，照常过输入闸；源断开、谓词失败、被停用都发系统通知（静默不等于正常）。
+- 监视器 monitor（2026-10-30 定稿）：统一为 `{source, when?, deliver, lifecycle?}` 的事件订阅，不设独立的 ScheduleCron。source 分 `qq` / `timer` / `stream` / `internal`；`when` 是谓词表达式，访问 `event.*` 与只读 `ctx.*`，求值失败告警而非静默；`deliver` 决定投给谁（main / 子代理）与形式（event / prompt），批量窗口 200ms；`lifecycle` 管空闲触发、冷却、上限、过期、一次性与错过的合并。定时任务沿用 Claude Code 的经验：本地 5 字段 cron、避开整点半点、抖动、recurring 默认 30 天过期、错过只补一次。`Monitor` 独立成工具（不塞进 `API`），支持 `add` / `remove` / `list` / `fire`；运行时创建默认有界且不允许 `stream` 源，`hold` 期间照常可用。monitor 有 `owner`：子代理自建的一律投给自己，不能投给父代理或兄弟；父代理可给子代建，随子代理结束而删除；匹配范围受创建者 `receive_scopes` 约束，子代理用 spawn 时的冻结快照。投递即输入，照常过输入闸；源断开、谓词失败、被停用都发系统通知（静默不等于正常）。
 
 - 内置 `docs` 子代理（2026-10-30 记录）：类似 `explore`，只读，工具集仅 `api.list` / `api.help` / `Read`，专门回答“某个 action 怎么调、有哪些同类动作”，只回结论与可复制的调用样例。Phase 4 随工具注册表一起落地。
 - 其余实现细节在 Phase 0–4 中确定。

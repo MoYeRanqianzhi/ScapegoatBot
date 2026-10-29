@@ -166,6 +166,8 @@
 >
 > Silence is not success. A monitor that only matches the happy path stays quiet through a failure. Before adding one, ask: if the thing I am watching failed right now, would this monitor deliver anything? If not, widen `when`.
 >
+> A monitor belongs to whoever created it. One you create delivers to you by default; you cannot point it at your parent or a sibling, and it is removed when you end. If you need events in the parent, report them yourself instead.
+>
 > `list` shows name, source, remaining quota and next fire time. `fire` triggers one immediately. A monitor delivers messages; it never executes anything on its own.
 
 ### Download
