@@ -152,7 +152,8 @@ NapCat 事件
 - 技能统一放在 `/skills`：宿主 `~/.sbot/skills` 只读层与 Agent 自建 VFS 层混合；`Skill` 工具只负责加载。
 - 网络工具固定为 `WebSearch` / `WebFetch` 两个名字；执行后端可选 provider 服务端或用户配置的 HTTP 工具接口。
 - `MCP` 可选，默认关闭。
-- 本地工具 16 个（MCP 开启时 17 个）；`WebSearch` / `WebFetch` 按后端决定本地或服务端执行。工具 schema 与静态 prompt 分开计量，合计计入上下文预算（见 8.1）。
+- `Monitor` 独立成工具，不做成 `API` 的 action：它的参数是全套订阅结构，描述里要教 cron 语义与“静默不等于正常”，塞进 `API` 会稀释两者。
+- 本地工具 17 个（MCP 开启时 18 个）；`WebSearch` / `WebFetch` 按后端决定本地或服务端执行。工具 schema 与静态 prompt 分开计量，合计计入上下文预算（见 8.1）。
 
 ### 5.2 工具集
 
@@ -176,6 +177,7 @@ NapCat 事件
 | `WebSearch` | 服务端或工具后端 | 网页搜索 | `query, count?, domains?` |
 | `WebFetch` | 服务端或工具后端 | 抓取网页为 Markdown | `url, max_content_tokens?` |
 | `Agent` | 本地 | 子代理管理；内置 `type` 或自定义 `agent` 决定提示词与工具集 | `action: spawn \| message \| check \| wait \| list, type?: general \| explore \| plan \| docs, agent?: <name>, monitor?: {source, when?, deliver, lifecycle?}` |
+| `Monitor` | 本地 | 事件订阅：QQ 事件、定时、外部流、内部状态；投递为上下文消息 | `op: add \| remove \| list \| fire, name?, source?, when?, deliver?, lifecycle?` |
 | `MCP` | 本地（可选） | 外部 MCP 工具 | `server, tool, args` |
 
 没有 Bash 时补齐的文件能力：
@@ -213,7 +215,6 @@ NapCat 事件
 | `agent.quarantine` | 把指定消息或片段移入 `/quarantine/`，并在上下文中标为不可执行 | 不删除原始记录，审计保留 |
 | `agent.compact` | 手动触发一次压缩 | 被隔离的内容不进入摘要，直接丢弃 |
 | `agent.clear_context` | 丢弃当前上下文状态并开新分段，磁盘 transcript 不动 | 不影响审计与账本 |
-| `agent.monitor` | 增删查触发器：`op: add \| remove \| list \| fire` | 源可为 QQ 事件、定时、内部状态；运行时创建的默认带过期，见 5.11 |
 
 这样做的好处是：agent 发现上下文里进了脏东西时，不必等人，也不用新工具——它手上那个 `API` 就能把上下文压掉、清掉、把可疑片段隔离，或者把自己从 `hold` 里放出来。`agent.*` 不被允许修改审计、账本、配置与 `hold` 状态本身，所以它再自由也改不了自己推理所依据的证据。
 
@@ -625,18 +626,18 @@ lifecycle = { max_events = 100, expires = "1h" }
 
 - 只在空闲时触发，避免和正在跑的回合抢上下文。
 - 加抖动：recurring 最多迟到周期的 10%，上限 15 分钟。
-- 选时间避开整点和半点，除非主人明确要求；这条写进 `agent.monitor` 的帮助文本，作为模型侧指引。
+- 选时间避开整点和半点，除非主人明确要求；这条写进 `Monitor` 工具描述，作为模型侧指引。
 - 一次性任务用 `at` + `one_shot`。
 - 重启后错过的触发合并成一次，不补发 N 次。
 - recurring 默认 30 天后自动停用（Claude Code 是 7 天；我们的 agent 本来就长期运行，放宽但仍要有界）。
 
 **运行时创建**
 
-`API` 的 `agent.monitor`：
+`Monitor` 工具：
 
 | op | 参数 | 行为 |
 |----|------|------|
-| `add` | 完整 monitor 结构 | 运行时创建；默认 `expires = "2h"`、`max_events = 50`；`source` 只能是 `qq` / `timer` / `internal` |
+| `add` | `name` + `source` + `when?` + `deliver` + `lifecycle?` | 运行时创建；默认 `expires = "2h"`、`max_events = 50`、`idle_only = true`；`source` 只能是 `qq` / `timer` / `internal` |
 | `remove` | `name` | 删除 |
 | `list` | — | 名称、source、剩余配额、下次触发时间 |
 | `fire` | `name` | 手动触发一次，等价一次事件 |
@@ -1454,7 +1455,7 @@ agents_dir = "~/.sbot/agents"   # 自定义子代理定义的共享只读层
 default_max_steps = 32          # 自定义子代理未写 max_steps 时的上限
 
 [[monitor]]
-name = "at-me"                  # 运行时也可通过 API 的 agent.monitor 增删
+name = "at-me"                  # 运行时也可通过 Monitor 工具增删
 enabled = true
 source = { qq = true }          # qq | timer | stream | internal，只能一种
 when = "event.type == 'message' and event.mentions_self"   # 可省略；求值失败会告警
@@ -1699,7 +1700,7 @@ action = "log"
 - `[storage].encryption` 只能是 `xchacha20poly1305` / `none`，且必须与数据库 `meta` 中记录的模式一致；加密模式下 `~/.sbot/key` 必须存在、格式正确且 canary 校验通过；`none` 启动时警告。
 - `[storage].max_*_bytes` 必须为非负整数（0 = 不限制）；`message_retention_days` / `session_retention_days` 必须为非负整数（0 = 不按年龄删除）；`storage.path` 必须可创建且可写。
 - `[compaction]` 的 `reserve_tokens` / `keep_recent_tokens` / `max_failures` / `turn_context_budget` 必须为正数；`reserve_tokens >= agent.max_output_tokens`，否则启动失败。`agent.max_output_tokens` 必须 ≤ 所选模型的 `max_tokens`。
-- `[[monitor]]` 的 `source` 只能是 `qq` / `timer` / `stream` / `internal` 之一；`timer` 必须且只能给 `cron` / `every` / `at` 之一，`every ≥ 60s`；`stream` 只允许出现在配置文件，运行时 `agent.monitor add` 一律拒绝；`when` 必须可解析，失败则启动报错并指出位置；`deliver.to` 必须合法，指向 `agent:<name>` 时定义必须存在；`lifecycle` 各项非负，`expires` 是合法时长或 `0`；`one_shot = true` 时必须带 `timer`；`name` 不能重复；匹配范围超出 `receive_scopes` 时拒绝启动并列出越界项。
+- `[[monitor]]` 的 `source` 只能是 `qq` / `timer` / `stream` / `internal` 之一；`timer` 必须且只能给 `cron` / `every` / `at` 之一，`every ≥ 60s`；`stream` 只允许出现在配置文件，`Monitor` 工具的 `add` 一律拒绝该源；`when` 必须可解析，失败则启动报错并指出位置；`deliver.to` 必须合法，指向 `agent:<name>` 时定义必须存在；`lifecycle` 各项非负，`expires` 是合法时长或 `0`；`one_shot = true` 时必须带 `timer`；`name` 不能重复；匹配范围超出 `receive_scopes` 时拒绝启动并列出越界项。
 - `[swarm].max_depth` / `max_concurrency` / `default_max_steps` 必须为正数；`agents_dir` 必须可读。自定义子代理 frontmatter 的 `name` 唯一且合法，`tools` 必须是已知工具的子集，`model` 为空或存在于 `available_models`，`allow_send` 为布尔值；非法定义启动时告警并跳过，不阻止主进程启动。
 - 未知字段、未知协议、越界数值一次性列出全部错误，启动失败。
 - 子代理的 `model` / `thinking_level` 在 spawn 时校验；模型不存在则拒绝，级别不支持则 clamp 到最近级别并警告。
@@ -1825,7 +1826,7 @@ src/
 2. **Phase 1**：VFS（路径、SQLite 后端、二进制分块、配额、Read-before-Edit、种子、`/friends` 动态节点）。
 3. **Phase 2**：Provider trait + `chat` / `openai` / `anthropic` 三协议流式、服务端工具声明与结果解析、Agent loop 状态机、事件流、测试用 fake provider。
 4. **Phase 3**：NapCat 接入、事件归一化、断线重连与补消息、消息按月/群/日 JSONL 分区持久化、消息 VFS 视图、索引缓存与重建、配额与清理、过滤器、按 chat 去抖与队列、transcript 分段与 `/sessions` 映射。
-5. **Phase 4**：工具注册表、权限、全部文件工具、`Memory`、`API`、`Skill`、`Download`、`WebSearch` / `WebFetch`（含用户配置的 HTTP 后端）、子代理类型与工具隔离、monitor（`inject` / `wake` / `notify` 与 `agent.monitor`）。
+5. **Phase 4**：工具注册表、权限、全部文件工具、`Memory`、`API`、`Skill`、`Download`、`WebSearch` / `WebFetch`（含用户配置的 HTTP 后端）、子代理类型与工具隔离、`Monitor` 工具（事件订阅与定时）。
 6. **Phase 5**：提示词组装（含 USER/STYLE 块）、上下文注入 hook、记忆来源与分层、后台复盘、压缩（memory flush / 分层输入 / pruning）与 transcript 轮转/历史链（`previous_session`、`current_session`）。
 7. **Phase 6**：Swarm、MCP、monitor 绑定常驻子代理（`spawn` 动作与 `Agent spawn` 的 `monitor` 参数）。
 8. **Phase 7**：`sbot backup` / `sbot doctor`、成本与健康报告、端到端测试、百万级消息与清理负载测试、NapCat 兼容性验证、文档、发布 tag。
@@ -1846,7 +1847,7 @@ src/
 - 提示词：12 个静态 section 的快照与顺序、动态边界、动态段顺序（owner context → USER → memory → STYLE → skills → runtime）；快照包含纯文本/无 Markdown/QQ 表情规则；两套身份各自快照；相同配置下静态前缀字节一致，runtime 字段变化不影响前缀；内置 prompt/tool description 不含 CJK；owner context 不能覆盖内置规则；`<memory_context>` 不被当成 owner guidance；英文 prompt 下 QQ 回复仍跟随会话语言（fake provider 断言）。
 - 记忆：`Memory` 工具按最终状态检查预算、拒绝清空、精确命中条目；文件工具写入 `/MEMORY.md` 被拒绝；会话中写入不重建 system prompt，压缩后重载；后台复盘只在 `idle`/`every_turn` 配置下触发，不发送 QQ 消息。
 - 记忆来源：`owner`/`agent` 可自动注入；`untrusted` 不进入 `<memory_context>`，显式读取时标注来源；群成员声称“我是主人”不改变来源；CLI 控制输入以 `control:<id>` 作为来源并反查 `control_inputs`；召回内容不会被再次提取；非交互会话不产生候选。
-- 监视器：`when = "event.mentions_self"` 的常驻监视器在群内 @ 时立即投递；`timer` 源按 `every` / `cron` / `at` 触发，`every < 60s` 被拒；`one_shot` 首次投递后自动删除；`idle_only` 在回合进行中不投递；重启后错过的定时触发合并成一次（fake clock）；`batch_window_ms` 内多事件合并为一条消息；`as = prompt` 的模板占位符正确渲染；`expires` / `max_events` 到期或超限自动停用并产生系统通知；谓词求值失败产生告警而不是静默；`stream` 源在运行时 `agent.monitor add` 被拒绝；绑定子代理后只有订阅到的事件进入该子代理；monitor 投递的事件照常过输入闸。
+- 监视器：`when = "event.mentions_self"` 的常驻监视器在群内 @ 时立即投递；`timer` 源按 `every` / `cron` / `at` 触发，`every < 60s` 被拒；`one_shot` 首次投递后自动删除；`idle_only` 在回合进行中不投递；重启后错过的定时触发合并成一次（fake clock）；`batch_window_ms` 内多事件合并为一条消息；`as = prompt` 的模板占位符正确渲染；`expires` / `max_events` 到期或超限自动停用并产生系统通知；谓词求值失败产生告警而不是静默；`stream` 源在 `Monitor` 工具的 `add` 中被拒绝；`Monitor` 在各模式下都与 `agent.*` 同权（不产生对外影响，`hold` 期间可用）；绑定子代理后只有订阅到的事件进入该子代理；monitor 投递的事件照常过输入闸。
 
 - 会话并发：同一 chat 的连发合并；不同 chat 各自成回合但共享 transcript；回合回复默认落在 `origin_chat`；跨 chat 发送触发 n-gram 检查与门禁；队列溢出按 `summarize`/`old`/`new` 处理。
 - 长期运行：ESTOP 暂停新回合与发送、不打断进行中回合；崩溃恢复不重发已确认消息；断线重连后按最后 `message_id` 补齐并去重，缺口写入 `[gap]`；provider 429/超时按退避重试并走回退链，完成后不重放已完成工具；内部标签在流式与非流式发送前均被剥离。
@@ -1901,7 +1902,7 @@ src/
 待定：
 
 - `[gate].llm_review` 默认值待定（当前 false）。
-- 监视器 monitor（2026-10-30 定稿）：统一为 `{source, when?, deliver, lifecycle?}` 的事件订阅，不设独立的 ScheduleCron。source 分 `qq` / `timer` / `stream` / `internal`；`when` 是谓词表达式，访问 `event.*` 与只读 `ctx.*`，求值失败告警而非静默；`deliver` 决定投给谁（main / 子代理）与形式（event / prompt），批量窗口 200ms；`lifecycle` 管空闲触发、冷却、上限、过期、一次性与错过的合并。定时任务沿用 Claude Code 的经验：本地 5 字段 cron、避开整点半点、抖动、recurring 默认 30 天过期、错过只补一次。运行时通过 `agent.monitor` 增删查与手动触发，默认有界且不允许创建 `stream` 源。投递即输入，照常过输入闸；源断开、谓词失败、被停用都发系统通知（静默不等于正常）。
+- 监视器 monitor（2026-10-30 定稿）：统一为 `{source, when?, deliver, lifecycle?}` 的事件订阅，不设独立的 ScheduleCron。source 分 `qq` / `timer` / `stream` / `internal`；`when` 是谓词表达式，访问 `event.*` 与只读 `ctx.*`，求值失败告警而非静默；`deliver` 决定投给谁（main / 子代理）与形式（event / prompt），批量窗口 200ms；`lifecycle` 管空闲触发、冷却、上限、过期、一次性与错过的合并。定时任务沿用 Claude Code 的经验：本地 5 字段 cron、避开整点半点、抖动、recurring 默认 30 天过期、错过只补一次。`Monitor` 独立成工具（不塞进 `API`），支持 `add` / `remove` / `list` / `fire`；运行时创建默认有界且不允许 `stream` 源，`hold` 期间照常可用。投递即输入，照常过输入闸；源断开、谓词失败、被停用都发系统通知（静默不等于正常）。
 
 - 内置 `docs` 子代理（2026-10-30 记录）：类似 `explore`，只读，工具集仅 `api.list` / `api.help` / `Read`，专门回答“某个 action 怎么调、有哪些同类动作”，只回结论与可复制的调用样例。Phase 4 随工具注册表一起落地。
 - 其余实现细节在 Phase 0–4 中确定。

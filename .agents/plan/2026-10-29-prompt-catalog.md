@@ -132,27 +132,41 @@
 > - `agent.quarantine` — move a message or excerpt into `/quarantine/` and mark it non-executable in context. The original record stays for audit.
 > - `agent.compact` — run compaction now. Quarantined content is dropped rather than summarized.
 > - `agent.clear_context` — discard the current in-memory context and start a new segment; the transcript on disk is untouched.
-> - `agent.monitor` — `{"op":"add"|"remove"|"list"|"fire"}`. A monitor subscribes to an event source and delivers each event as a message, so it does not have to wait for a turn. Runtime-created monitors expire on their own (`2h` by default, `50` events max) and may only use `qq`, `timer` or `internal` sources; `stream` sources must be written into the config by the owner.
->
->   Shape: `{"name":..., "source":{...}, "when":"<expression>", "deliver":{"to":"main","as":"event"|"prompt"}, "lifecycle":{...}}`.
->
->   Timer source: `{"timer":{"cron":"*/10 * * * *"}}` uses a local-time 5-field cron; `{"timer":{"every":"10m"}}` needs at least 60s; `{"timer":{"at":"09:07"}}` plus `lifecycle.one_shot = true` is a one-shot reminder. Prefer an off-minute (`7 9 * * 1-5`, not `0 9 * * 1-5`) unless the exact time matters. Timers only fire while you are idle, recurring timers jitter and expire on their own, and missed fires are coalesced into one rather than replayed.
->
->   `as = "prompt"` sends an instruction you write; `{{event.*}}` and `{{count}}` are substituted. `as = "event"` forwards the event itself. Keep `when` expressions simple; a broken expression is reported, not silently ignored.
-> **`api.*` — about this tool.** Read-only, always available:
->
-> - `api.list` — list actions. Filters: `namespace` (`napcat` / `agent` / `api`), `category`, `query` (matches name and summary), `offset`, `limit` (default 20, max 100). Returns one line per action: name, one-line summary, whether it works during a hold, plus `total` and `next_offset`.
-> - `api.help` — full details for one action: its parameters, returns, examples, gate rules, and whether it works during a hold.
->
-> The description above is only one line per action. When you are unsure which action to use, call `api.list` with a `category` or `query` to narrow it down; when you are unsure about the parameters, call `api.help` instead of guessing — a wrong field is rejected and wastes a step.
->
-> Use `agent.*` when you see something in your own context that should not stay there: isolate it, compact around it, or clear the context. Use `agent.resume` only when you have dealt with what tripped the gate; the gate re-checks the current context and will refuse if it still sees a problem.
->
+
 > Sends return a `message_id`; the runtime records them as `sender = self`. Every `napcat.*` call passes the gate, and during a hold every one of them returns `Disabled during hold`. On failure, returns a readable error; do not retry a send without checking whether it went out. Use query actions to verify identity or target before destructive actions.
 
 参数：`action`, `params`。
 
 > 实现注：`API` description 由 action registry 生成；两个命名空间共用同一个 `action` 字段，前缀决定分发。每个 action 一行 summary、参数 schema 与返回字段。不要手写一个不断漂移的巨大字符串。
+
+### Monitor
+
+> Subscribe to an event source; each event, or a prompt you write, arrives as a message in this conversation so you do not have to wait for a turn.
+>
+> Params: `op` (`add` | `remove` | `list` | `fire`), `name`, and for `add`: `source`, optional `when`, `deliver`, optional `lifecycle`.
+>
+> **source** — exactly one kind:
+> - `{"qq": true}` — inbound QQ events: messages, recalls, friend and group requests.
+> - `{"timer": {"every": "10m"}}` / `{"timer": {"cron": "7 9 * * 1-5"}}` / `{"timer": {"at": "09:07"}}` — local time; `every` needs at least 60s.
+> - `{"stream": {...}}` — external WebSocket / SSE / poll. Config file only; `add` rejects it.
+> - `{"internal": "security" | "budget" | "agent" | "storage"}` — runtime state changes.
+>
+> **when** — optional expression over `event.*` and read-only `ctx.*`, e.g. `event.mentions_self`, `event.text contains "报名"`, `event.chat == "group:123"`. A broken expression is reported, never silently ignored.
+>
+> **deliver** — `{"to": "main" | "agent:<name>", "as": "event" | "prompt", "prompt"?: "...", "batch_window_ms"?: 200, "cc"?: false}`. `as: "prompt"` sends an instruction you write; `{{event.*}}` and `{{count}}` are substituted. Events within the batch window arrive as one message.
+>
+> **lifecycle** — `{"idle_only"?: true, "min_interval_secs"?: 0, "max_events"?: 1000, "expires"?: "30d", "one_shot"?: false, "catch_up"?: "coalesce"}`.
+>
+> Scheduling rules:
+> - Timers fire only while you are idle; missed fires are coalesced into one, never replayed N times.
+> - Recurring timers jitter by up to 10% of the period (max 15 min) and expire on their own.
+> - Prefer an off-minute (`7 9 * * 1-5`, not `0 9 * * 1-5`) unless the exact time matters.
+> - One-shot reminders: `{"timer":{"at":"..."}}` plus `lifecycle.one_shot = true`.
+> - `add` at runtime is bounded: `expires` defaults to `2h`, `max_events` to `50`.
+>
+> Silence is not success. A monitor that only matches the happy path stays quiet through a failure. Before adding one, ask: if the thing I am watching failed right now, would this monitor deliver anything? If not, widen `when`.
+>
+> `list` shows name, source, remaining quota and next fire time. `fire` triggers one immediately. A monitor delivers messages; it never executes anything on its own.
 
 ### Download
 
