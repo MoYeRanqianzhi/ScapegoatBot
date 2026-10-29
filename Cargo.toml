@@ -50,6 +50,8 @@ dirs = "6"
 regex = "1"
 # 十六进制编码：主密钥文件与哈希摘要。
 hex = "0.4"
+# VFS 路径的 Unicode NFC 规范化（设计 §6.3）。
+unicode-normalization = "0.1"
 # Unix 域套接字权限、Windows 管道 DACL 需要平台 API。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

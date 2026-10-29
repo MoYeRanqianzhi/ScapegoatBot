@@ -25,10 +25,11 @@ const CANARY_PLAINTEXT: &[u8] = b"scapegoat-bot/canary/v1";
 const CANARY_KEY: &str = "encryption.canary";
 
 /// 迁移列表：`(版本号, 说明, SQL)`。只追加，不修改已发布条目。
-const MIGRATIONS: &[(u32, &str, &str)] = &[(
-    1,
-    "phase0: meta, control_inputs, idempotency",
-    r#"
+const MIGRATIONS: &[(u32, &str, &str)] = &[
+    (
+        1,
+        "phase0: meta, control_inputs, idempotency",
+        r#"
     CREATE TABLE meta (
         key   TEXT PRIMARY KEY,
         value BLOB NOT NULL
@@ -49,7 +50,61 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[(
         created_at TEXT NOT NULL
     );
     "#,
-)];
+    ),
+    (
+        2,
+        "phase1: VFS nodes, chunks, read state",
+        r#"
+    -- 虚拟文件系统。`name` 是明文路径段（目录索引需要），内容单独加密。
+    CREATE TABLE vfs_nodes (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        parent_id    INTEGER REFERENCES vfs_nodes(id) ON DELETE CASCADE,
+        name         TEXT NOT NULL,
+        kind         TEXT NOT NULL,
+        content_enc  BLOB,
+        size         INTEGER NOT NULL DEFAULT 0,
+        mime         TEXT,
+        mode         INTEGER NOT NULL DEFAULT 420,
+        version      INTEGER NOT NULL DEFAULT 1,
+        origin_chat  TEXT,
+        created_at   TEXT NOT NULL,
+        updated_at   TEXT NOT NULL,
+        hash         TEXT,
+        trashed_at   TEXT,
+        trash_origin TEXT
+    );
+
+    -- 同一目录下不重名；回收站内的节点不参与唯一约束（可以同名重建）。
+    CREATE UNIQUE INDEX vfs_nodes_unique_name
+        ON vfs_nodes(parent_id, name)
+        WHERE trashed_at IS NULL;
+    CREATE INDEX vfs_nodes_parent ON vfs_nodes(parent_id);
+    CREATE INDEX vfs_nodes_trashed ON vfs_nodes(trashed_at);
+
+    -- 二进制分块索引；密文在 blobs/<node_id>/<idx>，不存 SQLite。
+    CREATE TABLE vfs_chunks (
+        node_id INTEGER NOT NULL REFERENCES vfs_nodes(id) ON DELETE CASCADE,
+        idx     INTEGER NOT NULL,
+        offset  INTEGER NOT NULL,
+        length  INTEGER NOT NULL,
+        hash    TEXT NOT NULL,
+        PRIMARY KEY (node_id, idx)
+    );
+
+    -- Read-before-Edit：全局单 agent，无会话维度。
+    CREATE TABLE vfs_reads (
+        node_id      INTEGER PRIMARY KEY REFERENCES vfs_nodes(id) ON DELETE CASCADE,
+        version      INTEGER NOT NULL,
+        content_hash TEXT,
+        is_partial   INTEGER NOT NULL,
+        read_at      TEXT NOT NULL
+    );
+
+    INSERT INTO vfs_nodes (id, parent_id, name, kind, size, version, created_at, updated_at)
+    VALUES (1, NULL, '', 'dir', 0, 1, datetime('now'), datetime('now'));
+    "#,
+    ),
+];
 
 /// 数据库句柄。
 ///
@@ -221,6 +276,14 @@ impl Database {
             warn!(removed, "pruned expired idempotency records");
         }
         Ok(removed)
+    }
+
+    /// 取得连接锁。
+    ///
+    /// VFS 等模块需要自己控制事务边界；单连接 + 单互斥锁保证写路径串行，
+    /// 这比按节点加锁更简单，也消除了写写冲突。调用方必须在同一作用域内完成事务。
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().expect("database mutex poisoned")
     }
 
     /// 写入一条控制通道输入，返回自增 id。

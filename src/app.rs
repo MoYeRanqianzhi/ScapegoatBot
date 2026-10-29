@@ -24,6 +24,8 @@ use crate::ipc::{self, AiAction, Handler, Request, RequestBody, Response};
 use crate::paths::SbotPaths;
 use crate::storage::Database;
 use crate::storage::crypto::MasterKey;
+use crate::vfs::Vfs;
+use crate::vfs::sqlite::VfsStore;
 
 /// 内置模型清单：随二进制发布，用户 `models.json` 覆盖/追加（设计 §9.3）。
 const EMBEDDED_MODELS: &str = include_str!("../assets/models.default.json");
@@ -40,9 +42,11 @@ pub struct Runtime {
     #[allow(dead_code)]
     pub auth: AuthFile,
     /// SQLite。
-    pub db: Database,
-    /// 主密钥。
-    pub key: MasterKey,
+    pub db: Arc<Database>,
+    /// 主密钥；VFS 与后续阶段共用。
+    pub key: Arc<MasterKey>,
+    /// 虚拟文件系统。Phase 4 的工具层从这里读写。
+    pub vfs: Arc<VfsStore>,
     /// LLM 调用开关（`sbot ai stop` 只停 LLM，不收消息）。
     ai_enabled: AtomicBool,
     /// 启动时间用于 uptime。
@@ -77,12 +81,19 @@ impl Runtime {
         // 单实例锁必须早于数据库与 IPC：否则第二个进程会在打开 WAL 时才失败。
         let instance_lock = InstanceLock::acquire(&paths.instance_lock())?;
 
-        let key = MasterKey::load_or_create(paths.key_file())?;
+        let key = Arc::new(MasterKey::load_or_create(paths.key_file())?);
         let data_dir = paths.resolve(&loaded.config.storage.path, &loaded.dir);
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("cannot create storage path {}", data_dir.display()))?;
-        let db = Database::open(data_dir.join("sbot.db"))?;
+        let db = Arc::new(Database::open(data_dir.join("data.db"))?);
         db.ensure_key(&key)?;
+
+        let vfs = Arc::new(VfsStore::from_config(
+            Arc::clone(&db),
+            Arc::clone(&key),
+            data_dir.clone(),
+            &loaded.config.storage,
+        )?);
 
         if loaded.config.storage.encryption == EncryptionMode::None {
             warn!("storage.encryption = \"none\": data is stored in plaintext (debug only)");
@@ -96,6 +107,7 @@ impl Runtime {
             auth,
             db,
             key,
+            vfs,
             ai_enabled: AtomicBool::new(true),
             started_at: chrono::Utc::now(),
             shutdown,
@@ -167,6 +179,15 @@ impl Runtime {
             "estop": self.estop_active(),
             "hold": self.hold_active(),
             "session_scope": config.session.scope,
+            // VFS 用量：活跃与回收站分开，方便 `sbot status` 直接看出配额压力。
+            "vfs": self.vfs.usage().ok().map(|usage| {
+                json!({
+                    "active_bytes": usage.active_bytes,
+                    "trash_bytes": usage.trash_bytes,
+                    "nodes": usage.nodes,
+                    "trash_nodes": usage.trash_nodes,
+                })
+            }),
             "guard": {
                 "enabled": config.security.guard.enabled,
                 "mode": config.security.guard.mode,
@@ -388,10 +409,11 @@ impl Handler for Runtime {
         // 只缓存成功结果：失败允许客户端重试。
         if response.ok
             && let Some(key) = idempotency_key
-                && let Ok(serialized) = serde_json::to_string(&response)
-                    && let Err(error) = self.db.idempotency_put(&key, &serialized) {
-                        warn!(%error, "cannot store idempotent response");
-                    }
+            && let Ok(serialized) = serde_json::to_string(&response)
+            && let Err(error) = self.db.idempotency_put(&key, &serialized)
+        {
+            warn!(%error, "cannot store idempotent response");
+        }
 
         response
     }

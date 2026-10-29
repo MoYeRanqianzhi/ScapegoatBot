@@ -678,7 +678,6 @@ pub struct FilterConfig {
     pub require_mention: bool,
 }
 
-
 impl FilterConfig {
     fn validate(&self, errors: &mut Vec<ConfigError>) {
         if self.ignore_groups.contains(&0) {
@@ -1239,7 +1238,6 @@ pub struct TimerSource {
     pub jitter_secs: Option<u64>,
 }
 
-
 /// 外部流源（只能由主人写进配置文件）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1273,7 +1271,6 @@ pub struct InternalSource {
     /// `agent` / `security` / `budget` / `storage` 之一。
     pub kind: String,
 }
-
 
 /// 一个 monitor 只能有一种 source；校验阶段保证恰好一个非空。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1476,28 +1473,30 @@ fn validate_monitors(monitors: &[MonitorConfig], errors: &mut Vec<ConfigError>) 
                 || stream.url.starts_with("wss://")
                 || stream.url.starts_with("http://")
                 || stream.url.starts_with("https://"))
-            {
-                errors.push(ConfigError::new(
-                    format!("{field}.source.stream.url"),
-                    "must be an http(s) or ws(s) URL",
-                ));
-            }
+        {
+            errors.push(ConfigError::new(
+                format!("{field}.source.stream.url"),
+                "must be an http(s) or ws(s) URL",
+            ));
+        }
 
         if let Some(internal) = &monitor.source.internal
-            && !["agent", "security", "budget", "storage"].contains(&internal.kind.as_str()) {
-                errors.push(ConfigError::new(
-                    format!("{field}.source.internal.kind"),
-                    "must be one of \"agent\", \"security\", \"budget\" or \"storage\"",
-                ));
-            }
+            && !["agent", "security", "budget", "storage"].contains(&internal.kind.as_str())
+        {
+            errors.push(ConfigError::new(
+                format!("{field}.source.internal.kind"),
+                "must be one of \"agent\", \"security\", \"budget\" or \"storage\"",
+            ));
+        }
 
         if let Some(when) = &monitor.when
-            && when.trim().is_empty() {
-                errors.push(ConfigError::new(
-                    format!("{field}.when"),
-                    "must not be empty; omit the field to match everything",
-                ));
-            }
+            && when.trim().is_empty()
+        {
+            errors.push(ConfigError::new(
+                format!("{field}.when"),
+                "must not be empty; omit the field to match everything",
+            ));
+        }
 
         if monitor.deliver.to.trim().is_empty() {
             errors.push(ConfigError::new(
@@ -1506,12 +1505,13 @@ fn validate_monitors(monitors: &[MonitorConfig], errors: &mut Vec<ConfigError>) 
             ));
         } else if monitor.deliver.to != "main"
             && let Some(name) = monitor.deliver.to.strip_prefix("agent:")
-                && name.is_empty() {
-                    errors.push(ConfigError::new(
-                        format!("{field}.deliver.to"),
-                        "\"agent:\" requires a name",
-                    ));
-                }
+            && name.is_empty()
+        {
+            errors.push(ConfigError::new(
+                format!("{field}.deliver.to"),
+                "\"agent:\" requires a name",
+            ));
+        }
 
         if monitor.deliver.as_ == DeliverAs::Prompt && monitor.deliver.prompt.trim().is_empty() {
             errors.push(ConfigError::new(
