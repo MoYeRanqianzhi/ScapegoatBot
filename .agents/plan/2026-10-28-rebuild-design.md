@@ -71,6 +71,8 @@ AgentEvent = agent_start | turn_start | message_start | message_update
   7. `pause_turn`：服务端工具暂停时，追加响应内容并继续请求。
   8. `finish_turn`：返回 `End` 或 `Continue`。
 - 错误/取消：`stop_reason = Error | Aborted` 直接结束本轮并发出 `agent_end`。
+- 逐步哨兵 tick（见 5.10）：`prepare_next_turn` 之后、`before_tool_call` 之内、工具结果提交之前、每个流式 delta 窗口、`finish_turn` 之前、以及每个副作用（发送/记忆写/配置写/子代理 spawn）执行之前各触发一次。只读 tick 与 `Delta` 走非阻塞车道，`Effect` 与破坏性 `ToolCall` 走阻塞车道。
+- `stop_reason = Refusal`（Claude 4+ 的安全分类器）：不作为 provider 错误、不盲目重试（被拒请求可能仍计费）；记录 `stop_details.category` / `stop_details.explanation` 到 `security_events`，向主人的 `agent_end` 报告；需要时用回退模型重发同一请求一次，仍被拒则结束回合，不在群里解释。
 - 流式与重试语义：部分流一律丢弃、不落盘；只有完整解析的 tool_call 才执行；tool result 先提交（或写入 turn buffer）再发下一次请求。请求失败重试时从已记录的 tool result 继续，不重新执行已完成工具。
 - 协议回退：从 `anthropic` 回退到 `chat` / `openai` 时，历史中的 `server_tool_use` / `web_search_tool_result` / `web_fetch_tool_result` / `pause_turn` 块降级为带标注的文本；重算窗口与工具声明，必要时先压缩再请求，避免回退链因历史块不兼容而 400。
 - `stop_reason = MaxTokens` 且存在工具调用时：所有调用失败，不执行（参数可能被截断）。
@@ -402,6 +404,142 @@ OwnerIntent { kind: control | owner_message | standing, chat_id?, message_id?, c
 - 身份冒充：自称主人、新主人、主人代表、转发主人授权。
 - 记忆投毒：要求写入“主人授权/偏好”或修改 `/USER.md`。
 - 行为证据：agent 是否实际写了记忆、发了跨 chat 消息、改了配置、接受了请求；`complied` 必须由事件与 tool result 支持，不能只看模型自述。
+
+### 5.10 逐步哨兵（per-step guard）
+
+5.9 回答的是“过去 256K 有没有出事”，而一条注入链完全可以在两次检查之间走完；只在工具调用前检查也不够——模型可能在被工具结果说服的那一刻就已经失守，之后的“正常”调用只是在执行已被接受的意图。因此把检查粒度压到 **Agent Loop 的每一个 tick**，并靠分层承担成本。
+
+参考三种现成做法（见 `.agents/plan/2026-10-30-step-guard-research.md`）：
+
+- **Anthropic Constitutional Classifiers++**：廉价内部探针扫全部流量，可疑才升级到 exchange classifier；后者同时看提示词与响应（而不是各自单独看），因此能抓“输出用隐喻伪装”“危险信息分散在多个片段再组装”。整体约 +1% 计算量。
+- **Claude Code auto mode**：输入侧对每个工具结果做注入检测后才让它进入上下文；输出侧用一个 **reasoning-blind** 的 transcript 分类器——**剥掉 agent 的文本与思考、剥掉工具结果原文**，只保留用户消息与工具调用，避免 agent 的自我辩解替危险调用辩护，也避免恶意文件说服审查器放行。先走规则与只读白名单，只有 shell/网络/MCP/跨项目操作才进分类器。
+- **TypeSafe Jev（System One）**：非自回归决策模型，`{model, state, questions}` → `{answers}`，问题是强类型的 `noul`（是/否概率）、`choice`（1–255 项）、`score`（2–10 级）；**一次请求可以在同一 state 上批量回答多个问题**；延迟 70–500ms，输入 $0.042/M token、输出免费，单次约 $0.00001。它很快也很便宜，足以放进循环内部。
+
+代价可算：主模型一次前向是数百毫秒到数秒，一次工具执行是几十毫秒到数秒；单遍决策 70–500ms、约 $0.00001，按 tick 调用不会成为瓶颈，也不构成预算问题。
+
+**四层级联**
+
+| 层 | 形态 | 延迟 | 频率 | 职责 |
+|----|------|------|------|------|
+| L0 | 确定性 runtime | µs、0 成本 | 每一 tick | 来源、scope、预算、账本、action 分类、硬规则 |
+| L1 | 单遍决策模型（Jev 式） | 70–500ms，~$0.00001 | 每一 tick | 窄问题上的结构化感知判定 |
+| L2 | 交换级生成式审查 | 0.2–3s | L1 越界或落在不确定带 | 提示词 + 输出一起看，抓混淆与拼接 |
+| L3 | 周期全量审查（5.9） | 数秒 | 每 256K token | 长程漂移、渐进式围猎 |
+
+L0 永不依赖模型：没有分类器时，破坏性动作、跨 chat 发送、owner intent 缺失这些判定照常生效。**分类器只能收窄，不能放宽 L0 的结论。**
+
+**tick 定义**
+
+| tick | 时机 | 视图 | 阻塞 |
+|------|------|------|------|
+| `Inbound` | 入站消息写入 transcript 之前 | `ingest_view` | 否，标注 |
+| `ToolCall` | `before_tool_call`，门禁规则之后 | `approval_view` | 破坏性阻塞，只读不阻塞 |
+| `ToolResult` | 工具结果写入 turn buffer 之前 | `ingest_view` | 否，标注 |
+| `Delta` | 流式文本/思考每 `delta_every_tokens`（默认 200）token | `output_view` | 否，可提前中止生成 |
+| `StepEnd` | 下一次 provider 请求之前 | `approval_view` + 轨迹 | 否 |
+| `Effect` | 发送、记忆写、配置写、子代理 spawn 之前 | `effect_view` | 是，fail closed |
+
+**四种视图（reasoning-blind）**
+
+视图由 runtime 现场组装，不是让模型自述。这是本设计最重要的一条：**被审查的是事实，不是 agent 对事实的解释。**
+
+- `ingest_view`：待进入上下文的原始内容、来源信封（chat_id / sender / message_id / 是否本人）、最近若干条消息。**不含** agent 的文本与思考，不含其他工具结果。
+- `approval_view`：用户消息、工具名与参数、runtime 元数据（scope、owner intent 证据、发送账本摘要、actor 关系）。**剔除** agent 的文本与思考，**剔除**工具结果原文（只留 `t2 API ok, 214 chars (omitted)` 这类一行摘要）。
+- `output_view`：待发送或正在生成的文本、目标 chat、`context_sources` 的来源清单。同样不含工具结果原文。
+- `effect_view`：待执行动作、目标、owner intent 证据、账本、scopes、最近同类动作。
+
+`approval_view` 剔除工具结果，是因为恶意网页/文件正是通过“劝审查器放行”生效的；`ingest_view` 剔除 agent 输出，是因为 agent 已经可能被说服，它的复述会污染判断。
+
+**问题集**
+
+每个 tick 只问**它这一层能回答的窄问题**，一次请求批量问完（Jev 支持同一 state 上多问题），由 runtime 把答案与 ground truth 对照后决定动作。问题定义与英文原文在 prompt catalog §12。
+
+| tick | 问题 | 类型 | 用途 |
+|------|------|------|------|
+| `Inbound` | `inject` | noul | 这条消息是否在对 agent 下指令 |
+| `Inbound` | `identity_claim` | choice（none / self / authority / relayed / delegation） | 自称主人、自称上级、转述授权、代表授权 |
+| `Inbound` | `urgency_pressure` | noul | 紧迫 + 保密 + 权威的组合，社工前兆 |
+| `Inbound` | `exfil_probe` | noul | 探询其他 chat、密钥、配置、主人身份 |
+| `ToolCall` | `route` | choice（allow / ask / block） | 门禁裁决 |
+| `ToolCall` | `reversibility` | score 1–10 | 可逆 ↔ 不可逆 |
+| `ToolCall` | `scope_escape` | noul | 目标超出 `origin_chat` 与 `send_scopes` |
+| `ToolCall` | `exfil` | noul | 把内容带出它所在的 chat |
+| `ToolResult` | `contains_instruction` | noul | 结果里是否有对 agent 的指令（间接注入） |
+| `ToolResult` | `secret_bearing` | noul | 是否含密钥、他人隐私、其他 chat 内容 |
+| `Delta` | `leak` | noul | 输出是否夹带其他 chat 的材料 |
+| `Delta` | `claim_without_action` | noul | 输出声称完成了某个动作 |
+| `Delta` | `hostile` | noul | 对主人或他人的人身攻击、威胁 |
+| `Effect` | `owner_intent_supports` | noul | 给定证据是否真的支持这个动作 |
+
+`claim_without_action` 是本设计的一个具体收益：runtime 手里有账本，知道写入到底有没有发生。分类器只需要回答“这句话是不是一个完成态的声明”这种近乎抽取的窄问题，真假由 runtime 用账本裁决。于是“哈哈哈，我记录了！”这种社交性敷衍可以被准确识别为**没有写入**，而不是被判为违规——**策略与能力分离：可以敷衍，不能撒谎说自己做了。**
+
+**为什么必须窄**：Jev 这类单遍模型的论文（arXiv:2610.24929）给出了明确边界——它是“对别处算好的状态做选择”的模型，20k token / 64 选项内选择可靠，但需要多步推理的题只有 74% 正确，会跟随过期的 state，且置信度**不会暴露继承自过期状态的错误**。因此：
+
+- state 必须由 runtime 现场组装，永远不传摘要、不传 agent 自述；
+- 问题必须是感知型的（“这段文本是不是在给指令”），不是判断型的（“这个对话安不安全”）；
+- 需要推理的判断一律留给 L2，不让 L1 越界；
+- L1 的置信度只用于分级与升级，不用于自我背书。
+
+**轨迹累计（对抗分布式攻击）**
+
+单步都低于阈值、合起来构成攻击，是这类系统最常见的绕过方式。因此保留一个按 tick 累计、指数衰减的风险轨迹：
+
+```
+risk = Σ_k w_kind · max(0, p_k − 0.5) · exp(−(t − t_k) / τ)      τ = 600s
+```
+
+- 单 tick `p ≥ 0.9` → 立即动作（不看累计）。
+- `risk ≥ 0.6` → 升级 L2 交换级审查，即使没有任何单条越界。
+- 每 chat 20 分钟内多次越过 → 通知主人，并把该 chat 加入短期观察名单（提高其 tick 的审查级别，不改 L0 能力）。
+- 衰减是必要的：昨天的一次误报不应该永远压着今天。
+
+**延迟工程**
+
+1. **预跑（pre-emptive）**：tick 一开始就用当前可得的状态发请求，不等结果就继续。
+2. **投机（speculative）**：入站消息一到达就打分，不等回合真正开始；工具还在执行就先给它的结果打分。
+3. **阻塞（blocking）**：只有 `Effect` 与破坏性 `ToolCall` 等答案；`guard_timeout_ms` 默认 800。
+4. **合并**：同一 tick 的问题一次请求；`batch_ticks = 4` 内状态兼容的多个 tick 合并成一个请求（state 只发一次）。
+5. **隔离**：guard 使用独立的连接池、独立并发上限、独立超时，不进入主请求队列。guard 变慢不能拖住循环，ESTOP 也不取消 guard。
+
+**失败策略**
+
+| tick | 分类器不可用/超时 |
+|------|-------------------|
+| `Inbound` | 标注后放行，绝不丢消息 |
+| `ToolResult` | 标注后写入（内容进上下文时附带警告） |
+| `Delta` | 放行（发送前还有一次检查） |
+| `ToolCall`（只读） | 放行并标注 |
+| `ToolCall`（破坏性） | fail closed → `ask`；无裁决通道时按 5.6 降级 `block` |
+| `Effect` | fail closed → `SECURITY_HOLD` 级别的拒绝 |
+
+**结果去向**
+
+- 干净：只写 `security_events`，**不注入任何东西**，避免污染上下文与浪费 token。
+- 非干净但未达动作阈值：在下一次 runtime context 末尾追加一个 `[guard]` 块（英文、事实陈述、不含指令），最多 3 行。
+- 达到动作阈值：走 5.9 的 `SECURITY_HOLD` / `pause_*` 机制，与周期检查共用暂停状态机。
+
+**后端**
+
+抽象是 `DecisionRequest { state, questions }` → `DecisionResponse { answers, usage, cost }`，问题类型固定为 `noul` / `choice` / `score`。后端可替换：
+
+| backend | 形态 | 延迟 | 说明 |
+|---------|------|------|------|
+| `local` | ONNX / llama.cpp 小模型，单 token 读出 | 10–30ms | 离线、免费；模型缺失时跳过 |
+| `jev` | TypeSafe System One `POST /v3/alpha/decisions` | 70–500ms | 需 key；alpha 接口可能不兼容变更，必须有适配层与响应校验 |
+| `llm` | 小模型 + 严格 JSON + 小 `max_tokens` | 200–800ms | 前两者都不可用时的退路 |
+| `off` | 无 | — | 只跑 L0 + L3 |
+
+启动时按 `local → jev → llm → off` 降级，并把实际生效的后端写进 `/system/security`；无论降到哪一档，破坏性动作的 fail-closed 不变。
+
+**校准与灰度**
+
+- `[security.guard].mode = "shadow"` 先只记录不执行；至少观察 3 天或 1 万次 tick 再切 `enforce`。
+- 每个问题单独计 FPR/FNR，参照 auto mode 的做法（两阶段 0.4% FPR / 17% FNR，第一阶段单独 8.5% FPR / 6.6% FNR）设定阈值；达不到 FPR 预算的问题降级为 advisory（只标注，不参与裁决）。
+- 每个分类器判定都要有确定性对照：能用账本、scope、预算判的，不用分类器判。分类器只处理“文本意图”这一类确定性规则无法覆盖的部分。
+
+**与 5.6 / 5.9 的关系**
+
+`API` 门禁（5.6）是 action 级规则；5.10 的 L1 为它提供每 tick 的分类信号，取代原先“每条发送再跑一次 LLM 审查”的粗粒度做法（`llm_review` 保留为 L2 开关）。5.9 的 256K 周期检查退化为**兜底**：抓低于单步阈值、也低于轨迹阈值的慢速漂移。三者是级联关系，不是三套并行规则。
 
 
 ## 6. 虚拟文件系统（VFS）
@@ -1081,7 +1219,7 @@ enabled = true
 
 - 单一文件 `sbot.toml`（默认 `~/.sbot/sbot.toml`），不再有 `llm.toml`。
 - 严格 schema：`version = 1`，未知字段报错，所有字段有显式默认。
-- 配置文件中不出现任何凭据字段（`api_key`、`token`、`key`）；全部凭据在 `auth.json`，该文件不挂载 VFS。
+- 凭据默认放在 `auth.json`（不挂载 VFS，Agent 不可见）；**值是明文，直接写字面量**，不依赖环境变量或外部密钥管理。
 - 环境变量覆盖：`SBOT__SECTION__KEY`（双下划线表示层级）。
 - 相对路径按配置文件所在目录解析并规范化。
 - 配置对 Agent 可见：`/config.toml` 与 `/config/**` 可读；敏感项不可见或只读。
@@ -1211,6 +1349,22 @@ review_model = ""             # 空 = compaction_model
 check_timeout_secs = 60       # 检查超时后放行，不暂停
 auto_resume_minutes = 0       # 0 = 只能主人手动 resume；>0 到期复检后自动恢复
 
+[security.guard]
+enabled = true                  # 逐步哨兵总开关；false 时只剩 L0 规则与 5.9 周期检查
+mode = "shadow"                 # shadow = 只记录不执行；enforce = 参与裁决
+backend = "local"               # local | jev | llm | off；不可用时按 local→jev→llm→off 降级
+model = ""                      # 空 = 后端默认模型
+base_url = ""                   # jev 后端地址；空 = https://api.typesafe.ai/v1/alpha/decisions
+                                # key 不写在这里：放 auth.json 的 security.guard.api_key（明文）
+timeout_ms = 800                # 阻塞车道超时；超时按 tick 的失败策略处理
+max_state_tokens = 8000         # state 上限；超过只传信封与目标内容，不传历史
+batch_ticks = 4                 # 状态兼容的多个 tick 合并成一个请求
+delta_every_tokens = 200        # 流式文本每多少 token 打分一次
+trajectory_tau_secs = 600       # 风险轨迹的时间常数
+trajectory_escalate = 0.6       # 累计风险达到该值升级 L2
+blocking_kinds = ["effect", "tool_call_destructive"]
+fail_closed_kinds = ["effect", "tool_call_destructive", "admin", "memory_write_owner"]
+
 [budget]
 daily_tokens = 2000000          # 0 = 不限制；超限暂停新回合并向 master 报告
 daily_usd = 10.0                # 0 = 不限制；按 models.json 的 cost 估算
@@ -1218,6 +1372,7 @@ turn_tokens = 150000            # 单回合总 token 上限；超限中止回合
 chat_sends_per_hour = 60        # 单 chat 每小时发送上限；超限进入冷却
 chat_turns_per_hour = 120       # 单 chat 每小时回合上限
 round_trip_wall_secs = 600      # 单回合墙钟上限；超时中止并报告
+guard_usd_per_day = 0.20        # 逐步哨兵每日费用上限；超限降级为 L0 + L3 并告警
 
 [gate]
 mode = "auto"                  # trusted | auto | approve
@@ -1348,7 +1503,7 @@ action = "log"
 {
   "providers": {
     "anthropic": { "api_key": "$SBOT_ANTHROPIC_KEY" },
-    "deepseek": { "api_key": "$DEEPSEEK_API_KEY" }
+    "deepseek": { "api_key": "sk-直接写在文件里也可以" }
   },
   "napcat": {
     "access_token": "$NAPCAT_TOKEN"
@@ -1356,13 +1511,17 @@ action = "log"
   "tools": {
     "web_search": { "api_key": "$SBOT_SEARCH_KEY" },
     "web_fetch": { "api_key": "$SBOT_FETCH_KEY" }
+  },
+  "security": {
+    "guard": { "api_key": "$TYPESAFE_API_KEY" }
   }
 }
 ```
 
 - `sbot.toml` 与 `/config` 中完全不出现凭据字段；所有 key/token 只在这里。
-- 值支持 `"$ENV_NAME"` 环境变量插值或字面量；不集成 OS keychain（存储密钥由 `~/.sbot/key` 承担）。
-- `auth.json` 不挂载到 VFS，模型无法读取；日志与 `status` 不显示 key。
+- **值是明文，直接写字面量**（例如 `"api_key": "sk-..."`）。这是默认且推荐的形式，不要求环境变量、不要求外部密钥管理，配置即用。
+- `"$ENV_NAME"` 只是可选便捷插值：仅当值以 `$` 开头时才展开；不写 `$` 就原样当明文使用。不集成 OS keychain（存储密钥由 `~/.sbot/key` 承担）。
+- `auth.json` 不挂载到 VFS，模型无法读取；日志与 `status` 不显示 key（只显示前 3 位与后 4 位）。
 - 未在 `auth.json` 中提供 key 的 provider 不可用；启动时只对 `available_models` 引用到的 provider 校验。
 - 文件缺失时，允许全部凭据来自环境变量；启动时打印缺失项。
 
@@ -1402,6 +1561,8 @@ action = "log"
 - `[tools.web_*].backend = "tool"` 时 URL 与 key 必须同时存在；未填 key 不注册对应工具。
 - `[tools.download].max_bytes` 必须为正数；域名列表合法。
 - `[security].check_every_tokens` / `check_overlap_tokens` / `check_timeout_secs` / `auto_resume_minutes` 必须为非负整数；`check_every_tokens = 0` 表示关闭周期检查；`review_model` 为空时回退 `compaction_model`，非空时必须存在。
+- `[security.guard].mode` 只能是 `shadow` / `enforce`；`backend` 只能是 `local` / `jev` / `llm` / `off`；`timeout_ms` 必须在 50–5000 之间；`max_state_tokens` 必须在 1000–20000 之间（Jev 类模型超过 20k 选择精度显著下降）；`delta_every_tokens ≥ 50`；`batch_ticks` 在 1–32 之间；`trajectory_escalate` 在 0–1 之间；`blocking_kinds` / `fail_closed_kinds` 必须是已知 tick 名的子集。`backend = "jev"` 时必须能从 `auth.json` 的 `security.guard.api_key` 解析出非空明文（允许 `$ENV` 插值）；解析不到就把该后端标记为不可用并降级，不阻止启动。`fail_closed_kinds` 必须包含 `effect`，否则启动失败（禁止把副作用 tick 配置成失败放行）。
+- `[budget].guard_usd_per_day` 必须为非负数（0 = 不限制）；超过后只降级 guard，不影响主循环。
 - `[budget]` 的数值必须为非负整数/浮点数（0 = 不限制）；`turn_tokens` 必须 ≤ `turn_context_budget`。
 - `[gate].mode` 只能是 `trusted` / `auto` / `approve`；`max_per_minute` 必须为正数；`llm_review = true` 时审查模型必须可用。
 - `[storage].encryption` 只能是 `xchacha20poly1305` / `none`，且必须与数据库 `meta` 中记录的模式一致；加密模式下 `~/.sbot/key` 必须存在、格式正确且 canary 校验通过；`none` 启动时警告。
@@ -1490,6 +1651,12 @@ src/
     mod.rs             周期检查调度、SECURITY_HOLD、恢复
     review.rs          独立模型的安全审查请求与 JSON 解析
     events.rs          security_events 审计
+    guard/
+      mod.rs           tick 定义、三条车道（预跑/投机/阻塞）、轨迹累计与升级
+      views.rs         ingest/approval/output/effect 四视图裁剪（reasoning-blind）
+      questions.rs     问题集定义、阈值、答案到动作的映射
+      decision.rs      DecisionRequest/Response 抽象、后端无关的类型与校验
+      backends.rs      local（ONNX/llama.cpp）/ jev / llm / off 适配与降级
   memory/
     mod.rs             记忆存储、字符预算、条目合并
     provenance.rs      来源判定与门控（owner/agent/untrusted/system）
@@ -1547,6 +1714,8 @@ src/
 - 长期运行：ESTOP 暂停新回合与发送、不打断进行中回合；崩溃恢复不重发已确认消息；断线重连后按最后 `message_id` 补齐并去重，缺口写入 `[gap]`；provider 429/超时按退避重试并走回退链，完成后不重放已完成工具；内部标签在流式与非流式发送前均被剥离。
 - 预算：CJK 文本的 token 估算、工具 schema 上限、单条工具结果截断、pruning 不裁剪最近 3 个回合与 bootstrap 读取。
 - 安全周期检查：达到 `check_every_tokens` 触发一次；检查请求的前缀与主请求逐字节一致；良性长对话不暂停；注入且 `complied = true` 触发 `pause_outbound`；`critical` 触发 `pause_agent`；检查超时不暂停、连续失败告警；`sbot security resume` 恢复。
+- 逐步哨兵：用 fake backend 计数，断言每个 tick（入站、工具调用、工具结果、delta、回合结束、副作用）各产生一次 L1 调用，且同一 tick 的多个问题合并成一个请求；`approval_view` 快照断言不含 agent 文本与工具结果原文，`ingest_view` 断言不含 agent 输出；只读 tick 在 backend 超时时放行并标注，破坏性 tick 与 `effect` 在超时时 fail closed；`fail_closed_kinds` 缺少 `effect` 时启动失败；五个各 0.25 的注入碎片触发轨迹升级而任何单条都不触发；`claim_without_action` 在“声称已写入但账本无记录”时为真、有真实 `Memory` 调用时为假；`shadow` 模式只写事件不改行为；guard 慢请求不阻塞主循环且不影响 ESTOP；`guard_usd_per_day` 超限后降级为 L0 + L3 并告警。
+- provider 拒绝：`stop_reason = refusal` 不重试、不当作错误，`stop_details` 写入 `security_events` 并通知主人；回退模型仍被拒时结束回合且不在群里解释。
 
 - NapCat 实机冒烟：连接、版本探测、群/成员查询、文本与组合消息、`message_sent` 开关、禁言权限、解散群、公告、文件、已读、断线重连。
 - NapCat：协议层静态兼容已确认；上线前必须完成一次 v4.18.41 实机冒烟。
@@ -1560,7 +1729,7 @@ src/
 - 不 fork NapCatLink：它是项目自有代码，直接修改并提交；重构期间继续用 `=0.1.0-alpha.2`，修复后发 alpha.3 升级。
 - `WebSearch` / `WebFetch` 的 `tool` 后端由用户填写 URL 与 key 启用；不填则不注册工具，不假定官方地址。
 - DeepSeek 兼容服务的 5 QPS 与计费可接受；不足由服务方限制决定。
-- 模型与凭据分离：`models.json` 只定义模型参数，`auth.json` 只存所有凭据（不挂载 VFS，模型不可见）；`sbot.toml` 不含任何凭据，维护 `available_models`、当前 `model` 与 `thinking_level`，可通过指令热切换。
+- 模型与凭据分离：`models.json` 只定义模型参数，`auth.json` 只存所有凭据（不挂载 VFS，模型不可见）；`sbot.toml` 不含任何凭据，维护 `available_models`、当前 `model` 与 `thinking_level`，可通过指令热切换。**凭据值一律明文写在 `auth.json`**，`$ENV` 插值只是可选便捷形式，不作为必需项；逐步哨兵的 key 同样在 `auth.json` 的 `security.guard.api_key`。
 - Agent 可通过 `/config.toml` 与 `/config/**` 查看并修改自己的配置；敏感项与 `auth.json` 除外。
 - 上下文注入由 `[[hooks.context]]` 决定（AGENTS.md 是默认 hook），只在会话开始与压缩后触发；Agent 可自行增删。
 - 事件 hook 首版支持 `SessionStart` / `SessionEnd` / `PreCompact` / `PostCompact` / `MessageReceived` / `BeforeSend` / `Stop` / `ConfigChange`；动作为声明式，不执行脚本。
@@ -1581,6 +1750,7 @@ src/
 - 长期运行运维参考 OpenClaw / Grok Build（见 `.agents/plan/2026-10-29-design-review-2.md`）：断线重连按最后 `message_id` 补齐并去重；每 chat 队列有上限与 `summarize/old/new` 丢弃策略；provider 重试 + `Retry-After` + 回退链，失败不重放已完成工具；崩溃恢复写 marker、不自动重放；IPC 带版本、请求 id 与幂等键；`sbot backup` / `sbot doctor`。
 - 记忆参考 OpenClaw 的来源模型：`owner` / `agent` / `untrusted` / `system` 由写入代码判定；只有 `owner` / `agent` 自动注入；untagged 不自动注入；召回内容不回流；非交互会话不产生候选。记忆分 `/USER.md`（偏好祈使句）与 `/MEMORY.md`（事实陈述句），详细材料放 `/memory/topics/`，压缩前 flush、压缩后检索。
 - 周期安全检查：每 `check_every_tokens`（默认 256K）新增上下文触发一次独立模型检查；共享主请求前缀缓存，底部追加检查指令，响应不写入主 transcript；`high + complied` 暂停对外发送，`critical` 暂停新回合，写 `~/.sbot/SECURITY_HOLD`，主人 `sbot security resume` 后恢复。
+- 逐步哨兵（2026-10-30 决定）：安全检查从“每 256K”降到“每个 tick”，四层级联 L0 确定性规则 → L1 单遍决策模型（Jev 式，70–500ms、约 $0.00001/次，问题类型 `noul`/`choice`/`score`）→ L2 交换级生成式审查 → L3 周期检查兜底；视图 reasoning-blind（`approval_view` 剔除 agent 文本与工具结果原文，`ingest_view` 剔除 agent 输出）；问题必须窄、state 由 runtime 现场组装（不传摘要、不传自述），需要推理的判断交给 L2；风险轨迹按 tick 指数衰减累计，对抗“每步都无害、合起来是攻击”的分布式绕过；只读 tick 超时放行并标注，副作用与破坏性动作 fail closed；先 `shadow` 观察再 `enforce`。参考 Anthropic Constitutional Classifiers++、Claude Code auto mode、TypeSafe Jev，见 `.agents/plan/2026-10-30-step-guard-research.md`。
 - 身份与信任：owner 由 runtime 固定（stand_in 为本账号，companion 为 `owner_qq`）；自称主人、转述授权、要求改记忆/权限的请求一律不执行，核验不在聊天中公告，不信任体现在行为而非台词；可以社交性敷衍，但不能声称做了实际没做的写入或授权。
 - 上下文预算按四块计量（静态 prompt / 动态注入 / 工具 schema / 对话与工具结果），CJK 感知；工具 schema 上限 12k tokens、单条结果 32 KB；旧工具结果可 pruning，最近 3 个回合与 bootstrap 读取不裁剪。
 - 自定义子代理：`/agents/<name>.md` 与宿主 `~/.sbot/agents` overlay；frontmatter 定义 name/description/tools/model/thinking_level/max_steps/allow_send；`Agent` 工具 description 自动列出可选 agent；工具只能收窄，`allow_send` 默认 false。参考 Claude Code / Codex / Grok Build。
