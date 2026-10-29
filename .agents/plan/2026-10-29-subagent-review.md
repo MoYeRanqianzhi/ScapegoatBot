@@ -35,7 +35,7 @@
 
 ### P2
 
-- 文档数字漂移：已统一为 v4 单一数字（3,442–3,887）。
+- 文档数字漂移：已统一为 v4 单一数字（3,446–3,892）。
 - Windows 管道 ACL 措辞：改为创建者 + Administrators + SYSTEM。
 - `per_chat` 双布局：明确 Phase 6 后实现，Phase 3 只做 shared + buffer。
 - `terminate` 死代码：删除。
