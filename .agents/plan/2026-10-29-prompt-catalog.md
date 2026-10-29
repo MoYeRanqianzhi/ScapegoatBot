@@ -88,7 +88,15 @@
 
 ### RM
 
-> Move a VFS file or directory to `/trash` by default; `permanent: true` deletes it. Directories require `recursive: true`. Returns the trashed path or deletion result. Use `MV` to restore from `/trash`.
+> Remove a file or directory. Directories require `recursive: true`. Removal moves the item to `/trash` unless `permanent: true`.
+>
+> On `/inbox`, removal means **dismiss**: the entry leaves the inbox without being marked read. Use it when a message does not deserve your attention — spam, noise, a chat you are deliberately not answering.
+>
+> - `RM /inbox/<chat>/<message_id>.md` dismisses one message.
+> - `RM /inbox/<chat>.md` dismisses every unread message from that chat and reports how many.
+> - `RM /inbox?filter=...` dismisses the matches; the filter is required. `RM /inbox` without a filter is rejected.
+>
+> Dismissing never deletes the underlying message: it stays searchable under `/messages`. Dismissed entries are audited and can be reviewed with `?filter=state:dismissed`.
 
 参数：`path`, `recursive?`, `permanent?`。
 
