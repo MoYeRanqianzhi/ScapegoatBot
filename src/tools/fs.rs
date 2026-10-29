@@ -140,12 +140,26 @@ impl Tool for WriteTool {
             Ok(path) => path,
             Err(error) => return error,
         };
-        if views::Views::handles(&path) {
-            return ToolResult::error("Dynamic views are read-only.");
-        }
         let Ok(content) = arg_str(&args, "content") else {
             return ToolResult::error("Missing required parameter \"content\" (string).");
         };
+        // `/config/**` 与 `/config.toml` 走受限写入：白名单 + 校验 + 原子写回。
+        if views::Views::is_config_path(&path) {
+            let Some(views) = &ctx.views else {
+                return ToolResult::error("Configuration views are not available in this runtime.");
+            };
+            let target = crate::vfs::path::ParsedTarget {
+                path: path.clone(),
+                query: None,
+            };
+            return match views.write_config(&target, content) {
+                Ok(message) => ToolResult::ok(message),
+                Err(error) => ToolResult::error(error.to_string()),
+            };
+        }
+        if views::Views::handles(&path) {
+            return ToolResult::error("Dynamic views are read-only.");
+        }
         match ctx.vfs.write_text(&path, content, None) {
             Ok(meta) => ToolResult::ok(format!(
                 "Wrote {} bytes to {} (version {}).",
@@ -201,9 +215,6 @@ impl Tool for EditTool {
             Ok(path) => path,
             Err(error) => return error,
         };
-        if views::Views::handles(&path) {
-            return ToolResult::error("Dynamic views are read-only.");
-        }
         let (Ok(old_text), Ok(new_text)) = (arg_str(&args, "old_text"), arg_str(&args, "new_text"))
         else {
             return ToolResult::error("Parameters \"old_text\" and \"new_text\" are required.");
@@ -212,6 +223,36 @@ impl Tool for EditTool {
             Ok(value) => value,
             Err(error) => return error,
         };
+        // 配置叶子：读取当前值、做精确替换，再走受限写入。
+        if views::Views::is_config_path(&path) {
+            let Some(views) = &ctx.views else {
+                return ToolResult::error("Configuration views are not available in this runtime.");
+            };
+            let target = crate::vfs::path::ParsedTarget {
+                path: path.clone(),
+                query: None,
+            };
+            let current = match views.read(&target).await {
+                Ok(views::ViewRead::Text(text)) => text,
+                Ok(_) => return ToolResult::error("Configuration leaves are text."),
+                Err(error) => return ToolResult::error(error.to_string()),
+            };
+            if !current.contains(old_text) {
+                return ToolResult::error(format!("old_text was not found in {path}"));
+            }
+            let updated = if replace_all {
+                current.replace(old_text, new_text)
+            } else {
+                current.replacen(old_text, new_text, 1)
+            };
+            return match views.write_config(&target, &updated) {
+                Ok(message) => ToolResult::ok(message),
+                Err(error) => ToolResult::error(error.to_string()),
+            };
+        }
+        if views::Views::handles(&path) {
+            return ToolResult::error("Dynamic views are read-only.");
+        }
         match ctx
             .vfs
             .edit_text_count(&path, old_text, new_text, replace_all)
