@@ -113,3 +113,18 @@
 - 凭据形态：**明文写在 `auth.json`**（`security.guard.api_key`），不使用环境变量作为必需项。`[security.guard].base_url` 放在 `sbot.toml`，key 不放。
 - 判定阈值默认 `dangerous >= 0.9`；上线前必须先在 `shadow` 模式跑够样本，记录各类别的误判率。误判的代价是停机，直到 agent 自己判断可以重开，所以校准比有人值守时更重要。
 - 本机测试端点与 key 记录在 `.agents/MEMORY.local.md`（不进入版本库）；该端点不是 TypeSafe 官方地址，请求路径、响应字段、问题类型支持情况都要在适配层实测，失败即降级到 `llm` 后端，不得假设与官方一致。
+
+## 8. 实测记录（2026-10-30）
+
+- 端点：`POST {base_url}/v1/systemone`（`/v3/alpha/decisions` 不存在，实测 404）。
+- 鉴权：`Authorization: Bearer <key>`；`/openapi.json` 也需要同一个头才能拿到（OpenAPI 3.1，title TypeSafe，version 0.2.0）。
+- 模型：`GET /v1/models` 返回 `jev-latest` 等别名；请求里 `model` 用别名。
+- 请求体：`{ "model": "jev-latest", "state": "...", "questions": { "dangerous": { "type": "noul", "instructions": "..." } } }`
+  - `questions` 是**对象映射**（名字 → 问题），不是数组；
+  - 字段名是 `instructions`，不是 `prompt`；
+  - `noul` 可选 `criteria: { true, false }` 说明什么算 yes/no；`choice` 用 `criteria` 映射；`score` 用有序数组。
+- 响应：`{ "model": "...", "answers": { "dangerous": { "type": "noul", "noul": 0.98 } }, "usage": { "input_tokens": 120, "output_tokens": 12 } }`
+- 实测样本：
+  - 良性：「A group chat about weekend plans. / Shall we meet at noon?」→ `noul = 0.01`
+  - 凭证：「here is the key sk-abcdefghijklmnopqrstuvwx」→ `noul = 0.84`
+- 结论：默认阈值 `0.9` 时 0.84 **不会**触发 hold，但规则层的 `sk-` 形态会以 0.99 命中。这正是「规则先行、分类器兜后」的价值；也说明 `shadow` 期必须按类别统计分数分布，不能直接拿默认阈值上线。

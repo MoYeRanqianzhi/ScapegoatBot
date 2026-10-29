@@ -104,6 +104,23 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     VALUES (1, NULL, '', 'dir', 0, 1, datetime('now'), datetime('now'));
     "#,
     ),
+    (
+        3,
+        "phase2: security events",
+        r#"
+    -- 每次输入闸/输出闸判定都记一条；shadow 期用于校准阈值。
+    CREATE TABLE security_events (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        checkpoint TEXT NOT NULL,
+        allowed    INTEGER NOT NULL,
+        score      REAL NOT NULL,
+        backend    TEXT NOT NULL,
+        reason     TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX security_events_created ON security_events(created_at);
+    "#,
+    ),
 ];
 
 /// 数据库句柄。
