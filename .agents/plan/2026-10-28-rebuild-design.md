@@ -1953,10 +1953,14 @@ src/
 - 监视器 monitor（2026-10-30 定稿）：统一为 `{source, when?, deliver, lifecycle?}` 的事件订阅，不设独立的 ScheduleCron。source 分 `qq` / `timer` / `stream` / `internal`；`when` 是谓词表达式，访问 `event.*` 与只读 `ctx.*`，求值失败告警而非静默；`deliver` 决定投给谁（main / 子代理）与形式（event / prompt），批量窗口 200ms；`lifecycle` 管空闲触发、冷却、上限、过期、一次性与错过的合并。定时任务沿用 Claude Code 的经验：本地 5 字段 cron、避开整点半点、抖动、recurring 默认 30 天过期、错过只补一次。`Monitor` 独立成工具（不塞进 `API`），支持 `add` / `remove` / `list` / `fire`；运行时创建默认有界且不允许 `stream` 源，`hold` 期间照常可用。monitor 有 `owner`：子代理自建的一律投给自己，不能投给父代理或兄弟；父代理可给子代建，随子代理结束而删除；匹配范围受创建者 `receive_scopes` 约束，子代理用 spawn 时的冻结快照。投递即输入，照常过输入闸；源断开、谓词失败、被停用都发系统通知（静默不等于正常）。
 待定：
 
-- `[gate].llm_review` 默认值待定（当前 false）。
-
-- 内置 `docs` 子代理（2026-10-30 记录）：类似 `explore`，只读，工具集仅 `api.list` / `api.help` / `Read`，专门回答“某个 action 怎么调、有哪些同类动作”，只回结论与可复制的调用样例。Phase 4 随工具注册表一起落地。
-- 其余实现细节在 Phase 0–4 中确定。
+- `[gate].llm_review`：**默认 `false`，保留开关**。它与输出闸职责重叠但不等价——分类器判“内容危险”，规则判硬约束，`llm_review` 多出来的是对意图的推理，代价是每条发送一次完整模型调用（0.5–3 秒）。它面向高风险部署，不是默认防护。`shadow` 期跑出数据后复核：若真实流量里出现“内容本身不危险、但这次发送不该发生”的案例，就把默认值改为 `true` 并记录理由；否则维持 `false`。
+- 内置 `docs` 子代理：**方向已定，暂不实现**。`api.help` 已能直接回答单条用法；多一个子代理只是把枚举开销挪到子上下文。Phase 4 工具注册表落地后实测“主代理自查”与“派子代理查”的 token 差，差距明显（一次翻十几个 action 的场景）才加；否则砍掉，只留 `api.help`。
+- 实现细节的定稿节点（到点必须定，不许顺延到下一阶段）：
+  - **Phase 0**：配置 schema 字段名与默认值、IPC 帧格式版本、单实例锁的位置与争用行为。
+  - **Phase 2**：provider 错误码枚举、`stop_reason` 映射表（含 `refusal`、`MaxTokens`、服务端工具暂停）、流式中断后的重试边界。
+  - **Phase 3**：`[filter]` 规则语法与匹配优先级（拒收判定在哪一步、与去抖的先后）、断线补消息的游标字段。
+  - **Phase 4**：`when` 表达式的完整语法与可用函数、action 注册表元数据字段、`Monitor` 的 JSON schema、`api.list` 的过滤键取值域。
+  - **Phase 5**：压缩摘要各段的 token 分配、记忆召回的相关性阈值、`shadow` 转 `enforce` 的判定标准。
 
 ## 14. 工程约定
 
