@@ -148,11 +148,12 @@ impl MonitorTool {
         let when = arg_opt_str(args, "when").map(str::to_owned);
         let deliver = args.get("deliver").cloned().unwrap_or_else(|| json!({}));
         let to = deliver.get("to").and_then(Value::as_str).unwrap_or("main");
-        if to != "main" {
-            return ToolResult::error(
-                "Only deliver.to = \"main\" is supported; subagent monitors arrive with Phase 6.",
-            );
-        }
+        // `main` / `<spawn_id>` / `agent:<name>`；目标不存在时由 runtime 告警。
+        let target = if to == "main" {
+            None
+        } else {
+            Some(to.to_owned())
+        };
         let as_prompt = deliver.get("as").and_then(Value::as_str) == Some("prompt");
         let prompt = deliver
             .get("prompt")
@@ -215,6 +216,7 @@ impl MonitorTool {
                 min_interval,
                 idle_only,
                 batch_window,
+                target,
             )
             .await
         {
@@ -345,6 +347,7 @@ mod tests {
         assert!(result.is_error);
         assert!(result.content.contains("config-file"));
 
+        // 子代理绑定现在允许；列表里应带 target。
         let result = run(
             &tool,
             json!({
@@ -353,7 +356,13 @@ mod tests {
             }),
         )
         .await;
-        assert!(result.is_error);
+        assert!(!result.is_error, "{}", result.content);
+        let listed = run(&tool, json!({"op": "list"})).await;
+        assert!(
+            listed.content.contains("agent:helper"),
+            "{}",
+            listed.content
+        );
     }
 
     #[tokio::test]

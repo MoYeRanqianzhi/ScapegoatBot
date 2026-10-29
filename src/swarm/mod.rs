@@ -511,6 +511,22 @@ impl AgentHub {
         Ok(serde_json::json!({"id": id, "restarted": true}))
     }
 
+    /// 把一条投递路由到子代理：`sa-…` 是实例 id，`agent:<name>` 取该定义最新的实例。
+    pub async fn deliver_to(&self, target: &str, text: String) -> Result<()> {
+        let id = if let Some(label) = target.strip_prefix("agent:") {
+            let instances = self.instances.read().await;
+            instances
+                .values()
+                .filter(|instance| instance.label == label)
+                .max_by_key(|instance| instance.created_at)
+                .map(|instance| instance.id.clone())
+                .ok_or_else(|| anyhow::anyhow!("no subagent named {label:?}"))?
+        } else {
+            target.to_owned()
+        };
+        self.message(&id, text).await.map(|_| ())
+    }
+
     /// 查询一个或全部实例。
     pub async fn check(&self, id: Option<&str>) -> Result<serde_json::Value> {
         let instances = self.instances.read().await;
@@ -721,6 +737,32 @@ mod tests {
         let list = hub.check(None).await.unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1);
         assert!(hub.list().await["definitions"].is_array());
+    }
+
+    #[tokio::test]
+    async fn deliver_to_routes_by_label_and_restarts() {
+        let runner = Arc::new(FakeRunner::default());
+        let hub = hub(Arc::clone(&runner) as Arc<dyn SubagentRunner>);
+        hub.spawn(Some("explore"), None, "first".to_owned(), 0)
+            .await
+            .unwrap();
+        let id = hub.check(None).await.unwrap().as_array().unwrap()[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        hub.wait(&id, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        hub.deliver_to("agent:explore", "second".to_owned())
+            .await
+            .unwrap();
+        let done = hub
+            .wait(&id, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(done["result"].as_str().unwrap().contains("second"));
+        assert!(hub.deliver_to("sa-missing", "x".to_owned()).await.is_err());
     }
 
     #[tokio::test]

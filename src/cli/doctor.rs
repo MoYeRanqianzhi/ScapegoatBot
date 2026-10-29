@@ -270,6 +270,8 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
     }
     if loaded.config.session.scope == crate::config::SessionScope::Shared {
         report.warn("session.scope = shared: one transcript spans all chats (by design)");
+    } else {
+        report.warn("session.scope = per_chat is not implemented in this build; shared is used");
     }
     if !loaded.config.security.guard.enabled {
         report.warn("security.guard.enabled = false: no input/output classifier");
