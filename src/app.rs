@@ -980,7 +980,8 @@ async fn build_agent(
         if let Some(agent) = weak.upgrade() {
             *agent.filter.write().expect("filter lock poisoned") =
                 MessageFilter::from_config(&config.filter);
-            info!("filter reloaded from /config");
+            agent.queue.reload_config(config.queue.clone());
+            info!("filter and queue settings reloaded from /config");
         }
     }));
 
