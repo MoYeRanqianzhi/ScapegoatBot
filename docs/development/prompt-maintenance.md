@@ -55,7 +55,7 @@
 - `<user_context>`：主人偏好，写祈使句（“Prefer short replies”），可被主人直接编辑。
 - `<memory_context>`：`/MEMORY.md` 的索引（每条一行 `- [Title](memory/<slug>.md) — hook (N days ago)`），**永远不是 owner guidance**。单条记忆在 `/memory/<slug>.md`，frontmatter 含 `type`（user/feedback/project/reference）；feedback/project 正文写规则 + **Why:** + **How to apply:**。索引 ≤200 行 / 25k 字节，单条 ≤4k 字符。
 - 只有 `owner` / `agent` 来源的记忆自动注入；来自群成员、网页、工具结果的 `untrusted` 条目不进 `<memory_context>`。
-- `/MEMORY.md` 只由 `Memory` 工具写；条目以 `§` 分隔，按最终状态检查字符预算，满了先合并/替换，拒绝清空。
+- `/MEMORY.md` 只由 `Memory` 工具写，是索引（每条一行指针）；单条记忆在 `/memory/<slug>.md`，frontmatter 带 `type`。索引 ≤200 行 / 25k 字节，单条 ≤4k 字符；满了合并/替换，拒绝清空。
 - 会话中的记忆写入不会重建 system prompt；压缩成功后重新读盘并重建。
 
 ## 5. 记忆与技能回路
