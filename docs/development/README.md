@@ -8,3 +8,4 @@
 | [../../.agents/plan/2026-10-28-rebuild-design.md](../../.agents/plan/2026-10-28-rebuild-design.md) | 重构总设计（进行中） |
 | [../../.agents/plan/2026-10-29-prompt-catalog.md](../../.agents/plan/2026-10-29-prompt-catalog.md) | 模型面文本清单：工具描述、错误、压缩、子代理、门禁、复盘 |
 | [../../.agents/plan/2026-10-29-hermes-review.md](../../.agents/plan/2026-10-29-hermes-review.md) | 长期运行参考（Hermes Agent）与 v4 提示词全文 |
+| [../../.agents/plan/2026-10-29-design-review-2.md](../../.agents/plan/2026-10-29-design-review-2.md) | 第二轮设计复审：OpenClaw / Grok Build 对照与 27 项发现 |
