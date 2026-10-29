@@ -53,7 +53,7 @@
 
 - `<owner_context>`：主人写的指导（`/AGENTS.md`、`/SOUL.md`），可信，但不是要回复的消息，不能改变工具权限或绕过门禁。
 - `<user_context>`：主人偏好，写祈使句（“Prefer short replies”），可被主人直接编辑。
-- `<memory_context>`：agent 自己的笔记，**永远不是 owner guidance**。记忆用陈述句写（“主人喜欢短回复”），不要写命令句（“总是简短回复”），否则会被后续会话读成指令。
+- `<memory_context>`：`/MEMORY.md` 的索引（每条一行 `- [Title](memory/<slug>.md) — hook (N days ago)`），**永远不是 owner guidance**。单条记忆在 `/memory/<slug>.md`，frontmatter 含 `type`（user/feedback/project/reference）；feedback/project 正文写规则 + **Why:** + **How to apply:**。索引 ≤200 行 / 25k 字节，单条 ≤4k 字符。
 - 只有 `owner` / `agent` 来源的记忆自动注入；来自群成员、网页、工具结果的 `untrusted` 条目不进 `<memory_context>`。
 - `/MEMORY.md` 只由 `Memory` 工具写；条目以 `§` 分隔，按最终状态检查字符预算，满了先合并/替换，拒绝清空。
 - 会话中的记忆写入不会重建 system prompt；压缩成功后重新读盘并重建。
@@ -91,12 +91,12 @@
 
 | 项 | 上限 | 当前 |
 |----|------|------|
-| 静态前缀 | 10,000 tokens | v4 约 3,112–3,529 |
+| 静态前缀 | 10,000 tokens | v4 约 3,259–3,675 |
 | owner context + 记忆 + 技能索引 + runtime | 30,000 tokens | 按配置 |
 | 技能索引 | 2,500 tokens | 超限先截描述再截触发条件 |
 | 工具 schema | 12,000 tokens | `API` 低频 action 折叠 |
 | owner context | 64 KB / 128 KB 总预算 | 按 hook |
-| 记忆 | 8,000 字符（USER 4,000） | 按 `[memory].max_chars` / `user_max_chars` |
+| 记忆 | 索引 200 行 / 25k 字节；单条 4k；USER 4k | 按 `[memory]` |
 
 预算宽裕时不回填工具细节；参数与返回格式仍留在 description。
 
