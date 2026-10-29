@@ -301,7 +301,8 @@ impl MonitorManager {
     }
 
     /// 喂入 QQ 事件；匹配的 monitor 各投递一次。
-    pub async fn on_qq_event(&self, event: &QqEvent) {        let Some(view) = MonitorEvent::from_qq(event) else {
+    pub async fn on_qq_event(&self, event: &QqEvent) {
+        let Some(view) = MonitorEvent::from_qq(event) else {
             return;
         };
         let monitors: Vec<Arc<Monitor>> = {
@@ -440,9 +441,10 @@ async fn deliver_once(
     {
         let mut last = monitor.last_delivery.lock().expect("monitor lock");
         if let Some(previous) = *last
-            && previous.elapsed() < monitor.min_interval {
-                return;
-            }
+            && previous.elapsed() < monitor.min_interval
+        {
+            return;
+        }
         *last = Some(std::time::Instant::now());
     }
 
@@ -704,33 +706,29 @@ pub async fn load_config_monitors(
             Some(crate::config::QqSource::Detailed(ref config))
                 if config.backlog == crate::config::BacklogMode::Inbox
         );
-        if wants_backlog {
-            if let Some(messages) = messages {
-                let mut lines = Vec::new();
-                for message in messages.unread(None).unwrap_or_default() {
-                    let event = MonitorEvent {
-                        kind: "message".to_owned(),
-                        chat: message.chat.to_string(),
-                        sender: message.sender.qq,
-                        text: message.plain_text(),
-                        mentions_self: message
-                            .segments
-                            .iter()
-                            .any(|segment| {
-                                matches!(segment, crate::qq::event::Segment::At { .. })
-                            }),
-                    };
-                    if !matches(monitor.when.as_deref(), &event).unwrap_or(false) {
-                        continue;
-                    }
-                    lines.push(format::render_inbound(&message));
-                    let _ = messages.mark_read(message.chat, &[message.message_id]);
+        if wants_backlog && let Some(messages) = messages {
+            let mut lines = Vec::new();
+            for message in messages.unread(None).unwrap_or_default() {
+                let event = MonitorEvent {
+                    kind: "message".to_owned(),
+                    chat: message.chat.to_string(),
+                    sender: message.sender.qq,
+                    text: message.plain_text(),
+                    mentions_self: message
+                        .segments
+                        .iter()
+                        .any(|segment| matches!(segment, crate::qq::event::Segment::At { .. })),
+                };
+                if !matches(monitor.when.as_deref(), &event).unwrap_or(false) {
+                    continue;
                 }
-                if !lines.is_empty() {
-                    manager
-                        .deliver_text(&monitor.name, lines.join("\n\n"))
-                        .await?;
-                }
+                lines.push(format::render_inbound(&message));
+                let _ = messages.mark_read(message.chat, &[message.message_id]);
+            }
+            if !lines.is_empty() {
+                manager
+                    .deliver_text(&monitor.name, lines.join("\n\n"))
+                    .await?;
             }
         }
     }
@@ -985,13 +983,7 @@ mod tests {
             .unwrap();
 
         let event = event("private:10001", "hello", false);
-        let monitor = manager
-            .monitors
-            .read()
-            .await
-            .get("idle")
-            .cloned()
-            .unwrap();
+        let monitor = manager.monitors.read().await.get("idle").cloned().unwrap();
         manager.enqueue(&monitor, &event).await;
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(sink.deliveries.lock().unwrap().is_empty());

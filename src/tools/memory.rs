@@ -324,9 +324,10 @@ impl MemoryTool {
         let Some(db) = &self.db else {
             return;
         };
-        let Ok(index_text) = self.vfs.read_text_unrecorded(
-            &VfsPath::parse("/MEMORY.md").expect("valid path"),
-        ) else {
+        let Ok(index_text) = self
+            .vfs
+            .read_text_unrecorded(&VfsPath::parse("/MEMORY.md").expect("valid path"))
+        else {
             return;
         };
         let mut rows = Vec::new();
@@ -342,7 +343,14 @@ impl MemoryTool {
                 continue;
             };
             let (kind, source, observed_at) = parse_frontmatter(&text);
-            rows.push((slug, path.to_string(), kind, source, observed_at, now.clone()));
+            rows.push((
+                slug,
+                path.to_string(),
+                kind,
+                source,
+                observed_at,
+                now.clone(),
+            ));
         }
 
         let mut conn = db.lock();
@@ -598,7 +606,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_writes_file_and_index() {        let (tool, vfs) = setup();
+    async fn add_writes_file_and_index() {
+        let (tool, vfs) = setup();
         let result = run(
             &tool,
             json!({
@@ -791,11 +800,9 @@ mod tests {
 
         let conn = db.lock();
         let (slug, kind, source): (String, String, String) = conn
-            .query_row(
-                "SELECT slug, kind, source FROM memory_entries",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
+            .query_row("SELECT slug, kind, source FROM memory_entries", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
             .unwrap();
         assert_eq!(slug, "phase-seven");
         assert_eq!(kind, "project");

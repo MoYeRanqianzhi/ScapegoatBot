@@ -270,7 +270,8 @@ impl VfsStore {
         self.key
             .seal(BLOB_PURPOSE, aad.as_bytes(), plain)
             .map_err(VfsError::from)
-    }    /// 按行读取文本；`offset` / `limit` 单位是行。
+    }
+    /// 按行读取文本；`offset` / `limit` 单位是行。
     ///
     /// 与 [`Vfs::read`] 的区别：这里直接给出模型习惯的行号语义。
     /// 带 offset/limit 的读取仍记为 partial，不满足编辑前置条件。

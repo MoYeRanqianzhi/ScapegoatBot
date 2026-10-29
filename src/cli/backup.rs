@@ -75,11 +75,9 @@ fn run_with_paths(
     // 用底层 `Backup` 句柄而不是 `Connection::backup(path)`：
     // 守护进程运行时源库仍可能被写入，`Busy` / `Locked` 应当重试而不是直接失败。
     {
-        let source = Connection::open_with_flags(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .with_context(|| format!("cannot open {}", db_path.display()))?;
+        let source =
+            Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("cannot open {}", db_path.display()))?;
         source
             .busy_timeout(std::time::Duration::from_secs(5))
             .context("cannot configure the source busy timeout")?;
@@ -222,9 +220,11 @@ mod tests {
         // 快照必须是可打开的完整数据库。
         let conn = Connection::open(output.join("data.db")).unwrap();
         let version: u32 = conn
-            .query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert!(version >= 1, "backup lost the schema migrations");
     }

@@ -8,7 +8,9 @@
 ## 能力
 
 - **拟人回复**：静态提示词 + owner context + `/USER.md` + 记忆索引 + 风格画像 + 技能索引；运行时上下文每回合单独注入。
-- **工具**：11 个文件工具（读/写/编辑/删除/移动/复制/建目录/信息/Glob/Grep）、`API`（NapCat action）、`Memory`、`Skill`、`Download`、`WebSearch` / `WebFetch`、`Monitor`、`Agent`（未实现，见限制）。
+- **工具**：11 个文件工具（读/写/编辑/删除/移动/复制/建目录/信息/Glob/Grep）、`API`（NapCat action）、`Memory`、`Skill`、`Download`、`WebSearch` / `WebFetch`、`Monitor`、`Agent`（子代理）、`MCP`（可选）。
+- **子代理**：`general` / `explore` / `plan` / `docs` 四种内置类型 + `/agents/*.md` 自定义定义；独立上下文、工具集强制为父代理子集、并发上限。当前为单层，不支持嵌套 spawn 与 monitor 绑定。
+- **MCP**：可选、默认关闭；stdio JSON-RPC，自动发现 `tools/list`，通过单个 `MCP` 工具调用。
 - **动态视图**：`/messages`、`/inbox`、`/sessions`、`/friends`、`/groups`、`/config`、`/system` 由运行时生成，不落盘。
 - **安全闸**：规则层（凭据形状、提示注入）+ Jev 分类器；命中即进入永久 `hold`，直到 agent 用当前上下文重新过闸。
 - **准入过滤**：`[filter]` 是拒收门。被拒消息不写 JSONL、不进 inbox、不进 transcript。
@@ -105,7 +107,7 @@ account_qq = 10000
 ## 隐私与已知限制
 
 - `[session].scope` 默认 `shared`：整个 QQ 号一份 transcript，跨聊天上下文会互相可见。需要强隔离时配置项已存在，但 **`per_chat` 尚未实现**。
-- **未实现**：MCP、swarm `Agent` 工具与自定义 `/agents` 子代理、`/config` 写入（当前只读）、记忆复盘 / 技能 curator / 风格学习、`per_chat` 会话、监控绑定子代理。
+- **未实现**：`per_chat` 会话隔离、`/config` 写入（当前只读）、记忆复盘 / 技能 curator / 风格学习、monitor 绑定子代理、子代理嵌套 spawn 与 `Agent message` 的完整定义保持。
 - 尚未提供旧 0.1 数据迁移；0.2 从空存储开始。
 - `tools::web` 的搜索/抓取依赖用户配置的端点，不内置官方地址。
 

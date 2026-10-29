@@ -847,8 +847,7 @@ impl Views {
             .get(section)
             .ok_or_else(|| VfsError::NotFound(format!("/config/{section}")))?;
         let text = match value {
-            toml::Value::Table(_) => toml::to_string(value)
-                .unwrap_or_else(|_| value.to_string()),
+            toml::Value::Table(_) => toml::to_string(value).unwrap_or_else(|_| value.to_string()),
             _ => value.to_string(),
         };
         Ok(ViewRead::Text(text))
@@ -873,8 +872,8 @@ impl Views {
             .as_ref()
             .map(|handle| handle.read().expect("config lock poisoned").path.clone())
             .ok_or_else(|| VfsError::Offline("/config.toml".to_owned()))?;
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| VfsError::Storage(error.to_string()))?;
+        let text =
+            std::fs::read_to_string(&path).map_err(|error| VfsError::Storage(error.to_string()))?;
         Ok(ViewRead::Text(text))
     }
 
@@ -907,7 +906,10 @@ impl Views {
                 out.push_str(&format!("mode: {:?}\n", config.agent.mode));
                 out.push_str(&format!("session_scope: {:?}\n", config.session.scope));
                 out.push_str(&format!("model: {}\n", config.agent.model));
-                out.push_str(&format!("thinking_level: {}\n", config.agent.thinking_level));
+                out.push_str(&format!(
+                    "thinking_level: {}\n",
+                    config.agent.thinking_level
+                ));
                 if let Some(enabled) = &self.context.ai_enabled {
                     out.push_str(&format!(
                         "ai_enabled: {}\n",
@@ -950,12 +952,14 @@ impl Views {
                 out
             }
             "security" => {
-                let mut out = format!("# Security\n\nhold: {}\n", self
-                    .context
-                    .gate
-                    .as_ref()
-                    .map(|gate| gate.hold_active().to_string())
-                    .unwrap_or_else(|| "unknown".to_owned()));
+                let mut out = format!(
+                    "# Security\n\nhold: {}\n",
+                    self.context
+                        .gate
+                        .as_ref()
+                        .map(|gate| gate.hold_active().to_string())
+                        .unwrap_or_else(|| "unknown".to_owned())
+                );
                 out.push_str(&format!(
                     "guard: enabled={} mode={:?} backend={:?} threshold={}\n",
                     config.security.guard.enabled,
@@ -963,19 +967,19 @@ impl Views {
                     config.security.guard.backend,
                     config.security.guard.threshold
                 ));
-                if let Some(db) = &self.context.db {
-                    if let Ok(events) = crate::security::events::recent(db, 10) {
-                        out.push_str("\n## Recent events\n");
-                        for event in events {
-                            out.push_str(&format!(
-                                "- {} {:?} allowed={} score={:.2} {}\n",
-                                event.created_at,
-                                event.checkpoint,
-                                event.allowed,
-                                event.score,
-                                event.reason
-                            ));
-                        }
+                if let Some(db) = &self.context.db
+                    && let Ok(events) = crate::security::events::recent(db, 10)
+                {
+                    out.push_str("\n## Recent events\n");
+                    for event in events {
+                        out.push_str(&format!(
+                            "- {} {:?} allowed={} score={:.2} {}\n",
+                            event.created_at,
+                            event.checkpoint,
+                            event.allowed,
+                            event.score,
+                            event.reason
+                        ));
                     }
                 }
                 out

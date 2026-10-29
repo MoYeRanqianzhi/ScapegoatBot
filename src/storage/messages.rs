@@ -508,11 +508,10 @@ impl MessageStore {
         } else {
             0
         };
-        let indexed: u64 = self.db.lock().query_row(
-            "SELECT COUNT(*) FROM message_files",
-            [],
-            |row| row.get(0),
-        )?;
+        let indexed: u64 =
+            self.db
+                .lock()
+                .query_row("SELECT COUNT(*) FROM message_files", [], |row| row.get(0))?;
         Ok((disk, indexed))
     }
 

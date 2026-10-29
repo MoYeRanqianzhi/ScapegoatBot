@@ -22,6 +22,8 @@
 - **安全**：规则层 + Jev `/v1/systemone` 分类器、永久 hold、`SECURITY_HOLD`、安全事件审计、主人/管理员目标保护、hold 期间拒绝全部 `napcat.*`。
 - **会话**：加密 transcript 分段与 `prev_file` 链、turn buffer 崩溃恢复、CJK 感知压缩、回合边界切割、加密 `compaction_checkpoints`。
 - **工具**：文件工具、动态视图（`/messages`、`/inbox`、`/sessions`、`/friends`、`/groups`、`/config`、`/system`）、`API` 命名空间、`Memory`（含 `memory_entries`）、`Skill`、`Download`（SSRF）、`WebSearch` / `WebFetch`、`Monitor`（qq/timer/internal、cron、batching、idle_only、backlog）。
+- **子代理（swarm）**：`Agent` 工具的 spawn / message / check / wait / list；`general` / `explore` / `plan` / `docs` 内置类型；`/agents/*.md` 自定义定义；工具集强制为父代理子集；并发上限；独立上下文（单层，不含嵌套与 monitor 绑定）。
+- **MCP**：可选、默认关闭；stdio JSON-RPC `initialize` / `tools/list` / `tools/call`；单个 `MCP` 工具；服务器启动失败只告警。
 - **提示词**：v4 静态/动态边界模板、context hooks、每回合 runtime 上下文。
 - **IPC**：Windows 命名管道（DACL）/ Unix UDS（0600）、长度前缀 JSON、幂等表。
 - **CLI**：`start/stop/restart/status`、`ai`、`chat`、`pause/resume`、`security`、`model`、`effort`、`backup`、`doctor`。
@@ -36,7 +38,7 @@
 
 ### 已知限制
 
-- 未实现：MCP、swarm `Agent` 工具与自定义 `/agents` 子代理、`per_chat` 会话隔离、`/config` 写入、记忆复盘 / 技能 curator / 风格学习、监控绑定子代理。
+- 未实现：`per_chat` 会话隔离、`/config` 写入、记忆复盘 / 技能 curator / 风格学习、monitor 绑定子代理、子代理嵌套 spawn。
 - 真实 Chat 端点与真实 Jev 的测试默认 `#[ignore]`，需要环境变量显式启用。
 
 ## [0.1.0-alpha.2] - 2026-03-23
