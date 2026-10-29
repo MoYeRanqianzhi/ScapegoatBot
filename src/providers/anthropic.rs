@@ -417,8 +417,13 @@ impl Provider for AnthropicProvider {
 
         let status = response.status();
         if !status.is_success() {
+            let headers = response.headers().clone();
             let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::from_status(status.as_u16(), &text));
+            return Err(ProviderError::from_response(
+                status.as_u16(),
+                Some(&headers),
+                &text,
+            ));
         }
 
         let (tx, rx) = mpsc::channel(256);

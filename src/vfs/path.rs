@@ -238,7 +238,7 @@ pub struct ParsedTarget {
 
 /// 动态视图前缀：只有这些路径允许查询串。
 const DYNAMIC_ROOTS: &[&str] = &[
-    "inbox", "messages", "sessions", "friends", "groups", "config",
+    "inbox", "messages", "sessions", "friends", "groups", "config", "config.toml", "system",
 ];
 
 impl ParsedTarget {

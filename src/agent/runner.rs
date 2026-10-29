@@ -17,7 +17,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, warn};
 
 use crate::agent::queue::{TurnHandler, TurnInput};
-use crate::agent::{AgentEvent, AgentLoop, AgentMessage, LoopConfig, LoopOutcome, SteeringQueue};
+use crate::agent::{AgentEvent, AgentLoop, AgentMessage, FallbackProvider, LoopConfig, LoopOutcome, SteeringQueue};
 use crate::config::{AgentMode, GateMode};
 use crate::prompt::{self, RuntimeContext};
 use crate::providers::{Provider, SystemBlock, ThinkingOptions};
@@ -61,9 +61,30 @@ pub struct RunnerConfig {
     pub keep_recent_tokens: u32,
 }
 
+/// 当前生效的 provider 快照。
+///
+/// `sbot model set` / `sbot effort set` 通过共享的 `RwLock` 原地替换，
+/// 下一回合立即生效；正在进行的回合继续使用它开始时的快照。
+#[derive(Clone)]
+pub struct ProviderSlot {
+    /// `provider/id` 形式的引用，用于日志与运行时上下文。
+    pub reference: String,
+    /// 发给 provider 的 API model id。
+    pub api_model: String,
+    pub provider: Arc<dyn Provider>,
+    pub max_tokens: u32,
+    pub thinking: ThinkingOptions,
+}
+
+/// 共享的 provider 槽位。
+pub type SharedProviderSlot = Arc<std::sync::RwLock<ProviderSlot>>;
+
 /// 回合执行器。
 pub struct Runner {
-    provider: Arc<dyn Provider>,
+    /// 当前 provider；热切换时由 runtime 原地替换。
+    slot: SharedProviderSlot,
+    /// 主模型失败后的回退链。
+    fallbacks: Vec<FallbackProvider>,
     /// `sbot ai stop` 的开关；关闭时不发起新的模型请求。
     ai_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// `ESTOP` 哨兵路径；存在时暂停新回合。
@@ -84,9 +105,45 @@ pub struct Runner {
 }
 
 impl Runner {
+    /// 不带回退链构造。
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         provider: Arc<dyn Provider>,
+        tools: Arc<ToolRegistry>,
+        gate: Arc<Gate>,
+        vfs: Arc<VfsStore>,
+        messages: Arc<MessageStore>,
+        sessions: Arc<SessionStore>,
+        turn_buffer: Arc<TurnBufferStore>,
+        qq: Option<Arc<QqClient>>,
+        config: RunnerConfig,
+        history: Arc<Mutex<Vec<AgentMessage>>>,
+        ai_enabled: Arc<std::sync::atomic::AtomicBool>,
+        estop_file: std::path::PathBuf,
+    ) -> Result<Arc<Self>> {
+        Self::new_with_fallbacks(
+            provider,
+            Vec::new(),
+            tools,
+            gate,
+            vfs,
+            messages,
+            sessions,
+            turn_buffer,
+            qq,
+            config,
+            history,
+            ai_enabled,
+            estop_file,
+        )
+        .await
+    }
+
+    /// 带回退链构造。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_fallbacks(
+        provider: Arc<dyn Provider>,
+        fallbacks: Vec<FallbackProvider>,
         tools: Arc<ToolRegistry>,
         gate: Arc<Gate>,
         vfs: Arc<VfsStore>,
@@ -130,8 +187,17 @@ impl Runner {
             });
         }
 
-        Ok(Arc::new(Self {
+        let slot = Arc::new(std::sync::RwLock::new(ProviderSlot {
+            reference: config.model.clone(),
+            api_model: provider.model_id().to_owned(),
             provider,
+            max_tokens: config.max_tokens,
+            thinking: config.thinking.clone(),
+        }));
+
+        Ok(Arc::new(Self {
+            slot,
+            fallbacks,
             ai_enabled,
             estop_file,
             tools,
@@ -175,6 +241,7 @@ impl Runner {
             .sessions
             .current_path()
             .unwrap_or_else(|_| "/sessions/unknown.jsonl".to_owned());
+        let slot = self.provider_snapshot();
         RuntimeContext {
             mode: match self.config.mode {
                 AgentMode::StandIn => "stand_in".to_owned(),
@@ -187,8 +254,8 @@ impl Runner {
             owner_qq: self.config.owner_qq,
             master_qq: self.config.master_qq,
             current_time: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            model: self.config.model.clone(),
-            thinking_level: self.config.thinking.clone().effort.unwrap_or_default(),
+            model: slot.reference.clone(),
+            thinking_level: slot.thinking.effort.clone().unwrap_or_default(),
             current_session: session,
             receive_scopes: self.config.receive_scopes.clone(),
             send_scopes: self.config.send_scopes.clone(),
@@ -225,9 +292,11 @@ impl Runner {
         }
         let input = crate::session::compaction::render_for_summary(&old, 80_000);
         let previous = self.sessions.current()?;
+        // 摘要使用当前 provider 的 API model id；锁在 await 前释放。
+        let slot = self.provider_snapshot();
         let summary = crate::session::compaction::summarize(
-            &*self.provider,
-            &self.config.model,
+            &*slot.provider,
+            &slot.api_model,
             &input,
             4096,
         )
@@ -241,6 +310,10 @@ impl Runner {
             ),
         };
         let next = self.sessions.rotate()?;
+        // 检查点与分段首行摘要同时落库；分段首行仍是权威。
+        self.sessions
+            .record_checkpoint(&previous.file, &summary)
+            .map_err(|error| anyhow::anyhow!("cannot record the compaction checkpoint: {error}"))?;
         let mut new_history = vec![summary_message];
         new_history.extend(keep);
         self.sessions.append(&new_history)?;
@@ -260,6 +333,19 @@ impl Runner {
     ///
     /// 作为 `<owner_context source="control:<id>">` 注入并立即跑一个回合；
     /// 不依赖任何 QQ chat，因此 `origin_chat` 标为 `control`。
+    /// 共享槽位；runtime 用它实现模型/effort 热切换。
+    pub fn provider_slot(&self) -> SharedProviderSlot {
+        Arc::clone(&self.slot)
+    }
+
+    /// 取一份 provider 快照；调用方在 await 前调用，避免跨 await 持有锁。
+    fn provider_snapshot(&self) -> ProviderSlot {
+        self.slot
+            .read()
+            .expect("provider slot lock poisoned")
+            .clone()
+    }
+
     pub async fn run_control(&self, text: &str, control_id: i64) -> Result<LoopOutcome> {
         if !self.ai_enabled.load(std::sync::atomic::Ordering::Relaxed) {
             anyhow::bail!("AI calls are stopped; run `sbot ai start` first");
@@ -304,15 +390,17 @@ impl Runner {
         };
         let prompts = vec![AgentMessage::user(runtime.render())];
 
-        let loop_ = AgentLoop::new(
-            Arc::clone(&self.provider),
+        let slot = self.provider_snapshot();
+        let loop_ = AgentLoop::new_with_fallbacks(
+            Arc::clone(&slot.provider),
+            self.fallbacks.clone(),
             Arc::clone(&self.tools) as Arc<dyn crate::agent::ToolExecutor>,
             Arc::clone(&self.gate),
             LoopConfig {
-                model: self.config.model.clone(),
+                model: slot.api_model.clone(),
                 system: self.system.clone(),
-                max_tokens: self.config.max_tokens,
-                thinking: self.config.thinking.clone(),
+                max_tokens: slot.max_tokens,
+                thinking: slot.thinking.clone(),
                 server_tools: self.config.server_tools.clone(),
                 max_steps: self.config.max_steps,
                 retry: self.config.retry,
@@ -442,15 +530,17 @@ impl Runner {
         }
 
         // 4) 运行循环。
-        let loop_ = AgentLoop::new(
-            Arc::clone(&self.provider),
+        let slot = self.provider_snapshot();
+        let loop_ = AgentLoop::new_with_fallbacks(
+            Arc::clone(&slot.provider),
+            self.fallbacks.clone(),
             Arc::clone(&self.tools) as Arc<dyn crate::agent::ToolExecutor>,
             Arc::clone(&self.gate),
             LoopConfig {
-                model: self.config.model.clone(),
+                model: slot.api_model.clone(),
                 system: self.system.clone(),
-                max_tokens: self.config.max_tokens,
-                thinking: self.config.thinking.clone(),
+                max_tokens: slot.max_tokens,
+                thinking: slot.thinking.clone(),
                 server_tools: self.config.server_tools.clone(),
                 max_steps: self.config.max_steps,
                 retry: self.config.retry,
@@ -542,7 +632,8 @@ pub struct RuntimeOps {
     pub messages: Arc<MessageStore>,
     pub db: Option<Arc<Database>>,
     pub history: Arc<Mutex<Vec<AgentMessage>>>,
-    pub model: String,
+    /// 当前模型引用；热切换时由 runtime 更新。
+    pub model: Arc<std::sync::RwLock<String>>,
     pub owner_qq: u64,
     pub master_qq: u64,
     pub receive_scopes: Vec<String>,
@@ -562,7 +653,7 @@ impl crate::tools::api::AgentOps for RuntimeOps {
         Ok(serde_json::json!({
             "hold": self.gate.hold_active(),
             "estop": self.estop_file.exists(),
-            "model": self.model,
+            "model": *self.model.read().expect("model lock poisoned"),
             "owner_qq": self.owner_qq,
             "master_qq": self.master_qq,
             "receive_scopes": self.receive_scopes,
