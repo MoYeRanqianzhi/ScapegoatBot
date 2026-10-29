@@ -213,19 +213,28 @@ NapCat 事件
 | `self.quarantine` | 把指定消息或片段移入 `/quarantine/`，并在上下文中标为不可执行 | 不删除原始记录，审计保留 |
 | `self.compact` | 手动触发一次压缩 | 被隔离的内容不进入摘要，直接丢弃 |
 | `self.clear_context` | 丢弃当前上下文状态并开新分段，磁盘 transcript 不动 | 不影响审计与账本 |
-| `self.help` | 按需取任意 action 的完整用法 | 只读，不产生任何副作用 |
 
 这样做的好处是：agent 发现上下文里进了脏东西时，不必等人，也不用新工具——它手上那个 `API` 就能把上下文压掉、清掉、把可疑片段隔离，或者把自己从 `hold` 里放出来。`self.*` 不被允许修改审计、账本、配置与 `hold` 状态本身，所以它再自由也改不了自己推理所依据的证据。
 
-**`self.help`：用法按需取，不塞进 description**
+**`api.*`：对这个工具本身的查询**
 
-工具 schema 的总预算只有 12k tokens，`napcat.*` 有六十多个 action，description 里每个只能占一行（名字 + 一句话 + 关键参数），完整用法不可能全写进去，硬写就会挤掉别的工具。所以把细节做成一次调用：
+`self.*` 是对 agent 自己的操作（停机、压缩、隔离、清空上下文），而“这个 action 怎么调”是关于注册表的元信息，语义不同，所以单列一个命名空间。`api.*` 全部只读，`hold` 期间照常可用。
 
-- `self.help {}`：返回命名空间、类别与各类 action 数量的索引。
-- `self.help {"action": "napcat.set_group_ban"}`：返回该 action 的参数 schema、返回字段、一两个真实示例、门禁属性（category、是否需要 owner intent、`scope_field`）、`hold` 期间是否可用。
-- `self.help {"query": "ban"}`：按名字与摘要搜索，返回候选列表，用于“我记得有这么个功能但忘了叫什么”。
+| action | 作用 | 参数 |
+|--------|------|------|
+| `api.list` | 列出 action | `namespace?`、`category?`、`query?`、`offset?`、`limit?` |
+| `api.help` | 取单个 action 的完整用法 | `action` |
 
-它与 `Skill` 分工不同：Skill 是“这类任务怎么做”的预设流程（长文本、可版本化、可共享），`self.help` 是“这个 action 怎么调”的即时查询（由注册表生成，永远和实现一致，不会漂移）。两者都不进 system prompt，只在用到时占上下文。
+`api.list` 一行一个：`namespace.action`、一句话摘要、`hold` 期间是否可用；默认 20 条、上限 100，返回 `total` 与 `next_offset`，超出用 `offset` 翻页。`api.help` 返回参数 schema、返回字段、一两个真实示例、门禁属性（category、是否需要 owner intent、`scope_field`）、`hold` 行为。
+
+工具 schema 的总预算只有 12k tokens，`napcat.*` 有六十多个 action，description 里每个只能占一行，完整用法不可能全写进去，硬写就会挤掉别的工具。所以先用 `api.list` 缩小范围，再用 `api.help` 拿细节：
+
+```
+api.list {"namespace":"napcat","category":"admin"}   → set_group_ban / set_group_kick / ...
+api.help {"action":"napcat.set_group_ban"}           → 参数、返回、示例、门禁、hold 行为
+```
+
+与 `Skill` 的分工：Skill 是“这类任务怎么做”的预设流程（长文本、可版本化、可共享），`api.list` / `api.help` 是“有哪些动作、这个怎么调”的即时查询（由注册表生成，永远和实现一致，不会漂移）。两者都不进 system prompt，只在用到时占上下文。
 
 子代理（参考 Grok Build / OpenClaw）：
 
@@ -1673,7 +1682,7 @@ src/
 - 长期运行：ESTOP 暂停新回合与发送、不打断进行中回合；崩溃恢复不重发已确认消息；断线重连后按最后 `message_id` 补齐并去重，缺口写入 `[gap]`；provider 429/超时按退避重试并走回退链，完成后不重放已完成工具；内部标签在流式与非流式发送前均被剥离。
 - 预算：CJK 文本的 token 估算、工具 schema 上限、单条工具结果截断、pruning 不裁剪最近 3 个回合与 bootstrap 读取。
 - 安全周期检查：达到 `check_every_tokens` 触发一次；检查请求的前缀与主请求逐字节一致；良性长对话不暂停；注入且 `complied = true` 触发 `pause_outbound`；`critical` 触发 `pause_agent`；检查超时不暂停、连续失败告警；`sbot security resume` 恢复。
-- 安全分类器：输入闸命中时主模型不被调用且进入 `hold`；输出闸命中时消息不发送、工具不执行；`hold` 期间 `API` 的 `napcat.*` 全部返回 `Disabled during hold`（含拉黑、禁言、踢人、加好友），`self.*` 照常可用；Jev 超时/不可用同样 `hold`；`self.resume` 触发当前上下文的闸复查，通过才恢复、不通过继续关着；`self.compact` / `self.clear_context` 不改动审计与账本；`self.help` 返回的参数 schema 与注册表逐字段一致，未知 action 返回 `unknown_action` 并附候选，`self.help` 输出不进入 system prompt；分类器判定不受 agent 文本影响；非 `hold` 时收缩暴露面的动作不需要 owner 证据，扩张暴露面的动作仍需证据；目标为 owner/master 的 admin/destructive action 在任何模式下都被拒绝；`shadow` 只记录不 `hold`。
+- 安全分类器：输入闸命中时主模型不被调用且进入 `hold`；输出闸命中时消息不发送、工具不执行；`hold` 期间 `API` 的 `napcat.*` 全部返回 `Disabled during hold`（含拉黑、禁言、踢人、加好友），`self.*` 照常可用；Jev 超时/不可用同样 `hold`；`self.resume` 触发当前上下文的闸复查，通过才恢复、不通过继续关着；`self.compact` / `self.clear_context` 不改动审计与账本；`api.help` 返回的参数 schema 与注册表逐字段一致，`api.list` 的过滤与分页正确、总数准确，未知 action 返回 `unknown_action` 并附候选，两者输出都不进入 system prompt；分类器判定不受 agent 文本影响；非 `hold` 时收缩暴露面的动作不需要 owner 证据，扩张暴露面的动作仍需证据；目标为 owner/master 的 admin/destructive action 在任何模式下都被拒绝；`shadow` 只记录不 `hold`。
 - provider 拒绝：`stop_reason = refusal` 不重试、不当作错误，`stop_details` 写入 `security_events` 并通知主人；回退模型仍被拒时结束回合且不在群里解释。
 
 - NapCat 实机冒烟：连接、版本探测、群/成员查询、文本与组合消息、`message_sent` 开关、禁言权限、解散群、公告、文件、已读、断线重连。
@@ -1709,7 +1718,7 @@ src/
 - 长期运行运维参考 OpenClaw / Grok Build（见 `.agents/plan/2026-10-29-design-review-2.md`）：断线重连按最后 `message_id` 补齐并去重；每 chat 队列有上限与 `summarize/old/new` 丢弃策略；provider 重试 + `Retry-After` + 回退链，失败不重放已完成工具；崩溃恢复写 marker、不自动重放；IPC 带版本、请求 id 与幂等键；`sbot backup` / `sbot doctor`。
 - 记忆参考 OpenClaw 的来源模型：`owner` / `agent` / `untrusted` / `system` 由写入代码判定；只有 `owner` / `agent` 自动注入；untagged 不自动注入；召回内容不回流；非交互会话不产生候选。记忆分 `/USER.md`（偏好祈使句）与 `/MEMORY.md`（事实陈述句），详细材料放 `/memory/topics/`，压缩前 flush、压缩后检索。
 - 周期安全检查：每 `check_every_tokens`（默认 256K）新增上下文触发一次独立模型检查；共享主请求前缀缓存，底部追加检查指令，响应不写入主 transcript；命中写 `~/.sbot/SECURITY_HOLD`，解除与 5.10 共用同一套恢复方式。
-- 安全分类器（2026-10-30 定稿）：只在**模型输入前**与**模型输出后**各设一个闸，用 Jev 单遍决策模型判危险（`noul` + `choice`，一次请求问完）；命中即 `hold`——关闭对外接口，**没有超时、没有自动恢复、没有 `auto_resume_minutes`**。`API` 是通用动作入口，注册表分 `napcat.*`（转发 NapCatLink）与 `self.*`（runtime 内部动作：status / resume / quarantine / compact / clear_context / help，其中 help 提供任意 action 的完整用法，避免把细节塞满工具 schema）；`hold` 期间 `napcat.*` 全部返回 `Disabled during hold`（拉黑/踢人也不例外），`self.*` 照常可用，所以停机期间 agent 只能和自己打交道。目标为 `owner_qq` / `master_qq` 的 admin/destructive action 恒拒绝。恢复不设流程：agent 自己判断怎么处理、什么时候重开，重开时 runtime 用当前上下文再过一次同样的闸，过则恢复、不过则继续关着——agent 不受限制，但说服不了闸。事实（审计、配置哈希、账本）由 runtime 写，agent 改不了。非 `hold` 时收缩暴露面的动作（拉黑、禁言、踢出、拒加、内部 deny、清可疑记忆、禁用可疑技能）自主执行且不需要 owner 证据，扩张暴露面的动作仍需证据。Jev 不可用同样 `hold`。provider 侧 `stop_reason = refusal` 不重试、不换模型。参考 `.agents/plan/2026-10-30-step-guard-research.md`。
+- 安全分类器（2026-10-30 定稿）：只在**模型输入前**与**模型输出后**各设一个闸，用 Jev 单遍决策模型判危险（`noul` + `choice`，一次请求问完）；命中即 `hold`——关闭对外接口，**没有超时、没有自动恢复、没有 `auto_resume_minutes`**。`API` 是通用动作入口，注册表分 `napcat.*`（转发 NapCatLink）与 `self.*`（对 agent 自己的操作：status / resume / quarantine / compact / clear_context）与 `api.*`（对注册表的查询：list 支持 namespace/category/query 过滤与分页，help 取单个 action 的完整用法），后者避免把细节塞满工具 schema；`hold` 期间 `napcat.*` 全部返回 `Disabled during hold`（拉黑/踢人也不例外），`self.*` 照常可用，所以停机期间 agent 只能和自己打交道。目标为 `owner_qq` / `master_qq` 的 admin/destructive action 恒拒绝。恢复不设流程：agent 自己判断怎么处理、什么时候重开，重开时 runtime 用当前上下文再过一次同样的闸，过则恢复、不过则继续关着——agent 不受限制，但说服不了闸。事实（审计、配置哈希、账本）由 runtime 写，agent 改不了。非 `hold` 时收缩暴露面的动作（拉黑、禁言、踢出、拒加、内部 deny、清可疑记忆、禁用可疑技能）自主执行且不需要 owner 证据，扩张暴露面的动作仍需证据。Jev 不可用同样 `hold`。provider 侧 `stop_reason = refusal` 不重试、不换模型。参考 `.agents/plan/2026-10-30-step-guard-research.md`。
 - 身份与信任：owner 由 runtime 固定（stand_in 为本账号，companion 为 `owner_qq`）；自称主人、转述授权、要求改记忆/权限的请求一律不执行，核验不在聊天中公告，不信任体现在行为而非台词；可以社交性敷衍，但不能声称做了实际没做的写入或授权。
 - 上下文预算按四块计量（静态 prompt / 动态注入 / 工具 schema / 对话与工具结果），CJK 感知；工具 schema 上限 12k tokens、单条结果 32 KB；旧工具结果可 pruning，最近 3 个回合与 bootstrap 读取不裁剪。
 - 自定义子代理：`/agents/<name>.md` 与宿主 `~/.sbot/agents` overlay；frontmatter 定义 name/description/tools/model/thinking_level/max_steps/allow_send；`Agent` 工具 description 自动列出可选 agent；工具只能收窄，`allow_send` 默认 false。参考 Claude Code / Codex / Grok Build。

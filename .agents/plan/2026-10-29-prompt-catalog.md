@@ -132,9 +132,12 @@
 > - `self.quarantine` — move a message or excerpt into `/quarantine/` and mark it non-executable in context. The original record stays for audit.
 > - `self.compact` — run compaction now. Quarantined content is dropped rather than summarized.
 > - `self.clear_context` — discard the current in-memory context and start a new segment; the transcript on disk is untouched.
-> - `self.help` — look up how any action works: `{}` lists namespaces and categories, `{"action":"napcat.set_group_ban"}` returns its parameters, returns, examples, gate rules, and whether it works during a hold, `{"query":"ban"}` searches names by name and summary.
+> **`api.*` — about this tool.** Read-only, always available:
 >
-> The description above is only one line per action. When you are unsure about an action's parameters, call `self.help` first instead of guessing; a wrong field is rejected and wastes a step.
+> - `api.list` — list actions. Filters: `namespace` (`napcat` / `self` / `api`), `category`, `query` (matches name and summary), `offset`, `limit` (default 20, max 100). Returns one line per action: name, one-line summary, whether it works during a hold, plus `total` and `next_offset`.
+> - `api.help` — full details for one action: its parameters, returns, examples, gate rules, and whether it works during a hold.
+>
+> The description above is only one line per action. When you are unsure which action to use, call `api.list` with a `category` or `query` to narrow it down; when you are unsure about the parameters, call `api.help` instead of guessing — a wrong field is rejected and wastes a step.
 >
 > Use `self.*` when you see something in your own context that should not stay there: isolate it, compact around it, or clear the context. Use `self.resume` only when you have dealt with what tripped the gate; the gate re-checks the current context and will refuse if it still sees a problem.
 >
