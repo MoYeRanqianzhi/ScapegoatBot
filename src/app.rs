@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, watch};
 use tracing::{debug, info, warn};
 
 use crate::agent::queue::ChatQueue;
-use crate::agent::runner::{Runner, RunnerConfig, RuntimeOps};
+use crate::agent::runner::{ProviderSlot, Runner, RunnerConfig, RuntimeOps};
 use crate::config::{
     AgentMode, AuthFile, EncryptionMode, LoadedConfig, ModelsFile, SbotConfig, SessionScope,
 };
@@ -44,7 +44,7 @@ use crate::tools::memory::MemoryTool;
 use crate::tools::monitor::MonitorTool;
 use crate::tools::net::NetPolicy;
 use crate::tools::skill::SkillTool;
-use crate::tools::views::Views;
+use crate::tools::views::{ViewContext, Views};
 use crate::tools::web::{WebBackend, WebFetchTool, WebSearchTool};
 use crate::vfs::Vfs;
 use crate::vfs::sqlite::VfsStore;
@@ -67,6 +67,8 @@ struct AgentRuntime {
 #[derive(Default)]
 struct RunnerSink {
     runner: std::sync::OnceLock<Arc<Runner>>,
+    /// 用于 `idle_only`：有活跃回合时不投递。
+    queue: std::sync::OnceLock<Arc<ChatQueue>>,
 }
 
 #[async_trait::async_trait]
@@ -83,6 +85,14 @@ impl MonitorSink for RunnerSink {
             warn!(%error, monitor = %delivery.name, "monitor delivery failed");
         }
     }
+
+    async fn is_idle(&self) -> bool {
+        match self.queue.get() {
+            Some(queue) => queue.active_turns().await == 0,
+            // 队列尚未装配时按空闲处理，避免启动阶段的 monitor 永久等待。
+            None => true,
+        }
+    }
 }
 
 /// 守护进程运行时。
@@ -90,7 +100,7 @@ pub struct Runtime {
     /// 路径布局。
     pub paths: SbotPaths,
     /// 已校验的配置；`SetModel` / `SetEffort` 会就地更新。
-    config: RwLock<LoadedConfig>,
+    config: Arc<RwLock<LoadedConfig>>,
     /// 模型清单（内置 + 用户覆盖）。
     models: ModelsFile,
     /// 凭据（只读，不挂载 VFS）；`sbot doctor` 会读取。
@@ -214,8 +224,10 @@ impl Runtime {
         }
 
         let (owner_qq, master_qq) = resolve_principals(&loaded.config, self_id)?;
+        let config_handle = Arc::new(RwLock::new(loaded.clone()));
         let agent = build_agent(
             &loaded,
+            Arc::clone(&config_handle),
             &models,
             &auth,
             Arc::clone(&db),
@@ -242,7 +254,7 @@ impl Runtime {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let runtime = Arc::new(Self {
             paths: paths.clone(),
-            config: RwLock::new(loaded),
+            config: Arc::clone(&config_handle),
             models,
             auth,
             db,
@@ -364,9 +376,39 @@ impl Runtime {
         let Some(reference) = self.models.find(model) else {
             anyhow::bail!("model {model:?} is not defined in models.json");
         };
+        // 先构造新 provider：失败时保持旧配置与旧 provider 不变。
+        let provider = build_provider(&self.models, &self.auth, model)?;
+        let api_model = reference.model.id.clone();
+        let thinking = ThinkingOptions {
+            enabled: reference.model.reasoning,
+            effort: if reference.model.reasoning
+                && !config.agent.thinking_level.trim().is_empty()
+            {
+                Some(config.agent.thinking_level.clone())
+            } else {
+                None
+            },
+        };
+        let max_tokens = config.agent.max_output_tokens;
+
         let previous = std::mem::replace(&mut config.agent.model, model.to_owned());
         if let Err(error) = persist_agent_setting(&loaded.path, "model", model) {
             warn!(%error, "cannot persist agent.model; change is runtime-only");
+        }
+        // 热切换：下一回合使用新 provider；在飞回合继续用旧快照。
+        if let Some(agent) = self.agent.read().expect("agent lock poisoned").as_ref() {
+            *agent
+                .runner
+                .provider_slot()
+                .write()
+                .expect("provider slot lock poisoned") = ProviderSlot {
+                reference: model.to_owned(),
+                api_model,
+                provider,
+                max_tokens,
+                thinking,
+            };
+            *agent.ops.model.write().expect("model lock poisoned") = model.to_owned();
         }
         info!(from = %previous, to = model, "primary model switched");
         Ok(json!({
@@ -399,6 +441,15 @@ impl Runtime {
         config.agent.thinking_level = level.to_owned();
         if let Err(error) = persist_agent_setting(&loaded.path, "thinking_level", level) {
             warn!(%error, "cannot persist agent.thinking_level; change is runtime-only");
+        }
+        if let Some(agent) = self.agent.read().expect("agent lock poisoned").as_ref() {
+            if let Ok(mut slot) = agent.runner.provider_slot().write() {
+                slot.thinking.effort = if reference.model.reasoning {
+                    Some(level.to_owned())
+                } else {
+                    None
+                };
+            }
         }
         Ok(json!({ "thinking_level": level }))
     }
@@ -546,6 +597,7 @@ impl AgentRuntime {
 #[allow(clippy::too_many_arguments)]
 async fn build_agent(
     loaded: &LoadedConfig,
+    config_handle: Arc<RwLock<LoadedConfig>>,
     models: &ModelsFile,
     auth: &AuthFile,
     db: Arc<Database>,
@@ -572,6 +624,29 @@ async fn build_agent(
     let Some(model_ref) = models.find(&config.agent.model) else {
         anyhow::bail!("model {} disappeared from models.json", config.agent.model);
     };
+    // 回退链：每个模型单独构造 provider（协议/密钥可能不同）。
+    let fallbacks: Vec<crate::agent::FallbackProvider> = config
+        .agent
+        .fallback_models
+        .iter()
+        .filter_map(|reference| {
+            let Some(def) = models.find(reference) else {
+                warn!(model = %reference, "fallback model is not defined in models.json");
+                return None;
+            };
+            match build_provider(models, auth, reference) {
+                Ok(provider) => Some(crate::agent::FallbackProvider {
+                    model: def.model.id.clone(),
+                    provider,
+                    max_tokens: def.model.max_tokens.min(config.agent.max_output_tokens),
+                }),
+                Err(error) => {
+                    warn!(%error, model = %reference, "cannot build a fallback provider");
+                    None
+                }
+            }
+        })
+        .collect();
     let thinking = ThinkingOptions {
         enabled: model_ref.model.reasoning,
         effort: if model_ref.model.reasoning && !config.agent.thinking_level.is_empty() {
@@ -590,7 +665,7 @@ async fn build_agent(
         messages: Arc::clone(&messages),
         db: Some(Arc::clone(&db)),
         history: Arc::clone(&history),
-        model: config.agent.model.clone(),
+        model: Arc::new(std::sync::RwLock::new(config.agent.model.clone())),
         owner_qq,
         master_qq,
         receive_scopes: config.agent.receive_scopes.clone(),
@@ -598,12 +673,23 @@ async fn build_agent(
         estop_file: estop_file.clone(),
     });
 
-    let views = Arc::new(Views::new(
-        Arc::clone(&vfs),
-        Arc::clone(&messages),
-        Arc::clone(&sessions),
-        qq.clone(),
-    ));
+    let views = Arc::new(
+        Views::new(
+            Arc::clone(&vfs),
+            Arc::clone(&messages),
+            Arc::clone(&sessions),
+            qq.clone(),
+        )
+        .with_context(ViewContext {
+            config: Some(Arc::clone(&config_handle)),
+            models: Some(models.clone()),
+            gate: Some(Arc::clone(&gate)),
+            ai_enabled: Some(Arc::clone(&ai_enabled)),
+            estop_file: Some(estop_file.clone()),
+            started_at: Some(chrono::Utc::now()),
+            db: Some(Arc::clone(&db)),
+        }),
+    );
     let sink = Arc::new(RunnerSink::default());
     let monitors = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
 
@@ -715,8 +801,9 @@ async fn build_agent(
     )));
     let tools = Arc::new(tools);
 
-    let runner = Runner::new(
+    let runner = Runner::new_with_fallbacks(
         provider,
+        fallbacks,
         tools,
         Arc::clone(&gate),
         Arc::clone(&vfs),
@@ -761,13 +848,15 @@ async fn build_agent(
     // runner 就绪后才能投递 monitor、执行手动压缩。
     let _ = sink.runner.set(Arc::clone(&runner));
     let _ = ops.runner.set(Arc::clone(&runner));
-    crate::monitor::load_config_monitors(&monitors, &config.monitor).await?;
+    crate::monitor::load_config_monitors(&monitors, &config.monitor, Some(&messages)).await?;
 
     let filter = MessageFilter::from_config(&config.filter);
     let queue = ChatQueue::new(
         config.queue.clone(),
         Arc::clone(&runner) as Arc<dyn crate::agent::queue::TurnHandler>,
     );
+    // `idle_only` monitor 依赖队列的活跃回合数。
+    let _ = sink.queue.set(Arc::clone(&queue));
 
     Ok(Some(Arc::new(AgentRuntime {
         runner,

@@ -186,6 +186,9 @@ pub struct ProviderError {
     pub message: String,
     pub status: Option<u16>,
     pub retryable: bool,
+    /// `Retry-After` 建议的等待时间（毫秒）；由重试循环尊重，并受 `retry_max_ms` 上限约束。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
 }
 
 impl ProviderError {
@@ -199,6 +202,7 @@ impl ProviderError {
             message: message.into(),
             status: None,
             retryable,
+            retry_after_ms: None,
         }
     }
 
@@ -219,6 +223,42 @@ impl ProviderError {
         };
         Self::new(kind, truncate(body, 800)).with_status(status)
     }
+
+    /// 由完整 HTTP 响应构造：在状态码之外读取 `Retry-After`。
+    ///
+    /// 支持两种合法形式：秒数（可带小数）与 HTTP-date（RFC 7231）。
+    /// 无法解析时忽略，回退到指数退避。
+    pub fn from_response(
+        status: u16,
+        headers: Option<&reqwest::header::HeaderMap>,
+        body: &str,
+    ) -> Self {
+        let mut error = Self::from_status(status, body);
+        if let Some(headers) = headers {
+            if let Some(raw) = headers
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+            {
+                error.retry_after_ms = parse_retry_after(raw);
+            }
+        }
+        error
+    }
+}
+
+/// 解析 `Retry-After`；返回值单位毫秒。
+fn parse_retry_after(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if let Ok(seconds) = raw.parse::<f64>() {
+        if seconds.is_finite() && seconds >= 0.0 {
+            return Some((seconds * 1000.0) as u64);
+        }
+        return None;
+    }
+    // HTTP-date：只接受未来时间；过去时间按 0 处理。
+    let date = chrono::DateTime::parse_from_rfc2822(raw).ok()?;
+    let millis = date.timestamp_millis() - chrono::Utc::now().timestamp_millis();
+    Some(millis.max(0) as u64)
 }
 
 impl std::fmt::Display for ProviderError {

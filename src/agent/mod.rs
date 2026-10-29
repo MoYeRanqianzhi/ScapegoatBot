@@ -16,7 +16,7 @@ pub mod message;
 pub mod queue;
 pub mod runner;
 
-pub use agent_loop::{AgentLoop, LoopConfig, LoopOutcome, SteeringQueue};
+pub use agent_loop::{AgentLoop, FallbackProvider, LoopConfig, LoopOutcome, SteeringQueue};
 pub use event::{AgentEvent, DeltaKind, SecurityCheckpoint};
 pub use message::{
     AgentMessage, AssistantBlock, AssistantMessage, RefusalDetails, StopReason, ToolCall,

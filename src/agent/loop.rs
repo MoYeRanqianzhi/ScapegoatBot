@@ -120,9 +120,23 @@ impl SteeringQueue {
     }
 }
 
+/// 回退模型：主模型失败后按顺序尝试。
+///
+/// 每个回退项持有自己的 provider（协议与密钥可能不同）与输出上限。
+#[derive(Clone)]
+pub struct FallbackProvider {
+    /// `provider/id` 形式的模型名，仅用于日志与请求体。
+    pub model: String,
+    pub provider: Arc<dyn Provider>,
+    /// 该模型的最大输出 token；实际请求取当前请求与该值的较小者。
+    pub max_tokens: u32,
+}
+
 /// Agent 循环。
 pub struct AgentLoop {
     provider: Arc<dyn Provider>,
+    /// 主模型失败后的回退链；空表示不回退。
+    fallbacks: Vec<FallbackProvider>,
     tools: Arc<dyn ToolExecutor>,
     gate: Arc<Gate>,
     config: LoopConfig,
@@ -135,8 +149,20 @@ impl AgentLoop {
         gate: Arc<Gate>,
         config: LoopConfig,
     ) -> Self {
+        Self::new_with_fallbacks(provider, Vec::new(), tools, gate, config)
+    }
+
+    /// 带回退链构造。
+    pub fn new_with_fallbacks(
+        provider: Arc<dyn Provider>,
+        fallbacks: Vec<FallbackProvider>,
+        tools: Arc<dyn ToolExecutor>,
+        gate: Arc<Gate>,
+        config: LoopConfig,
+    ) -> Self {
         Self {
             provider,
+            fallbacks,
             tools,
             gate,
             config,
@@ -466,32 +492,74 @@ impl AgentLoop {
         }
     }
 
-    /// 请求并重试。
+    /// 请求并按“主模型 → 回退链”的顺序重试。
+    ///
+    /// 每个候选模型先按 [`RetryPolicy`] 重试；全部用尽后换下一个模型。
+    /// `Retry-After` 优先于指数退避，但仍受 `max_ms` 上限约束。
     async fn request_with_retry(
         &self,
         request: &LlmRequest,
         events: &mpsc::Sender<AgentEvent>,
     ) -> Result<AssistantMessage, ProviderError> {
-        let mut attempt = 0u32;
-        loop {
-            match self.request_once(request, events).await {
-                Ok(message) => return Ok(message),
-                Err(error) => {
-                    if !error.retryable || attempt >= self.config.retry.attempts {
-                        return Err(error);
+        let mut last_error: Option<ProviderError> = None;
+        let candidates = std::iter::once((
+            self.config.model.as_str(),
+            Arc::clone(&self.provider),
+            self.config.max_tokens,
+        ))
+        .chain(self.fallbacks.iter().map(|fallback| {
+            (
+                fallback.model.as_str(),
+                Arc::clone(&fallback.provider),
+                fallback.max_tokens,
+            )
+        }));
+
+        for (index, (model, provider, max_tokens)) in candidates.enumerate() {
+            let mut candidate = request.clone();
+            candidate.model = model.to_owned();
+            candidate.max_tokens = candidate.max_tokens.min(max_tokens);
+
+            let mut attempt = 0u32;
+            loop {
+                match self.request_once(&candidate, events, &provider).await {
+                    Ok(message) => return Ok(message),
+                    Err(error) => {
+                        if !error.retryable || attempt >= self.config.retry.attempts {
+                            if index == 0 && !self.fallbacks.is_empty() {
+                                warn!(
+                                    model,
+                                    %error,
+                                    "primary model failed; trying the fallback chain"
+                                );
+                            }
+                            last_error = Some(error);
+                            break;
+                        }
+                        attempt += 1;
+                        let exponential = self
+                            .config
+                            .retry
+                            .base_ms
+                            .saturating_mul(1u64 << attempt.min(6))
+                            .min(self.config.retry.max_ms);
+                        let backoff = error
+                            .retry_after_ms
+                            .unwrap_or(exponential)
+                            .min(self.config.retry.max_ms);
+                        debug!(attempt, backoff, %error, "retrying provider request");
+                        tokio::time::sleep(Duration::from_millis(backoff)).await;
                     }
-                    attempt += 1;
-                    let backoff = self
-                        .config
-                        .retry
-                        .base_ms
-                        .saturating_mul(1u64 << attempt.min(6))
-                        .min(self.config.retry.max_ms);
-                    debug!(attempt, backoff, %error, "retrying provider request");
-                    tokio::time::sleep(Duration::from_millis(backoff)).await;
                 }
             }
         }
+
+        Err(last_error.unwrap_or_else(|| {
+            ProviderError::new(
+                crate::providers::ProviderErrorKind::Config,
+                "no provider is configured",
+            )
+        }))
     }
 
     /// 单次流式请求。
@@ -499,8 +567,9 @@ impl AgentLoop {
         &self,
         request: &LlmRequest,
         events: &mpsc::Sender<AgentEvent>,
+        provider: &Arc<dyn Provider>,
     ) -> Result<AssistantMessage, ProviderError> {
-        let mut receiver = self.provider.stream(request.clone()).await?;
+        let mut receiver = provider.stream(request.clone()).await?;
 
         let mut blocks: Vec<BlockAccumulator> = Vec::new();
         let mut calls: BTreeMap<u32, CallAccumulator> = BTreeMap::new();
@@ -1213,6 +1282,7 @@ mod tests {
                 message: "temporary".to_owned(),
                 status: Some(500),
                 retryable: true,
+                retry_after_ms: None,
             })],
             text_response("recovered"),
         ]));
@@ -1233,5 +1303,49 @@ mod tests {
 
         assert_eq!(outcome.stop_reason, StopReason::EndTurn);
         assert_eq!(provider.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_the_next_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = Arc::new(FakeProvider::new(vec![vec![ProviderEvent::Error(
+            ProviderError::new(crate::providers::ProviderErrorKind::Auth, "no key")
+                .with_status(401),
+        )]]));
+        let backup = Arc::new(FakeProvider::new(vec![text_response("from backup")]));
+        let tools = Arc::new(FakeTools::new(false));
+        let mut config = config();
+        config.model = "primary-model".to_owned();
+        let agent = AgentLoop::new_with_fallbacks(
+            primary.clone(),
+            vec![FallbackProvider {
+                model: "backup-model".to_owned(),
+                provider: backup.clone(),
+                max_tokens: 99,
+            }],
+            tools,
+            gate(dir.path(), GuardMode::Shadow),
+            config,
+        );
+        let (tx, _rx) = mpsc::channel(128);
+        let mut history = vec![AgentMessage::user("go")];
+        let outcome = agent
+            .run(&mut history, Vec::new(), &mut SteeringQueue::default(), &tx)
+            .await;
+
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        // 主模型只尝试一次（401 不可重试），随后回退。
+        assert_eq!(primary.requests.lock().unwrap().len(), 1);
+        let backup_requests = backup.requests.lock().unwrap();
+        assert_eq!(backup_requests.len(), 1);
+        assert_eq!(backup_requests[0].model, "backup-model");
+        assert_eq!(backup_requests[0].max_tokens, 99);
+        assert!(history.iter().any(|message| matches!(
+            message,
+            AgentMessage::Assistant(assistant) if assistant.content.iter().any(|block| matches!(
+                block,
+                AssistantBlock::Text { text } if text == "from backup"
+            ))
+        )));
     }
 }

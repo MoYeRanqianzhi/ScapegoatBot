@@ -10,12 +10,20 @@
 //! `after:<YYYY-MM-DD>`、`before:<YYYY-MM-DD>`、`unread`、`mentions_self`。
 //! 多个条件用空白分隔，按 AND 组合。
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use chrono::{DateTime, Utc};
 
 use crate::agent::message::{AgentMessage, AssistantBlock};
+use crate::config::models::ModelsFile;
+use crate::config::{LoadedConfig, SbotConfig};
 use crate::qq::event::{ChatId, QqMessage};
 use crate::qq::{QqClient, format};
+use crate::security::gate::Gate;
 use crate::session::SessionStore;
+use crate::storage::Database;
 use crate::storage::messages::{InboxState, MessageStore};
 use crate::vfs::sqlite::VfsStore;
 use crate::vfs::{NodeKind, Vfs, VfsError, VfsPath, path::ParsedTarget};
@@ -46,6 +54,21 @@ pub struct Views {
     messages: Arc<MessageStore>,
     sessions: Arc<SessionStore>,
     client: Option<Arc<QqClient>>,
+    /// `/config` 与 `/system` 使用的运行时快照；未接入时为 `None`。
+    context: ViewContext,
+}
+
+/// `/config` 与 `/system` 的只读上下文。
+#[derive(Default, Clone)]
+pub struct ViewContext {
+    /// 当前配置；`SetModel` / `SetEffort` 会原地更新。
+    pub config: Option<Arc<std::sync::RwLock<LoadedConfig>>>,
+    pub models: Option<ModelsFile>,
+    pub gate: Option<Arc<Gate>>,
+    pub ai_enabled: Option<Arc<AtomicBool>>,
+    pub estop_file: Option<PathBuf>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub db: Option<Arc<Database>>,
 }
 
 impl Views {
@@ -60,7 +83,22 @@ impl Views {
             messages,
             sessions,
             client,
+            context: ViewContext::default(),
         }
+    }
+
+    /// 接入 `/config` 与 `/system` 所需的运行时句柄。
+    pub fn with_context(mut self, context: ViewContext) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// 当前配置快照；未接入时返回 `None`。
+    fn config_snapshot(&self) -> Option<SbotConfig> {
+        self.context
+            .config
+            .as_ref()
+            .map(|handle| handle.read().expect("config lock poisoned").config.clone())
     }
 
     /// 路径是否属于动态视图。
@@ -88,7 +126,10 @@ impl Views {
             [root, group, members] if root == "groups" && members == "members" => {
                 self.list_group_members(group).await
             }
-            [root, _] if root == "config" => Ok(self.list_config()),
+            [root] if root == "config" => Ok(self.list_config_root()),
+            [root, section] if root == "config" => Ok(self.list_config_section(section)),
+            [root, _, _] if root == "config" => Ok(Vec::new()),
+            [root] if root == "system" => Ok(self.list_system()),
             _ => self.vfs_list_fallback(path),
         }?;
 
@@ -141,7 +182,13 @@ impl Views {
                     .await
             }
             [root, group, file] if root == "groups" => self.read_group_file(group, file).await,
-            [root, name] if root == "config" => self.read_config(name),
+            [root] if root == "config.toml" => self.read_config_toml(),
+            [root] if root == "config" => self.read_config_digest(),
+            [root, file] if root == "config" && file == "models.json" => self.read_models_json(),
+            [root, section] if root == "config" => self.read_config_section(section),
+            [root, section, key] if root == "config" => self.read_config_value(section, key),
+            [root] if root == "system" => self.read_system("status"),
+            [root, section] if root == "system" => self.read_system(section),
             _ => Err(VfsError::NotFound(path.to_string())),
         }
     }
@@ -735,22 +782,231 @@ impl Views {
     }
 
     // ---------------------------------------------------------------------
-    // /config
+    // /config /system
     // ---------------------------------------------------------------------
 
-    fn list_config(&self) -> Vec<ViewEntry> {
-        vec![
-            text_entry("/config/agent"),
-            text_entry("/config/security"),
-            text_entry("/config/tools"),
-            text_entry("/config/filter"),
-        ]
+    /// 把当前配置序列化成 TOML 表；失败时视为视图不可用。
+    fn config_table(&self) -> Option<toml::Table> {
+        let config = self.config_snapshot()?;
+        let text = toml::to_string(&config).ok()?;
+        toml::from_str(&text).ok()
     }
 
-    fn read_config(&self, name: &str) -> Result<ViewRead, VfsError> {
-        Err(VfsError::NotFound(format!(
-            "/config/{name}: the config view is wired in Phase 5"
-        )))
+    fn list_config_root(&self) -> Vec<ViewEntry> {
+        let mut entries: Vec<ViewEntry> = self
+            .config_table()
+            .map(|table| {
+                table
+                    .keys()
+                    .map(|name| text_entry(&format!("/config/{name}")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.push(text_entry("/config/models.json"));
+        entries
+    }
+
+    fn list_config_section(&self, section: &str) -> Vec<ViewEntry> {
+        if section == "models.json" {
+            return Vec::new();
+        }
+        let Some(table) = self.config_table() else {
+            return Vec::new();
+        };
+        let Some(value) = table.get(section) else {
+            return Vec::new();
+        };
+        // 数组（如 [[monitor]]）作为叶子整体读取。
+        let Some(section_table) = value.as_table() else {
+            return Vec::new();
+        };
+        section_table
+            .keys()
+            .map(|key| text_entry(&format!("/config/{section}/{key}")))
+            .collect()
+    }
+
+    fn read_config_digest(&self) -> Result<ViewRead, VfsError> {
+        let Some(table) = self.config_table() else {
+            return Err(VfsError::Offline("/config".to_owned()));
+        };
+        let mut out = String::from("# Configuration\n");
+        for (name, value) in &table {
+            let kind = if value.is_table() { "table" } else { "leaf" };
+            out.push_str(&format!("- /config/{name} ({kind})\n"));
+        }
+        out.push_str("- /config/models.json (read-only)\n");
+        Ok(ViewRead::Text(out))
+    }
+
+    fn read_config_section(&self, section: &str) -> Result<ViewRead, VfsError> {
+        let table = self
+            .config_table()
+            .ok_or_else(|| VfsError::Offline("/config".to_owned()))?;
+        let value = table
+            .get(section)
+            .ok_or_else(|| VfsError::NotFound(format!("/config/{section}")))?;
+        let text = match value {
+            toml::Value::Table(_) => toml::to_string(value)
+                .unwrap_or_else(|_| value.to_string()),
+            _ => value.to_string(),
+        };
+        Ok(ViewRead::Text(text))
+    }
+
+    fn read_config_value(&self, section: &str, key: &str) -> Result<ViewRead, VfsError> {
+        let table = self
+            .config_table()
+            .ok_or_else(|| VfsError::Offline("/config".to_owned()))?;
+        let value = table
+            .get(section)
+            .and_then(|section| section.get(key))
+            .ok_or_else(|| VfsError::NotFound(format!("/config/{section}/{key}")))?;
+        Ok(ViewRead::Text(value.to_string()))
+    }
+
+    /// `/config.toml`：`sbot.toml` 原文；凭据不在其中。
+    fn read_config_toml(&self) -> Result<ViewRead, VfsError> {
+        let path = self
+            .context
+            .config
+            .as_ref()
+            .map(|handle| handle.read().expect("config lock poisoned").path.clone())
+            .ok_or_else(|| VfsError::Offline("/config.toml".to_owned()))?;
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| VfsError::Storage(error.to_string()))?;
+        Ok(ViewRead::Text(text))
+    }
+
+    /// `/config/models.json`：只读模型定义。
+    fn read_models_json(&self) -> Result<ViewRead, VfsError> {
+        let models = self
+            .context
+            .models
+            .as_ref()
+            .ok_or_else(|| VfsError::Offline("/config/models.json".to_owned()))?;
+        Ok(ViewRead::Text(
+            serde_json::to_string_pretty(models).unwrap_or_default(),
+        ))
+    }
+
+    fn list_system(&self) -> Vec<ViewEntry> {
+        ["status", "storage", "security", "gate", "hooks", "context"]
+            .into_iter()
+            .map(|name| text_entry(&format!("/system/{name}")))
+            .collect()
+    }
+
+    fn read_system(&self, section: &str) -> Result<ViewRead, VfsError> {
+        let config = self
+            .config_snapshot()
+            .ok_or_else(|| VfsError::Offline("/system".to_owned()))?;
+        let text = match section {
+            "status" => {
+                let mut out = String::from("# Runtime\n");
+                out.push_str(&format!("mode: {:?}\n", config.agent.mode));
+                out.push_str(&format!("session_scope: {:?}\n", config.session.scope));
+                out.push_str(&format!("model: {}\n", config.agent.model));
+                out.push_str(&format!("thinking_level: {}\n", config.agent.thinking_level));
+                if let Some(enabled) = &self.context.ai_enabled {
+                    out.push_str(&format!(
+                        "ai_enabled: {}\n",
+                        enabled.load(Ordering::Relaxed)
+                    ));
+                }
+                if let Some(gate) = &self.context.gate {
+                    out.push_str(&format!("hold: {}\n", gate.hold_active()));
+                }
+                if let Some(estop) = &self.context.estop_file {
+                    out.push_str(&format!("estop: {}\n", estop.exists()));
+                }
+                if let Some(started) = self.context.started_at {
+                    out.push_str(&format!("started_at: {}\n", started.to_rfc3339()));
+                    out.push_str(&format!(
+                        "uptime_secs: {}\n",
+                        (Utc::now() - started).num_seconds().max(0)
+                    ));
+                }
+                out
+            }
+            "storage" => {
+                let mut out = String::from("# Storage\n");
+                if let Ok(usage) = self.vfs.usage() {
+                    out.push_str(&format!(
+                        "vfs: {} active bytes, {} trash bytes, {} nodes, {} trashed\n",
+                        usage.active_bytes, usage.trash_bytes, usage.nodes, usage.trash_nodes
+                    ));
+                }
+                if let Ok((bytes, count)) = self.messages.usage() {
+                    out.push_str(&format!("messages: {bytes} bytes, {count} messages\n"));
+                }
+                if let Ok((bytes, count)) = self.sessions.usage() {
+                    out.push_str(&format!("sessions: {bytes} bytes, {count} messages\n"));
+                }
+                out.push_str(&format!(
+                    "retention: messages {} days, sessions {} days\n",
+                    config.storage.message_retention_days, config.storage.session_retention_days
+                ));
+                out
+            }
+            "security" => {
+                let mut out = format!("# Security\n\nhold: {}\n", self
+                    .context
+                    .gate
+                    .as_ref()
+                    .map(|gate| gate.hold_active().to_string())
+                    .unwrap_or_else(|| "unknown".to_owned()));
+                out.push_str(&format!(
+                    "guard: enabled={} mode={:?} backend={:?} threshold={}\n",
+                    config.security.guard.enabled,
+                    config.security.guard.mode,
+                    config.security.guard.backend,
+                    config.security.guard.threshold
+                ));
+                if let Some(db) = &self.context.db {
+                    if let Ok(events) = crate::security::events::recent(db, 10) {
+                        out.push_str("\n## Recent events\n");
+                        for event in events {
+                            out.push_str(&format!(
+                                "- {} {:?} allowed={} score={:.2} {}\n",
+                                event.created_at,
+                                event.checkpoint,
+                                event.allowed,
+                                event.score,
+                                event.reason
+                            ));
+                        }
+                    }
+                }
+                out
+            }
+            "gate" => format!(
+                "# API gate\n\nmode: {:?}\nreceive_scopes: {:?}\nsend_scopes: {:?}\n",
+                config.gate.mode, config.agent.receive_scopes, config.agent.send_scopes
+            ),
+            "hooks" => {
+                let mut out = String::from("# Context hooks\n");
+                for hook in &config.hooks.context {
+                    out.push_str(&format!(
+                        "- {} path={} kind={:?} inject={:?} enabled={}\n",
+                        hook.name, hook.path, hook.kind, hook.inject, hook.enabled
+                    ));
+                }
+                out
+            }
+            "context" => {
+                let static_prompt = crate::prompt::render_static(config.agent.mode);
+                format!(
+                    "# Context budget\n\nstatic_prompt_tokens≈{}\nturn_context_budget: {}\nkeep_recent_tokens: {}\nmax_output_tokens: {}\n",
+                    crate::session::compaction::estimate_tokens(&static_prompt),
+                    config.compaction.turn_context_budget,
+                    config.compaction.keep_recent_tokens,
+                    config.agent.max_output_tokens
+                )
+            }
+            _ => return Err(VfsError::NotFound(format!("/system/{section}"))),
+        };
+        Ok(ViewRead::Text(text))
     }
 
     // ---------------------------------------------------------------------
@@ -933,4 +1189,111 @@ fn filter_matches_path(filter: &str, path: &str) -> bool {
 /// 判断工具是否应该走动态视图。
 pub fn is_dynamic_target(target: &ParsedTarget) -> bool {
     target.query.is_some() || Views::handles(&target.path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SbotConfig;
+    use crate::storage::crypto::MasterKey;
+    use crate::vfs::quota::Limits;
+
+    fn views() -> (Views, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let key = Arc::new(MasterKey::from_bytes([5u8; 32]));
+        let vfs = Arc::new(
+            VfsStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                dir.path().join("data"),
+                Limits::default(),
+            )
+            .unwrap(),
+        );
+        let messages = Arc::new(
+            MessageStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                dir.path().join("data"),
+                0,
+                crate::config::EncryptionMode::None,
+            )
+            .unwrap(),
+        );
+        let sessions = Arc::new(
+            SessionStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                dir.path().join("data"),
+                0,
+                crate::config::EncryptionMode::None,
+            )
+            .unwrap(),
+        );
+        let config = SbotConfig::default();
+        let path = dir.path().join("sbot.toml");
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let handle = Arc::new(std::sync::RwLock::new(LoadedConfig {
+            config,
+            path,
+            dir: dir.path().to_path_buf(),
+        }));
+        let models = ModelsFile::parse(include_str!("../../assets/models.default.json")).unwrap();
+        let views = Views::new(vfs, messages, sessions, None).with_context(ViewContext {
+            config: Some(handle),
+            models: Some(models),
+            ..ViewContext::default()
+        });
+        (views, dir)
+    }
+
+    fn target(path: &str) -> ParsedTarget {
+        ParsedTarget {
+            path: VfsPath::parse(path).unwrap(),
+            query: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn config_tree_and_leaves_are_readable() {
+        let (views, _dir) = views();
+        let sections = views.list(&target("/config")).await.unwrap();
+        assert!(sections.iter().any(|entry| entry.path == "/config/agent"));
+        assert!(
+            sections
+                .iter()
+                .any(|entry| entry.path == "/config/models.json")
+        );
+
+        let keys = views.list(&target("/config/agent")).await.unwrap();
+        assert!(keys.iter().any(|entry| entry.path == "/config/agent/model"));
+
+        match views.read(&target("/config/agent/model")).await.unwrap() {
+            ViewRead::Text(text) => assert!(text.contains("claude-opus-5-5")),
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // 整文件视图返回原始 TOML（不含凭据）。
+        match views.read(&target("/config.toml")).await.unwrap() {
+            ViewRead::Text(text) => assert!(text.contains("version = 1")),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn system_view_reports_runtime_defaults() {
+        let (views, _dir) = views();
+        match views.read(&target("/system/status")).await.unwrap() {
+            ViewRead::Text(text) => {
+                assert!(text.contains("mode: StandIn"), "{text}");
+                assert!(text.contains("session_scope: Shared"), "{text}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+        match views.read(&target("/system/context")).await.unwrap() {
+            ViewRead::Text(text) => assert!(text.contains("static_prompt_tokens")),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
 }

@@ -25,6 +25,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use crate::qq::event::QqEvent;
+use crate::qq::format;
 
 /// 投递内容。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,6 +43,11 @@ pub struct MonitorDelivery {
 #[async_trait::async_trait]
 pub trait MonitorSink: Send + Sync {
     async fn deliver(&self, delivery: MonitorDelivery);
+
+    /// agent 是否空闲；`idle_only` 的 monitor 会等待这里返回 `true`。
+    async fn is_idle(&self) -> bool {
+        true
+    }
 }
 
 /// 事件视图。
@@ -149,6 +155,14 @@ struct Monitor {
     max_events: u64,
     expires_at: Option<DateTime<Local>>,
     one_shot: bool,
+    /// 只在 agent 空闲时投递。
+    idle_only: bool,
+    /// 批处理窗口；0 表示逐个投递。
+    batch_window: Duration,
+    /// 待合并的事件文本。
+    batch: Mutex<Vec<String>>,
+    /// 是否已有 flush 任务在等待。
+    flush_queued: AtomicBool,
     delivered: AtomicU64,
     last_delivery: Mutex<Option<std::time::Instant>>,
     cancelled: AtomicBool,
@@ -183,6 +197,8 @@ impl MonitorManager {
         expires: Option<Duration>,
         one_shot: bool,
         min_interval: Duration,
+        idle_only: bool,
+        batch_window: Duration,
     ) -> Result<()> {
         {
             let mut monitors = self.monitors.write().await;
@@ -203,6 +219,10 @@ impl MonitorManager {
                         .map(|duration| Local::now() + duration)
                 }),
                 one_shot,
+                idle_only,
+                batch_window,
+                batch: Mutex::new(Vec::new()),
+                flush_queued: AtomicBool::new(false),
                 delivered: AtomicU64::new(0),
                 last_delivery: Mutex::new(None),
                 cancelled: AtomicBool::new(false),
@@ -263,9 +283,25 @@ impl MonitorManager {
         Ok(())
     }
 
+    /// 以一条合成事件投递一次；用于 `backlog = "inbox"` 的首次补投。
+    pub async fn deliver_text(&self, name: &str, text: String) -> Result<()> {
+        let monitor = {
+            let monitors = self.monitors.read().await;
+            monitors.get(name).cloned()
+        };
+        let Some(monitor) = monitor else {
+            anyhow::bail!("monitor {name:?} does not exist");
+        };
+        let event = MonitorEvent {
+            text,
+            ..MonitorEvent::default()
+        };
+        deliver_once(&monitor, &*self.sink, Some(&event), 1).await;
+        Ok(())
+    }
+
     /// 喂入 QQ 事件；匹配的 monitor 各投递一次。
-    pub async fn on_qq_event(&self, event: &QqEvent) {
-        let Some(view) = MonitorEvent::from_qq(event) else {
+    pub async fn on_qq_event(&self, event: &QqEvent) {        let Some(view) = MonitorEvent::from_qq(event) else {
             return;
         };
         let monitors: Vec<Arc<Monitor>> = {
@@ -278,7 +314,7 @@ impl MonitorManager {
         };
         for monitor in monitors {
             match matches(monitor.when.as_deref(), &view) {
-                Ok(true) => deliver_once(&monitor, &*self.sink, Some(&view), 1).await,
+                Ok(true) => self.enqueue(&monitor, &view).await,
                 Ok(false) => {}
                 Err(error) => {
                     warn!(%error, monitor = %monitor.name, "monitor predicate failed");
@@ -298,9 +334,51 @@ impl MonitorManager {
             }
         }
     }
-}
 
-/// 投递一次：检查取消、到期、上限、冷却，然后写入 sink。
+    /// 按批处理窗口投递事件；窗口为 0 时立即投递。
+    ///
+    /// 投递在独立任务里执行，避免 `idle_only` 等待空闲时阻塞 QQ 事件处理。
+    async fn enqueue(&self, monitor: &Arc<Monitor>, event: &MonitorEvent) {
+        if monitor.batch_window.is_zero() {
+            // 无批处理且无需等空闲时直接投递，保持调用方看到同步结果。
+            if !monitor.idle_only {
+                deliver_once(monitor, &*self.sink, Some(event), 1).await;
+                return;
+            }
+            let monitor = Arc::clone(monitor);
+            let sink = Arc::clone(&self.sink);
+            let event = event.clone();
+            tokio::spawn(async move {
+                deliver_once(&monitor, &*sink, Some(&event), 1).await;
+            });
+            return;
+        }
+
+        monitor
+            .batch
+            .lock()
+            .expect("monitor lock")
+            .push(format!("[{}] {}", event.chat, event.text));
+        if monitor.flush_queued.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let monitor = Arc::clone(monitor);
+        let sink = Arc::clone(&self.sink);
+        tokio::spawn(async move {
+            tokio::time::sleep(monitor.batch_window).await;
+            let texts = std::mem::take(&mut *monitor.batch.lock().expect("monitor lock"));
+            monitor.flush_queued.store(false, Ordering::SeqCst);
+            if texts.is_empty() {
+                return;
+            }
+            let event = MonitorEvent {
+                text: texts.join("\n"),
+                ..MonitorEvent::default()
+            };
+            deliver_once(&monitor, &*sink, Some(&event), texts.len() as u64).await;
+        });
+    }
+}
 async fn deliver_once(
     monitor: &Monitor,
     sink: &dyn MonitorSink,
@@ -343,6 +421,22 @@ async fn deliver_once(
         .await;
         return;
     }
+    // idle_only：等到 agent 空闲再投递；最多等 10 分钟，超时放弃本次事件。
+    if monitor.idle_only {
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        while !sink.is_idle().await {
+            if monitor.cancelled.load(Ordering::SeqCst)
+                || monitor
+                    .expires_at
+                    .is_some_and(|deadline| Local::now() > deadline)
+                || std::time::Instant::now() > deadline
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
     {
         let mut last = monitor.last_delivery.lock().expect("monitor lock");
         if let Some(previous) = *last
@@ -550,6 +644,8 @@ fn parse_field(field: &str, min: u32, max: u32) -> Result<Vec<u32>, String> {
 pub async fn load_config_monitors(
     manager: &Arc<MonitorManager>,
     monitors: &[crate::config::MonitorConfig],
+    // 用于 `backlog = "inbox"` 的首次补投；`None` 时跳过。
+    messages: Option<&Arc<crate::storage::messages::MessageStore>>,
 ) -> Result<()> {
     for monitor in monitors.iter().filter(|monitor| monitor.enabled) {
         let (source, timer) = if monitor.source.qq.is_some() {
@@ -596,8 +692,47 @@ pub async fn load_config_monitors(
                 expires,
                 monitor.lifecycle.one_shot,
                 Duration::from_secs(monitor.lifecycle.min_interval_secs),
+                monitor.lifecycle.idle_only,
+                Duration::from_millis(monitor.deliver.batch_window_ms),
             )
             .await?;
+
+        // `backlog = "inbox"`：创建时把匹配的未读消息补投一次；
+        // 只有真正投递出去的条目才标记已读。
+        let wants_backlog = matches!(
+            monitor.source.qq,
+            Some(crate::config::QqSource::Detailed(ref config))
+                if config.backlog == crate::config::BacklogMode::Inbox
+        );
+        if wants_backlog {
+            if let Some(messages) = messages {
+                let mut lines = Vec::new();
+                for message in messages.unread(None).unwrap_or_default() {
+                    let event = MonitorEvent {
+                        kind: "message".to_owned(),
+                        chat: message.chat.to_string(),
+                        sender: message.sender.qq,
+                        text: message.plain_text(),
+                        mentions_self: message
+                            .segments
+                            .iter()
+                            .any(|segment| {
+                                matches!(segment, crate::qq::event::Segment::At { .. })
+                            }),
+                    };
+                    if !matches(monitor.when.as_deref(), &event).unwrap_or(false) {
+                        continue;
+                    }
+                    lines.push(format::render_inbound(&message));
+                    let _ = messages.mark_read(message.chat, &[message.message_id]);
+                }
+                if !lines.is_empty() {
+                    manager
+                        .deliver_text(&monitor.name, lines.join("\n\n"))
+                        .await?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -614,15 +749,29 @@ fn parse_at(raw: &str) -> Result<TimerSpec> {
 mod tests {
     use super::*;
 
-    #[derive(Default)]
     struct RecordingSink {
         deliveries: Mutex<Vec<MonitorDelivery>>,
+        idle: AtomicBool,
+    }
+
+    impl Default for RecordingSink {
+        fn default() -> Self {
+            Self {
+                deliveries: Mutex::new(Vec::new()),
+                // 默认空闲，既有测试不进入等待。
+                idle: AtomicBool::new(true),
+            }
+        }
     }
 
     #[async_trait::async_trait]
     impl MonitorSink for RecordingSink {
         async fn deliver(&self, delivery: MonitorDelivery) {
             self.deliveries.lock().unwrap().push(delivery);
+        }
+
+        async fn is_idle(&self) -> bool {
+            self.idle.load(Ordering::SeqCst)
         }
     }
 
@@ -687,6 +836,8 @@ mod tests {
                 None,
                 false,
                 Duration::ZERO,
+                false,
+                Duration::ZERO,
             )
             .await
             .unwrap();
@@ -727,6 +878,8 @@ mod tests {
                 None,
                 false,
                 Duration::ZERO,
+                false,
+                Duration::ZERO,
             )
             .await
             .unwrap();
@@ -754,6 +907,8 @@ mod tests {
                 None,
                 false,
                 Duration::ZERO,
+                false,
+                Duration::ZERO,
             )
             .await
             .unwrap();
@@ -761,5 +916,88 @@ mod tests {
         assert!(manager.remove("m").await);
         assert!(!manager.remove("m").await);
         assert!(manager.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_window_merges_events_into_one_delivery() {
+        let sink = Arc::new(RecordingSink::default());
+        let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+        manager
+            .add(
+                "batched".to_owned(),
+                "qq".to_owned(),
+                None,
+                None,
+                None,
+                false,
+                10,
+                None,
+                false,
+                Duration::ZERO,
+                false,
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap();
+
+        let first = event("group:1001", "first", false);
+        let second = event("group:1001", "second", false);
+        let monitor = manager
+            .monitors
+            .read()
+            .await
+            .get("batched")
+            .cloned()
+            .unwrap();
+        manager.enqueue(&monitor, &first).await;
+        manager.enqueue(&monitor, &second).await;
+        // 窗口未到时不应投递。
+        assert!(sink.deliveries.lock().unwrap().is_empty());
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let deliveries = sink.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].text.contains("first"));
+        assert!(deliveries[0].text.contains("second"));
+    }
+
+    #[tokio::test]
+    async fn idle_only_waits_for_the_agent() {
+        let sink = Arc::new(RecordingSink::default());
+        sink.idle.store(false, Ordering::SeqCst);
+        let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+        manager
+            .add(
+                "idle".to_owned(),
+                "qq".to_owned(),
+                None,
+                None,
+                None,
+                false,
+                10,
+                None,
+                false,
+                Duration::ZERO,
+                true,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+
+        let event = event("private:10001", "hello", false);
+        let monitor = manager
+            .monitors
+            .read()
+            .await
+            .get("idle")
+            .cloned()
+            .unwrap();
+        manager.enqueue(&monitor, &event).await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(sink.deliveries.lock().unwrap().is_empty());
+
+        sink.idle.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(sink.deliveries.lock().unwrap().len(), 1);
     }
 }

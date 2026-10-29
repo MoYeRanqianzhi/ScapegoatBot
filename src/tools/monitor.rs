@@ -177,6 +177,17 @@ impl MonitorTool {
             .get("one_shot")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // 运行时创建默认只在空闲时投递，避免与正在进行的回合抢上下文。
+        let idle_only = lifecycle
+            .get("idle_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let batch_window = Duration::from_millis(
+            deliver
+                .get("batch_window_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(200),
+        );
         let expires = match lifecycle.get("expires").and_then(Value::as_str) {
             None => Some(Duration::from_secs(2 * 3600)),
             Some("0") => None,
@@ -202,6 +213,8 @@ impl MonitorTool {
                 expires,
                 one_shot,
                 min_interval,
+                idle_only,
+                batch_window,
             )
             .await
         {
