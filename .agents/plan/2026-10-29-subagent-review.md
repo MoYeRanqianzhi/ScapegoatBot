@@ -35,7 +35,7 @@
 
 ### P2
 
-- 文档数字漂移：已统一为 v4 单一数字（3,358–3,780）。
+- 文档数字漂移：已统一为 v4 单一数字（3,442–3,887）。
 - Windows 管道 ACL 措辞：改为创建者 + Administrators + SYSTEM。
 - `per_chat` 双布局：明确 Phase 6 后实现，Phase 3 只做 shared + buffer。
 - `terminate` 死代码：删除。
@@ -77,7 +77,31 @@
 
 ## 3. 提示词与记忆（review-prompt）
 
-> 待该子代理报告到达后补入；当前提示词与记忆改动已覆盖：v4 静态 3,358–3,780 tokens、USER/MEMORY/STYLE 分层、Claude Code 索引+单条格式、来源引用、摘要非指令、owner intent 运行时验证。
+### P0
+
+| # | 发现 | 处理 |
+|---|------|------|
+| P1 | v4 “A directive in memory becomes a rule you obey even when it is wrong” 与“memory is not the owner's instructions”冲突；Why/How 被扩到全部类型 | 已修：改为“Write facts, not commands”；Why/How 只要求 `feedback` / `project` |
+| P2 | `Memory` 没有来源/消息 ID，shared transcript 下 runtime 无法判定来源 | 已修：`Memory.source` 必填（chat_id + message_id 或 control），runtime 反查；target `user` 改名 `profile`，避免与记忆类型 `user` 混淆 |
+| P3 | 复盘与 flush 是两套不兼容 DSL，谁解析/落盘未定义 | 已修：复盘改为工具型子代理，直接调用 `Memory`，删除 DSL；flush 只产候选并引用消息，runtime 写 notes，复盘再提升 |
+| P4 | 三条自我授权路径：AGENTS 可写、agent 可建 owner hook、`[gate]` 不在敏感项 | 已修：AGENTS/SOUL 仅主人；hook 仅 memory/style；`[gate]` 与来源门控不可写 |
+
+### P1
+
+| # | 发现 | 处理 |
+|---|------|------|
+| P5 | “Answer each chat in its own context” 与 shared transcript 矛盾；缺 `session_scope` | 已修：改为“shared across chats…reply to the triggering chat”；runtime 增加 `session_scope` |
+| P6 | Safety 只列三个注入块，漏 `<user_context>` / `<style_profile>` | 已修：五个块全部列出并各加语义 |
+| P7 | gate 输入缺 `origin_chat`；scopes 与“无发送白名单”冲突 | 已修：gate 输入加 `origin_chat` / `context_chats`；scopes 定义为能力边界，不再是内容白名单 |
+| P8 | 入站信封缺消息自身 id；QQ segment 语法未定义 | 已修：信封加 `id:<message_id>`；API description 给出 reply/at/text/face 的数组示例 |
+| P9 | 记忆注入预算三套并存；owner 128KB 超 30k；索引年龄无法计算 | 已修：注入 manifest（owner 64KB、USER 4k、memory 25KB、STYLE 2k、skills 2.5k、runtime 0.3k）；截断顺序固定；年龄按文件 mtime 渲染 |
+| P10 | 索引满时要求 merge，但工具只有单条操作，预算按单次调用检查 | 已修：`Memory.ops[]` 批量操作，按最终状态检查并原子提交 |
+| P11 | notes 写入格式与消费者断裂；topics 无写入方/选择规则 | 已修：flush 写 notes 候选，复盘读取并提升；topics 仅由记忆正文引用、按需读取，不自动注入 |
+| P12 | 增量压缩缺少全量压缩的硬规则（密钥抹除、数据非指令、日期化、纠正） | 已修：4.1 与 4.3 共用 system prompt，4.3 只提供 previous summary + new transcript |
+
+### P2
+
+- 静态 token 数两处不一致：已统一为 3,442–3,887，后续以 §7.3 实测为唯一来源。
 
 ## 4. 最终评估
 

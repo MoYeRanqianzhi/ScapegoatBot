@@ -6,6 +6,7 @@
 - [Hermes 参考评审（2026-10-29）](plan/2026-10-29-hermes-review.md) -- 长期运行 agent 的分层 prompt、记忆/技能回路与 v4 全文
 - [设计复审二（2026-10-29）](plan/2026-10-29-design-review-2.md) -- OpenClaw/Grok Build 对照：并发、长期运行、记忆可信度与 27 项发现
 - [Claude Code 记忆格式（2026-10-29）](plan/2026-10-29-claude-memory-format.md) -- 索引 + 单条记忆 + 四类 + 新鲜度，及本项目适配
+- [子代理审查汇总（2026-10-29）](plan/2026-10-29-subagent-review.md) -- 架构/提示词/安全三份评审、P0 修复与最终评估
 - [Prompt Catalog（2026-10-29）](plan/2026-10-29-prompt-catalog.md) -- 工具/压缩/子代理/门禁/复盘/错误提示的英文稿
 - [旧架构总览（重构前）](memory/legacy-architecture.md) -- 模块结构、数据流、会话/沙箱/MCP/Swarm/安全设计
 - [旧工具参考（重构前）](memory/legacy-tools-reference.md) -- 43 个内置工具的分组、数量与实现位置
