@@ -60,7 +60,8 @@ struct ChatState {
 
 /// 聊天队列。
 pub struct ChatQueue {
-    config: QueueConfig,
+    /// `/config/queue` 写入后可原地替换；信号量上限仍需重启才变化。
+    config: std::sync::RwLock<QueueConfig>,
     handler: Arc<dyn TurnHandler>,
     states: Mutex<HashMap<ChatId, ChatState>>,
     semaphore: Arc<Semaphore>,
@@ -71,7 +72,7 @@ impl ChatQueue {
     pub fn new(config: QueueConfig, handler: Arc<dyn TurnHandler>) -> Arc<Self> {
         let max = config.max_concurrent.max(1);
         Arc::new(Self {
-            config,
+            config: std::sync::RwLock::new(config),
             handler,
             states: Mutex::new(HashMap::new()),
             semaphore: Arc::new(Semaphore::new(max)),
@@ -79,15 +80,29 @@ impl ChatQueue {
         })
     }
 
+    /// 热更新队列参数；`max_concurrent` 的信号量不会缩小，需重启生效。
+    pub fn reload_config(&self, config: QueueConfig) {
+        *self.config.write().expect("queue config lock poisoned") = config;
+    }
+
+    /// 当前配置快照。
+    fn config(&self) -> QueueConfig {
+        self.config
+            .read()
+            .expect("queue config lock poisoned")
+            .clone()
+    }
+
     /// 注入一条已通过过滤器的消息。
     pub async fn ingest(self: &Arc<Self>, message: QqMessage) {
         let chat = message.chat;
+        let config = self.config();
         let mut states = self.states.lock().await;
         let state = states.entry(chat).or_default();
 
         // 回合进行中：steer 模式直接注入。
         if let Some(steering) = &state.active
-            && self.config.mode == QueueMode::Steer
+            && config.mode == QueueMode::Steer
         {
             let _ = steering.send(AgentMessage::user(render_inbound(&message)));
             return;
@@ -101,14 +116,15 @@ impl ChatQueue {
         // `pending_batches` 只在真正形成批次（`fire`）时增加，避免重复计数。
         if state.active.is_none() && state.pending_batches == 0 {
             drop(states);
-            self.schedule(chat, token, self.config.debounce_ms);
+            self.schedule(chat, token, config.debounce_ms);
         }
     }
 
     /// 按上限压入待处理队列。
     fn push_with_caps(&self, state: &mut ChatState, message: QqMessage) {
-        if state.pending.len() >= self.config.cap_messages {
-            match self.config.drop {
+        let config = self.config();
+        if state.pending.len() >= config.cap_messages {
+            match config.drop {
                 DropPolicy::New => {
                     debug!(chat = %message.chat, "queue full; dropping the newest message");
                     return;
@@ -140,6 +156,7 @@ impl ChatQueue {
 
     /// 去抖窗口结束：取出一批并启动回合。
     async fn fire(self: &Arc<Self>, chat: ChatId, token: u64) {
+        let config = self.config();
         let (batch, steering_tx, permission) = {
             let mut states = self.states.lock().await;
             let Some(state) = states.get_mut(&chat) else {
@@ -151,7 +168,7 @@ impl ChatQueue {
             }
 
             // 批次上限：超出时按丢弃策略处理旧批次（这里只有消息，直接丢最旧）。
-            if state.pending_batches > self.config.cap_batches {
+            if state.pending_batches > config.cap_batches {
                 state.pending.pop_front();
                 state.dropped += 1;
             }
@@ -305,6 +322,19 @@ mod tests {
             drop: DropPolicy::Summarize,
             debounce_ms: 100,
         }
+    }
+
+    #[tokio::test]
+    async fn reload_config_updates_the_snapshot() {
+        let handler = Arc::new(RecordingHandler::default());
+        let queue = ChatQueue::new(config(), handler);
+        let mut updated = config();
+        updated.cap_messages = 99;
+        updated.debounce_ms = 7;
+        queue.reload_config(updated);
+        let snapshot = queue.config();
+        assert_eq!(snapshot.cap_messages, 99);
+        assert_eq!(snapshot.debounce_ms, 7);
     }
 
     #[tokio::test]
