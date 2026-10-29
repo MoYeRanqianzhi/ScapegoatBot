@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::agent::ToolResult;
+use crate::storage::Database;
 use crate::vfs::sqlite::VfsStore;
 use crate::vfs::{Vfs, VfsPath};
 
@@ -73,6 +74,8 @@ enum Op {
 /// `Memory` 工具。
 pub struct MemoryTool {
     vfs: Arc<VfsStore>,
+    /// 可查询索引；`None` 时只写文件（测试与最小装配）。
+    db: Option<Arc<Database>>,
     max_entry_chars: usize,
     max_index_lines: usize,
     max_index_bytes: usize,
@@ -89,11 +92,18 @@ impl MemoryTool {
     ) -> Self {
         Self {
             vfs,
+            db: None,
             max_entry_chars: max_entry_chars as usize,
             max_index_lines: max_index_lines as usize,
             max_index_bytes: max_index_bytes as usize,
             user_max_chars: user_max_chars as usize,
         }
+    }
+
+    /// 接入 `memory_entries` 索引；doctor 与 `/system/memory` 依赖它。
+    pub fn with_db(mut self, db: Arc<Database>) -> Self {
+        self.db = Some(db);
+        self
     }
 
     /// 解析 `memory` 类操作。
@@ -301,7 +311,54 @@ impl MemoryTool {
             let _ = self.vfs.remove(&path, true);
         }
 
+        // 文件与索引已落盘；同步可查询索引。失败不回滚文件（文件是事实来源）。
+        self.sync_entries();
+
         Ok(json!({"ok": true, "operations": applied}))
+    }
+
+    /// 从 `/MEMORY.md` 与 `/memory/*.md` 重建 `memory_entries`。
+    ///
+    /// 在一个事务里整体替换，避免“删了旧行、插新行失败”留下半截索引。
+    fn sync_entries(&self) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        let Ok(index_text) = self.vfs.read_text_unrecorded(
+            &VfsPath::parse("/MEMORY.md").expect("valid path"),
+        ) else {
+            return;
+        };
+        let mut rows = Vec::new();
+        let now = chrono::Utc::now().to_rfc3339();
+        for line in index_text.lines() {
+            let Some(slug) = index_slug(line) else {
+                continue;
+            };
+            let Ok(path) = VfsPath::parse(&format!("/memory/{slug}.md")) else {
+                continue;
+            };
+            let Ok(text) = self.vfs.read_text_unrecorded(&path) else {
+                continue;
+            };
+            let (kind, source, observed_at) = parse_frontmatter(&text);
+            rows.push((slug, path.to_string(), kind, source, observed_at, now.clone()));
+        }
+
+        let mut conn = db.lock();
+        let Ok(tx) = conn.transaction() else {
+            return;
+        };
+        let _ = tx.execute("DELETE FROM memory_entries", []);
+        for (slug, path, kind, source, observed_at, updated_at) in rows {
+            let _ = tx.execute(
+                "INSERT INTO memory_entries
+                    (slug, path, kind, source, observed_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![slug, path, kind, source, observed_at, updated_at],
+            );
+        }
+        let _ = tx.commit();
     }
 
     /// 记忆工具自己拥有这些文件：写入前先读取，满足 Read-before-Edit。
@@ -336,6 +393,30 @@ pub(crate) fn index_slug(line: &str) -> Option<String> {
     let rest = &line[start..];
     let end = rest.find(".md)")?;
     Some(rest[..end].to_owned())
+}
+
+/// 解析记忆文件的 frontmatter；缺失字段按 `untrusted` / `unknown` 处理。
+fn parse_frontmatter(text: &str) -> (String, String, String) {
+    let mut kind = "untrusted".to_owned();
+    let mut source = "unknown".to_owned();
+    let mut observed_at = String::new();
+    let mut lines = text.lines();
+    if lines.next() != Some("---") {
+        return (kind, source, observed_at);
+    }
+    for line in lines {
+        if line == "---" {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("type: ") {
+            kind = value.trim().to_owned();
+        } else if let Some(value) = line.strip_prefix("source: ") {
+            source = value.trim().to_owned();
+        } else if let Some(value) = line.strip_prefix("observed_at: ") {
+            observed_at = value.trim().to_owned();
+        }
+    }
+    (kind, source, observed_at)
 }
 
 #[async_trait]
@@ -517,8 +598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_writes_file_and_index() {
-        let (tool, vfs) = setup();
+    async fn add_writes_file_and_index() {        let (tool, vfs) = setup();
         let result = run(
             &tool,
             json!({
@@ -674,5 +754,51 @@ mod tests {
         assert_eq!(prefix, vec!["# Memory"]);
         assert_eq!(entries[0].0, "a");
         assert_eq!(entries[1].0, "b");
+    }
+
+    #[tokio::test]
+    async fn writes_memory_entries_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let key = Arc::new(MasterKey::from_bytes([6u8; 32]));
+        let vfs = Arc::new(
+            VfsStore::open(
+                Arc::clone(&db),
+                key,
+                dir.path().join("data"),
+                Limits::default(),
+            )
+            .unwrap(),
+        );
+        vfs.mkdir_all(&VfsPath::parse("/memory").unwrap()).unwrap();
+        let tool =
+            MemoryTool::new(Arc::clone(&vfs), 4000, 200, 25_000, 4000).with_db(Arc::clone(&db));
+
+        let result = run(
+            &tool,
+            json!({
+                "target": "memory",
+                "action": "add",
+                "type": "project",
+                "name": "phase-seven",
+                "description": "Doctor and backup shipped",
+                "content": "sbot doctor reports drift without fixing it.",
+                "source": "owner"
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+
+        let conn = db.lock();
+        let (slug, kind, source): (String, String, String) = conn
+            .query_row(
+                "SELECT slug, kind, source FROM memory_entries",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(slug, "phase-seven");
+        assert_eq!(kind, "project");
+        assert_eq!(source, "owner");
     }
 }

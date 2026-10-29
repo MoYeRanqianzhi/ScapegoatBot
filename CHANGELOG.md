@@ -5,7 +5,43 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.2.0-alpha.1] - 2026-10-30
+
+0.2 是完整重写：旧 0.1 的模块划分、数据结构与调用方式全部放弃，按
+`.agents/plan/2026-10-28-rebuild-design.md` 重新实现。量化对比见
+`docs/development/refactor-report.md`（复用 0 行，重写 78.2%，废弃 21.8%）。
+
+### 新增
+
+- **配置与凭据**：严格 `sbot.toml` schema（`version = 1`、未知字段拒绝、字段路径校验）、`SBOT__SECTION__KEY` 覆盖、`models.json` 模型清单、明文优先的 `auth.json`（掩码 Debug）。
+- **存储**：SQLite 迁移 v1–v6、主密钥 `~/.sbot/key`、HKDF 域分离、XChaCha20-Poly1305、canary 校验、`SBOT_HOME`。
+- **VFS**：POSIX 路径与 NFC、文本加密、1 MiB blob 分块、回收站、Read-before-Edit、配额与磁盘水位、种子布局。
+- **Provider**：Anthropic Messages（自适应 thinking、effort）、OpenAI Chat Completions、OpenAI Responses、SSE 解析、工具参数按 index 组装、`Retry-After`、按模型回退链。
+- **Agent 循环**：pi 风格内/外循环、事件流、steering / follow-up、配对的工具结果、`max_tokens` 带工具时不执行、输出闸、parallel/sequential 工具执行、refusal 进入 hold。
+- **QQ**：NapCat 连接、事件归一化、内部标签剥离、准入门（拒收）、断线重连补消息（不触发回合）、JSONL 按群/私聊/月/日分区、索引重建、inbox 状态、发送账本。
+- **安全**：规则层 + Jev `/v1/systemone` 分类器、永久 hold、`SECURITY_HOLD`、安全事件审计、主人/管理员目标保护、hold 期间拒绝全部 `napcat.*`。
+- **会话**：加密 transcript 分段与 `prev_file` 链、turn buffer 崩溃恢复、CJK 感知压缩、回合边界切割、加密 `compaction_checkpoints`。
+- **工具**：文件工具、动态视图（`/messages`、`/inbox`、`/sessions`、`/friends`、`/groups`、`/config`、`/system`）、`API` 命名空间、`Memory`（含 `memory_entries`）、`Skill`、`Download`（SSRF）、`WebSearch` / `WebFetch`、`Monitor`（qq/timer/internal、cron、batching、idle_only、backlog）。
+- **提示词**：v4 静态/动态边界模板、context hooks、每回合 runtime 上下文。
+- **IPC**：Windows 命名管道（DACL）/ Unix UDS（0600）、长度前缀 JSON、幂等表。
+- **CLI**：`start/stop/restart/status`、`ai`、`chat`、`pause/resume`、`security`、`model`、`effort`、`backup`、`doctor`。
+- **备份与诊断**：`sbot backup` 在线 SQLite 快照（Busy/Locked 重试）+ 文件归档，拒绝写入被复制目录；`sbot doctor` 只读检查配置、canary、索引、孤儿 blob、记忆三方对账、权限与路径边界。
+- **模型热切换**：`sbot model set` / `effort set` 通过共享 provider 槽位在下一回合生效。
+
+### 变更
+
+- CLI 行为与 0.1 不兼容；不提供旧数据迁移，0.2 从空存储开始。
+- 文件能力改为 VFS，不再使用 `cap-std` 工作区。
+- 白名单语义改为**拒收门**：被拒消息不进入任何存储。
+
+### 已知限制
+
+- 未实现：MCP、swarm `Agent` 工具与自定义 `/agents` 子代理、`per_chat` 会话隔离、`/config` 写入、记忆复盘 / 技能 curator / 风格学习、监控绑定子代理。
+- 真实 Chat 端点与真实 Jev 的测试默认 `#[ignore]`，需要环境变量显式启用。
+
+## [0.1.0-alpha.2] - 2026-03-23
+
+历史版本（0.1 系列）。以下内容已被 0.2 取代，保留用于对照。
 
 ### 新增
 

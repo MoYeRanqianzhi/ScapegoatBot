@@ -704,7 +704,8 @@ async fn build_agent(
             config.memory.max_index_lines,
             config.memory.max_index_bytes,
             config.memory.user_max_chars,
-        )));
+        )
+        .with_db(Arc::clone(&db))));
     }
     let download_policy = NetPolicy {
         allowed_domains: config.tools.download.allowed_domains.clone(),

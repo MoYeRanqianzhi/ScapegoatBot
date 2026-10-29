@@ -463,6 +463,20 @@ fn check_memory(conn: &Connection, key: &MasterKey, report: &mut Report) {
             ));
         }
     }
+
+    // 第三方对账：`memory_entries` 是 Memory 工具维护的可查询索引。
+    let recorded: u64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_entries", [], |row| row.get(0))
+        .unwrap_or(0);
+    if recorded != files.len() as u64 {
+        report.warn(format!(
+            "memory: memory_entries has {recorded} row(s) but {} file(s) exist; \
+             the next Memory write rebuilds it",
+            files.len()
+        ));
+    } else {
+        report.ok(format!("memory: memory_entries matches {recorded} file(s)"));
+    }
 }
 
 fn count_files(directory: &std::path::Path, extension: Option<&str>) -> u64 {
