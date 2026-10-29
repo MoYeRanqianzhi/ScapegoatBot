@@ -48,6 +48,9 @@ pub enum ViewRead {
     },
 }
 
+/// 配置写入后的热更新回调。
+pub type HotReload = Arc<dyn Fn(&SbotConfig) + Send + Sync>;
+
 /// 动态视图服务。
 pub struct Views {
     vfs: Arc<VfsStore>,
@@ -56,6 +59,8 @@ pub struct Views {
     client: Option<Arc<QqClient>>,
     /// `/config` 与 `/system` 使用的运行时快照；未接入时为 `None`。
     context: ViewContext,
+    /// 配置写入后的热更新回调（filter/queue 等内存副本）。
+    hot_reload: std::sync::Mutex<Option<HotReload>>,
 }
 
 /// `/config` 与 `/system` 的只读上下文。
@@ -84,6 +89,20 @@ impl Views {
             sessions,
             client,
             context: ViewContext::default(),
+            hot_reload: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// 接入配置热更新回调；写入成功后调用。
+    pub fn set_hot_reload(&self, callback: HotReload) {
+        *self.hot_reload.lock().expect("hot reload lock") = Some(callback);
+    }
+
+    /// 通知热更新；回调失败不影响写入结果。
+    fn notify(&self, config: &SbotConfig) {
+        let callback = self.hot_reload.lock().expect("hot reload lock").clone();
+        if let Some(callback) = callback {
+            callback(config);
         }
     }
 
@@ -933,6 +952,7 @@ impl Views {
                 let config =
                     validate_config_text(&new_document.to_string(), self.context.models.as_ref())?;
                 self.persist(&path, new_document.to_string())?;
+                self.notify(&config);
                 *handle.write().expect("config lock poisoned") = LoadedConfig {
                     config,
                     path: path.clone(),
@@ -957,6 +977,7 @@ impl Views {
                 let config =
                     validate_config_text(&document.to_string(), self.context.models.as_ref())?;
                 self.persist(&path, document.to_string())?;
+                self.notify(&config);
                 *handle.write().expect("config lock poisoned") = LoadedConfig {
                     config,
                     path: path.clone(),
@@ -989,6 +1010,7 @@ impl Views {
                 let config =
                     validate_config_text(&document.to_string(), self.context.models.as_ref())?;
                 self.persist(&path, document.to_string())?;
+                self.notify(&config);
                 *handle.write().expect("config lock poisoned") = LoadedConfig {
                     config,
                     path: path.clone(),
@@ -1567,5 +1589,20 @@ mod tests {
             ViewRead::Text(text) => assert_eq!(text.trim(), "\"high\""),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn config_writes_notify_hot_reload() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (views, _dir) = views();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        views.set_hot_reload(Arc::new(move |_config| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        views
+            .write_config(&target("/config/agent/thinking_level"), "\"low\"")
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

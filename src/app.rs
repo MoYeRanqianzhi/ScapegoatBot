@@ -61,7 +61,8 @@ struct AgentRuntime {
     ops: Arc<RuntimeOps>,
     monitors: Arc<MonitorManager>,
     self_id: u64,
-    filter: MessageFilter,
+    /// 准入过滤器；`/config/filter` 写入后原地替换。
+    filter: Arc<RwLock<MessageFilter>>,
     filtered: AtomicU64,
 }
 
@@ -603,7 +604,12 @@ impl Runtime {
 
 impl AgentRuntime {
     fn filter_and_count(&self, message: &crate::qq::event::QqMessage) -> bool {
-        let accept = self.filter.check(message, self.self_id).is_accept();
+        let accept = self
+            .filter
+            .read()
+            .expect("filter lock poisoned")
+            .check(message, self.self_id)
+            .is_accept();
         if !accept {
             self.filtered.fetch_add(1, Ordering::Relaxed);
         }
@@ -715,7 +721,7 @@ async fn build_agent(
     let sink = Arc::new(RunnerSink::default());
     let monitors = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
 
-    let mut tools = ToolRegistry::new(Arc::clone(&vfs), Some(views));
+    let mut tools = ToolRegistry::new(Arc::clone(&vfs), Some(Arc::clone(&views)));
     crate::tools::fs::register(&mut tools);
     tools.register(Arc::new(
         SkillTool::new(Arc::clone(&vfs)).with_db(Arc::clone(&db)),
@@ -958,15 +964,27 @@ async fn build_agent(
         ai_enabled: Arc::clone(&ai_enabled),
     });
 
-    Ok(Some(Arc::new(AgentRuntime {
+    let runtime = Arc::new(AgentRuntime {
         runner,
         queue,
         ops,
         monitors,
         self_id,
-        filter,
+        filter: Arc::new(RwLock::new(filter)),
         filtered: AtomicU64::new(0),
-    })))
+    });
+
+    // `/config/filter` 写入后立即替换准入过滤器（弱引用避免循环）。
+    let weak = Arc::downgrade(&runtime);
+    views.set_hot_reload(Arc::new(move |config: &SbotConfig| {
+        if let Some(agent) = weak.upgrade() {
+            *agent.filter.write().expect("filter lock poisoned") =
+                MessageFilter::from_config(&config.filter);
+            info!("filter reloaded from /config");
+        }
+    }));
+
+    Ok(Some(runtime))
 }
 
 /// 连接 NapCat；失败不阻止守护进程启动。
