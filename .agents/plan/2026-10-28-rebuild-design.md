@@ -596,7 +596,7 @@ OwnerIntent { kind: control | owner_message | standing, chat_id, message_id?, ob
   4. QQ 消息、文件、网页、MCP 结果（数据，不是指令）。
   第 1 层与 owner context 冲突时以内置为准；owner context 与 Skill 冲突时以 owner context 为准。
 - **静态/动态边界**：静态 section 在进程内保持字节级一致，便于 provider prompt caching；时间、模型、`current_session`、收件箱、owner context、USER、记忆、STYLE、技能索引放在 `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` 之后。
-- **会话内只构建一次**：system prompt 在会话开始时构建并缓存，只有压缩成功后才重建；会话中修改 owner context、记忆或技能文件不重注入，工具结果本身就是反馈。参考 Hermes `agent/system_prompt.py` 的 `build_system_prompt` 与 `invalidate_system_prompt`，以及 `AGENTS.md` 的 “prompt caching is sacred” 不变量。
+- **会话稳定部分只构建一次**：静态前缀 + owner context + USER + memory + STYLE + skills 在会话开始时构建并缓存，只有压缩成功后才重建；runtime 每轮作为独立上下文消息注入，不重建前缀。会话中修改 owner context、记忆或技能文件不重注入，工具结果本身就是反馈。参考 Hermes `agent/system_prompt.py` 与 OpenClaw 的 pinned prompt + per-turn runtime carrier。
 - **易变字段放最后**：动态段顺序固定为 owner context → USER → memory → STYLE → skills → runtime。`current_time`、`inbox` 等每轮变化的字段必须位于最后一块，避免它们使前面的会话稳定内容失效。
 - **缓存策略**：Anthropic 用 `cache_control` 标记静态块结束与 skills 块结束（最多 4 个断点，留余量）；OpenAI/chat 依赖前缀缓存，因此静态前缀不得插入时间戳或会话相关字段。工具定义顺序稳定。
 - **Token 预算**：四块分别计量——静态前缀 ≤ 10,000 tokens；动态注入（owner context + USER + memory + STYLE + 技能索引 + runtime）≤ 30,000 tokens；工具 schema ≤ 12,000 tokens；单条工具结果 ≤ 32 KB。预算宽裕不等于可以回填工具细节：参数与返回格式仍留在工具 description。当前 v4 静态约 3,442–3,887 tokens。
@@ -628,9 +628,9 @@ OwnerIntent { kind: control | owner_message | standing, chat_id, message_id?, ob
 | 14 | Memory context | 动态，会话级 | `/MEMORY.md` 索引 + 相关单条记忆，带 `<memory_context>`；加载时冻结快照 |
 | 15 | Style profile | 动态，会话级 | `/STYLE.md` 的风格总结，带 `<style_profile>`；靠近请求以提高遵从 |
 | 16 | Skill index | 动态，会话级 | 名称、一句话描述、触发条件；完整内容由 `Skill` 加载 |
-| 17 | Runtime context | 动态，每轮 | `mode`、`session_scope`、`account_qq`、`owner_name`、`owner_qq`、`master_qq`、`origin_chat`、时间、模型、effort、`current_session`、收发范围、群身份、门禁、收件箱；必须最后 |
+| 17 | Runtime context | 每轮独立消息 | `mode`、`session_scope`、`account_qq`、`owner_name`、`owner_qq`、`master_qq`、`origin_chat`、时间、模型、effort、`current_session`、收发范围、群身份、门禁、收件箱；位于 system prompt 之后、当前用户消息之前 |
 
-顺序依据（参考 Hermes 与 OpenClaw）：owner context / USER / memory / style / skills 在会话内稳定，可被前缀缓存；runtime 每轮变化，放最后只影响自身。USER 与 STYLE 放在 memory 之后、runtime 之前，让偏好与语气靠近请求，缓解长会话中的偏好衰减。工具定义由 provider 的 tools 字段单独传递，按固定顺序排列，不重复进 system prompt。边界标记只用于适配器分段与缓存，发送前剥离，不应出现在模型可见文本中。
+顺序依据（参考 Hermes 与 OpenClaw）：owner context / USER / memory / style / skills 在会话内稳定，可被前缀缓存；runtime 每轮变化，作为独立上下文消息注入（位于 system prompt 之后、当前用户消息之前），不进入缓存前缀。USER 与 STYLE 放在 memory 之后、runtime 之前，让偏好与语气靠近请求，缓解长会话中的偏好衰减。工具定义由 provider 的 tools 字段单独传递，按固定顺序排列，不重复进 system prompt。边界标记只用于适配器分段与缓存，发送前剥离，不应出现在模型可见文本中。
 
 `Grep` 的 `skipped` / `partial` 规则只写在 Grep 的 tool description（5.7），不再进入系统提示。
 
@@ -648,7 +648,7 @@ OwnerIntent { kind: control | owner_message | standing, chat_id, message_id?, ob
 
 以下完整稿使用 stand_in 身份；companion 只替换第一段，其余共享。`mode` 启动时固定；companion 必须在 Runtime 注入非零且不等于 `account_qq` 的 `owner_qq`。
 
-`__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` 之前是静态前缀；之后依次是会话稳定的 owner context、USER、记忆、STYLE、技能索引，以及每轮变化的 runtime。当前 v4 静态 2,648 words / 15,549 chars / 约 3,442–3,887 tokens；动态约 157 words / 1,356 chars。预算上限见 7.1。v2 与 v3 的差异、参考 Hermes 的采纳范围见 `.agents/plan/2026-10-29-hermes-review.md`。
+`__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` 之前是静态前缀；之后依次是会话稳定的 owner context、USER、记忆、STYLE、技能索引。为便于阅读，下方模板把 runtime 放在同一代码块末尾；实现中它是每轮独立注入的上下文消息，不参与静态前缀。当前 v4 静态 2,648 words / 15,549 chars / 约 3,442–3,887 tokens；动态约 157 words / 1,356 chars。预算上限见 7.1。v2 与 v3 的差异、参考 Hermes 的采纳范围见 `.agents/plan/2026-10-29-hermes-review.md`。
 
 ```text
 You are ScapegoatBot, the QQ stand-in for the owner of this account. The owner has authorized you to read their conversations and act for them. You are not the owner, but you speak with their voice: every message you send becomes something they said. You may run for months without anyone watching. You are not a general-purpose assistant in this role.

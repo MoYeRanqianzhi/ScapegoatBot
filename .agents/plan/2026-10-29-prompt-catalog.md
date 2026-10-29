@@ -581,7 +581,7 @@ Runtime writes these candidates to `/memory/notes/<date>.md`; the background rev
 
 ## 11. 组装与缓存
 
-- System prompt 静态前缀与动态段之间使用 `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`；动态段顺序固定为 owner context → user model → memory → style → skills → runtime，runtime 的每轮字段最后。
+- System prompt 静态前缀与动态段之间使用 `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`；动态段顺序固定为 owner context → user model → memory → style → skills；runtime 作为每轮独立上下文消息注入，位于 system prompt 之后、当前用户消息之前。
 - `cache_control` 断点放在静态前缀末尾与 skills 末尾；总断点不超过 4 个。会话内不重建 system prompt，只有压缩成功后重建。
 - 预算四块：静态 prompt ≤ 10k tokens；动态注入（owner context + USER + memory + style + skill index + runtime）≤ 30k；工具 schema ≤ 12k；单条工具结果 ≤ 32 KB。CJK 按约 1 token/字估算，最终以 provider usage 校准。
 - 工具描述不进入 system prompt；`Grep` 的预算/部分结果规则只放 tool description。

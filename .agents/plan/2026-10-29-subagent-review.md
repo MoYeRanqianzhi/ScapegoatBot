@@ -7,7 +7,7 @@
 - **可以进入 Phase 0**（脚手架、配置、SQLite 迁移框架、IPC、单实例、CLI）；但迁移框架必须现在就预留 `turn_id/seq`、`turn_buffer`、`outbound_intents`、`segment.state`、`memory_entries.origin` 这些列与表。
 - **Phase 3 之前必须定稿**：回合缓冲与并发模型、崩溃恢复、压缩屏障、补消息语义、上下文预算。
 - **Phase 4 之前必须定稿**：配置白名单、owner intent 证据、指令层写权限、记忆来源反查、跨 chat 泄露检查。
-- 审查发现的 12 条 P0（架构 6 + 安全 6）已全部写入设计；P1 已处理大部分，剩余标注为 Phase 5–7。
+- 审查发现 16 条 P0（架构 6、安全 6、提示词 4，部分重叠）已全部写入设计；P1 已处理大部分，剩余标注为 Phase 5–7。
 
 ## 1. 架构与长期运行（review-arch）
 
