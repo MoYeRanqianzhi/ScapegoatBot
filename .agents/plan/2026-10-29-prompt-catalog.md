@@ -92,8 +92,8 @@
 >
 > On `/inbox`, removal means **dismiss**: the entry leaves the inbox without being marked read. Use it when a message does not deserve your attention — spam, noise, a chat you are deliberately not answering.
 >
-> - `RM /inbox/<chat>/<message_id>.md` dismisses one message.
-> - `RM /inbox/<chat>.md` dismisses every unread message from that chat and reports how many.
+> - `RM /inbox/<chat>/<message_id>.md` dismisses one message (`/inbox/<chat>/index.md` is that chat's digest).
+> - `RM /inbox/<chat>/index.md` dismisses every unread message from that chat and reports how many.
 > - `RM /inbox?filter=...` dismisses the matches; the filter is required. `RM /inbox` without a filter is rejected.
 >
 > Dismissing never deletes the underlying message: it stays searchable under `/messages`. Dismissed entries are audited and can be reviewed with `?filter=state:dismissed`.

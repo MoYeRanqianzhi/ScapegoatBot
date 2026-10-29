@@ -319,7 +319,7 @@ api.help {"action":"napcat.set_group_ban"}           → 参数、返回、示�
 - `API` 的群管理 action → Bot 在该群为管理员/群主（能力限制，不是白名单）。
 - `API` 的成员/群查询 action → 模型自主；查询结果用于提示。
 - `Download` → 域名过滤 + SSRF 防护 + 大小限制。
-- 消息过滤器：`[filter]` 规则决定哪些消息注入 Agent；规则可由 Agent 通过 `/config/filter` 修改；消息始终写入存储。
+- 消息过滤器：`[filter]` 是**准入门**，不是提示开关。被拒的消息不写 JSONL、不进 inbox、不进 transcript——agent 根本看不到它。规则可由 Agent 通过 `/config/filter` 修改，这是它划定自己活动范围的手段（例如把含保密内容的工作群排除在外）。审计只记规则名与条数，不记内容、发送者与 `chat_id`；agent 自己发出的消息始终记录。
 - `Write` / `Edit` / `RM` / `MV` / `CP` / `Mkdir` → 源与目标挂载点可写 + 配额；`RM` 为软删除。
 - `/USER.md` 与 `/MEMORY.md` 的写入只允许通过 `Memory` 工具（主人可直接编辑 `/USER.md`）；`Write` / `Edit` / `RM` 命中这两个路径时返回指引错误，避免绕过条目预算、来源与格式。
 - `/config` 写入 → 仅限 `model_writable` 白名单；只读键整体拒绝并记录审计。
@@ -547,7 +547,7 @@ lifecycle = { idle_only = true, max_events = 500, expires = "30d" }
 | `stream` | 外部 URL：WebSocket 帧、SSE 事件、HTTP 轮询结果 | CI、RSS、第三方 webhook |
 | `internal` | `agent` / `security` / `budget` / `storage` 状态变化 | hold 触发时通知、子代理结束 |
 
-- `qq` 源可带 `backlog = "none" | "inbox"`：`inbox` 表示创建时把 `/inbox?filter=<when>` 的结果投递一次，之后只跟新事件；投递出去的条目才算已消费，其余保持未读。
+- `qq` 源可带 `backlog = "none" | "inbox"`：`inbox` 表示创建时把 `/inbox?filter=<when>` 的结果投递一次，之后只跟新事件；投递出去的条目才算已消费，其余保持未读。已 `dismissed` 的条目不会被投递。
 - `timer` 的 `cron` 是本地时区 5 字段；`every` 用时长且最小 60s（防止把自己跑死）；`at` 是本地时间。
 - `stream` 只能由主人写进配置文件；运行时创建一律拒绝——外部网络属于扩张暴露面。
 - 一个 monitor 只能有一个 source 类型。
@@ -644,6 +644,7 @@ lifecycle = { max_events = 100, expires = "1h" }
 | `fire` | `name` | 手动触发一次，等价一次事件 |
 
 配置文件里声明的才是长期常驻；运行时创建的一律有界，且不能创建 `stream` 源。
+- 运行时创建的 monitor **只在内存里**，进程重启即消失，重启后只按配置文件重建。`Monitor list` 标明来源（`config` / `runtime`），避免把临时的当成常驻的。
 
 **专用子代理**
 
@@ -666,6 +667,7 @@ lifecycle = { max_events = 100, expires = "1h" }
 - 投递就是“新消息进入上下文”，照常过输入闸；`hold` 期间可以投递与收集，但回复会被输出闸拦。
 - 单个 monitor 的事件速率有上限，超限自动停用并通知（Claude Code 的做法：输出过多自动停）。
 - 静默不等于正常：源断开、谓词求值失败、monitor 被停用，三者都产生一条系统通知。
+- `hold` 期间定时器照常触发并计入 `[budget]`：停的是对外接口，不是内部时钟。预算耗尽时暂停定时投递，只保留 `qq` 源，避免停机期间空转烧钱又漏掉新消息。
 - monitor 不执行脚本、不读写文件、不调用工具；它只产生消息。
 
 ## 6. 虚拟文件系统（VFS）## 6. 虚拟文件系统（VFS）
@@ -844,7 +846,7 @@ lifecycle = { max_events = 100, expires = "1h" }
 ### 6.8 配置视图
 
 - `/config.toml` 映射 `sbot.toml` 原文，但**只有 schema 中标记为 `model_writable = true` 的键可写**；其余键在 VFS 中只读。不是黑名单：新增配置项默认只读，必须显式标记才可由 Agent 修改。
-- 可写白名单（首版）：`[filter]`、`[agent].available_models`、`[agent].thinking_level`、`[compaction]`、`[skills]`、`[queue]`、`[style]`。其余一律只读，包括 `[agent].mode` / `owner_qq` / `owner_name` / `master` / `fallback_models`、`[session]`、`[gate]`、`[memory]`（来源门控永远开启，不可配置关闭）、`[storage]`、`[napcat]`、`[tools]`、`[mcp]`、`[[hooks.events]]`。
+- 可写白名单（首版）：`[filter]`、`[agent].available_models`、`[agent].thinking_level`、`[compaction]`、`[skills]`、`[queue]`、`[style]`。其余一律只读，包括 `[agent].mode` / `owner_qq` / `owner_name` / `master` / `fallback_models`、`[session]`、`[gate]`、`[memory]`（来源门控永远开启，不可配置关闭）、`[storage]`、`[napcat]`、`[tools]`、`[mcp]`、`[[hooks.events]]`、`[[monitor]]`（含 `stream` 源——外部网络必须由主人写，agent 只能通过 `Monitor` 工具建临时的）。
 - `/config/<section>/<key>` 映射每个配置项，叶子文件内容为当前生效值（TOML 字面量）。只读键的写入直接返回 `Error: config key is read-only for the agent.`。未显式配置的项也存在于虚拟树中，显示默认值。
 - 数组/表按叶子路径展开：`/config/agent/available_models`、`/config/tools/web_search/backend`、`/config/models/main/max_tokens`。
 - 写入流程：解析 → 校验 → 与旧值逐键对比 → 若任何只读键发生变化，整体拒绝并审计 → 应用可热更项 → `toml_edit` 原子写回 `sbot.toml` → 失败回滚。`/config.toml` 整文件写入同样执行逐键对比，不允许“整体重写”绕过只读键。
@@ -879,6 +881,7 @@ lifecycle = { max_events = 100, expires = "1h" }
 回收站：
 
 - `RM` 默认移动到 `/trash/<timestamp>-<原路径>`，保留原路径、删除时间、大小、hash；`/trash/index.jsonl` 记录。
+- 例外：`/inbox` 条目的 `RM` 是标记 `dismissed`，**不产生 `/trash` 记录**，也不删除 `/messages` 里的原文——inbox 只是待处理队列。
 - `RM` 参数 `permanent = true` 彻底删除；对 `/trash` 内条目执行 `RM` 也是永久删除。
 - 恢复：`MV /trash/... /原路径`。
 - 自动清理：超过 30 天或 `/trash` 超过总配额 10% 时清理最旧条目。
@@ -1261,7 +1264,7 @@ enabled = true
 
 ### 8.2 消息存储
 
-- 过滤只影响是否注入，不影响写入：所有入站与发送消息都记录。
+- 过滤是准入而不是提示：被拒的入站消息完全不进系统（不写 JSONL、不进 inbox、不进 transcript），审计里只有一个计数。agent 自己发出的消息始终记录。
 - 物理格式：加密 JSONL，按月/群/日分区；磁盘只存 JSONL 与可重建的索引缓存，不生成 Markdown、日视图或其他派生文件。
 - 目录（与 VFS 路径一一对应）：
   - `~/.sbot/messages/groups/<gid>/<YYYY-MM>/<DD>.jsonl`
@@ -1293,16 +1296,16 @@ enabled = true
 ### 8.4 收件箱
 
 - `/inbox` 由系统维护：每个未处理来源（群/私聊）一个 Markdown 文件，外加 `index.jsonl`；记录来源类型、ID、最早/最新消息 ID、未读数、更新时间。超过 `inbox_retention_days`（默认 7）或只保留最近 N 个来源（默认 50），其余折叠为计数，避免不触发回合的 chat 无限增长。
-- 每条未处理消息也有自己的路径 `/inbox/<chat>/<message_id>.md`，便于按条处理。
+- 每个来源是一个目录：`/inbox/<chat>/index.md` 是来源摘要，`/inbox/<chat>/<message_id>.md` 是单条消息。不要用 `/inbox/<chat>.md` 与 `/inbox/<chat>/` 同名并存，那在 VFS 里是文件与目录冲突。
 - **读状态的唯一规则：内容进入上下文就算读过，看到多少标多少。**
   - `Read /inbox`、`Read /inbox?filter=...`、`Read /inbox/<chat>/<message_id>.md`：返回的条目全部标记已读，受 `limit` 约束——没返回的不标。过滤之后读了几分之一，就只标几分之一。
-  - `Grep /inbox`：匹配到的条目标记已读；扫过但不匹配的不算。
+  - `Grep /inbox`：匹配到的条目标记已读；扫过但不匹配的不算；受 §5.7 预算截断时只标记**实际出现在结果里**的条目。
   - `LS` / `Stat`：只给名字、未读数与元信息，**不标记**——这是唯一“看见但不读”的路径，也是估算规模时该用的方式。
   - monitor 投递：投递了哪几条就标哪几条。
   - 每次标记写审计：哪些 message_id、由哪次调用触发。
 - **忽略（dismiss）**：`RM` 是唯一入口，它把条目从 inbox 里拿掉，但**不算读过**——区别在于“我看到了”与“我判定它不值得处理”。
   - `RM /inbox/<chat>/<message_id>.md`：忽略这一条。
-  - `RM /inbox/<chat>.md`：忽略该 chat 的全部未读，返回条数。
+  - `RM /inbox/<chat>/index.md`：忽略该 chat 的全部未读，返回条数。
   - `RM /inbox?filter=...`：批量忽略匹配项，**必须带 `filter`**；不带 filter 的 `RM /inbox` 直接拒绝，避免一次手滑清空。
   - 忽略不删除消息本体：`/messages` 里的原文照旧可查，`/trash` 也不涉及——inbox 只是一个待处理队列。
   - 忽略写审计（message_id、调用来源、时间），并在 `index.jsonl` 里保留一个 `dismissed` 计数；`?filter=state:dismissed` 可以回看被忽略的东西。
@@ -1868,10 +1871,10 @@ src/
 
 1. **Phase 0**：新 crate 脚手架、配置、SQLite 迁移框架、IPC、单实例、CLI。
 2. **Phase 1**：VFS（路径、SQLite 后端、二进制分块、配额、Read-before-Edit、种子、`/friends` 动态节点）。
-3. **Phase 2**：Provider trait + `chat` / `openai` / `anthropic` 三协议流式、服务端工具声明与结果解析、Agent loop 状态机、事件流、测试用 fake provider。
+3. **Phase 2**：Provider trait + `chat` / `openai` / `anthropic` 三协议流式、服务端工具声明与结果解析、Agent loop 状态机、事件流、测试用 fake provider；安全分类器的输入闸/输出闸骨架与 `mode = shadow`（Jev 后端可接，未配置时只跑规则层）。
 4. **Phase 3**：NapCat 接入、事件归一化、断线重连与补消息、消息按月/群/日 JSONL 分区持久化、消息 VFS 视图、索引缓存与重建、配额与清理、过滤器、按 chat 去抖与队列、transcript 分段与 `/sessions` 映射。
 5. **Phase 4**：工具注册表、权限、全部文件工具、`Memory`、`API`、`Skill`、`Download`、`WebSearch` / `WebFetch`（含用户配置的 HTTP 后端）、子代理类型与工具隔离、`Monitor` 工具（事件订阅与定时）。
-6. **Phase 5**：提示词组装（含 USER/STYLE 块）、上下文注入 hook、记忆来源与分层、后台复盘、压缩（memory flush / 分层输入 / pruning）与 transcript 轮转/历史链（`previous_session`、`current_session`）。
+6. **Phase 5**：提示词组装（含 USER/STYLE 块）、上下文注入 hook、记忆来源与分层、后台复盘、压缩（memory flush / 分层输入 / pruning）与 transcript 轮转/历史链（`previous_session`、`current_session`）；安全分类器切到 `enforce`，含 `hold` 状态机与 `agent.resume` 的重开路径。
 7. **Phase 6**：Swarm、MCP、monitor 绑定常驻子代理（`spawn` 动作与 `Agent spawn` 的 `monitor` 参数）。
 8. **Phase 7**：`sbot backup` / `sbot doctor`、成本与健康报告、端到端测试、百万级消息与清理负载测试、NapCat 兼容性验证、文档、发布 tag。
 
@@ -1894,6 +1897,7 @@ src/
 - VFS 查询：`Read /inbox?filter=...` 只标记实际返回的条目已读（受 `limit` 约束）；`RM` 把条目标记为 `dismissed` 而非 `read`，批量忽略必须带 `filter`，不带 filter 的 `RM /inbox` 被拒绝，消息本体仍可在 `/messages` 查到，未返回的保持未读；`LS` / `Stat` 不标记；`Grep` 只标记匹配到的条目；读单条路径只标记该条；审计记录 message_id；静态文件路径带查询报错；`filter` 语法与 monitor 的 `when` 一致。
 - 监视器：`backlog = "inbox"` 只消费并投递匹配的未读条目，其余保持未读；`when = "event.mentions_self"` 的常驻监视器在群内 @ 时立即投递；`timer` 源按 `every` / `cron` / `at` 触发，`every < 60s` 被拒；`one_shot` 首次投递后自动删除；`idle_only` 在回合进行中不投递；重启后错过的定时触发合并成一次（fake clock）；`batch_window_ms` 内多事件合并为一条消息；`as = prompt` 的模板占位符正确渲染；`expires` / `max_events` 到期或超限自动停用并产生系统通知；谓词求值失败产生告警而不是静默；`stream` 源在 `Monitor` 工具的 `add` 中被拒绝；`Monitor` 在各模式下都与 `agent.*` 同权（不产生对外影响，`hold` 期间可用）；绑定子代理后只有订阅到的事件进入该子代理；子代理自建的 monitor 只投递给自身，向父代理或兄弟投递被拒；子代理结束时其 monitor 一并删除并对父代理发通知；子代理 monitor 匹配范围受 spawn 快照的 `receive_scopes` 约束；monitor 投递的事件照常过输入闸。
 
+- 过滤器是准入门：被拒的入站消息不写 JSONL、不进 inbox、不进 transcript，`/messages` 里也搜不到；审计只有规则名与条数；agent 自己发出的消息不受影响。
 - 会话并发：同一 chat 的连发合并；不同 chat 各自成回合但共享 transcript；回合回复默认落在 `origin_chat`；跨 chat 发送触发 n-gram 检查与门禁；队列溢出按 `summarize`/`old`/`new` 处理。
 - 长期运行：ESTOP 暂停新回合与发送、不打断进行中回合；崩溃恢复不重发已确认消息；断线重连后按最后 `message_id` 补齐并去重，缺口写入 `[gap]`；provider 429/超时按退避重试并走回退链，完成后不重放已完成工具；内部标签在流式与非流式发送前均被剥离。
 - 预算：CJK 文本的 token 估算、工具 schema 上限、单条工具结果截断、pruning 不裁剪最近 3 个回合与 bootstrap 读取。
@@ -1917,7 +1921,7 @@ src/
 - Agent 可通过 `/config.toml` 与 `/config/**` 查看并修改自己的配置；敏感项与 `auth.json` 除外。
 - 上下文注入由 `[[hooks.context]]` 决定（AGENTS.md 是默认 hook），只在会话开始与压缩后触发；Agent 可自行增删。
 - 事件 hook 首版支持 `SessionStart` / `SessionEnd` / `PreCompact` / `PostCompact` / `MessageReceived` / `BeforeSend` / `Stop` / `ConfigChange`；动作为声明式，不执行脚本。
-- 消息白名单改为模型可控的过滤器；过滤只影响是否提示，不影响存储。
+- 消息白名单改为模型可控的过滤器，且过滤是**拒收**而非提示开关：被拒消息完全不进系统，agent 看不到、也搜不到。它因此成为 agent 划定活动范围的工具（例如排除含保密内容的群），而不是一个字面上的“静音”。
 - 身份：创建空的 `/AGENTS.md` 与 `/MEMORY.md`；核心内容内置 system prompt；owner 文件（`/AGENTS.md`、`/SOUL.md` 等）自动加载为附加指导，`/MEMORY.md` 由 `Memory` 工具维护并以 `<memory_context>` 注入；`SOUL.md`、`IDENTITY.md`、`MASTER.md` 不预置；不设 `/identity` 与 `/memory`。
 - VFS 支持二进制：blob 分块加密、单文件 512 MB、`max_vfs_bytes` 默认 10 GB；下载与发送文件流式处理。
 - `/friends/<qq>/` 为多层动态节点（`profile.md`、`info.json` 实时查询，`notes.md` 本地可写）。
@@ -1946,10 +1950,10 @@ src/
 - 压缩参考 Claude Code 与 pi：`reserve_tokens = 16384`、`keep_recent_tokens = 20000`、turn 边界切割、结构化检查点摘要、增量更新、PostCompact 重注入。
 - 全新项目，不迁移旧数据、不兼容旧 workspace。
 
+- 监视器 monitor（2026-10-30 定稿）：统一为 `{source, when?, deliver, lifecycle?}` 的事件订阅，不设独立的 ScheduleCron。source 分 `qq` / `timer` / `stream` / `internal`；`when` 是谓词表达式，访问 `event.*` 与只读 `ctx.*`，求值失败告警而非静默；`deliver` 决定投给谁（main / 子代理）与形式（event / prompt），批量窗口 200ms；`lifecycle` 管空闲触发、冷却、上限、过期、一次性与错过的合并。定时任务沿用 Claude Code 的经验：本地 5 字段 cron、避开整点半点、抖动、recurring 默认 30 天过期、错过只补一次。`Monitor` 独立成工具（不塞进 `API`），支持 `add` / `remove` / `list` / `fire`；运行时创建默认有界且不允许 `stream` 源，`hold` 期间照常可用。monitor 有 `owner`：子代理自建的一律投给自己，不能投给父代理或兄弟；父代理可给子代建，随子代理结束而删除；匹配范围受创建者 `receive_scopes` 约束，子代理用 spawn 时的冻结快照。投递即输入，照常过输入闸；源断开、谓词失败、被停用都发系统通知（静默不等于正常）。
 待定：
 
 - `[gate].llm_review` 默认值待定（当前 false）。
-- 监视器 monitor（2026-10-30 定稿）：统一为 `{source, when?, deliver, lifecycle?}` 的事件订阅，不设独立的 ScheduleCron。source 分 `qq` / `timer` / `stream` / `internal`；`when` 是谓词表达式，访问 `event.*` 与只读 `ctx.*`，求值失败告警而非静默；`deliver` 决定投给谁（main / 子代理）与形式（event / prompt），批量窗口 200ms；`lifecycle` 管空闲触发、冷却、上限、过期、一次性与错过的合并。定时任务沿用 Claude Code 的经验：本地 5 字段 cron、避开整点半点、抖动、recurring 默认 30 天过期、错过只补一次。`Monitor` 独立成工具（不塞进 `API`），支持 `add` / `remove` / `list` / `fire`；运行时创建默认有界且不允许 `stream` 源，`hold` 期间照常可用。monitor 有 `owner`：子代理自建的一律投给自己，不能投给父代理或兄弟；父代理可给子代建，随子代理结束而删除；匹配范围受创建者 `receive_scopes` 约束，子代理用 spawn 时的冻结快照。投递即输入，照常过输入闸；源断开、谓词失败、被停用都发系统通知（静默不等于正常）。
 
 - 内置 `docs` 子代理（2026-10-30 记录）：类似 `explore`，只读，工具集仅 `api.list` / `api.help` / `Read`，专门回答“某个 action 怎么调、有哪些同类动作”，只回结论与可复制的调用样例。Phase 4 随工具注册表一起落地。
 - 其余实现细节在 Phase 0–4 中确定。
