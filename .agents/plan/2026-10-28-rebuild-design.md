@@ -900,7 +900,7 @@ enabled = true
 - `[session].scope = "shared"`（默认）：`/sessions` 中的文件是 transcript 分段（segment），不是会话实体；整个 QQ 号只有一份逻辑 transcript。
 - `[session].scope = "per_chat"`（可选强隔离，Phase 6 之后再实现）：每个 `chat_id` 一条独立 transcript 链，路径为 `/sessions/<scope>/<peer>/<file>`；`current_session` 指向本回合 `origin_chat` 的分段；压缩、轮转、保留按 chat 分别执行；`/USER.md`、`/MEMORY.md`、技能仍共享。Phase 3 只实现 `shared` + turn buffer，避免同时维护两套并发与存储模型。
 - 文件：`~/.sbot/sessions/<YYYYMMDDTHHMMSSZ>-<seq>.jsonl`（UTC），名称按字典序即时间序；虚拟路径为 `/sessions/<file>`。
-- 启动：存在未关闭的当前分段时继续追加；否则创建新分段。当前分段路径以 VFS 路径写入 system prompt 的运行时上下文（`current_session`）。
+- 启动：按下方“崩溃恢复”统一算法选择或恢复分段，再决定继续追加还是新建；当前分段路径以 VFS 路径写入 system prompt 的运行时上下文（`current_session`）。
 - **回合缓冲（turn buffer）**：共享 transcript 允许多个 chat 的回合并行，但工具调用历史必须保持 `assistant(tool_use)` 与 `tool_result` 连续成对。每个回合有自己的 `turn_buffer`；LLM 请求 = 已提交日志前缀（`base_seq` 固定快照）+ 本回合 buffer，绝不包含其他回合未提交的块。回合结束时把 buffer 作为连续块原子追加到 transcript，写入 `turn_id` 与单调 `seq`。
 - **入站消息与回合块分离**：QQ 入站消息由单一写任务立即追加为 `kind = inbound`；assistant / tool 块只进 buffer。这样 A 群回合的工具循环不会因为 B 私聊的 committed 消息插入而非法；B 的消息在 A 的下一个回合才可见。
 - **回合状态**：`turn_buffer(turn_id, seq, line, state)`，`state ∈ {open, committing, committed, aborted}`；崩溃后按 `open` 重放：未配对的 `tool_use` 追加合成 `is_error` 结果（“interrupted; the action may or may not have taken effect”），已完成的块提交，未完成的块隔离并告警。
