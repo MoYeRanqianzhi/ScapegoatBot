@@ -87,6 +87,8 @@ pub struct Runner {
     slot: SharedProviderSlot,
     /// 主模型失败后的回退链。
     fallbacks: Vec<FallbackProvider>,
+    /// 子代理 hub；后置注入，用于嵌套 spawn 时给子代理注册 `Agent` 工具。
+    hub: std::sync::OnceLock<Arc<crate::swarm::AgentHub>>,
     /// `sbot ai stop` 的开关；关闭时不发起新的模型请求。
     ai_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// `ESTOP` 哨兵路径；存在时暂停新回合。
@@ -200,6 +202,7 @@ impl Runner {
         Ok(Arc::new(Self {
             slot,
             fallbacks,
+            hub: std::sync::OnceLock::new(),
             ai_enabled,
             estop_file,
             tools,
@@ -334,6 +337,11 @@ impl Runner {
     /// 共享槽位；runtime 用它实现模型/effort 热切换。
     pub fn provider_slot(&self) -> SharedProviderSlot {
         Arc::clone(&self.slot)
+    }
+
+    /// 注入子代理 hub；之后嵌套 spawn 才能为子代理注册 `Agent` 工具。
+    pub fn set_hub(&self, hub: Arc<crate::swarm::AgentHub>) {
+        let _ = self.hub.set(hub);
     }
 
     /// 取一份 provider 快照；调用方在 await 前调用，避免跨 await 持有锁。
@@ -619,7 +627,19 @@ impl crate::swarm::SubagentRunner for Runner {
     /// - 不注入 owner context / USER / memory / skills。
     async fn run_subagent(&self, request: crate::swarm::SubagentRequest) -> Result<String> {
         let slot = self.provider_snapshot();
-        let tools = Arc::new(self.tools.filtered(&request.tools));
+        let mut tools = self.tools.filtered(&request.tools);
+        // 嵌套 spawn：只有未到 max_depth 且 hub 已注入时，才给子代理 Agent 工具。
+        if request.depth + 1 < request.max_depth
+            && let Some(hub) = self.hub.get()
+        {
+            let handle = Arc::new(crate::tools::agent::HubHandle::new());
+            let _ = handle.set(Arc::clone(hub));
+            tools.register(Arc::new(crate::tools::agent::AgentTool::new(
+                handle,
+                request.depth + 1,
+            )));
+        }
+        let tools = Arc::new(tools);
         let system = vec![SystemBlock {
             text: request.system,
             cache: false,

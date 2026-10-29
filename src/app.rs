@@ -700,11 +700,39 @@ async fn build_agent(
 
     let mut tools = ToolRegistry::new(Arc::clone(&vfs), Some(views));
     crate::tools::fs::register(&mut tools);
-    tools.register(Arc::new(SkillTool::new(Arc::clone(&vfs))));
+    tools.register(Arc::new(
+        SkillTool::new(Arc::clone(&vfs)).with_db(Arc::clone(&db)),
+    ));
+    // 技能 curator：每小时检查一次；只在积累足够新技能时运行，只归档不删除。
+    if config.skills.curator {
+        let vfs_curator = Arc::clone(&vfs);
+        let db_curator = Arc::clone(&db);
+        let skills_config = config.skills.clone();
+        tokio::spawn(async move {
+            loop {
+                let vfs = Arc::clone(&vfs_curator);
+                let db = Arc::clone(&db_curator);
+                let cfg = skills_config.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::tools::skill::curate(&vfs, &db, &cfg)
+                })
+                .await
+                {
+                    Ok(Ok(report)) if !report.archived.is_empty() => {
+                        info!(archived = ?report.archived, "skill curator archived unused skills");
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => warn!(%error, "skill curator failed"),
+                    Err(error) => warn!(%error, "skill curator task failed"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
     // Agent 工具先注册；hub 需要 runner，稍后注入。
     let hub_handle = Arc::new(HubHandle::new());
     if config.swarm.enabled {
-        tools.register(Arc::new(AgentTool::new(Arc::clone(&hub_handle))));
+        tools.register(Arc::new(AgentTool::new(Arc::clone(&hub_handle), 0)));
     }
     if config.mcp.enabled {
         let manager = Arc::new(McpManager::connect(&config.mcp).await);
@@ -864,7 +892,7 @@ async fn build_agent(
             turn_context_budget: config.compaction.turn_context_budget,
             keep_recent_tokens: config.compaction.keep_recent_tokens,
         },
-        history,
+        Arc::clone(&history),
         Arc::clone(&ai_enabled),
         estop_file,
     )
@@ -884,6 +912,9 @@ async fn build_agent(
         if hub_handle.set(hub).is_err() {
             warn!("subagent hub was already initialized");
         }
+        if let Some(hub) = hub_handle.get() {
+            runner.set_hub(Arc::clone(hub));
+        }
     }
     crate::monitor::load_config_monitors(&monitors, &config.monitor, Some(&messages)).await?;
 
@@ -894,6 +925,18 @@ async fn build_agent(
     );
     // `idle_only` monitor 依赖队列的活跃回合数。
     let _ = sink.queue.set(Arc::clone(&queue));
+
+    // 后台复盘：记忆候选 + 风格画像；`review = off` 时立即返回。
+    crate::memory::spawn(crate::memory::ReviewerConfig {
+        provider: runner.provider_slot(),
+        history: Arc::clone(&history),
+        vfs: Arc::clone(&vfs),
+        db: Some(Arc::clone(&db)),
+        queue: Arc::clone(&queue),
+        memory: config.memory.clone(),
+        style: config.style.clone(),
+        ai_enabled: Arc::clone(&ai_enabled),
+    });
 
     Ok(Some(Arc::new(AgentRuntime {
         runner,

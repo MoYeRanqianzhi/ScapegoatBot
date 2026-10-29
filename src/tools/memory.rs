@@ -318,55 +318,10 @@ impl MemoryTool {
     }
 
     /// 从 `/MEMORY.md` 与 `/memory/*.md` 重建 `memory_entries`。
-    ///
-    /// 在一个事务里整体替换，避免“删了旧行、插新行失败”留下半截索引。
     fn sync_entries(&self) {
-        let Some(db) = &self.db else {
-            return;
-        };
-        let Ok(index_text) = self
-            .vfs
-            .read_text_unrecorded(&VfsPath::parse("/MEMORY.md").expect("valid path"))
-        else {
-            return;
-        };
-        let mut rows = Vec::new();
-        let now = chrono::Utc::now().to_rfc3339();
-        for line in index_text.lines() {
-            let Some(slug) = index_slug(line) else {
-                continue;
-            };
-            let Ok(path) = VfsPath::parse(&format!("/memory/{slug}.md")) else {
-                continue;
-            };
-            let Ok(text) = self.vfs.read_text_unrecorded(&path) else {
-                continue;
-            };
-            let (kind, source, observed_at) = parse_frontmatter(&text);
-            rows.push((
-                slug,
-                path.to_string(),
-                kind,
-                source,
-                observed_at,
-                now.clone(),
-            ));
+        if let Some(db) = &self.db {
+            sync_entries(&self.vfs, db);
         }
-
-        let mut conn = db.lock();
-        let Ok(tx) = conn.transaction() else {
-            return;
-        };
-        let _ = tx.execute("DELETE FROM memory_entries", []);
-        for (slug, path, kind, source, observed_at, updated_at) in rows {
-            let _ = tx.execute(
-                "INSERT INTO memory_entries
-                    (slug, path, kind, source, observed_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![slug, path, kind, source, observed_at, updated_at],
-            );
-        }
-        let _ = tx.commit();
     }
 
     /// 记忆工具自己拥有这些文件：写入前先读取，满足 Read-before-Edit。
@@ -376,6 +331,178 @@ impl MemoryTool {
         }
         Ok(())
     }
+}
+
+/// 从索引与文件重建 `memory_entries`；一个事务整体替换。
+pub(crate) fn sync_entries(vfs: &VfsStore, db: &Database) {
+    let Ok(index_text) =
+        vfs.read_text_unrecorded(&VfsPath::parse("/MEMORY.md").expect("valid path"))
+    else {
+        return;
+    };
+    let mut rows = Vec::new();
+    let now = chrono::Utc::now().to_rfc3339();
+    for line in index_text.lines() {
+        let Some(slug) = index_slug(line) else {
+            continue;
+        };
+        let Ok(path) = VfsPath::parse(&format!("/memory/{slug}.md")) else {
+            continue;
+        };
+        let Ok(text) = vfs.read_text_unrecorded(&path) else {
+            continue;
+        };
+        let (kind, source, observed_at) = parse_frontmatter(&text);
+        rows.push((
+            slug,
+            path.to_string(),
+            kind,
+            source,
+            observed_at,
+            now.clone(),
+        ));
+    }
+
+    let mut conn = db.lock();
+    let Ok(tx) = conn.transaction() else {
+        return;
+    };
+    let _ = tx.execute("DELETE FROM memory_entries", []);
+    for (slug, path, kind, source, observed_at, updated_at) in rows {
+        let _ = tx.execute(
+            "INSERT INTO memory_entries
+                (slug, path, kind, source, observed_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![slug, path, kind, source, observed_at, updated_at],
+        );
+    }
+    let _ = tx.commit();
+}
+
+/// 后台复盘使用的预算。
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryLimits {
+    pub max_entry_chars: usize,
+    pub max_index_lines: usize,
+    pub max_index_bytes: usize,
+}
+
+/// 复盘产出的一条候选记忆。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewEntry {
+    pub name: String,
+    pub kind: String,
+    pub description: String,
+    pub content: String,
+    pub source: String,
+}
+
+/// 把复盘候选写入 `/memory` 与 `/MEMORY.md`，然后重建 `memory_entries`。
+///
+/// 只追加：已存在的 slug 跳过；超出预算的条目跳过。返回新增条数。
+pub fn apply_review(
+    vfs: &VfsStore,
+    db: Option<&Database>,
+    limits: &MemoryLimits,
+    entries: &[ReviewEntry],
+) -> anyhow::Result<usize> {
+    let index_path = VfsPath::parse("/MEMORY.md").expect("valid path");
+    let index_text = vfs.read_text_unrecorded(&index_path).unwrap_or_default();
+    let (mut prefix, mut index_entries) = MemoryTool::parse_index(&index_text);
+    let mut taken: std::collections::HashSet<String> =
+        index_entries.iter().map(|(slug, _)| slug.clone()).collect();
+    let mut files = Vec::new();
+    let now = chrono::Utc::now().format("%Y-%m-%d").to_string();
+
+    for entry in entries {
+        let Ok(slug) = validate_slug(&entry.name) else {
+            continue;
+        };
+        if taken.contains(&slug) {
+            continue;
+        }
+        let Some(kind) = MemoryType::parse(&entry.kind) else {
+            continue;
+        };
+        let content = entry.content.trim();
+        if content.is_empty() || content.chars().count() > limits.max_entry_chars {
+            continue;
+        }
+        let description = entry
+            .description
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if description.is_empty() {
+            continue;
+        }
+        let source = entry.source.trim();
+        let source = if source.is_empty() { "self" } else { source };
+        let body = format!(
+            "---\nname: {slug}\ndescription: {description}\ntype: {}\nobserved_at: {now}\nsource: {source}\n---\n\n{content}\n",
+            kind.as_str()
+        );
+        let line = MemoryTool::index_line(&Entry {
+            slug: slug.clone(),
+            description: description.clone(),
+            kind,
+            content: content.to_owned(),
+            source: source.to_owned(),
+        });
+
+        if index_entries.len() + 1 > limits.max_index_lines {
+            break;
+        }
+        let mut candidate = prefix.join("\n");
+        if !candidate.is_empty() {
+            candidate.push_str("\n\n");
+        }
+        for (_, existing) in &index_entries {
+            candidate.push_str(existing);
+            candidate.push('\n');
+        }
+        candidate.push_str(&line);
+        if candidate.len() > limits.max_index_bytes {
+            break;
+        }
+        taken.insert(slug.clone());
+        index_entries.push((slug.clone(), line));
+        files.push((slug, body));
+    }
+
+    if files.is_empty() {
+        return Ok(0);
+    }
+
+    // 索引前缀只保留非空行，避免多次复盘累积空行。
+    prefix.retain(|line| !line.trim().is_empty());
+    let mut index = String::new();
+    if !prefix.is_empty() {
+        index.push_str(&prefix.join("\n"));
+        index.push_str("\n\n");
+    }
+    for (_, line) in &index_entries {
+        index.push_str(line);
+        index.push('\n');
+    }
+
+    for (slug, body) in &files {
+        let path = VfsPath::parse(&format!("/memory/{slug}.md")).expect("valid");
+        if vfs.stat(&path).is_ok() {
+            let _ = vfs.read_lines(&path, None, None);
+        }
+        vfs.write_text(&path, body, None)?;
+    }
+    if vfs.stat(&index_path).is_ok() {
+        let _ = vfs.read_lines(&index_path, None, None);
+    }
+    vfs.write_text(&index_path, &index, None)?;
+    if let Some(db) = db {
+        sync_entries(vfs, db);
+    }
+    Ok(files.len())
 }
 
 fn validate_slug(raw: &str) -> Result<String, ToolResult> {
@@ -807,5 +934,50 @@ mod tests {
         assert_eq!(slug, "phase-seven");
         assert_eq!(kind, "project");
         assert_eq!(source, "owner");
+    }
+
+    #[test]
+    fn review_applies_entries_and_skips_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let key = Arc::new(MasterKey::from_bytes([8u8; 32]));
+        let vfs = Arc::new(
+            VfsStore::open(
+                Arc::clone(&db),
+                key,
+                dir.path().join("data"),
+                Limits::default(),
+            )
+            .unwrap(),
+        );
+        // 写入缺失的目录与索引种子由 VfsStore 完成。
+        let limits = MemoryLimits {
+            max_entry_chars: 4000,
+            max_index_lines: 200,
+            max_index_bytes: 25_000,
+        };
+        let entries = vec![ReviewEntry {
+            name: "phase-seven".to_owned(),
+            kind: "project".to_owned(),
+            description: "Reviewer added this".to_owned(),
+            content: "The reviewer writes durable facts.".to_owned(),
+            source: "self".to_owned(),
+        }];
+        assert_eq!(apply_review(&vfs, Some(&db), &limits, &entries).unwrap(), 1);
+        // 第二次同 slug 跳过。
+        assert_eq!(apply_review(&vfs, Some(&db), &limits, &entries).unwrap(), 0);
+        let index = vfs
+            .read_text_unrecorded(&VfsPath::parse("/MEMORY.md").unwrap())
+            .unwrap();
+        assert!(index.contains("phase-seven"));
+        let row: String = db
+            .lock()
+            .query_row(
+                "SELECT source FROM memory_entries WHERE slug = 'phase-seven'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(row, "self");
     }
 }

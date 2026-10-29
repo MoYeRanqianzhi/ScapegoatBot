@@ -904,14 +904,16 @@ impl Views {
     /// - `/config.toml`：整文件，但只读键不得改变。
     pub fn write_config(&self, target: &ParsedTarget, content: &str) -> Result<String, VfsError> {
         let Some(handle) = &self.context.config else {
-            return Err(VfsError::Offline("configuration is not attached".to_owned()));
+            return Err(VfsError::Offline(
+                "configuration is not attached".to_owned(),
+            ));
         };
         let path = {
             let guard = handle.read().expect("config lock poisoned");
             guard.path.clone()
         };
-        let current_text = std::fs::read_to_string(&path)
-            .map_err(|error| VfsError::Storage(error.to_string()))?;
+        let current_text =
+            std::fs::read_to_string(&path).map_err(|error| VfsError::Storage(error.to_string()))?;
         let mut document: toml_edit::DocumentMut = current_text
             .parse()
             .map_err(|error| VfsError::Storage(format!("cannot parse sbot.toml: {error}")))?;
@@ -928,7 +930,8 @@ impl Views {
                 let new_value: toml::Value = toml::from_str(&new_document.to_string())
                     .map_err(|error| VfsError::Storage(error.to_string()))?;
                 check_protected_keys(&old_value, &new_value)?;
-                let config = validate_config_text(&new_document.to_string(), self.context.models.as_ref())?;
+                let config =
+                    validate_config_text(&new_document.to_string(), self.context.models.as_ref())?;
                 self.persist(&path, new_document.to_string())?;
                 *handle.write().expect("config lock poisoned") = LoadedConfig {
                     config,
@@ -951,7 +954,8 @@ impl Views {
                 })?;
                 let table = snippet.as_table().clone();
                 document[section.as_str()] = toml_edit::Item::Table(table);
-                let config = validate_config_text(&document.to_string(), self.context.models.as_ref())?;
+                let config =
+                    validate_config_text(&document.to_string(), self.context.models.as_ref())?;
                 self.persist(&path, document.to_string())?;
                 *handle.write().expect("config lock poisoned") = LoadedConfig {
                     config,
@@ -969,9 +973,8 @@ impl Views {
                         "config key {section}.{key} is read-only for the agent"
                     )));
                 }
-                let snippet: toml_edit::DocumentMut = format!("{key} = {content}")
-                    .parse()
-                    .map_err(|error| {
+                let snippet: toml_edit::DocumentMut =
+                    format!("{key} = {content}").parse().map_err(|error| {
                         VfsError::Storage(format!(
                             "value for {section}.{key} is not a TOML literal: {error}"
                         ))
@@ -983,7 +986,8 @@ impl Views {
                     document[section.as_str()] = toml_edit::Item::Table(toml_edit::Table::new());
                 }
                 document[section.as_str()][key.as_str()] = item;
-                let config = validate_config_text(&document.to_string(), self.context.models.as_ref())?;
+                let config =
+                    validate_config_text(&document.to_string(), self.context.models.as_ref())?;
                 self.persist(&path, document.to_string())?;
                 *handle.write().expect("config lock poisoned") = LoadedConfig {
                     config,
@@ -1021,7 +1025,8 @@ impl Views {
             .collect()
     }
 
-    fn read_system(&self, section: &str) -> Result<ViewRead, VfsError> {        let config = self
+    fn read_system(&self, section: &str) -> Result<ViewRead, VfsError> {
+        let config = self
             .config_snapshot()
             .ok_or_else(|| VfsError::Offline("/system".to_owned()))?;
         let text = match section {
@@ -1269,10 +1274,7 @@ fn check_protected_keys(old: &toml::Value, new: &toml::Value) -> Result<(), VfsE
 }
 
 /// 解析并校验候选配置；失败时不写盘。
-fn validate_config_text(
-    text: &str,
-    models: Option<&ModelsFile>,
-) -> Result<SbotConfig, VfsError> {
+fn validate_config_text(text: &str, models: Option<&ModelsFile>) -> Result<SbotConfig, VfsError> {
     let config: SbotConfig = toml::from_str(text)
         .map_err(|error| VfsError::Storage(format!("invalid sbot.toml: {error}")))?;
     config
@@ -1515,13 +1517,15 @@ mod tests {
         views
             .write_config(&target("/config/agent/thinking_level"), "\"low\"")
             .unwrap();
-        match views.read(&target("/config/agent/thinking_level")).await.unwrap() {
+        match views
+            .read(&target("/config/agent/thinking_level"))
+            .await
+            .unwrap()
+        {
             ViewRead::Text(text) => assert_eq!(text.trim(), "\"low\""),
             other => panic!("expected text, got {other:?}"),
         }
-        let text = views
-            .write_config(&target("/config.toml"), "")
-            .unwrap_err();
+        let text = views.write_config(&target("/config.toml"), "").unwrap_err();
         // 空文档首先触发只读键对比（缺少受保护键），同样被拒绝。
         assert!(text.to_string().contains("read-only"), "{text}");
 
@@ -1543,10 +1547,7 @@ mod tests {
             current.contains("compaction_model"),
             "leaf write dropped sibling keys:\n{current}"
         );
-        let altered = current.replace(
-            "path = \"./data\"",
-            "path = \"./other-data\"",
-        );
+        let altered = current.replace("path = \"./data\"", "path = \"./other-data\"");
         assert_ne!(altered, current);
         let error = views
             .write_config(&target("/config.toml"), &altered)
@@ -1555,8 +1556,14 @@ mod tests {
 
         // 整文件写入：允许修改白名单键。
         let allowed = current.replace("thinking_level = \"low\"", "thinking_level = \"high\"");
-        views.write_config(&target("/config.toml"), &allowed).unwrap();
-        match views.read(&target("/config/agent/thinking_level")).await.unwrap() {
+        views
+            .write_config(&target("/config.toml"), &allowed)
+            .unwrap();
+        match views
+            .read(&target("/config/agent/thinking_level"))
+            .await
+            .unwrap()
+        {
             ViewRead::Text(text) => assert_eq!(text.trim(), "\"high\""),
             other => panic!("expected text, got {other:?}"),
         }

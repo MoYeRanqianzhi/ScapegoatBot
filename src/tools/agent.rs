@@ -18,11 +18,13 @@ pub type HubHandle = std::sync::OnceLock<Arc<AgentHub>>;
 
 pub struct AgentTool {
     hub: Arc<HubHandle>,
+    /// 当前代理深度；根代理为 0，子代理为父深度 + 1。
+    depth: u32,
 }
 
 impl AgentTool {
-    pub fn new(hub: Arc<HubHandle>) -> Self {
-        Self { hub }
+    pub fn new(hub: Arc<HubHandle>, depth: u32) -> Self {
+        Self { hub, depth }
     }
 
     fn hub(&self) -> Result<Arc<AgentHub>, ToolResult> {
@@ -90,7 +92,10 @@ impl Tool for AgentTool {
                 {
                     return ToolResult::error("type must be general, explore, plan or docs.");
                 }
-                match hub.spawn(kind, arg_opt_str(&args, "agent"), task).await {
+                match hub
+                    .spawn(kind, arg_opt_str(&args, "agent"), task, self.depth)
+                    .await
+                {
                     Ok(value) => ToolResult::ok(value.to_string()),
                     Err(error) => ToolResult::error(error.to_string()),
                 }
@@ -171,7 +176,7 @@ mod tests {
         );
         let handle = Arc::new(HubHandle::new());
         let _ = handle.set(hub);
-        (AgentTool::new(handle), dir)
+        (AgentTool::new(handle, 0), dir)
     }
 
     async fn call(tool: &AgentTool, value: serde_json::Value) -> ToolResult {
