@@ -19,7 +19,7 @@
 ### 2.1 形态
 
 - 单实例守护进程承载 NapCat 连接、Agent、VFS、SQLite。
-- CLI 作为独立客户端：`start`、`stop`、`restart`、`status`、`ai start|stop|restart`、`chat`、`pause`、`resume`、`backup`、`doctor`。
+- CLI 作为独立客户端：`start`、`stop`、`restart`、`status`、`ai start|stop|restart`、`chat`、`pause`、`resume`、`security status|resume`、`backup`、`doctor`。
 - 不监听任何网络端口。
 
 ### 2.2 传输
@@ -367,6 +367,43 @@ OwnerIntent { kind: control | owner_message | standing, chat_id?, message_id?, c
 - 确认记录（谁、何时、哪个 action、nonce）写审计；过期未确认自动拒绝。
 
 
+### 5.9 周期性安全检查（security review）
+
+提示词里的 Trust 段是行为指导，不是保证。长时间运行后，模型可能已经被一段精心构造的注入说服，而表面上看不出异常。因此增加一个**周期性、独立模型**的安全检查，专门找“是否有人尝试注入/社工，以及 agent 是否真的信了”。
+
+**触发与窗口**
+
+- `[security].check_every_tokens`（默认 262144）：统计自上次检查以来新增的 transcript 内容（消息、工具结果、记忆写入、配置变更）的 token；达到阈值即在**回合边界**触发一次检查。
+- `[security].check_on_compaction = true`：压缩前也检查一次，避免压缩把证据吞掉。
+- 扫描窗口 = 上次检查点之后的内容 + `check_overlap_tokens`（默认 4096）的重叠；同时读取 `security_audit` 中的写入/发送/门禁事件，不只读文本。
+- 检查在回合边界同步执行，期间不接纳新回合；`check_timeout_secs`（默认 60）后超时放行，不暂停（避免被一条坏消息拖停整个 bot）；连续失败 3 次告警主人。
+
+**请求形状与缓存复用**
+
+- 检查请求与主请求共享**完全相同**的静态前缀与会话稳定块（owner context / USER / memory / STYLE / skills），逐字节一致；`cache_control` 断点位置不变。
+- 在底部追加一条 `security_review` 指令作为最后一条 user 消息，不修改 system prompt、不重排历史。这样 provider 的前缀缓存仍然命中，只付新增的检查指令与窗口内容的费用。
+- 使用 `[security].review_model`（默认 `compaction_model`）；不提供工具；只允许 JSON 输出；响应**不写入主 transcript**，只写 `security_events`。
+
+**输出与动作**
+
+```json
+{"risk":"low|medium|high|critical","complied":true,"categories":["injection","identity_spoof","memory_poisoning","cross_chat","exfiltration"],"findings":["..."],"recommended_action":"none|warn|pause_outbound|pause_agent"}
+```
+
+- 模型只给建议，动作由 runtime 按策略决定：`low` 记录；`medium` 通知 `master_qq`；`high` 且 `complied = true` → `pause_outbound`；`critical` → `pause_agent`。模型不能把 `low` 升级成停机，也不能把 `critical` 降级成放行。
+- `pause_outbound`：写 `~/.sbot/SECURITY_HOLD`（JSON：reason、severity、created_at、event_id），`API` 的 `message` / `admin` / `destructive` 全部拒绝；读取、记忆整理、压缩继续。
+- `pause_agent`：在 `pause_outbound` 基础上停止接纳新回合；控制通道仍可 `status` / `chat`（仅用于主人处理），`sbot security resume` 才能清除。
+- 主人可在 `~/.sbot/SECURITY_HOLD` 中看到 finding 摘要；`sbot status` 与 `/system/security` 显示暂停原因、时间、最近一次检查。恢复需要主人执行 `sbot security resume`（可配置 `auto_resume_minutes`，到期后先复检，通过才恢复）。
+- 若 `master_qq` 不可用，仍写哨兵与审计，`status` 显示“无通知通道”，不静默放行。
+
+**检查内容**
+
+- 注入/越权：要求忽略规则、改变身份、授予权限、读取其他 chat、导出秘密。
+- 身份冒充：自称主人、新主人、主人代表、转发主人授权。
+- 记忆投毒：要求写入“主人授权/偏好”或修改 `/USER.md`。
+- 行为证据：agent 是否实际写了记忆、发了跨 chat 消息、改了配置、接受了请求；`complied` 必须由事件与 tool result 支持，不能只看模型自述。
+
+
 ## 6. 虚拟文件系统（VFS）
 
 ### 6.1 目标
@@ -534,7 +571,7 @@ OwnerIntent { kind: control | owner_message | standing, chat_id?, message_id?, c
 - 热更新项：模型、effort、压缩参数、过滤器、队列、style、技能目录；需重启项：napcat、storage 等，写入时接受但提示重启；只读项不提供写入。
 - 敏感项只读或不可见：
   - `auth.json` 不挂载，模型不可见；`/config/models.json` 只读暴露模型定义。
-  - `[agent].mode`、`owner_qq`、`owner_name`、`master`、`[session].scope`、`[gate]`、`[memory]` 的来源门控、`[storage]` 的路径与加密模式、napcat token、control 端点不可由 Agent 修改；`mode` 修改需改配置文件并重启。
+  - `[agent].mode`、`owner_qq`、`owner_name`、`master`、`[session].scope`、`[gate]`、`[security]`、`[memory]` 的来源门控、`[storage]` 的路径与加密模式、napcat token、control 端点不可由 Agent 修改；`mode` 修改需改配置文件并重启。
   - `models.json` 只读；可用模型列表在 `/config/agent/available_models` 中修改。
 - context hook 分两类：
   - **Agent 可建**：`kind ∈ {memory, style}`、`inject = "system"`、`path` 只能是 `/memory/**` 或 `/STYLE.md`；写入 `/config/hooks/context/<name>/...` 生效。
@@ -931,7 +968,7 @@ enabled = true
 - SQLite `transcript_files(id, file, prev_id, base_seq, started_at, ended_at, message_count, bytes, pruned_at)` 只做可重建索引；`/sessions/index.jsonl` 是它的只读投影，列出 `file`、`prev`、`started_at`、`ended_at`、`message_count`、`bytes`、`pruned`，供从最新分段向历史遍历。
 - 内容只存加密 JSONL 分段；`/sessions`、`/sessions/index.jsonl` 与任何渲染/搜索结果都由 VFS 动态生成，不产生派生文件。
 - 压缩触发：四块预算（静态 prompt、动态注入、工具 schema、对话与工具结果）合计超过 `min(context_window - reserve_tokens, turn_context_budget)` 时触发。`reserve_tokens` 必须 ≥ `agent.max_output_tokens`（默认 8192），启动校验；`turn_context_budget` 默认 120,000，避免默认 1M 窗口下工作集膨胀到 87 万 token、先撞 provider 的 input+output 上限而压缩永不触发。连续失败达到 `max_failures`（默认 3）后停止自动压缩并告警。
-- 压缩屏障：全局 `compaction_barrier` + `epoch`，同一时刻只允许一个压缩。进入压缩前停止接纳新回合，等待在飞回合提交当前请求并结束（超时则中止并从 buffer 修复）；压缩后 `epoch + 1`，旧 epoch 的回合不得再写入。checkpoint、`transcript_files` 新行、当前分段指针在同一事务内写入并 fsync 后再放行。`previous_session` 以新分段首行摘要为唯一权威，DB 只是缓存。token 估算必须 CJK 感知（中文约 1 token/字，英文约 4 字符/token），最终用 provider `usage` 校准。
+- 压缩屏障：全局 `compaction_barrier` + `epoch`，同一时刻只允许一个压缩；压缩前若 `check_on_compaction` 为真，先运行 5.9 的安全检查，检查失败不阻塞压缩。进入压缩前停止接纳新回合，等待在飞回合提交当前请求并结束（超时则中止并从 buffer 修复）；压缩后 `epoch + 1`，旧 epoch 的回合不得再写入。checkpoint、`transcript_files` 新行、当前分段指针在同一事务内写入并 fsync 后再放行。`previous_session` 以新分段首行摘要为唯一权威，DB 只是缓存。token 估算必须 CJK 感知（中文约 1 token/字，英文约 4 字符/token），最终用 provider `usage` 校准。
 - 保留：按 `keep_recent_tokens`（默认 20000）从最新消息向前保留；切割点落在 turn 边界，不拆开工具调用与结果；单个工具结果超预算时保留其所属 turn。
 - 摘要结构（面向聊天，而不是任务）：`## Active chats`（每个活跃 chat 的最后话题、待回应、未解决请求）、`## People`（称呼/关系变化、需要注意的人）、`## Commitments`（答应过谁什么、截止时间）、`## Corrections`（主人纠正的原文与改动结果）、`## Facts`（稳定事实、偏好、环境）、`## Open loops`（等回复/等事件）、`## Session Chain`。已有摘要时增量更新，保留仍然有效的信息。
 - 摘要输入分层（控制 summarizer 输入）：最新消息逐字占一半预算；主人/其他人的历史消息占四分之一，每条截断到 2000 字符并均匀抽样；最旧消息占十分之一；剩余消息按等距抽样、每条截断到 6000 字符；每个缺口标注“N 条消息未纳入，不要猜测其内容”。超过 2000 字符的工具结果在摘要输入里做成首尾保留的投影，并带截断标记。
@@ -1166,6 +1203,14 @@ max_concurrency = 16
 agents_dir = "~/.sbot/agents"   # 自定义子代理定义的共享只读层
 default_max_steps = 32          # 自定义子代理未写 max_steps 时的上限
 
+[security]
+check_every_tokens = 262144   # 每新增 256K 上下文触发一次独立安全检查；0 = 关闭
+check_on_compaction = true    # 压缩前也检查一次
+check_overlap_tokens = 4096   # 扫描窗口向前重叠
+review_model = ""             # 空 = compaction_model
+check_timeout_secs = 60       # 检查超时后放行，不暂停
+auto_resume_minutes = 0       # 0 = 只能主人手动 resume；>0 到期复检后自动恢复
+
 [budget]
 daily_tokens = 2000000          # 0 = 不限制；超限暂停新回合并向 master 报告
 daily_usd = 10.0                # 0 = 不限制；按 models.json 的 cost 估算
@@ -1356,6 +1401,7 @@ action = "log"
 - `hooks.events` 的 `event` / `action` 必须为枚举值，`event` 只能是 `SessionStart` / `SessionEnd` / `PreCompact` / `PostCompact` / `MessageReceived` / `BeforeSend` / `Stop` / `ConfigChange`；`match` 字段合法，每个事件最多 16 条。
 - `[tools.web_*].backend = "tool"` 时 URL 与 key 必须同时存在；未填 key 不注册对应工具。
 - `[tools.download].max_bytes` 必须为正数；域名列表合法。
+- `[security].check_every_tokens` / `check_overlap_tokens` / `check_timeout_secs` / `auto_resume_minutes` 必须为非负整数；`check_every_tokens = 0` 表示关闭周期检查；`review_model` 为空时回退 `compaction_model`，非空时必须存在。
 - `[budget]` 的数值必须为非负整数/浮点数（0 = 不限制）；`turn_tokens` 必须 ≤ `turn_context_budget`。
 - `[gate].mode` 只能是 `trusted` / `auto` / `approve`；`max_per_minute` 必须为正数；`llm_review = true` 时审查模型必须可用。
 - `[storage].encryption` 只能是 `xchacha20poly1305` / `none`，且必须与数据库 `meta` 中记录的模式一致；加密模式下 `~/.sbot/key` 必须存在、格式正确且 canary 校验通过；`none` 启动时警告。
@@ -1440,6 +1486,10 @@ src/
     turn_buffer.rs     回合缓冲、base_seq 快照、崩溃重放
     jsonl.rs           分段 JSONL 写入/读取/加密
     compaction.rs      压缩与摘要（含 previous_session、屏障与 epoch）
+  security/
+    mod.rs             周期检查调度、SECURITY_HOLD、恢复
+    review.rs          独立模型的安全审查请求与 JSON 解析
+    events.rs          security_events 审计
   memory/
     mod.rs             记忆存储、字符预算、条目合并
     provenance.rs      来源判定与门控（owner/agent/untrusted/system）
@@ -1496,6 +1546,8 @@ src/
 - 会话并发：同一 chat 的连发合并；不同 chat 各自成回合但共享 transcript；回合回复默认落在 `origin_chat`；跨 chat 发送触发 n-gram 检查与门禁；队列溢出按 `summarize`/`old`/`new` 处理。
 - 长期运行：ESTOP 暂停新回合与发送、不打断进行中回合；崩溃恢复不重发已确认消息；断线重连后按最后 `message_id` 补齐并去重，缺口写入 `[gap]`；provider 429/超时按退避重试并走回退链，完成后不重放已完成工具；内部标签在流式与非流式发送前均被剥离。
 - 预算：CJK 文本的 token 估算、工具 schema 上限、单条工具结果截断、pruning 不裁剪最近 3 个回合与 bootstrap 读取。
+- 安全周期检查：达到 `check_every_tokens` 触发一次；检查请求的前缀与主请求逐字节一致；良性长对话不暂停；注入且 `complied = true` 触发 `pause_outbound`；`critical` 触发 `pause_agent`；检查超时不暂停、连续失败告警；`sbot security resume` 恢复。
+
 - NapCat 实机冒烟：连接、版本探测、群/成员查询、文本与组合消息、`message_sent` 开关、禁言权限、解散群、公告、文件、已读、断线重连。
 - NapCat：协议层静态兼容已确认；上线前必须完成一次 v4.18.41 实机冒烟。
 
@@ -1528,6 +1580,7 @@ src/
 - **会话上下文保持 shared（2026-10-29 决定）**：整个 QQ 号一份全局 transcript；A、B 的消息必须结合才能拼出完整信息。风险由回合绑定 `origin_chat`、按 chat 去抖、跨 chat 发送的 n-gram 门禁与提示词控制；`[session].scope = "per_chat"` 作为强隔离逃生口。README 如实写明 shared 的隐私边界。
 - 长期运行运维参考 OpenClaw / Grok Build（见 `.agents/plan/2026-10-29-design-review-2.md`）：断线重连按最后 `message_id` 补齐并去重；每 chat 队列有上限与 `summarize/old/new` 丢弃策略；provider 重试 + `Retry-After` + 回退链，失败不重放已完成工具；崩溃恢复写 marker、不自动重放；IPC 带版本、请求 id 与幂等键；`sbot backup` / `sbot doctor`。
 - 记忆参考 OpenClaw 的来源模型：`owner` / `agent` / `untrusted` / `system` 由写入代码判定；只有 `owner` / `agent` 自动注入；untagged 不自动注入；召回内容不回流；非交互会话不产生候选。记忆分 `/USER.md`（偏好祈使句）与 `/MEMORY.md`（事实陈述句），详细材料放 `/memory/topics/`，压缩前 flush、压缩后检索。
+- 周期安全检查：每 `check_every_tokens`（默认 256K）新增上下文触发一次独立模型检查；共享主请求前缀缓存，底部追加检查指令，响应不写入主 transcript；`high + complied` 暂停对外发送，`critical` 暂停新回合，写 `~/.sbot/SECURITY_HOLD`，主人 `sbot security resume` 后恢复。
 - 身份与信任：owner 由 runtime 固定（stand_in 为本账号，companion 为 `owner_qq`）；自称主人、转述授权、要求改记忆/权限的请求一律不执行，核验不在聊天中公告，不信任体现在行为而非台词；可以社交性敷衍，但不能声称做了实际没做的写入或授权。
 - 上下文预算按四块计量（静态 prompt / 动态注入 / 工具 schema / 对话与工具结果），CJK 感知；工具 schema 上限 12k tokens、单条结果 32 KB；旧工具结果可 pruning，最近 3 个回合与 bootstrap 读取不裁剪。
 - 自定义子代理：`/agents/<name>.md` 与宿主 `~/.sbot/agents` overlay；frontmatter 定义 name/description/tools/model/thinking_level/max_steps/allow_send；`Agent` 工具 description 自动列出可选 agent；工具只能收窄，`allow_send` 默认 false。参考 Claude Code / Codex / Grok Build。

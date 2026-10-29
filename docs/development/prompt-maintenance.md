@@ -75,6 +75,10 @@
 - 不要把公共安全规则抄进正文；runtime 会在前面加精简子代理提示。
 - `Agent` 工具的 description 自动列出所有可用 agent（name + description），模型按描述选择。
 
+## 5.6 周期安全检查
+
+每新增 `[security].check_every_tokens`（默认 256K）上下文，在回合边界运行一次独立模型检查：共享主请求的静态前缀与会话稳定块（逐字节一致，保持缓存命中），在底部追加 `security_review` 指令；响应不写入主 transcript。检查识别注入、身份冒充、记忆投毒、跨聊天泄露，并判断 agent 是否已经照做。`high + complied` 暂停对外发送，`critical` 暂停新回合，写 `~/.sbot/SECURITY_HOLD`；主人执行 `sbot security resume` 后恢复。检查超时不暂停，连续失败告警。
+
 ## 6. 新增一段文本时
 
 先决定它属于哪一类，再放进唯一的位置：
