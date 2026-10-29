@@ -8,7 +8,7 @@
 - [Claude Code 记忆格式（2026-10-29）](plan/2026-10-29-claude-memory-format.md) -- 索引 + 单条记忆 + 四类 + 新鲜度，及本项目适配
 - [子代理审查汇总（2026-10-29）](plan/2026-10-29-subagent-review.md) -- 架构/提示词/安全三份评审、P0 修复与最终评估
 - [Prompt Catalog（2026-10-29）](plan/2026-10-29-prompt-catalog.md) -- 工具/压缩/子代理/门禁/复盘/错误提示的英文稿
-- [逐步哨兵参考（2026-10-30）](plan/2026-10-30-step-guard-research.md) -- Jev 单遍决策、宪法分类器级联、auto mode，及每 tick 检查的成本与边界
+- [安全分类器参考（2026-10-30）](plan/2026-10-30-step-guard-research.md) -- Claude 的输入/输出分类器、Jev 单遍决策模型及其能力边界
 - [旧架构总览（重构前）](memory/legacy-architecture.md) -- 模块结构、数据流、会话/沙箱/MCP/Swarm/安全设计
 - [旧工具参考（重构前）](memory/legacy-tools-reference.md) -- 43 个内置工具的分组、数量与实现位置
 - [旧消息状态设计（重构前）](memory/legacy-message-state.md) -- Raw/Wrapped/Compact/Linked 判定与 CQ XML 格式
