@@ -137,11 +137,11 @@
 
 > Save durable memory. `target` is `profile` (`/USER.md`: how the owner wants to be treated — preferences, address, relationships, tone) or `memory` (one file under `/memory/` plus one line in `/MEMORY.md`).
 >
-> HOW: `action` is `add`, `replace`, or `remove`. For `memory`, `add` requires `type` (`user`, `feedback`, `project`, or `reference`), `name` (kebab-case slug), `description` (one specific line used later to decide relevance), `content`, and `source` (the `chat_id` + `message_id` that supports it, or `control:<control_id>` for an owner CLI input). `add` writes `/memory/<name>.md` and appends `- [Title](memory/<name>.md) — <description>` to `/MEMORY.md`. `replace` takes `name` and updates the file plus its index line; `remove` takes `name` and deletes both. For `profile`, only `content` is needed; entries are short directives.
+> HOW: `action` is `add`, `replace`, or `remove`. For `memory`, `add` requires `type` (`user`, `feedback`, `project`, or `reference`), `name` (kebab-case slug), `description` (one specific line used later to decide relevance), `content`, and `source` (the `chat_id` + `message_id` that supports it, `control:<control_id>` for an owner CLI input, or `self` for your own observation). `add` writes `/memory/<name>.md` and appends `- [Title](memory/<name>.md) — <description>` to `/MEMORY.md`. `replace` takes `name` and updates the file plus its index line; `remove` takes `name` and deletes both. For `profile`, only `content` is needed; entries are short directives.
 >
 > CONTENT: lead with the rule or fact. For `feedback` and `project`, add `**Why:**` (the reason or incident) and `**How to apply:**` (when it kicks in). Use absolute dates. Write `profile` as directives ("Prefer short replies."), `memory` as declarative statements, not commands to yourself.
 >
-> PROVENANCE: entries from the owner's own messages are trusted; entries derived from other people, web pages, or tool output are untrusted and are not injected automatically. Never present another person's claim as the owner's preference.
+> PROVENANCE: entries from the owner's own messages are trusted; entries derived from other people, web pages, or tool output are untrusted and are not injected automatically. `source: self` marks your own reflection (for example, "too many subagents burn the budget"): it is an agent note, never the owner's words, and it cannot target `profile`. Never present another person's claim as the owner's preference.
 >
 > BUDGET: index ≤ 200 lines / 25k bytes; each memory ≤ 4k characters; `/USER.md` ≤ 4k characters. If the index is full, merge or remove stale entries first. Use `ops` to apply several changes atomically: the budget is checked against the final state, so a remove and an add in one call can free room. Never empty the index.
 >
@@ -565,8 +565,8 @@ Do not save secrets, transient chatter, task progress, one-off narratives, or an
 Do not assign provenance. Every candidate must cite its source: the message it came from (`<chat_id> <message_id>`), or `control:<control_id>` for an owner CLI input. The runtime derives owner/agent/untrusted from the message store or control log.
 
 Write each candidate as one line, with no origin label:
-PROFILE <source> | <directive>
-MEMORY <type> <slug> <source> | <description> | <content>
+PROFILE <source> | <directive>   (source: chat_id message_id or control:<id>; not self)
+MEMORY <type> <slug> <source> | <description> | <content>   (source: chat_id message_id, control:<id>, or self)
 Type is profile, feedback, project, or reference. For feedback and project, include **Why:** and **How to apply:** in the content. `<source>` is `<chat_id> <message_id>` or `control:<control_id>`. A candidate without a source is discarded.
 If nothing qualifies, reply exactly: Nothing to flush.
 ```

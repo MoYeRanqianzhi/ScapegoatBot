@@ -112,7 +112,7 @@ name: short-kebab-slug
 description: One line, specific enough to decide relevance later.
 type: user | feedback | project | reference
 observed_at: 2026-10-29
-source: group:123 / private:456 / owner / review
+source: group:123 / private:456 / control:<id> / self
 ---
 
 Rule or fact.
@@ -122,7 +122,7 @@ Rule or fact.
 **How to apply:** When this kicks in, and where it does not.
 ```
 
-- `source` 与 `origin`（owner / agent / untrusted / system）分开：前者是位置，后者是可信级别；来源由代码写入，正文不能伪造。
+- `source` 与 `origin`（owner / agent / untrusted / system）分开：前者是位置，后者是可信级别；来源由代码写入，正文不能伪造。`source: self` 表示 agent 自己的观察/反思（例如“子代理开太多会消耗余额”），不引用外部消息，`origin` 固定为 `agent`，不能写入 `/USER.md`。
 - `feedback` / `project` 必须有 **Why** 与 **How to apply**；`user` 可以只有事实；`reference` 写“去哪里找什么”。
 - 所有相对日期在写入时转成绝对日期。
 
@@ -149,6 +149,7 @@ Rule or fact.
 - 预算：索引 ≤ 200 行 / 25k 字节；单条记忆 ≤ 4k 字符；`/USER.md` ≤ 4k 字符；超限拒绝并提示合并。
 - 来源：`origin` 由写入代码判定（主人陈述 / 从主人内容提炼 / 他人内容 / 系统）；`untrusted` 可写但不自动注入。
 - 显式保存门：主人明确说“记住”时立即保存最合适的类型；主人说“忘了”时找到并删除；主人要求保存流水账时，先问“哪一点让你意外/不显然”，只保存那一点。
+- 自我观察：agent 可以记录没有外部来源的经验（预算、工具、流程），标 `source: self`；这类记忆是 agent 的笔记，不能当主人偏好或 owner intent。
 
 ### 2.6 后台复盘
 
