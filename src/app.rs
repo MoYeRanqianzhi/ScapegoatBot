@@ -25,8 +25,9 @@ use crate::config::{
     AgentMode, AuthFile, EncryptionMode, LoadedConfig, ModelsFile, SbotConfig, SessionScope,
 };
 use crate::ipc::{self, AiAction, Handler, Request, RequestBody, Response};
+use crate::monitor::{MonitorDelivery, MonitorManager, MonitorSink};
 use crate::paths::SbotPaths;
-use crate::providers::{Provider, ThinkingOptions, build_provider};
+use crate::providers::{Provider, ServerToolKind, ThinkingOptions, build_provider};
 use crate::qq::event::QqEvent;
 use crate::qq::filter::MessageFilter;
 use crate::qq::{LoginInfo, QqClient};
@@ -38,7 +39,13 @@ use crate::storage::crypto::MasterKey;
 use crate::storage::messages::MessageStore;
 use crate::tools::ToolRegistry;
 use crate::tools::api::{AgentOps, ApiTool, NapcatGateway};
+use crate::tools::download::DownloadTool;
+use crate::tools::memory::MemoryTool;
+use crate::tools::monitor::MonitorTool;
+use crate::tools::net::NetPolicy;
+use crate::tools::skill::SkillTool;
 use crate::tools::views::Views;
+use crate::tools::web::{WebBackend, WebFetchTool, WebSearchTool};
 use crate::vfs::Vfs;
 use crate::vfs::sqlite::VfsStore;
 
@@ -50,9 +57,32 @@ struct AgentRuntime {
     runner: Arc<Runner>,
     queue: Arc<ChatQueue>,
     ops: Arc<RuntimeOps>,
+    monitors: Arc<MonitorManager>,
     self_id: u64,
     filter: MessageFilter,
     filtered: AtomicU64,
+}
+
+/// monitor 的投递端：把事件变成一次注入回合。
+#[derive(Default)]
+struct RunnerSink {
+    runner: std::sync::OnceLock<Arc<Runner>>,
+}
+
+#[async_trait::async_trait]
+impl MonitorSink for RunnerSink {
+    async fn deliver(&self, delivery: MonitorDelivery) {
+        let Some(runner) = self.runner.get() else {
+            warn!(monitor = %delivery.name, "monitor delivered before the runner was ready");
+            return;
+        };
+        if let Err(error) = runner
+            .run_event(&delivery.name, &delivery.source, &delivery.text)
+            .await
+        {
+            warn!(%error, monitor = %delivery.name, "monitor delivery failed");
+        }
+    }
 }
 
 /// 守护进程运行时。
@@ -569,8 +599,105 @@ async fn build_agent(
         Arc::clone(&sessions),
         qq.clone(),
     ));
+    let sink = Arc::new(RunnerSink::default());
+    let monitors = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+
     let mut tools = ToolRegistry::new(Arc::clone(&vfs), Some(views));
     crate::tools::fs::register(&mut tools);
+    tools.register(Arc::new(SkillTool::new(Arc::clone(&vfs))));
+    tools.register(Arc::new(MonitorTool::new(Arc::clone(&monitors))));
+    if config.memory.enabled {
+        tools.register(Arc::new(MemoryTool::new(
+            Arc::clone(&vfs),
+            config.memory.max_entry_chars,
+            config.memory.max_index_lines,
+            config.memory.max_index_bytes,
+            config.memory.user_max_chars,
+        )));
+    }
+    let download_policy = NetPolicy {
+        allowed_domains: config.tools.download.allowed_domains.clone(),
+        blocked_domains: config.tools.download.blocked_domains.clone(),
+        max_bytes: config.tools.download.max_bytes,
+        ..NetPolicy::default()
+    };
+    match DownloadTool::new(Arc::clone(&vfs), download_policy.clone()) {
+        Ok(tool) => tools.register(Arc::new(tool)),
+        Err(error) => warn!(%error, "cannot register Download"),
+    }
+
+    // Web 工具：服务端工具由 provider 声明；本地工具后端只在用户配置了
+    // base_url 与 key 时注册，不假定官方地址。
+    let protocol = model_ref.provider.api;
+    let mut server_tools: Vec<ServerToolKind> = Vec::new();
+    let mut add_server =
+        |kind: ServerToolKind, capability: &str, backend: crate::config::WebBackend| {
+            let server_capable = protocol != crate::config::models::Protocol::Chat
+                && model_ref.model.supports(capability);
+            if server_capable
+                && matches!(
+                    backend,
+                    crate::config::WebBackend::Auto | crate::config::WebBackend::Server
+                )
+            {
+                server_tools.push(kind);
+                true
+            } else {
+                false
+            }
+        };
+    let search_server = add_server(
+        ServerToolKind::WebSearch,
+        "server_tools.web_search",
+        config.tools.web_search.backend,
+    );
+    let fetch_server = add_server(
+        ServerToolKind::WebFetch,
+        "server_tools.web_fetch",
+        config.tools.web_fetch.backend,
+    );
+
+    let use_tool_backend = |backend: crate::config::WebBackend| {
+        matches!(backend, crate::config::WebBackend::Tool)
+            || (matches!(backend, crate::config::WebBackend::Auto)
+                && protocol == crate::config::models::Protocol::Chat)
+    };
+    if !search_server && use_tool_backend(config.tools.web_search.backend) {
+        if let Some(key) = auth
+            .tools
+            .web_search
+            .api_key
+            .value()
+            .filter(|_| !config.tools.web_search.base_url.trim().is_empty())
+        {
+            match WebBackend::new(config.tools.web_search.base_url.clone(), key) {
+                Ok(backend) => tools.register(Arc::new(WebSearchTool::new(
+                    Arc::new(backend),
+                    config.tools.web_search.count,
+                ))),
+                Err(error) => warn!(%error, "cannot register WebSearch"),
+            }
+        }
+    }
+    if !fetch_server && use_tool_backend(config.tools.web_fetch.backend) {
+        if let Some(key) = auth
+            .tools
+            .web_fetch
+            .api_key
+            .value()
+            .filter(|_| !config.tools.web_fetch.base_url.trim().is_empty())
+        {
+            match WebBackend::new(config.tools.web_fetch.base_url.clone(), key) {
+                Ok(backend) => tools.register(Arc::new(WebFetchTool::new(
+                    Arc::new(backend),
+                    config.tools.web_fetch.max_content_tokens,
+                    download_policy,
+                ))),
+                Err(error) => warn!(%error, "cannot register WebFetch"),
+            }
+        }
+    }
+
     let gateway: Option<Arc<dyn NapcatGateway>> = qq
         .as_ref()
         .map(|client| Arc::clone(client) as Arc<dyn NapcatGateway>);
@@ -618,12 +745,17 @@ async fn build_agent(
             },
             chat_history_limit: 20,
             hooks: config.hooks.context.clone(),
+            server_tools,
         },
         history,
         Arc::clone(&ai_enabled),
         estop_file,
     )
     .await?;
+
+    // monitor 只有在 runner 就绪后才能投递。
+    let _ = sink.runner.set(Arc::clone(&runner));
+    crate::monitor::load_config_monitors(&monitors, &config.monitor).await?;
 
     let filter = MessageFilter::from_config(&config.filter);
     let queue = ChatQueue::new(
@@ -635,6 +767,7 @@ async fn build_agent(
         runner,
         queue,
         ops,
+        monitors,
         self_id,
         filter,
         filtered: AtomicU64::new(0),
@@ -755,7 +888,9 @@ async fn handle_qq_event(
     data: &serde_json::Value,
     _self_id: u64,
 ) {
-    match crate::qq::event::normalize(name, data) {
+    let event = crate::qq::event::normalize(name, data);
+    agent.monitors.on_qq_event(&event).await;
+    match event {
         QqEvent::Message(message) => {
             if !agent.filter_and_count(&message) {
                 debug!(chat = %message.chat, "message rejected by the admission filter");

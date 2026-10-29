@@ -10,8 +10,14 @@
 //! 便于 `api.help`、审计与未来的策略表读取。
 
 pub mod api;
+pub mod download;
 pub mod fs;
+pub mod memory;
+pub mod monitor;
+pub mod net;
+pub mod skill;
 pub mod views;
+pub mod web;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

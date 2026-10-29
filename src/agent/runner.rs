@@ -53,6 +53,8 @@ pub struct RunnerConfig {
     pub chat_history_limit: u32,
     /// context hooks（AGENTS/USER/MEMORY/STYLE 或自定义）。
     pub hooks: Vec<crate::config::ContextHookConfig>,
+    /// 交给 provider 执行的服务端工具。
+    pub server_tools: Vec<crate::providers::ServerToolKind>,
 }
 
 /// 回合执行器。
@@ -207,10 +209,31 @@ impl Runner {
             anyhow::bail!("AI calls are stopped; run `sbot ai start` first");
         }
         let message = AgentMessage::user(format!(
-            "<owner_context source=\"control:{control_id}\">
-{text}
-</owner_context>"
+            "<owner_context source=\"control:{control_id}\">\n{text}\n</owner_context>"
         ));
+        self.run_injected("control", message).await
+    }
+
+    /// monitor 投递：以 `[monitor: name | source | time]` 信封进入上下文。
+    pub async fn run_event(&self, name: &str, source: &str, text: &str) -> Result<LoopOutcome> {
+        if !self.ai_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            anyhow::bail!("AI calls are stopped; run `sbot ai start` first");
+        }
+        if self.estop_file.exists() {
+            anyhow::bail!("ESTOP is active");
+        }
+        let message = AgentMessage::user(format!(
+            "[monitor: {} | {} | {}]\n{}",
+            name,
+            source,
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            text
+        ));
+        self.run_injected("monitor", message).await
+    }
+
+    /// 注入一条上下文消息并跑一个回合（控制通道与 monitor 共用）。
+    async fn run_injected(&self, origin: &str, message: AgentMessage) -> Result<LoopOutcome> {
         {
             let mut history = self.history.lock().await;
             history.push(message.clone());
@@ -220,7 +243,7 @@ impl Runner {
         let mut working = { self.history.lock().await.clone() };
         let base = working.len();
         let runtime = RuntimeContext {
-            origin_chat: "control".to_owned(),
+            origin_chat: origin.to_owned(),
             ..self.runtime_context(ChatId::Private(self.config.owner_qq))
         };
         let prompts = vec![AgentMessage::user(runtime.render())];
@@ -234,7 +257,7 @@ impl Runner {
                 system: self.system.clone(),
                 max_tokens: self.config.max_tokens,
                 thinking: self.config.thinking.clone(),
-                server_tools: Vec::new(),
+                server_tools: self.config.server_tools.clone(),
                 max_steps: self.config.max_steps,
                 retry: self.config.retry,
                 max_state_chars: 32_000,
@@ -362,7 +385,7 @@ impl Runner {
                 system: self.system.clone(),
                 max_tokens: self.config.max_tokens,
                 thinking: self.config.thinking.clone(),
-                server_tools: Vec::new(),
+                server_tools: self.config.server_tools.clone(),
                 max_steps: self.config.max_steps,
                 retry: self.config.retry,
                 max_state_chars: 32_000,
@@ -811,6 +834,7 @@ mod tests {
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
                 chat_history_limit: 10,
                 hooks: crate::config::HooksConfig::default().context,
+                server_tools: Vec::new(),
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -957,6 +981,7 @@ mod tests {
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
                 chat_history_limit: 10,
                 hooks: crate::config::HooksConfig::default().context,
+                server_tools: Vec::new(),
             },
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(AtomicBool::new(false)),

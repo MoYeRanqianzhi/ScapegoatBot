@@ -11,6 +11,7 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod ipc;
+pub mod monitor;
 pub mod paths;
 // 提示词在 Phase 5 由 runner 使用；Phase 4 已完成组装与测试。
 #[allow(dead_code)]
