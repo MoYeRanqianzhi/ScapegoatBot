@@ -31,6 +31,7 @@ ScapegoatBot 正在完全重构为全新项目，完整设计见 `.agents/plan/2
 - Swarm 保留，默认开启；默认模型 `anthropic/claude-opus-5-5` + `high`。
 - 默认协议 anthropic；chat/openai 同样实现 web 工具适配。
 - 消息白名单改为模型可控的 `[filter]`；过滤只影响提示，不影响存储。
+- 监视器 monitor（2026-10-30）：内容匹配触发、可指定目标、可唤醒，区别于 filter（是否提示）与 hook（生命周期注入）。匹配支持 `chat` / `sender` / `mention` / `keyword` / `regex` / `filter`，来源 `live | inbox | both`；动作 `inject` / `wake` / `notify` / `spawn`；典型用法是常驻“@ 我”监视器；可绑定常驻子代理专管某些群/好友；运行时 `agent.monitor` 增删、默认带 TTL；匹配受 `receive_scopes` 约束，注入内容照常过输入闸。Phase 4 基础、Phase 6 子代理绑定。
 - 内置 `docs` 子代理（2026-10-30 记录）：类似 `explore`，只读，工具集仅 `api.list` / `api.help` / `Read`，专门回答 action 用法，回结论与可复制的 `params` 样例；Phase 4 随工具注册表落地。
 
 ## 待定

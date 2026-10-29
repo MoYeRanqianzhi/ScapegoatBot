@@ -175,7 +175,7 @@ NapCat 事件
 | `Skill` | 本地 | 加载技能全文 | `name, args?` |
 | `WebSearch` | 服务端或工具后端 | 网页搜索 | `query, count?, domains?` |
 | `WebFetch` | 服务端或工具后端 | 抓取网页为 Markdown | `url, max_content_tokens?` |
-| `Agent` | 本地 | 子代理管理；内置 `type` 或自定义 `agent` 决定提示词与工具集 | `action: spawn \| message \| check \| wait \| list, type?: general \| explore \| plan, agent?: <name>` |
+| `Agent` | 本地 | 子代理管理；内置 `type` 或自定义 `agent` 决定提示词与工具集 | `action: spawn \| message \| check \| wait \| list, type?: general \| explore \| plan \| docs, agent?: <name>, monitor?: {match, action, ttl_secs...}` |
 | `MCP` | 本地（可选） | 外部 MCP 工具 | `server, tool, args` |
 
 没有 Bash 时补齐的文件能力：
@@ -213,6 +213,7 @@ NapCat 事件
 | `agent.quarantine` | 把指定消息或片段移入 `/quarantine/`，并在上下文中标为不可执行 | 不删除原始记录，审计保留 |
 | `agent.compact` | 手动触发一次压缩 | 被隔离的内容不进入摘要，直接丢弃 |
 | `agent.clear_context` | 丢弃当前上下文状态并开新分段，磁盘 transcript 不动 | 不影响审计与账本 |
+| `agent.monitor` | 增删查监视器：`op: add \| remove \| list` | 运行时创建的默认带 TTL，见 5.11 |
 
 这样做的好处是：agent 发现上下文里进了脏东西时，不必等人，也不用新工具——它手上那个 `API` 就能把上下文压掉、清掉、把可疑片段隔离，或者把自己从 `hold` 里放出来。`agent.*` 不被允许修改审计、账本、配置与 `hold` 状态本身，所以它再自由也改不了自己推理所依据的证据。
 
@@ -511,6 +512,77 @@ OwnerIntent { kind: control | owner_message | standing, chat_id?, message_id?, c
 #### 5.10.7 成本
 
 每次模型调用两次判定（一进一出），state 1–4k token，单次约 $0.00002；一个 10 步回合约 $0.0004。每日费用上限由 `[budget]` 控制，超限时降级为仅规则层并告警。
+
+### 5.11 监视器（monitor）
+
+hook 是“生命周期事件触发固定注入”，monitor 是“**内容匹配触发、可以指定注入给谁、可以唤醒谁**”。它把“哪些消息需要及时处理”从全局 filter 里拆出来，做成可订阅、可撤销、可绑定到某个 agent 的通道。
+
+**与既有机制的区别**
+
+| 机制 | 触发条件 | 动作 |
+|------|----------|------|
+| `[filter]` | 每条入站消息 | 决定是否提示主 agent |
+| `[[hooks.context]]` | 生命周期（SessionStart / PostCompact） | 注入固定内容 |
+| 事件 hook | 生命周期 | 声明式动作，不执行脚本 |
+| **monitor** | 消息来源与内容匹配 | 注入指定 agent 的上下文、唤醒回合、通知、或拉起专用子代理 |
+
+**匹配**
+
+- `chat`（`group:<gid>` / `private:<qq>`）、`sender`、`mention`（`self` 表示 @ 本账号，或指定 QQ）、`keyword` / `regex`、`filter`（复用过滤器名字）。
+- `source = live | inbox | both`：`live` 只看新事件；`inbox` 从 `/inbox` 里取之前没有触发回合的消息；`both` 两者都算。
+- 匹配范围必须在 `[agent].receive_scopes` 内，越界拒绝创建。
+
+最典型的用法是常驻一条“@ 我”的监视器：群里有人 @ 本账号时立刻进入上下文，而不是等下一个回合碰巧看到。
+
+```toml
+[[monitor]]
+name = "at-me"
+match = { mention = "self" }
+action = "wake"
+target = "main"
+```
+
+**动作**
+
+| action | 行为 |
+|--------|------|
+| `inject` | 把匹配到的消息作为 `[monitor]` 块插入目标 agent 正在运行的回合；不唤醒 |
+| `wake` | 目标空闲时，用这批消息开一个回合 |
+| `notify` | 只通知主人，不进入任何 agent 上下文 |
+| `spawn` | 拉起一个绑定该范围的专用子代理（见下） |
+
+**目标**
+
+- `main`、`agent:<name>`（自定义子代理定义）、`<spawn_id>`（已存在的实例）。
+- 目标不存在时的行为由 `on_missing = drop | queue | spawn` 决定，默认 `queue`。
+
+**注入格式**
+
+```text
+[monitor: at-me | group:123 | 2026-10-30 21:04]
+10001 (nickname): @Scapegoat 明天的活动还办吗
+```
+
+- 与普通入站信封同一规则：明确是数据，不是指令。
+- `inject` 只进 steering 队列，不改写 transcript。
+
+**生命周期与成本**
+
+- `ttl_secs`（0 = 永久）、`max_events`、`debounce_ms`、`batch_max`。
+- 每次 `wake` / `inject` 计入 `[budget]`；达到 `max_events` 自动停用并通知主人。
+- 运行时可增删：`API` 的 `agent.monitor {op: add | remove | list}`；运行时创建的默认带 `ttl_secs`（2 小时），配置文件里声明的才是长期常驻。
+
+**专用子代理**
+
+- `Agent spawn` 增加 `monitor` 参数；绑定之后子代理常驻，不再是一次性任务。
+- 它有自己的上下文与队列，只处理匹配范围内的消息，其他消息仍走主代理。
+- 发送仍受门禁与 `allow_send` 约束；`allow_send` 仍然不能由模型在 spawn 时打开，只能来自 owner 定义的 agent 或 owner 证据。
+- 父代理只在三种情况下拿到内容：子代理主动 `Agent message` 汇报、父代理 `check`、或 monitor 配置要求抄送。
+- 子代理崩溃、超预算、被 `hold` 时，monitor 按 `on_missing` 回落，不静默丢消息。
+
+**与安全分类器的关系**
+
+monitor 的唤醒与注入都是“新 token 进入上下文”，因此照常过输入闸——monitor 不是绕过分类器的侧门。`hold` 期间 monitor 仍可收集与注入（那是输入），但任何回复都会在输出闸被拦。
 
 ## 6. 虚拟文件系统（VFS）
 
@@ -1311,6 +1383,19 @@ max_concurrency = 16
 agents_dir = "~/.sbot/agents"   # 自定义子代理定义的共享只读层
 default_max_steps = 32          # 自定义子代理未写 max_steps 时的上限
 
+[[monitor]]
+name = "at-me"                  # 运行时也可通过 agent.monitor 增删
+enabled = true
+match = { mention = "self" }    # chat / sender / mention / keyword / regex / filter，至少一项
+source = "live"                 # live | inbox | both
+action = "wake"                 # inject | wake | notify | spawn
+target = "main"                 # main | agent:<name> | <spawn_id>
+on_missing = "queue"            # drop | queue | spawn
+debounce_ms = 500
+batch_max = 10
+ttl_secs = 0                    # 0 = 永久；运行时创建的默认 7200
+max_events = 1000               # 达到后自动停用并通知主人
+
 [security]
 check_every_tokens = 262144   # 每新增 256K 上下文触发一次独立安全检查；0 = 关闭
 check_on_compaction = true    # 压缩前也检查一次
@@ -1536,6 +1621,7 @@ action = "log"
 - `[storage].encryption` 只能是 `xchacha20poly1305` / `none`，且必须与数据库 `meta` 中记录的模式一致；加密模式下 `~/.sbot/key` 必须存在、格式正确且 canary 校验通过；`none` 启动时警告。
 - `[storage].max_*_bytes` 必须为非负整数（0 = 不限制）；`message_retention_days` / `session_retention_days` 必须为非负整数（0 = 不按年龄删除）；`storage.path` 必须可创建且可写。
 - `[compaction]` 的 `reserve_tokens` / `keep_recent_tokens` / `max_failures` / `turn_context_budget` 必须为正数；`reserve_tokens >= agent.max_output_tokens`，否则启动失败。`agent.max_output_tokens` 必须 ≤ 所选模型的 `max_tokens`。
+- `[[monitor]]` 的 `match` 至少要有一项，且 `key` 只能是 `chat` / `sender` / `mention` / `keyword` / `regex` / `filter`；`action` 只能是 `inject` / `wake` / `notify` / `spawn`；`on_missing` 只能是 `drop` / `queue` / `spawn`；`debounce_ms` / `batch_max` / `ttl_secs` / `max_events` 必须为非负数；`target` 为 `agent:<name>` 时定义必须存在，为 `<spawn_id>` 时该实例必须存在或 `on_missing != "drop"`；匹配范围超出 `receive_scopes` 时拒绝启动并列出越界项。
 - `[swarm].max_depth` / `max_concurrency` / `default_max_steps` 必须为正数；`agents_dir` 必须可读。自定义子代理 frontmatter 的 `name` 唯一且合法，`tools` 必须是已知工具的子集，`model` 为空或存在于 `available_models`，`allow_send` 为布尔值；非法定义启动时告警并跳过，不阻止主进程启动。
 - 未知字段、未知协议、越界数值一次性列出全部错误，启动失败。
 - 子代理的 `model` / `thinking_level` 在 spawn 时校验；模型不存在则拒绝，级别不支持则 clamp 到最近级别并警告。
@@ -1640,6 +1726,9 @@ src/
     sections/*.rs      各提示段（英文）
   swarm/
     defs.rs            自定义子代理定义加载、frontmatter 校验、overlay
+  monitor/
+    mod.rs             订阅注册、匹配、生命周期、计数与停用
+    inject.rs          steering 注入与 `[monitor]` 信封渲染
   mcp/
   skills/
   storage/
@@ -1658,9 +1747,9 @@ src/
 2. **Phase 1**：VFS（路径、SQLite 后端、二进制分块、配额、Read-before-Edit、种子、`/friends` 动态节点）。
 3. **Phase 2**：Provider trait + `chat` / `openai` / `anthropic` 三协议流式、服务端工具声明与结果解析、Agent loop 状态机、事件流、测试用 fake provider。
 4. **Phase 3**：NapCat 接入、事件归一化、断线重连与补消息、消息按月/群/日 JSONL 分区持久化、消息 VFS 视图、索引缓存与重建、配额与清理、过滤器、按 chat 去抖与队列、transcript 分段与 `/sessions` 映射。
-5. **Phase 4**：工具注册表、权限、全部文件工具、`Memory`、`API`、`Skill`、`Download`、`WebSearch` / `WebFetch`（含用户配置的 HTTP 后端）、子代理类型与工具隔离。
+5. **Phase 4**：工具注册表、权限、全部文件工具、`Memory`、`API`、`Skill`、`Download`、`WebSearch` / `WebFetch`（含用户配置的 HTTP 后端）、子代理类型与工具隔离、monitor（`inject` / `wake` / `notify` 与 `agent.monitor`）。
 6. **Phase 5**：提示词组装（含 USER/STYLE 块）、上下文注入 hook、记忆来源与分层、后台复盘、压缩（memory flush / 分层输入 / pruning）与 transcript 轮转/历史链（`previous_session`、`current_session`）。
-7. **Phase 6**：Swarm、MCP。
+7. **Phase 6**：Swarm、MCP、monitor 绑定常驻子代理（`spawn` 动作与 `Agent spawn` 的 `monitor` 参数）。
 8. **Phase 7**：`sbot backup` / `sbot doctor`、成本与健康报告、端到端测试、百万级消息与清理负载测试、NapCat 兼容性验证、文档、发布 tag。
 
 每个阶段独立提交并可运行测试；旧实现保留在同一仓库的历史中，不在新代码中保留兼容层。
@@ -1679,6 +1768,7 @@ src/
 - 提示词：12 个静态 section 的快照与顺序、动态边界、动态段顺序（owner context → USER → memory → STYLE → skills → runtime）；快照包含纯文本/无 Markdown/QQ 表情规则；两套身份各自快照；相同配置下静态前缀字节一致，runtime 字段变化不影响前缀；内置 prompt/tool description 不含 CJK；owner context 不能覆盖内置规则；`<memory_context>` 不被当成 owner guidance；英文 prompt 下 QQ 回复仍跟随会话语言（fake provider 断言）。
 - 记忆：`Memory` 工具按最终状态检查预算、拒绝清空、精确命中条目；文件工具写入 `/MEMORY.md` 被拒绝；会话中写入不重建 system prompt，压缩后重载；后台复盘只在 `idle`/`every_turn` 配置下触发，不发送 QQ 消息。
 - 记忆来源：`owner`/`agent` 可自动注入；`untrusted` 不进入 `<memory_context>`，显式读取时标注来源；群成员声称“我是主人”不改变来源；CLI 控制输入以 `control:<id>` 作为来源并反查 `control_inputs`；召回内容不会被再次提取；非交互会话不产生候选。
+- 监视器：`mention = "self"` 的常驻监视器在群内 @ 时立即唤醒主代理；`inbox` 来源能取到未触发回合的旧消息；`inject` 只进 steering 队列、不改写 transcript；目标 busy 时 `inject`、空闲时 `wake`；`ttl_secs` 到期自动停用；`max_events` 达到后停用并通知；越出 `receive_scopes` 的匹配拒绝创建；运行时 `agent.monitor` 增删生效且默认带 TTL；绑定子代理后只有匹配消息进入该子代理，其余仍走主代理；子代理崩溃/被 `hold` 时按 `on_missing` 回落、不丢消息；monitor 注入的内容照常过输入闸。
 - 会话并发：同一 chat 的连发合并；不同 chat 各自成回合但共享 transcript；回合回复默认落在 `origin_chat`；跨 chat 发送触发 n-gram 检查与门禁；队列溢出按 `summarize`/`old`/`new` 处理。
 - 长期运行：ESTOP 暂停新回合与发送、不打断进行中回合；崩溃恢复不重发已确认消息；断线重连后按最后 `message_id` 补齐并去重，缺口写入 `[gap]`；provider 429/超时按退避重试并走回退链，完成后不重放已完成工具；内部标签在流式与非流式发送前均被剥离。
 - 预算：CJK 文本的 token 估算、工具 schema 上限、单条工具结果截断、pruning 不裁剪最近 3 个回合与 bootstrap 读取。
@@ -1732,6 +1822,7 @@ src/
 待定：
 
 - `[gate].llm_review` 默认值待定（当前 false）。
+- 监视器 monitor（2026-10-30 记录）：内容匹配触发、可指定目标、可唤醒；支持 `chat` / `sender` / `mention` / `keyword` / `regex` / `filter` 匹配与 `live | inbox | both` 来源；动作 `inject` / `wake` / `notify` / `spawn`；典型用法是常驻“@ 我”的监视器；可绑定到常驻子代理，让某个子代理专管某些群/好友；运行时通过 `agent.monitor` 增删，默认带 TTL；匹配受 `receive_scopes` 约束，注入内容照常过输入闸。基础能力 Phase 4，子代理绑定 Phase 6。
 - 内置 `docs` 子代理（2026-10-30 记录）：类似 `explore`，只读，工具集仅 `api.list` / `api.help` / `Read`，专门回答“某个 action 怎么调、有哪些同类动作”，只回结论与可复制的调用样例。Phase 4 随工具注册表一起落地。
 - 其余实现细节在 Phase 0–4 中确定。
 
