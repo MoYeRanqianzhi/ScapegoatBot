@@ -114,7 +114,9 @@
 
 ### API
 
-> Perform a QQ operation through NapCat. `action` is a registered action name; `params` must match that action's schema. Message segments use the array form, for example `[{"type":"reply","data":{"id":98765}},{"type":"at","data":{"qq":10001}},{"type":"text","data":{"text":"hello"}},{"type":"face","data":{"id":14}}]`. Do not write CQ codes. The action catalog is generated from the action registry and grouped by:
+> Perform a registered action. `params` must match that action's schema. There are two namespaces.
+>
+> **`napcat.*` — QQ operations.** Message segments use the array form, for example `[{"type":"reply","data":{"id":98765}},{"type":"at","data":{"qq":10001}},{"type":"text","data":{"text":"hello"}},{"type":"face","data":{"id":14}}]`. Do not write CQ codes. The catalog is generated from the action registry and grouped by:
 >
 > - message: `send_group_msg`, `send_private_msg`, `delete_msg`, `set_msg_emoji_like`, `send_poke`
 > - query: `get_friend_list`, `get_group_list`, `get_group_member_list`, `get_group_member_info`, `get_msg`, `get_group_msg_history`
@@ -123,11 +125,24 @@
 > - file: `upload_group_file`, `upload_private_file`, `get_group_file_url`, and related actions
 > - profile/system: `set_qq_profile`, `set_online_status`, `get_login_info`, `get_version_info`, `get_status`
 >
-> The exact action list, parameters, and return fields are in the generated catalog. Sends return a `message_id`; the runtime records them as `sender = self`. Every call passes the gate. On failure, returns a readable error; do not retry a send without checking whether it went out. Use query actions to verify identity or target before destructive actions.
+> **`self.*` — your own runtime.** These never reach QQ and are always available:
+>
+> - `self.status` — current hold state, last verdicts, budget usage, scopes.
+> - `self.resume` — re-check the current context with the input gate; if it passes, outbound chat turns back on. A no-op when not on hold.
+> - `self.quarantine` — move a message or excerpt into `/quarantine/` and mark it non-executable in context. The original record stays for audit.
+> - `self.compact` — run compaction now. Quarantined content is dropped rather than summarized.
+> - `self.clear_context` — discard the current in-memory context and start a new segment; the transcript on disk is untouched.
+> - `self.help` — look up how any action works: `{}` lists namespaces and categories, `{"action":"napcat.set_group_ban"}` returns its parameters, returns, examples, gate rules, and whether it works during a hold, `{"query":"ban"}` searches names by name and summary.
+>
+> The description above is only one line per action. When you are unsure about an action's parameters, call `self.help` first instead of guessing; a wrong field is rejected and wastes a step.
+>
+> Use `self.*` when you see something in your own context that should not stay there: isolate it, compact around it, or clear the context. Use `self.resume` only when you have dealt with what tripped the gate; the gate re-checks the current context and will refuse if it still sees a problem.
+>
+> Sends return a `message_id`; the runtime records them as `sender = self`. Every `napcat.*` call passes the gate, and during a hold every one of them returns `Disabled during hold`. On failure, returns a readable error; do not retry a send without checking whether it went out. Use query actions to verify identity or target before destructive actions.
 
 参数：`action`, `params`。
 
-> 实现注：`API` description 由 action registry 生成；每个 action 一行 summary、参数 schema 与返回字段。不要手写一个不断漂移的巨大字符串。
+> 实现注：`API` description 由 action registry 生成；两个命名空间共用同一个 `action` 字段，前缀决定分发。每个 action 一行 summary、参数 schema 与返回字段。不要手写一个不断漂移的巨大字符串。
 
 ### Download
 

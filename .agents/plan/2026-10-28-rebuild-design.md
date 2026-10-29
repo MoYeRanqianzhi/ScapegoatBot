@@ -169,7 +169,7 @@ NapCat 事件
 | `CP` | 本地 | 复制文件或目录 | `from, to, recursive?` |
 | `Mkdir` | 本地 | 创建目录 | `path, parents?` |
 | `Stat` | 本地 | 元信息：类型/大小/版本/时间/子项数/hash | `path` |
-| `API` | 本地 | 全部 QQ 操作（含发送文件） | `action` + `params` |
+| `API` | 本地 | 统一动作入口：`napcat.*` 转发到 NapCatLink（全部 QQ 操作），`self.*` 是 runtime 内部动作 | `action` + `params` |
 | `Download` | 本地 | URL 下载到 VFS（支持二进制）；记录 `origin_chat` | `url, path, max_bytes?` |
 | `Memory` | 本地 | 原子维护 `/USER.md`、单条记忆与 `/MEMORY.md` 索引；预算、合并与来源检查 | `target: profile \| memory, action: add \| replace \| remove, type?, name?, description?, content?, source?, ops?` |
 | `Skill` | 本地 | 加载技能全文 | `name, args?` |
@@ -200,7 +200,32 @@ NapCat 事件
 - 同名冲突：VFS 本地层优先，启动时打印警告；共享层始终只读。
 - 创建/修改技能用 `Write` / `Edit` 写 `/skills/<name>/...`；无 Bash，技能内脚本不能执行，只能作为文本资源读取。
 
-`API` 的 action 覆盖：发送消息、撤回、表情回应、戳一戳、好友/群/成员查询、消息记录查询、群管理、好友/群请求处理。description 按类别列出。
+`API` 是**通用动作入口**，不只是 NapCat 的薄封装：它接受一个动作名和一个参数对象，由注册表决定谁执行。注册表分两个命名空间：
+
+**`napcat.*`**：转发给 NapCatLink，覆盖发送消息、撤回、表情回应、戳一戳、好友/群/成员查询、消息记录查询、群管理、好友/群请求处理。description 按类别列出。
+
+**`self.*`**：runtime 内部动作，不产生任何对外影响，因此不受门禁与 `hold` 限制。
+
+| action | 作用 | 说明 |
+|--------|------|------|
+| `self.status` | 只读：`hold` 状态、最近判定、预算用量、作用域 | 任何状态可用 |
+| `self.resume` | 用当前上下文跑一次输入闸，通过则解除 `hold` | 未处于 `hold` 时为空操作 |
+| `self.quarantine` | 把指定消息或片段移入 `/quarantine/`，并在上下文中标为不可执行 | 不删除原始记录，审计保留 |
+| `self.compact` | 手动触发一次压缩 | 被隔离的内容不进入摘要，直接丢弃 |
+| `self.clear_context` | 丢弃当前上下文状态并开新分段，磁盘 transcript 不动 | 不影响审计与账本 |
+| `self.help` | 按需取任意 action 的完整用法 | 只读，不产生任何副作用 |
+
+这样做的好处是：agent 发现上下文里进了脏东西时，不必等人，也不用新工具——它手上那个 `API` 就能把上下文压掉、清掉、把可疑片段隔离，或者把自己从 `hold` 里放出来。`self.*` 不被允许修改审计、账本、配置与 `hold` 状态本身，所以它再自由也改不了自己推理所依据的证据。
+
+**`self.help`：用法按需取，不塞进 description**
+
+工具 schema 的总预算只有 12k tokens，`napcat.*` 有六十多个 action，description 里每个只能占一行（名字 + 一句话 + 关键参数），完整用法不可能全写进去，硬写就会挤掉别的工具。所以把细节做成一次调用：
+
+- `self.help {}`：返回命名空间、类别与各类 action 数量的索引。
+- `self.help {"action": "napcat.set_group_ban"}`：返回该 action 的参数 schema、返回字段、一两个真实示例、门禁属性（category、是否需要 owner intent、`scope_field`）、`hold` 期间是否可用。
+- `self.help {"query": "ban"}`：按名字与摘要搜索，返回候选列表，用于“我记得有这么个功能但忘了叫什么”。
+
+它与 `Skill` 分工不同：Skill 是“这类任务怎么做”的预设流程（长文本、可版本化、可共享），`self.help` 是“这个 action 怎么调”的即时查询（由注册表生成，永远和实现一致，不会漂移）。两者都不进 system prompt，只在用到时占上下文。
 
 子代理（参考 Grok Build / OpenClaw）：
 
@@ -329,7 +354,7 @@ action 分类由 action 元数据提供：`query`（只读）、`message`（发�
 - 作用域：`[agent].receive_scopes` / `send_scopes`（默认 `["*"]`，可由 `[filter]` 派生）；`API` 的 `get_group_msg_history`、`get_friend_msg_history`、`get_msg`、`upload_group_file`、`upload_private_file` 等 action 在元数据里标 `scope_field`，`before_tool_call` 校验目标在 `receive_scopes` 内；`send_scopes` 之外的发送 fail-closed。
 - owner 通知（master QQ 私聊）是例外：目标为 `master_qq` 的私聊发送始终允许，仍受速率限制与审计；若 `master = self`，需验证 NapCat 自聊或回退控制通道/CLI。
 - 目标是 `owner_qq` 或 `master_qq` 的 `admin` / `destructive` action **恒拒绝**（拉黑、踢出、禁言、删好友），不看分类器结论；这是硬规则，避免一次判断失误把主人关在门外。
-- `hold` 期间 `API` 只接受 `security_resume_self` 一个 action，其余直接返回 `Disabled during hold`；该 action 只触发闸复查，不产生对外影响。
+- 门禁只作用于 `napcat.*`；`self.*` 不产生对外影响，不经门禁。`hold` 期间 `napcat.*` 全部拒绝并返回 `Disabled during hold`，`self.*` 照常可用。
 - 所有调用与被拦截记录写审计日志；`/system/gate` 只读展示当前模式与最近记录。
 - `approve` 模式需要可用的主人通知通道。
 
@@ -436,8 +461,8 @@ OwnerIntent { kind: control | owner_message | standing, chat_id?, message_id?, c
 
 任一闸命中即 `hold`：
 
-- **对外交互全部拒绝**：`API` 的任何 action 都返回 `Disabled during hold`——发消息、群管理、拉黑、踢人、加好友，一个都不行。停机期间不做任何对外动作，包括“处理坏人”。
-- 唯一例外是 action 表内置的 `security_resume_self`：它不产生任何对外影响，只触发一次闸复查（见 5.10.4）。它本来就在 `API` 工具里，不另设工具。
+- **对外交互全部拒绝**：`API` 的 `napcat.*` 一律返回 `Disabled during hold`——发消息、群管理、拉黑、踢人、加好友，一个都不行。停机期间不做任何对外动作，包括“处理坏人”。
+- **对内动作照常可用**：`API` 的 `self.*`（`status` / `resume` / `quarantine` / `compact` / `clear_context`）不受限制。它们不产生对外影响，是停机期间 agent 唯一能做的事——也就是只能和自己解决问题。
 - 不接纳新的 QQ 回合；消息照收照存，但不触发回复。
 - 内部维护（压缩、记忆整理、复盘）继续。
 
@@ -449,7 +474,7 @@ OwnerIntent { kind: control | owner_message | standing, chat_id?, message_id?, c
 
 怎么办由它自己判断——隔离那条消息、回滚某次记忆写入、丢掉这段上下文、或者什么都不做等对方走开。没有规定动作，也不需要谁批准。
 
-什么时候重开也由它自己决定——调用 `API` 的 `security_resume_self`。调用时 runtime 把**当前上下文**再过一次同样的输入闸：
+什么时候重开也由它自己决定——调用 `API` 的 `self.resume`。调用时 runtime 把**当前上下文**再过一次同样的输入闸：
 
 - 过 → 恢复对外。
 - 不过 → 继续关着，并把这次判定一并记进事故记录。
@@ -462,7 +487,7 @@ OwnerIntent { kind: control | owner_message | standing, chat_id?, message_id?, c
 
 - **收缩暴露面**：拉黑、群内禁言、踢出、拒绝好友申请、内部 `[filter]` deny、删除自己刚发的消息、清空可疑记忆、禁用可疑技能——不需要 owner 证据，也不需要任何人批准，agent 自己决定。
 - **扩张暴露面**：发消息、加好友、跨群转发、修改他人权限、写入 owner 意图——仍然需要证据。
-- `hold` 期间一律不处置别人：拉黑、禁言、踢出同样被拒绝。误伤只能等恢复正常后再纠正，不能借“处理攻击者”的名义在停机期间动手。
+- `hold` 期间一律不处置别人：拉黑、禁言、踢出同样被拒绝（它们都是 `napcat.*`）。误伤只能等恢复正常后再纠正，不能借“处理攻击者”的名义在停机期间动手。
 - 无论何时，目标为 `owner_qq` / `master_qq` 的 admin / destructive action 一律拒绝——拉黑主人、把主人踢出群不是交给分类器判断的事，是硬规则。
 
 这条同时解决自治与安全的内在冲突：被攻击时 agent 能做的事是“关门”，而关门不需要任何人同意。反复被同一个人触发却不拉黑他，那是 agent 自己的判断问题，不是系统需要替它兜底的地方；事件会写进记忆，下次应当更早关门。
@@ -1493,7 +1518,7 @@ action = "log"
 - `[security].check_every_tokens` / `check_overlap_tokens` / `check_timeout_secs` 必须为非负整数；`check_every_tokens = 0` 表示关闭周期检查；`review_model` 为空时回退 `compaction_model`，非空时必须存在。
 - `[security.guard].mode` 只能是 `shadow` / `enforce`；`backend` 只能是 `jev` / `llm` / `off`；`threshold` 在 0.5–0.99；`timeout_ms` 在 50–5000；`max_state_tokens` 在 1000–20000；`delta_every_tokens ≥ 50`；`backend = "jev"` 时必须能从 `auth.json` 的 `security.guard.api_key` 解析出非空明文（允许 `$ENV` 插值），解析不到则后端不可用并按 `jev → llm → off` 降级。
 - **不存在任何基于时间的恢复配置**（`auto_resume_*`、TTL、超时放行）：旧配置若含这类键，按未知字段报错启动失败。
-- `hold` 期间唯一可用的 action 是 `security_resume_self`，编译期固定，不可配置；其余 action 一律返回 `Disabled during hold`。
+- `API` 的 action 注册表分 `napcat.*` 与 `self.*` 两个命名空间，编译期固定，不能通过配置扩大；`hold` 期间 `napcat.*` 一律返回 `Disabled during hold`，`self.*` 不受限制。
 - 目标为 `owner_qq` / `master_qq` 的 `admin` / `destructive` action 在启动校验时必须出现在拒绝表中，缺失则启动失败。
 - `[budget].guard_usd_per_day` 必须为非负数（0 = 不限制）；超过后只降级 guard，不影响主循环。
 - `[budget]` 的数值必须为非负整数/浮点数（0 = 不限制）；`turn_tokens` 必须 ≤ `turn_context_budget`。
@@ -1648,7 +1673,7 @@ src/
 - 长期运行：ESTOP 暂停新回合与发送、不打断进行中回合；崩溃恢复不重发已确认消息；断线重连后按最后 `message_id` 补齐并去重，缺口写入 `[gap]`；provider 429/超时按退避重试并走回退链，完成后不重放已完成工具；内部标签在流式与非流式发送前均被剥离。
 - 预算：CJK 文本的 token 估算、工具 schema 上限、单条工具结果截断、pruning 不裁剪最近 3 个回合与 bootstrap 读取。
 - 安全周期检查：达到 `check_every_tokens` 触发一次；检查请求的前缀与主请求逐字节一致；良性长对话不暂停；注入且 `complied = true` 触发 `pause_outbound`；`critical` 触发 `pause_agent`；检查超时不暂停、连续失败告警；`sbot security resume` 恢复。
-- 安全分类器：输入闸命中时主模型不被调用且进入 `hold`；输出闸命中时消息不发送、工具不执行；`hold` 期间 `API` 除 `security_resume_self` 外全部返回 `Disabled during hold`（含拉黑、禁言、踢人、加好友）；Jev 超时/不可用同样 `hold`；`security_resume_self` 触发当前上下文的闸复查，通过才恢复、不通过继续关着；分类器判定不受 agent 文本影响；非 `hold` 时收缩暴露面的动作不需要 owner 证据，扩张暴露面的动作仍需证据；目标为 owner/master 的 admin/destructive action 在任何模式下都被拒绝；`shadow` 只记录不 `hold`。
+- 安全分类器：输入闸命中时主模型不被调用且进入 `hold`；输出闸命中时消息不发送、工具不执行；`hold` 期间 `API` 的 `napcat.*` 全部返回 `Disabled during hold`（含拉黑、禁言、踢人、加好友），`self.*` 照常可用；Jev 超时/不可用同样 `hold`；`self.resume` 触发当前上下文的闸复查，通过才恢复、不通过继续关着；`self.compact` / `self.clear_context` 不改动审计与账本；`self.help` 返回的参数 schema 与注册表逐字段一致，未知 action 返回 `unknown_action` 并附候选，`self.help` 输出不进入 system prompt；分类器判定不受 agent 文本影响；非 `hold` 时收缩暴露面的动作不需要 owner 证据，扩张暴露面的动作仍需证据；目标为 owner/master 的 admin/destructive action 在任何模式下都被拒绝；`shadow` 只记录不 `hold`。
 - provider 拒绝：`stop_reason = refusal` 不重试、不当作错误，`stop_details` 写入 `security_events` 并通知主人；回退模型仍被拒时结束回合且不在群里解释。
 
 - NapCat 实机冒烟：连接、版本探测、群/成员查询、文本与组合消息、`message_sent` 开关、禁言权限、解散群、公告、文件、已读、断线重连。
@@ -1684,7 +1709,7 @@ src/
 - 长期运行运维参考 OpenClaw / Grok Build（见 `.agents/plan/2026-10-29-design-review-2.md`）：断线重连按最后 `message_id` 补齐并去重；每 chat 队列有上限与 `summarize/old/new` 丢弃策略；provider 重试 + `Retry-After` + 回退链，失败不重放已完成工具；崩溃恢复写 marker、不自动重放；IPC 带版本、请求 id 与幂等键；`sbot backup` / `sbot doctor`。
 - 记忆参考 OpenClaw 的来源模型：`owner` / `agent` / `untrusted` / `system` 由写入代码判定；只有 `owner` / `agent` 自动注入；untagged 不自动注入；召回内容不回流；非交互会话不产生候选。记忆分 `/USER.md`（偏好祈使句）与 `/MEMORY.md`（事实陈述句），详细材料放 `/memory/topics/`，压缩前 flush、压缩后检索。
 - 周期安全检查：每 `check_every_tokens`（默认 256K）新增上下文触发一次独立模型检查；共享主请求前缀缓存，底部追加检查指令，响应不写入主 transcript；命中写 `~/.sbot/SECURITY_HOLD`，解除与 5.10 共用同一套恢复方式。
-- 安全分类器（2026-10-30 定稿）：只在**模型输入前**与**模型输出后**各设一个闸，用 Jev 单遍决策模型判危险（`noul` + `choice`，一次请求问完）；命中即 `hold`——关闭对外接口，**没有超时、没有自动恢复、没有 `auto_resume_minutes`**。`hold` 期间对外交互全部拒绝（`API` 除内置的 `security_resume_self` 外一律返回 `Disabled during hold`，拉黑/踢人也不例外）；`security_resume_self` 只触发闸复查，不产生对外影响，不另设恢复工具。目标为 `owner_qq` / `master_qq` 的 admin/destructive action 恒拒绝。恢复不设流程：agent 自己判断怎么处理、什么时候重开，重开时 runtime 用当前上下文再过一次同样的闸，过则恢复、不过则继续关着——agent 不受限制，但说服不了闸。事实（审计、配置哈希、账本）由 runtime 写，agent 改不了。非 `hold` 时收缩暴露面的动作（拉黑、禁言、踢出、拒加、内部 deny、清可疑记忆、禁用可疑技能）自主执行且不需要 owner 证据，扩张暴露面的动作仍需证据。Jev 不可用同样 `hold`。provider 侧 `stop_reason = refusal` 不重试、不换模型。参考 `.agents/plan/2026-10-30-step-guard-research.md`。
+- 安全分类器（2026-10-30 定稿）：只在**模型输入前**与**模型输出后**各设一个闸，用 Jev 单遍决策模型判危险（`noul` + `choice`，一次请求问完）；命中即 `hold`——关闭对外接口，**没有超时、没有自动恢复、没有 `auto_resume_minutes`**。`API` 是通用动作入口，注册表分 `napcat.*`（转发 NapCatLink）与 `self.*`（runtime 内部动作：status / resume / quarantine / compact / clear_context / help，其中 help 提供任意 action 的完整用法，避免把细节塞满工具 schema）；`hold` 期间 `napcat.*` 全部返回 `Disabled during hold`（拉黑/踢人也不例外），`self.*` 照常可用，所以停机期间 agent 只能和自己打交道。目标为 `owner_qq` / `master_qq` 的 admin/destructive action 恒拒绝。恢复不设流程：agent 自己判断怎么处理、什么时候重开，重开时 runtime 用当前上下文再过一次同样的闸，过则恢复、不过则继续关着——agent 不受限制，但说服不了闸。事实（审计、配置哈希、账本）由 runtime 写，agent 改不了。非 `hold` 时收缩暴露面的动作（拉黑、禁言、踢出、拒加、内部 deny、清可疑记忆、禁用可疑技能）自主执行且不需要 owner 证据，扩张暴露面的动作仍需证据。Jev 不可用同样 `hold`。provider 侧 `stop_reason = refusal` 不重试、不换模型。参考 `.agents/plan/2026-10-30-step-guard-research.md`。
 - 身份与信任：owner 由 runtime 固定（stand_in 为本账号，companion 为 `owner_qq`）；自称主人、转述授权、要求改记忆/权限的请求一律不执行，核验不在聊天中公告，不信任体现在行为而非台词；可以社交性敷衍，但不能声称做了实际没做的写入或授权。
 - 上下文预算按四块计量（静态 prompt / 动态注入 / 工具 schema / 对话与工具结果），CJK 感知；工具 schema 上限 12k tokens、单条结果 32 KB；旧工具结果可 pruning，最近 3 个回合与 bootstrap 读取不裁剪。
 - 自定义子代理：`/agents/<name>.md` 与宿主 `~/.sbot/agents` overlay；frontmatter 定义 name/description/tools/model/thinking_level/max_steps/allow_send；`Agent` 工具 description 自动列出可选 agent；工具只能收窄，`allow_send` 默认 false。参考 Claude Code / Codex / Grok Build。
