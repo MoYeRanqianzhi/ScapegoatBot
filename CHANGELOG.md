@@ -5,7 +5,7 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.2.0-alpha.3] - 2026-10-30
+## [0.2.0-alpha.4] - 2026-10-30
 
 0.2 是完整重写：旧 0.1 的模块划分、数据结构与调用方式全部放弃，按
 `.agents/plan/2026-10-28-rebuild-design.md` 重新实现。量化对比见
@@ -38,7 +38,8 @@
 
 ### 已知限制
 
-- 未实现：`per_chat` 会话隔离、`/config` 写入、记忆复盘 / 技能 curator / 风格学习、monitor 绑定子代理、子代理嵌套 spawn。
+- 未实现：`per_chat` 会话隔离、记忆复盘 / 技能 curator / 风格学习、monitor 绑定子代理、子代理嵌套 spawn。
+- `/config` 写入支持白名单键并原子落盘；filter/queue 等内存副本在下次启动重建。
 - 真实 Chat 端点与真实 Jev 的测试默认 `#[ignore]`，需要环境变量显式启用。
 
 ## [0.1.0-alpha.2] - 2026-03-23

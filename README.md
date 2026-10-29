@@ -107,7 +107,8 @@ account_qq = 10000
 ## 隐私与已知限制
 
 - `[session].scope` 默认 `shared`：整个 QQ 号一份 transcript，跨聊天上下文会互相可见。需要强隔离时配置项已存在，但 **`per_chat` 尚未实现**。
-- **未实现**：`per_chat` 会话隔离、`/config` 写入（当前只读）、记忆复盘 / 技能 curator / 风格学习、monitor 绑定子代理、子代理嵌套 spawn 与 `Agent message` 的完整定义保持。
+- **未实现**：`per_chat` 会话隔离、记忆复盘 / 技能 curator / 风格学习、monitor 绑定子代理、子代理嵌套 spawn 与 `Agent message` 的完整定义保持。
+- `/config` 写入已支持白名单键（`[filter]`、`[agent].available_models` / `thinking_level`、`[compaction]`、`[skills]`、`[queue]`、`[style]`），其余键只读；写入会校验并原子落盘，但 filter/queue 等组件的内存副本在下次启动才重建。
 - 尚未提供旧 0.1 数据迁移；0.2 从空存储开始。
 - `tools::web` 的搜索/抓取依赖用户配置的端点，不内置官方地址。
 
