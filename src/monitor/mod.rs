@@ -32,6 +32,8 @@ use crate::qq::format;
 pub struct MonitorDelivery {
     pub name: String,
     pub source: String,
+    /// `None` = 主代理；`Some("sa-…")` = 绑定的子代理实例；`Some("agent:<name>")` = 按定义名。
+    pub target: Option<String>,
     /// `true` 表示作为指令投递（`as = "prompt"`）。
     pub as_prompt: bool,
     pub text: String,
@@ -148,6 +150,8 @@ pub enum TimerSpec {
 struct Monitor {
     name: String,
     source: String,
+    /// 投递目标；`None` 表示主代理。
+    target: Option<String>,
     when: Option<String>,
     prompt: Option<String>,
     as_prompt: bool,
@@ -199,6 +203,7 @@ impl MonitorManager {
         min_interval: Duration,
         idle_only: bool,
         batch_window: Duration,
+        target: Option<String>,
     ) -> Result<()> {
         {
             let mut monitors = self.monitors.write().await;
@@ -208,6 +213,7 @@ impl MonitorManager {
             let monitor = Arc::new(Monitor {
                 name: name.clone(),
                 source,
+                target,
                 when,
                 prompt,
                 as_prompt,
@@ -258,6 +264,7 @@ impl MonitorManager {
                 serde_json::json!({
                     "name": monitor.name,
                     "source": monitor.source,
+                    "target": monitor.target,
                     "delivered": monitor.delivered.load(Ordering::Relaxed),
                     "max_events": monitor.max_events,
                     "one_shot": monitor.one_shot,
@@ -323,6 +330,7 @@ impl MonitorManager {
                         .deliver(MonitorDelivery {
                             name: monitor.name.clone(),
                             source: "internal".to_owned(),
+                            target: monitor.target.clone(),
                             as_prompt: false,
                             text: format!(
                                 "system: monitor {:?} has an invalid `when` expression: {error}",
@@ -397,6 +405,7 @@ async fn deliver_once(
         sink.deliver(MonitorDelivery {
             name: monitor.name.clone(),
             source: monitor.source.clone(),
+            target: monitor.target.clone(),
             as_prompt: false,
             text: format!(
                 "system: monitor {:?} expired and was disabled",
@@ -412,6 +421,7 @@ async fn deliver_once(
         sink.deliver(MonitorDelivery {
             name: monitor.name.clone(),
             source: monitor.source.clone(),
+            target: monitor.target.clone(),
             as_prompt: false,
             text: format!(
                 "system: monitor {:?} reached its event limit and was disabled",
@@ -467,6 +477,7 @@ async fn deliver_once(
     sink.deliver(MonitorDelivery {
         name: monitor.name.clone(),
         source: monitor.source.clone(),
+        target: monitor.target.clone(),
         as_prompt: monitor.as_prompt,
         text,
         system: false,
@@ -500,6 +511,7 @@ fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, timer: TimerSp
                             sink.deliver(MonitorDelivery {
                                 name: monitor.name.clone(),
                                 source: "internal".to_owned(),
+                                target: monitor.target.clone(),
                                 as_prompt: false,
                                 text: format!(
                                     "system: monitor {:?} has an invalid cron expression: {error}",
@@ -696,6 +708,11 @@ pub async fn load_config_monitors(
                 Duration::from_secs(monitor.lifecycle.min_interval_secs),
                 monitor.lifecycle.idle_only,
                 Duration::from_millis(monitor.deliver.batch_window_ms),
+                if monitor.deliver.to == "main" {
+                    None
+                } else {
+                    Some(monitor.deliver.to.clone())
+                },
             )
             .await?;
 
@@ -836,6 +853,7 @@ mod tests {
                 Duration::ZERO,
                 false,
                 Duration::ZERO,
+                None,
             )
             .await
             .unwrap();
@@ -878,6 +896,7 @@ mod tests {
                 Duration::ZERO,
                 false,
                 Duration::ZERO,
+                None,
             )
             .await
             .unwrap();
@@ -907,6 +926,7 @@ mod tests {
                 Duration::ZERO,
                 false,
                 Duration::ZERO,
+                None,
             )
             .await
             .unwrap();
@@ -934,6 +954,7 @@ mod tests {
                 Duration::ZERO,
                 false,
                 Duration::from_millis(50),
+                None,
             )
             .await
             .unwrap();
@@ -978,6 +999,7 @@ mod tests {
                 Duration::ZERO,
                 true,
                 Duration::ZERO,
+                None,
             )
             .await
             .unwrap();

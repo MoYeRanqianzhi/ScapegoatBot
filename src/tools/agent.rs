@@ -11,6 +11,7 @@ use async_trait::async_trait;
 
 use super::{Permission, Tool, ToolContext, arg_opt_str, arg_str, object_schema};
 use crate::agent::ToolResult;
+use crate::monitor::{CronSchedule, MonitorManager, TimerSpec};
 use crate::swarm::{AgentHub, AgentType};
 
 /// 子代理管理器句柄；runner 构造完成后注入。
@@ -20,11 +21,23 @@ pub struct AgentTool {
     hub: Arc<HubHandle>,
     /// 当前代理深度；根代理为 0，子代理为父深度 + 1。
     depth: u32,
+    /// 用于 `spawn` 的 `monitor` 绑定；未接入时忽略该参数。
+    monitors: Option<Arc<MonitorManager>>,
 }
 
 impl AgentTool {
     pub fn new(hub: Arc<HubHandle>, depth: u32) -> Self {
-        Self { hub, depth }
+        Self {
+            hub,
+            depth,
+            monitors: None,
+        }
+    }
+
+    /// 接入 monitor 管理器，支持 `Agent spawn` 的 `monitor` 绑定。
+    pub fn with_monitors(mut self, monitors: Arc<MonitorManager>) -> Self {
+        self.monitors = Some(monitors);
+        self
     }
 
     fn hub(&self) -> Result<Arc<AgentHub>, ToolResult> {
@@ -32,6 +45,124 @@ impl AgentTool {
             .get()
             .cloned()
             .ok_or_else(|| ToolResult::error("The subagent runtime is not ready yet."))
+    }
+
+    /// 把 `monitor` 参数绑定到刚创建的子代理：事件只投给它，不进主上下文。
+    async fn bind_monitor(&self, id: &str, spec: &serde_json::Value) -> anyhow::Result<String> {
+        let Some(manager) = &self.monitors else {
+            anyhow::bail!("monitor binding is unavailable in this runtime");
+        };
+        let source = spec
+            .get("source")
+            .ok_or_else(|| anyhow::anyhow!("monitor.source is required"))?;
+        let (kind, timer) = if source.get("qq").is_some() {
+            ("qq".to_owned(), None)
+        } else if let Some(timer) = source.get("timer") {
+            if let Some(every) = timer.get("every").and_then(serde_json::Value::as_str) {
+                let seconds = crate::config::parse_duration_secs(every)
+                    .ok_or_else(|| anyhow::anyhow!("invalid timer.every {every:?}"))?;
+                if seconds < 60 {
+                    anyhow::bail!("timer.every must be at least 60s");
+                }
+                (
+                    "timer".to_owned(),
+                    Some(TimerSpec::Every(std::time::Duration::from_secs(seconds))),
+                )
+            } else if let Some(cron) = timer.get("cron").and_then(serde_json::Value::as_str) {
+                CronSchedule::parse(cron).map_err(|error| anyhow::anyhow!(error))?;
+                ("timer".to_owned(), Some(TimerSpec::Cron(cron.to_owned())))
+            } else if let Some(at) = timer.get("at").and_then(serde_json::Value::as_str) {
+                let (hour, minute) = at
+                    .split_once(':')
+                    .ok_or_else(|| anyhow::anyhow!("timer.at must be HH:MM"))?;
+                (
+                    "timer".to_owned(),
+                    Some(TimerSpec::At {
+                        hour: hour.parse()?,
+                        minute: minute.parse()?,
+                    }),
+                )
+            } else {
+                anyhow::bail!("timer requires every, cron or at");
+            }
+        } else if let Some(internal) = source.get("internal").and_then(serde_json::Value::as_str) {
+            (format!("internal:{internal}"), None)
+        } else {
+            anyhow::bail!("source must be qq, timer or internal (stream is not allowed here)");
+        };
+
+        let when = spec
+            .get("when")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let deliver = spec
+            .get("deliver")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let as_prompt = deliver.get("as").and_then(serde_json::Value::as_str) == Some("prompt");
+        let prompt = deliver
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        if as_prompt && prompt.is_none() {
+            anyhow::bail!("deliver.as = \"prompt\" requires deliver.prompt");
+        }
+        let lifecycle = spec
+            .get("lifecycle")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let max_events = lifecycle
+            .get("max_events")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(50);
+        let one_shot = lifecycle
+            .get("one_shot")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let idle_only = lifecycle
+            .get("idle_only")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let min_interval = std::time::Duration::from_secs(
+            lifecycle
+                .get("min_interval_secs")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+        let expires = match lifecycle.get("expires").and_then(serde_json::Value::as_str) {
+            None => Some(std::time::Duration::from_secs(2 * 3600)),
+            Some("0") => None,
+            Some(raw) => Some(std::time::Duration::from_secs(
+                crate::config::parse_duration_secs(raw)
+                    .ok_or_else(|| anyhow::anyhow!("invalid expires {raw:?}"))?,
+            )),
+        };
+        let batch_window = std::time::Duration::from_millis(
+            deliver
+                .get("batch_window_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(200),
+        );
+
+        let name = format!("{id}:monitor");
+        manager
+            .add(
+                name.clone(),
+                kind,
+                timer,
+                when,
+                prompt,
+                as_prompt,
+                max_events,
+                expires,
+                one_shot,
+                min_interval,
+                idle_only,
+                batch_window,
+                Some(id.to_owned()),
+            )
+            .await?;
+        Ok(name)
     }
 }
 
@@ -96,7 +227,18 @@ impl Tool for AgentTool {
                     .spawn(kind, arg_opt_str(&args, "agent"), task, self.depth)
                     .await
                 {
-                    Ok(value) => ToolResult::ok(value.to_string()),
+                    Ok(mut value) => {
+                        if let Some(spec) = args.get("monitor") {
+                            let id = value["id"].as_str().unwrap_or_default().to_owned();
+                            match self.bind_monitor(&id, spec).await {
+                                Ok(name) => value["monitor"] = serde_json::json!(name),
+                                Err(error) => {
+                                    value["monitor_error"] = serde_json::json!(error.to_string());
+                                }
+                            }
+                        }
+                        ToolResult::ok(value.to_string())
+                    }
                     Err(error) => ToolResult::error(error.to_string()),
                 }
             }

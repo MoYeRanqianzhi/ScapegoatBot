@@ -71,11 +71,24 @@ struct RunnerSink {
     runner: std::sync::OnceLock<Arc<Runner>>,
     /// 用于 `idle_only`：有活跃回合时不投递。
     queue: std::sync::OnceLock<Arc<ChatQueue>>,
+    /// 绑定了子代理的 monitor 走这里。
+    hub: std::sync::OnceLock<Arc<crate::swarm::AgentHub>>,
 }
 
 #[async_trait::async_trait]
 impl MonitorSink for RunnerSink {
     async fn deliver(&self, delivery: MonitorDelivery) {
+        // 绑定目标：交给子代理，不进主上下文。
+        if let Some(target) = &delivery.target {
+            let Some(hub) = self.hub.get() else {
+                warn!(monitor = %delivery.name, target, "subagent monitor delivered before the hub was ready");
+                return;
+            };
+            if let Err(error) = hub.deliver_to(target, delivery.text).await {
+                warn!(%error, monitor = %delivery.name, target, "subagent monitor delivery failed");
+            }
+            return;
+        }
         let Some(runner) = self.runner.get() else {
             warn!(monitor = %delivery.name, "monitor delivered before the runner was ready");
             return;
@@ -151,6 +164,10 @@ impl Runtime {
         let auth_path = paths.resolve(&loaded.config.auth_file, &loaded.dir);
         let auth = AuthFile::load_optional(&auth_path)?;
         report_missing_credentials(&loaded.config, &auth);
+        // per_chat 尚未实现：明确告警，避免配置看起来生效但实际仍是 shared。
+        if loaded.config.session.scope == SessionScope::PerChat {
+            warn!("session.scope = per_chat is not implemented in this build; using shared");
+        }
 
         let instance_lock = InstanceLock::acquire(&paths.instance_lock())?;
         let key = Arc::new(MasterKey::load_or_create(paths.key_file())?);
@@ -732,7 +749,9 @@ async fn build_agent(
     // Agent 工具先注册；hub 需要 runner，稍后注入。
     let hub_handle = Arc::new(HubHandle::new());
     if config.swarm.enabled {
-        tools.register(Arc::new(AgentTool::new(Arc::clone(&hub_handle), 0)));
+        tools.register(Arc::new(
+            AgentTool::new(Arc::clone(&hub_handle), 0).with_monitors(Arc::clone(&monitors)),
+        ));
     }
     if config.mcp.enabled {
         let manager = Arc::new(McpManager::connect(&config.mcp).await);
@@ -914,6 +933,7 @@ async fn build_agent(
         }
         if let Some(hub) = hub_handle.get() {
             runner.set_hub(Arc::clone(hub));
+            let _ = sink.hub.set(Arc::clone(hub));
         }
     }
     crate::monitor::load_config_monitors(&monitors, &config.monitor, Some(&messages)).await?;
