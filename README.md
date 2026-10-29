@@ -106,9 +106,8 @@ account_qq = 10000
 
 ## 隐私与已知限制
 
-- `[session].scope` 默认 `shared`：整个 QQ 号一份 transcript，跨聊天上下文会互相可见。需要强隔离时配置项已存在，但 **`per_chat` 尚未实现**。
+- `[session].scope` 默认 `shared`：整个 QQ 号一份 transcript，跨聊天上下文会互相可见。需要强隔离时切换到 `per_chat`：每个 chat 一条独立 transcript 链（文件名带 `group-<id>-` / `private-<id>-` 前缀），压缩、轮转、保留、崩溃恢复均按 chat 执行。
 - **后台复盘**：空闲时从 transcript 提取记忆候选（只追加、来源固定 `self`）并更新 `/STYLE.md`；技能 curator 定期把长期未用技能归档到 `/skills/.archive/`，不删除。
-- **未实现**：`per_chat` 会话隔离（配置会被接受，但启动时告警并继续使用 shared）。
 - 子代理支持嵌套 spawn（受 `[swarm].max_depth` 限制），`Agent message` 续聊复用原定义的提示与工具集；`Agent spawn` 的 `monitor` 参数可把事件绑定到该子代理实例，`deliver.to = <spawn_id>` / `agent:<name>` 也支持。
 - `/config` 写入已支持白名单键（`[filter]`、`[agent].available_models` / `thinking_level`、`[compaction]`、`[skills]`、`[queue]`、`[style]`），其余键只读；写入会校验并原子落盘，但 `[filter]` 与 `[queue]` 写入立即热更新（`max_concurrent` 的信号量上限需重启）。
 - 尚未提供旧 0.1 数据迁移；0.2 从空存储开始。
