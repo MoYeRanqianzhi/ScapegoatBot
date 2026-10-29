@@ -175,7 +175,7 @@ NapCat 事件
 | `Skill` | 本地 | 加载技能全文 | `name, args?` |
 | `WebSearch` | 服务端或工具后端 | 网页搜索 | `query, count?, domains?` |
 | `WebFetch` | 服务端或工具后端 | 抓取网页为 Markdown | `url, max_content_tokens?` |
-| `Agent` | 本地 | 子代理管理；内置 `type` 或自定义 `agent` 决定提示词与工具集 | `action: spawn \| message \| check \| wait \| list, type?: general \| explore \| plan \| docs, agent?: <name>, monitor?: {match, action, ttl_secs...}` |
+| `Agent` | 本地 | 子代理管理；内置 `type` 或自定义 `agent` 决定提示词与工具集 | `action: spawn \| message \| check \| wait \| list, type?: general \| explore \| plan \| docs, agent?: <name>, monitor?: {source, when?, deliver, lifecycle?}` |
 | `MCP` | 本地（可选） | 外部 MCP 工具 | `server, tool, args` |
 
 没有 Bash 时补齐的文件能力：
@@ -213,7 +213,7 @@ NapCat 事件
 | `agent.quarantine` | 把指定消息或片段移入 `/quarantine/`，并在上下文中标为不可执行 | 不删除原始记录，审计保留 |
 | `agent.compact` | 手动触发一次压缩 | 被隔离的内容不进入摘要，直接丢弃 |
 | `agent.clear_context` | 丢弃当前上下文状态并开新分段，磁盘 transcript 不动 | 不影响审计与账本 |
-| `agent.monitor` | 增删查监视器：`op: add \| remove \| list` | 运行时创建的默认带 TTL，见 5.11 |
+| `agent.monitor` | 增删查触发器：`op: add \| remove \| list \| fire` | 源可为 QQ 事件、定时、内部状态；运行时创建的默认带过期，见 5.11 |
 
 这样做的好处是：agent 发现上下文里进了脏东西时，不必等人，也不用新工具——它手上那个 `API` 就能把上下文压掉、清掉、把可疑片段隔离，或者把自己从 `hold` 里放出来。`agent.*` 不被允许修改审计、账本、配置与 `hold` 状态本身，所以它再自由也改不了自己推理所依据的证据。
 
@@ -515,76 +515,146 @@ OwnerIntent { kind: control | owner_message | standing, chat_id?, message_id?, c
 
 ### 5.11 监视器（monitor）
 
-hook 是“生命周期事件触发固定注入”，monitor 是“**内容匹配触发、可以指定注入给谁、可以唤醒谁**”。它把“哪些消息需要及时处理”从全局 filter 里拆出来，做成可订阅、可撤销、可绑定到某个 agent 的通道。
+monitor 是**事件流到消息的订阅**：事件从哪来、怎么过滤、投给谁、活多久，全部是参数。它同时替代了“消息订阅”“定时任务”和“外部事件通知”三件事——我们没有子进程要盯，也没有会话生命周期，所以在 Claude Code 里必须分开的东西，在这里是同一个形状。
 
-**与既有机制的区别**
+参考与取舍：
 
-| 机制 | 触发条件 | 动作 |
-|------|----------|------|
-| `[filter]` | 每条入站消息 | 决定是否提示主 agent |
-| `[[hooks.context]]` | 生命周期（SessionStart / PostCompact） | 注入固定内容 |
-| 事件 hook | 生命周期 | 声明式动作，不执行脚本 |
-| **monitor** | 消息来源与内容匹配 | 注入指定 agent 的上下文、唤醒回合、通知、或拉起专用子代理 |
+- Claude Code 的 Monitor：一个工具、两种源（命令 stdout 每行一个事件、WebSocket 每帧一个事件），事件直接作为消息进对话，200ms 内合并；超时、进程退出、输出洪泛、`TaskStop` 都能结束它；过滤写在源里而不是配置里；工具描述反复强调“静默不等于成功”。
+- Claude Code 的 Cron：5 字段 cron + prompt，一次性或 recurring，只在空闲时触发，带抖动，recurring 默认 7 天自过期，错过的触发合并成一次。
+- 我们照抄形状与这些语义；不照抄它的 shell（我们没有、也不该有），也不设独立的 ScheduleCron——`timer` 就是 source 的一种，投递产物同样是“一条消息进入上下文”。
 
-**匹配**
+**结构**
 
-- `chat`（`group:<gid>` / `private:<qq>`）、`sender`、`mention`（`self` 表示 @ 本账号，或指定 QQ）、`keyword` / `regex`、`filter`（复用过滤器名字）。
-- `source = live | inbox | both`：`live` 只看新事件；`inbox` 从 `/inbox` 里取之前没有触发回合的消息；`both` 两者都算。
-- 匹配范围必须在 `[agent].receive_scopes` 内，越界拒绝创建。
+```
+monitor = { source, when?, deliver, lifecycle? }
+```
 
-最典型的用法是常驻一条“@ 我”的监视器：群里有人 @ 本账号时立刻进入上下文，而不是等下一个回合碰巧看到。
+```toml
+[[monitor]]
+name = "heartbeat"
+source = { timer = { every = "10m", jitter_secs = 60 } }
+deliver = { to = "main", as = "prompt", prompt = "Scan the inbox and open loops. Act only if something is due; otherwise end the turn." }
+lifecycle = { idle_only = true, max_events = 500, expires = "30d" }
+```
+
+**source：事件从哪来**
+
+| 形式 | 说明 | 典型用法 |
+|------|------|----------|
+| `qq` | 订阅 QQ 入站事件：消息、撤回、好友申请、群请求 | @ 我、某个好友的私聊 |
+| `timer` | `cron` / `every` / `at`，产生合成事件 | 每 10 分钟看一眼、每天 9:07 提醒 |
+| `stream` | 外部 URL：WebSocket 帧、SSE 事件、HTTP 轮询结果 | CI、RSS、第三方 webhook |
+| `internal` | `agent` / `security` / `budget` / `storage` 状态变化 | hold 触发时通知、子代理结束 |
+
+- `timer` 的 `cron` 是本地时区 5 字段；`every` 用时长且最小 60s（防止把自己跑死）；`at` 是本地时间。
+- `stream` 只能由主人写进配置文件；运行时创建一律拒绝——外部网络属于扩张暴露面。
+- 一个 monitor 只能有一个 source 类型。
+
+**when：可选过滤**
+
+- 谓词表达式：比较、`and` / `or` / `not`、`in`、`contains`、`matches`（正则）、字段访问。
+- 可访问 `event.*`（`event.type`、`event.chat`、`event.sender`、`event.text`、`event.mentions_self` 等）与只读 `ctx.*`（`ctx.now`、`ctx.idle`、`ctx.budget_left`、`ctx.hold`）。
+- 省略 = 该 source 的全部事件。
+- 求值失败记为不匹配，并产生一条系统告警——不允许因为谓词写错就静默失效。
+
+**deliver：投给谁、以什么形式**
+
+| 字段 | 值 | 说明 |
+|------|-----|------|
+| `to` | `main` / `agent:<name>` / `<spawn_id>` | 目标不存在时按 `on_missing` 处理 |
+| `as` | `event` / `prompt` | `event` 原样投递事件；`prompt` 投递渲染后的指令（定时任务用这个） |
+| `batch_window_ms` | 默认 200 | 窗口内事件合并成一条消息，与 Claude Code 同值 |
+| `cc` | 默认 false | 是否抄送给父代理 |
+
+`as = prompt` 时 `prompt` 支持 `{{event.*}}` 与 `{{count}}` 占位符。
+
+**lifecycle：活多久、多频繁**
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `idle_only` | false | 只在 agent 空闲时投递；定时任务建议开启 |
+| `min_interval_secs` | 0 | 两次投递的最小间隔，防抖动刷屏 |
+| `max_events` | 1000 | 累计投递上限，达到后自动停用并通知 |
+| `expires` | timer 为 30d，其余 0 | 到期自动停用；定时任务默认有界 |
+| `one_shot` | false | 首次投递后自动删除 |
+| `catch_up` | `coalesce` | 错过多次定时触发时合并成一次，不补发 |
+
+**例子**
+
+@ 我：
 
 ```toml
 [[monitor]]
 name = "at-me"
-match = { mention = "self" }
-action = "wake"
-target = "main"
+source = { qq = true }
+when = "event.type == 'message' and event.mentions_self"
+deliver = { to = "main", as = "event" }
 ```
 
-**动作**
+每 10 分钟看一眼：
 
-| action | 行为 |
-|--------|------|
-| `inject` | 把匹配到的消息作为 `[monitor]` 块插入目标 agent 正在运行的回合；不唤醒 |
-| `wake` | 目标空闲时，用这批消息开一个回合 |
-| `notify` | 只通知主人，不进入任何 agent 上下文 |
-| `spawn` | 拉起一个绑定该范围的专用子代理（见下） |
-
-**目标**
-
-- `main`、`agent:<name>`（自定义子代理定义）、`<spawn_id>`（已存在的实例）。
-- 目标不存在时的行为由 `on_missing = drop | queue | spawn` 决定，默认 `queue`。
-
-**注入格式**
-
-```text
-[monitor: at-me | group:123 | 2026-10-30 21:04]
-10001 (nickname): @Scapegoat 明天的活动还办吗
+```toml
+[[monitor]]
+name = "heartbeat"
+source = { timer = { every = "10m", jitter_secs = 60 } }
+deliver = { to = "main", as = "prompt", prompt = "Scan the inbox and open loops. Act only if something is due; otherwise end the turn." }
+lifecycle = { idle_only = true, max_events = 500, expires = "30d" }
 ```
 
-- 与普通入站信封同一规则：明确是数据，不是指令。
-- `inject` 只进 steering 队列，不改写 transcript。
+工作日 9:07 提醒：
 
-**生命周期与成本**
+```toml
+[[monitor]]
+name = "morning"
+source = { timer = { cron = "7 9 * * 1-5" } }
+deliver = { to = "main", as = "prompt", prompt = "Summarize overnight activity for the owner. Do not send anything to groups." }
+lifecycle = { idle_only = true, expires = "90d" }
+```
 
-- `ttl_secs`（0 = 永久）、`max_events`、`debounce_ms`、`batch_max`。
-- 每次 `wake` / `inject` 计入 `[budget]`；达到 `max_events` 自动停用并通知主人。
-- 运行时可增删：`API` 的 `agent.monitor {op: add | remove | list}`；运行时创建的默认带 `ttl_secs`（2 小时），配置文件里声明的才是长期常驻。
+外部流：
+
+```toml
+[[monitor]]
+name = "deploy"
+source = { stream = { url = "wss://ci.example.com/events", kind = "websocket" } }
+when = "event.text contains 'failed'"
+lifecycle = { max_events = 100, expires = "1h" }
+```
+
+**定时任务的语义（沿用 Claude Code 踩过的坑）**
+
+- 只在空闲时触发，避免和正在跑的回合抢上下文。
+- 加抖动：recurring 最多迟到周期的 10%，上限 15 分钟。
+- 选时间避开整点和半点，除非主人明确要求；这条写进 `agent.monitor` 的帮助文本，作为模型侧指引。
+- 一次性任务用 `at` + `one_shot`。
+- 重启后错过的触发合并成一次，不补发 N 次。
+- recurring 默认 30 天后自动停用（Claude Code 是 7 天；我们的 agent 本来就长期运行，放宽但仍要有界）。
+
+**运行时创建**
+
+`API` 的 `agent.monitor`：
+
+| op | 参数 | 行为 |
+|----|------|------|
+| `add` | 完整 monitor 结构 | 运行时创建；默认 `expires = "2h"`、`max_events = 50`；`source` 只能是 `qq` / `timer` / `internal` |
+| `remove` | `name` | 删除 |
+| `list` | — | 名称、source、剩余配额、下次触发时间 |
+| `fire` | `name` | 手动触发一次，等价一次事件 |
+
+配置文件里声明的才是长期常驻；运行时创建的一律有界，且不能创建 `stream` 源。
 
 **专用子代理**
 
-- `Agent spawn` 增加 `monitor` 参数；绑定之后子代理常驻，不再是一次性任务。
-- 它有自己的上下文与队列，只处理匹配范围内的消息，其他消息仍走主代理。
-- 发送仍受门禁与 `allow_send` 约束；`allow_send` 仍然不能由模型在 spawn 时打开，只能来自 owner 定义的 agent 或 owner 证据。
-- 父代理只在三种情况下拿到内容：子代理主动 `Agent message` 汇报、父代理 `check`、或 monitor 配置要求抄送。
-- 子代理崩溃、超预算、被 `hold` 时，monitor 按 `on_missing` 回落，不静默丢消息。
+`deliver.to = "agent:<name>"`，或 `Agent spawn` 的 `monitor` 参数绑定 → 子代理常驻，只吃它订阅到的事件。父代理只在子代理主动汇报、`check`、或 `cc = true` 时拿到内容。发送仍受门禁与 `allow_send` 约束。
 
-**与安全分类器的关系**
+**安全与边界**
 
-monitor 的唤醒与注入都是“新 token 进入上下文”，因此照常过输入闸——monitor 不是绕过分类器的侧门。`hold` 期间 monitor 仍可收集与注入（那是输入），但任何回复都会在输出闸被拦。
+- 投递就是“新消息进入上下文”，照常过输入闸；`hold` 期间可以投递与收集，但回复会被输出闸拦。
+- 单个 monitor 的事件速率有上限，超限自动停用并通知（Claude Code 的做法：输出过多自动停）。
+- 静默不等于正常：源断开、谓词求值失败、monitor 被停用，三者都产生一条系统通知。
+- monitor 不执行脚本、不读写文件、不调用工具；它只产生消息。
 
-## 6. 虚拟文件系统（VFS）
+## 6. 虚拟文件系统（VFS）## 6. 虚拟文件系统（VFS）
 
 ### 6.1 目标
 
@@ -1384,17 +1454,25 @@ agents_dir = "~/.sbot/agents"   # 自定义子代理定义的共享只读层
 default_max_steps = 32          # 自定义子代理未写 max_steps 时的上限
 
 [[monitor]]
-name = "at-me"                  # 运行时也可通过 agent.monitor 增删
+name = "at-me"                  # 运行时也可通过 API 的 agent.monitor 增删
 enabled = true
-match = { mention = "self" }    # chat / sender / mention / keyword / regex / filter，至少一项
-source = "live"                 # live | inbox | both
-action = "wake"                 # inject | wake | notify | spawn
-target = "main"                 # main | agent:<name> | <spawn_id>
+source = { qq = true }          # qq | timer | stream | internal，只能一种
+when = "event.type == 'message' and event.mentions_self"   # 可省略；求值失败会告警
 on_missing = "queue"            # drop | queue | spawn
-debounce_ms = 500
-batch_max = 10
-ttl_secs = 0                    # 0 = 永久；运行时创建的默认 7200
-max_events = 1000               # 达到后自动停用并通知主人
+
+[monitor.deliver]
+to = "main"                     # main | agent:<name> | <spawn_id>
+as = "event"                    # event | prompt
+batch_window_ms = 200
+cc = false
+
+[monitor.lifecycle]
+idle_only = false
+min_interval_secs = 0
+max_events = 1000
+expires = "0"                   # 0 = 不过期；timer 默认 30d
+one_shot = false
+catch_up = "coalesce"
 
 [security]
 check_every_tokens = 262144   # 每新增 256K 上下文触发一次独立安全检查；0 = 关闭
@@ -1621,7 +1699,7 @@ action = "log"
 - `[storage].encryption` 只能是 `xchacha20poly1305` / `none`，且必须与数据库 `meta` 中记录的模式一致；加密模式下 `~/.sbot/key` 必须存在、格式正确且 canary 校验通过；`none` 启动时警告。
 - `[storage].max_*_bytes` 必须为非负整数（0 = 不限制）；`message_retention_days` / `session_retention_days` 必须为非负整数（0 = 不按年龄删除）；`storage.path` 必须可创建且可写。
 - `[compaction]` 的 `reserve_tokens` / `keep_recent_tokens` / `max_failures` / `turn_context_budget` 必须为正数；`reserve_tokens >= agent.max_output_tokens`，否则启动失败。`agent.max_output_tokens` 必须 ≤ 所选模型的 `max_tokens`。
-- `[[monitor]]` 的 `match` 至少要有一项，且 `key` 只能是 `chat` / `sender` / `mention` / `keyword` / `regex` / `filter`；`action` 只能是 `inject` / `wake` / `notify` / `spawn`；`on_missing` 只能是 `drop` / `queue` / `spawn`；`debounce_ms` / `batch_max` / `ttl_secs` / `max_events` 必须为非负数；`target` 为 `agent:<name>` 时定义必须存在，为 `<spawn_id>` 时该实例必须存在或 `on_missing != "drop"`；匹配范围超出 `receive_scopes` 时拒绝启动并列出越界项。
+- `[[monitor]]` 的 `source` 只能是 `qq` / `timer` / `stream` / `internal` 之一；`timer` 必须且只能给 `cron` / `every` / `at` 之一，`every ≥ 60s`；`stream` 只允许出现在配置文件，运行时 `agent.monitor add` 一律拒绝；`when` 必须可解析，失败则启动报错并指出位置；`deliver.to` 必须合法，指向 `agent:<name>` 时定义必须存在；`lifecycle` 各项非负，`expires` 是合法时长或 `0`；`one_shot = true` 时必须带 `timer`；`name` 不能重复；匹配范围超出 `receive_scopes` 时拒绝启动并列出越界项。
 - `[swarm].max_depth` / `max_concurrency` / `default_max_steps` 必须为正数；`agents_dir` 必须可读。自定义子代理 frontmatter 的 `name` 唯一且合法，`tools` 必须是已知工具的子集，`model` 为空或存在于 `available_models`，`allow_send` 为布尔值；非法定义启动时告警并跳过，不阻止主进程启动。
 - 未知字段、未知协议、越界数值一次性列出全部错误，启动失败。
 - 子代理的 `model` / `thinking_level` 在 spawn 时校验；模型不存在则拒绝，级别不支持则 clamp 到最近级别并警告。
@@ -1768,7 +1846,8 @@ src/
 - 提示词：12 个静态 section 的快照与顺序、动态边界、动态段顺序（owner context → USER → memory → STYLE → skills → runtime）；快照包含纯文本/无 Markdown/QQ 表情规则；两套身份各自快照；相同配置下静态前缀字节一致，runtime 字段变化不影响前缀；内置 prompt/tool description 不含 CJK；owner context 不能覆盖内置规则；`<memory_context>` 不被当成 owner guidance；英文 prompt 下 QQ 回复仍跟随会话语言（fake provider 断言）。
 - 记忆：`Memory` 工具按最终状态检查预算、拒绝清空、精确命中条目；文件工具写入 `/MEMORY.md` 被拒绝；会话中写入不重建 system prompt，压缩后重载；后台复盘只在 `idle`/`every_turn` 配置下触发，不发送 QQ 消息。
 - 记忆来源：`owner`/`agent` 可自动注入；`untrusted` 不进入 `<memory_context>`，显式读取时标注来源；群成员声称“我是主人”不改变来源；CLI 控制输入以 `control:<id>` 作为来源并反查 `control_inputs`；召回内容不会被再次提取；非交互会话不产生候选。
-- 监视器：`mention = "self"` 的常驻监视器在群内 @ 时立即唤醒主代理；`inbox` 来源能取到未触发回合的旧消息；`inject` 只进 steering 队列、不改写 transcript；目标 busy 时 `inject`、空闲时 `wake`；`ttl_secs` 到期自动停用；`max_events` 达到后停用并通知；越出 `receive_scopes` 的匹配拒绝创建；运行时 `agent.monitor` 增删生效且默认带 TTL；绑定子代理后只有匹配消息进入该子代理，其余仍走主代理；子代理崩溃/被 `hold` 时按 `on_missing` 回落、不丢消息；monitor 注入的内容照常过输入闸。
+- 监视器：`when = "event.mentions_self"` 的常驻监视器在群内 @ 时立即投递；`timer` 源按 `every` / `cron` / `at` 触发，`every < 60s` 被拒；`one_shot` 首次投递后自动删除；`idle_only` 在回合进行中不投递；重启后错过的定时触发合并成一次（fake clock）；`batch_window_ms` 内多事件合并为一条消息；`as = prompt` 的模板占位符正确渲染；`expires` / `max_events` 到期或超限自动停用并产生系统通知；谓词求值失败产生告警而不是静默；`stream` 源在运行时 `agent.monitor add` 被拒绝；绑定子代理后只有订阅到的事件进入该子代理；monitor 投递的事件照常过输入闸。
+
 - 会话并发：同一 chat 的连发合并；不同 chat 各自成回合但共享 transcript；回合回复默认落在 `origin_chat`；跨 chat 发送触发 n-gram 检查与门禁；队列溢出按 `summarize`/`old`/`new` 处理。
 - 长期运行：ESTOP 暂停新回合与发送、不打断进行中回合；崩溃恢复不重发已确认消息；断线重连后按最后 `message_id` 补齐并去重，缺口写入 `[gap]`；provider 429/超时按退避重试并走回退链，完成后不重放已完成工具；内部标签在流式与非流式发送前均被剥离。
 - 预算：CJK 文本的 token 估算、工具 schema 上限、单条工具结果截断、pruning 不裁剪最近 3 个回合与 bootstrap 读取。
@@ -1822,7 +1901,8 @@ src/
 待定：
 
 - `[gate].llm_review` 默认值待定（当前 false）。
-- 监视器 monitor（2026-10-30 记录）：内容匹配触发、可指定目标、可唤醒；支持 `chat` / `sender` / `mention` / `keyword` / `regex` / `filter` 匹配与 `live | inbox | both` 来源；动作 `inject` / `wake` / `notify` / `spawn`；典型用法是常驻“@ 我”的监视器；可绑定到常驻子代理，让某个子代理专管某些群/好友；运行时通过 `agent.monitor` 增删，默认带 TTL；匹配受 `receive_scopes` 约束，注入内容照常过输入闸。基础能力 Phase 4，子代理绑定 Phase 6。
+- 监视器 monitor（2026-10-30 定稿）：统一为 `{source, when?, deliver, lifecycle?}` 的事件订阅，不设独立的 ScheduleCron。source 分 `qq` / `timer` / `stream` / `internal`；`when` 是谓词表达式，访问 `event.*` 与只读 `ctx.*`，求值失败告警而非静默；`deliver` 决定投给谁（main / 子代理）与形式（event / prompt），批量窗口 200ms；`lifecycle` 管空闲触发、冷却、上限、过期、一次性与错过的合并。定时任务沿用 Claude Code 的经验：本地 5 字段 cron、避开整点半点、抖动、recurring 默认 30 天过期、错过只补一次。运行时通过 `agent.monitor` 增删查与手动触发，默认有界且不允许创建 `stream` 源。投递即输入，照常过输入闸；源断开、谓词失败、被停用都发系统通知（静默不等于正常）。
+
 - 内置 `docs` 子代理（2026-10-30 记录）：类似 `explore`，只读，工具集仅 `api.list` / `api.help` / `Read`，专门回答“某个 action 怎么调、有哪些同类动作”，只回结论与可复制的调用样例。Phase 4 随工具注册表一起落地。
 - 其余实现细节在 Phase 0–4 中确定。
 
