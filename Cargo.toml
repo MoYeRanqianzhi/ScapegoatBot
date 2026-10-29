@@ -17,6 +17,8 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 # 异步运行时：守护进程、IPC、WebSocket、数据库都跑在 tokio 上。
 tokio = { version = "1", features = ["full"] }
+# 异步 trait：IPC Handler 需要 `Arc<dyn Handler>`。
+async-trait = "0.1"
 # 序列化 / 反序列化：IPC 帧、auth.json、models.json、审计记录。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

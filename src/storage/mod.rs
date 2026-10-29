@@ -1,208 +1,316 @@
-// src/storage/mod.rs
-// 消息存储管理器
-// 路由消息到对应的 JSONL（原始）和 MD（AI可读）写入器
-// 管理按日期+序号拆分的文件结构
+//! SQLite 存储：连接、迁移、键值元数据、幂等表。
+//!
+//! 设计依据：设计 §2.2（IPC 幂等）、§6.4（节点与存储）、§8。
+//!
+//! Phase 0 只建立底座：连接与 PRAGMA、迁移框架、`meta`（含密钥 canary）、
+//! `control_inputs`（控制通道输入）与 `idempotency`（请求去重）。
+//! VFS、消息索引、发送账本等表在各自阶段追加迁移，**只增不改**。
 
-pub mod cursor;
-pub mod images;
-pub mod jsonl;
-pub mod markdown;
-pub mod message_index;
-pub mod session;
+pub mod crypto;
 
-use crate::config::StorageConfig;
-use anyhow::{Context, Result};
-use chrono::{Local, NaiveDate};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Mutex;
 
-// ============================================================================
-// 存储位置信息
-// ============================================================================
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OptionalExtension, params};
+use tracing::{debug, warn};
 
-/// JSONL 文件写入后返回的物理位置信息
-/// main.rs 用此信息调用 message_index.index_message() 建立索引
-#[derive(Debug, Clone)]
-pub struct StoredLocation {
-    /// JSONL 文件路径（相对于 messages_dir，如 "all/2026-03-10_001.jsonl"）
-    pub file_path: String,
-    /// 写入的行号（1-based）
-    pub line_number: u32,
+use crypto::MasterKey;
+
+/// 密钥 canary 的用途名；改动会导致已有数据库无法打开，必须与迁移版本一同升级。
+const CANARY_PURPOSE: &str = "canary";
+/// canary 的明文常量。
+const CANARY_PLAINTEXT: &[u8] = b"scapegoat-bot/canary/v1";
+/// canary 在 `meta` 表中的键名。
+const CANARY_KEY: &str = "encryption.canary";
+
+/// 迁移列表：`(版本号, 说明, SQL)`。只追加，不修改已发布条目。
+const MIGRATIONS: &[(u32, &str, &str)] = &[(
+    1,
+    "phase0: meta, control_inputs, idempotency",
+    r#"
+    CREATE TABLE meta (
+        key   TEXT PRIMARY KEY,
+        value BLOB NOT NULL
+    );
+
+    -- 控制通道输入：CLI `chat` 持久化后作为 owner_context 注入（设计 §2.3）。
+    CREATE TABLE control_inputs (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        text_enc   BLOB NOT NULL,
+        actor      TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    -- IPC 幂等表：Chat / SetModel / SetEffort 带 idempotency_key，短期内重放返回原结果。
+    CREATE TABLE idempotency (
+        key        TEXT PRIMARY KEY,
+        response   TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    "#,
+)];
+
+/// 数据库句柄。
+///
+/// 用 `Mutex<Connection>` 而不是连接池：单实例、低频写入，锁竞争可以忽略；
+/// 长事务（如百万级索引重建）在各自阶段用独立连接处理。
+pub struct Database {
+    conn: Mutex<Connection>,
 }
 
-// ============================================================================
-// 存储管理器
-// ============================================================================
-
-/// 消息存储管理器
-/// 负责将消息持久化到文件系统
-///
-/// 核心设计：所有消息按时间顺序统一存储在 `messages/all/` 目录中，
-/// 不按群/私聊分离，确保 Agent 能看到完整的时间线上下文。
-///
-/// 文件结构:
-/// - `messages/all/{date}_{seq}.{jsonl|md}` — 全部消息的统一时间流
-/// - `messages/master/{date}_{seq}.md` — 主人消息副本（用于风格学习）
-/// - `messages/self/{date}_{seq}.md` — Agent 自发消息副本（用于自我分析）
-#[derive(Debug, Clone)]
-pub struct StorageManager {
-    /// 消息存储根目录（如 ./workspace/messages）
-    messages_dir: PathBuf,
-    /// 单个文件的最大消息条数
-    max_messages_per_file: u32,
-}
-
-impl StorageManager {
-    /// 创建存储管理器
-    pub fn new(config: &StorageConfig) -> Self {
-        let messages_dir = PathBuf::from(&config.workspace_dir).join("messages");
-        Self {
-            messages_dir,
-            max_messages_per_file: config.max_messages_per_file,
+impl Database {
+    /// 打开（或创建）数据库并应用迁移。
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
         }
+        let conn = Connection::open(path)
+            .with_context(|| format!("cannot open database {}", path.display()))?;
+        Self::from_connection(conn)
     }
 
-    /// 确保指定子目录存在并返回其路径
-    fn ensure_dir(&self, sub: &str) -> Result<PathBuf> {
-        let dir = self.messages_dir.join(sub);
-        if !dir.exists() {
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("创建存储目录失败: {}", dir.display()))?;
-        }
-        Ok(dir)
+    /// 内存数据库，供单元测试使用。
+    #[allow(dead_code)]
+    pub fn open_in_memory() -> Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
     }
 
-    /// 确定当前应写入的文件路径（根据日期+序号）
-    /// 如果当天最新文件的行数已达上限，序号 +1
+    fn from_connection(conn: Connection) -> Result<Self> {
+        // WAL + NORMAL：单进程写入下可靠性足够，避免每次提交都 fsync 拖慢消息落库。
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+
+        let db = Self {
+            conn: Mutex::new(conn),
+        };
+        db.apply_migrations()?;
+        Ok(db)
+    }
+
+    /// 顺序应用未执行的迁移。
+    fn apply_migrations(&self) -> Result<()> {
+        let mut conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                 version    INTEGER PRIMARY KEY,
+                 applied_at TEXT NOT NULL
+             );",
+        )?;
+
+        let applied: u32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        for (version, description, sql) in MIGRATIONS {
+            if *version <= applied {
+                continue;
+            }
+            debug!(version, description, "applying database migration");
+            let tx = conn.transaction()?;
+            tx.execute_batch(sql)
+                .with_context(|| format!("migration {version} ({description}) failed"))?;
+            tx.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                params![version, now_rfc3339()],
+            )?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// 当前迁移版本，供 `sbot doctor` 与测试使用。
+    pub fn schema_version(&self) -> Result<u32> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        Ok(conn.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// 读取元数据。
+    pub fn meta_get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// 写入元数据（覆盖）。
+    pub fn meta_set(&self, key: &str, value: &[u8]) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// 校验密钥与数据库匹配；首次打开时写入 canary。
     ///
-    /// # 参数
-    /// - `dir`: 目标目录路径
-    /// - `date`: 当天日期
-    /// - `ext`: 文件扩展名（"jsonl" 或 "md"）
-    fn resolve_file_path(
-        &self,
-        dir: &Path,
-        date: NaiveDate,
-        ext: &str,
-    ) -> Result<PathBuf> {
-        let date_str = date.format("%Y-%m-%d").to_string();
-        let mut seq: u32 = 1;
-
-        // 查找当天已存在的最大序号
-        loop {
-            let filename = format!("{date_str}_{seq:03}.{ext}");
-            let path = dir.join(&filename);
-
-            if !path.exists() {
-                return Ok(path);
+    /// 密钥换错或数据被换过时，AEAD 解密失败，直接拒绝启动——
+    /// 这比“打开后读到乱码再报错”更早、更明确。
+    pub fn ensure_key(&self, key: &MasterKey) -> Result<()> {
+        match self.meta_get(CANARY_KEY)? {
+            None => {
+                let sealed =
+                    key.seal(CANARY_PURPOSE, CANARY_PURPOSE.as_bytes(), CANARY_PLAINTEXT)?;
+                self.meta_set(CANARY_KEY, &sealed)?;
+                debug!("encryption canary written");
+                Ok(())
             }
-
-            // 文件存在，检查行数是否达到上限
-            let line_count = count_lines(&path)?;
-            if line_count < self.max_messages_per_file {
-                // 还没满，继续使用这个文件
-                return Ok(path);
+            Some(sealed) => {
+                let opened = key
+                    .open(CANARY_PURPOSE, CANARY_PURPOSE.as_bytes(), &sealed)
+                    .context("database was created with a different master key")?;
+                if opened != CANARY_PLAINTEXT {
+                    bail!("encryption canary does not match; refusing to open the database");
+                }
+                Ok(())
             }
-
-            // 已满，尝试下一个序号
-            seq += 1;
         }
     }
 
-    /// 存储一条原始消息到 JSONL 文件
-    /// 所有群聊和私聊的原始 JSON 按时间顺序追加到 messages/raw/ 下
-    /// 此目录受写保护，LLM 不可修改（仅系统写入）
-    /// 返回文件路径和行号，供消息索引使用
-    pub fn store_raw_jsonl(&self, raw_json: &serde_json::Value) -> Result<StoredLocation> {
-        let dir = self.ensure_dir("raw")?;
-        let today = Local::now().date_naive();
-        let path = self.resolve_file_path(&dir, today, "jsonl")?;
-
-        // 在追加前统计当前行数，确定写入后的行号
-        let current_count = count_lines(&path)?;
-        let line_number = current_count + 1;
-
-        // 追加 JSON 到文件
-        jsonl::append_jsonl(&path, raw_json)?;
-
-        // 提取相对于 messages_dir 的路径（如 "raw/2026-03-10_001.jsonl"）
-        let relative = path
-            .strip_prefix(&self.messages_dir)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            // 统一使用正斜杠（跨平台兼容）
-            .replace('\\', "/");
-
-        Ok(StoredLocation {
-            file_path: relative,
-            line_number,
-        })
+    /// 查询幂等结果。
+    pub fn idempotency_get(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT response FROM idempotency WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
-    /// 存储一条格式化消息到统一 MD 文件
-    /// 所有群聊和私聊的结构化消息按时间顺序追加到 messages/all/ 下
-    pub fn store_markdown(&self, record: &markdown::MessageRecord) -> Result<()> {
-        let dir = self.ensure_dir("all")?;
-        let today = Local::now().date_naive();
-        let path = self.resolve_file_path(&dir, today, "md")?;
-        markdown::append_markdown(&path, record)
+    /// 记录幂等结果。
+    pub fn idempotency_put(&self, key: &str, response: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "INSERT INTO idempotency (key, response, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO NOTHING",
+            params![key, response, now_rfc3339()],
+        )?;
+        Ok(())
     }
 
-    /// 存储主人的消息到风格分析文件
-    /// 独立存储到 messages/master/ 目录下，按日期拆分
-    /// 用于 LLM 学习主人的说话风格
-    /// 注意：当 master=self 时，此处仅包含主人本人发送的消息，不含 Agent 发送的
-    pub fn store_master(&self, record: &markdown::MessageRecord) -> Result<()> {
-        let dir = self.ensure_dir("master")?;
-        let today = Local::now().date_naive();
-        let path = self.resolve_file_path(&dir, today, "md")?;
-        markdown::append_markdown(&path, record)
+    /// 清理过期幂等记录（默认 5 分钟）；Phase 3 的周期维护任务调用。
+    #[allow(dead_code)]
+    pub fn idempotency_prune(&self, older_than: chrono::Duration) -> Result<usize> {
+        let cutoff = (chrono::Utc::now() - older_than).to_rfc3339();
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let removed = conn.execute(
+            "DELETE FROM idempotency WHERE created_at < ?1",
+            params![cutoff],
+        )?;
+        if removed > 0 {
+            warn!(removed, "pruned expired idempotency records");
+        }
+        Ok(removed)
     }
 
-    /// 存储 Agent 自发消息到独立文件
-    /// 独立存储到 messages/self/ 目录下，按日期拆分
-    /// 仅包含 Agent 确认发送的消息（排除主人或他人通过同账号发送的）
-    /// 用于自我分析、模仿程度评估等
-    pub fn store_self(&self, record: &markdown::MessageRecord) -> Result<()> {
-        let dir = self.ensure_dir("self")?;
-        let today = Local::now().date_naive();
-        let path = self.resolve_file_path(&dir, today, "md")?;
-        markdown::append_markdown(&path, record)
+    /// 写入一条控制通道输入，返回自增 id。
+    pub fn insert_control_input(&self, text_enc: &[u8], actor: &str) -> Result<i64> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "INSERT INTO control_inputs (text_enc, actor, created_at) VALUES (?1, ?2, ?3)",
+            params![text_enc, actor, now_rfc3339()],
+        )?;
+        Ok(conn.last_insert_rowid())
     }
 }
 
-// ============================================================================
-// 辅助函数
-// ============================================================================
+/// RFC3339 UTC 时间戳，所有 `created_at` 统一用这个格式。
+pub fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
 
-/// 统计文件的行数（用于判断是否需要拆分）
-/// JSONL 中每行一条消息；MD 中每条消息由 "---" 分隔
-fn count_lines(path: &Path) -> Result<u32> {
-    if !path.exists() {
-        return Ok(0);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key() -> MasterKey {
+        MasterKey::from_bytes([3u8; 32])
     }
 
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    #[test]
+    fn migrations_apply_and_are_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sbot.db");
 
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("读取文件失败: {}", path.display()))?;
+        let db = Database::open(&path).unwrap();
+        let version = db.schema_version().unwrap();
+        assert_eq!(version, MIGRATIONS.last().unwrap().0);
+        drop(db);
 
-    if ext == "jsonl" {
-        // JSONL: 每行一条消息
-        Ok(content.lines().filter(|l| !l.trim().is_empty()).count() as u32)
-    } else {
-        // MD: 按 "---" 分隔符计数消息条数
-        // 每条消息以 "### Time" 开头，以 "---" 结尾
-        Ok(content.matches("\n---\n").count() as u32
-            + if content.ends_with("\n---\n") || content.ends_with("\n---") {
-                0
-            } else if content.contains("### Time") {
-                // 最后一条可能还没有结尾 ---
-                1
-            } else {
-                0
-            })
+        // 第二次打开不应重复执行迁移或报错。
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), version);
+    }
+
+    #[test]
+    fn meta_roundtrip_and_overwrite() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.meta_get("k").unwrap(), None);
+        db.meta_set("k", b"one").unwrap();
+        assert_eq!(db.meta_get("k").unwrap().as_deref(), Some(&b"one"[..]));
+        db.meta_set("k", b"two").unwrap();
+        assert_eq!(db.meta_get("k").unwrap().as_deref(), Some(&b"two"[..]));
+    }
+
+    #[test]
+    fn canary_accepts_same_key_and_rejects_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sbot.db");
+
+        let db = Database::open(&path).unwrap();
+        db.ensure_key(&key()).unwrap();
+        drop(db);
+
+        let db = Database::open(&path).unwrap();
+        db.ensure_key(&key()).unwrap();
+
+        let other = MasterKey::from_bytes([9u8; 32]);
+        let error = db.ensure_key(&other).unwrap_err().to_string();
+        assert!(error.contains("different master key"));
+    }
+
+    #[test]
+    fn idempotency_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.idempotency_get("abc").unwrap(), None);
+        db.idempotency_put("abc", "{\"ok\":true}").unwrap();
+        assert_eq!(
+            db.idempotency_get("abc").unwrap().as_deref(),
+            Some("{\"ok\":true}")
+        );
+        // 重复写入不覆盖原结果。
+        db.idempotency_put("abc", "{\"ok\":false}").unwrap();
+        assert_eq!(
+            db.idempotency_get("abc").unwrap().as_deref(),
+            Some("{\"ok\":true}")
+        );
+    }
+
+    #[test]
+    fn control_input_gets_incrementing_ids() {
+        let db = Database::open_in_memory().unwrap();
+        let first = db.insert_control_input(b"x", "cli").unwrap();
+        let second = db.insert_control_input(b"y", "cli").unwrap();
+        assert_eq!(second, first + 1);
     }
 }

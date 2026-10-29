@@ -1392,6 +1392,9 @@ version = 1
 models_file = "~/.sbot/models.json"   # 可选，默认该路径
 auth_file = "~/.sbot/auth.json"       # 可选，默认该路径
 
+[ipc]
+name = "scapegoat-bot"         # Windows 管道名（完整形式 `\\.\pipe\<name>`）；Unix 下是 socket 文件名
+
 [agent]
 name = "ScapegoatBot"
 mode = "stand_in"              # stand_in | companion；启动时固定，修改需重启
@@ -1718,6 +1721,7 @@ action = "log"
 ### 9.6 启动校验
 
 - `version` 必须为 1。
+- `[ipc].name` 非空，只含 ASCII 字母、数字、`-`、`_`、`.`；Windows 下据此拼出 `\\.\pipe\<name>`，Unix 下为 `$XDG_RUNTIME_DIR/<name>.sock`。
 - `agent.model` / `compaction_model` 必须存在于 `available_models`；`thinking_level` 必须在所选模型的 `thinking_levels` 中。
 - `agent.mode` 必须是 `stand_in` / `companion`；启动时固定，修改需重启；`companion` 要求 `owner_qq` 非零且不等于 `account_qq`；`stand_in` 要求 `account_qq == owner_qq`（`account_qq` 来自 NapCat `get_login_info`）。
 - `agent.master` 必须是 `self` 或非零 QQ 号；owner 通知使用 `master_qq` 私聊；`companion` 默认 `master_qq = owner_qq`，`master = self`/stand_in 时需验证 NapCat 自聊或回退控制通道/CLI；解析不到的 `master_qq` 置空，不注入不可用的号。
@@ -1742,7 +1746,7 @@ action = "log"
 - `API` 的 action 注册表分 `napcat.*` 与 `agent.*` 两个命名空间，编译期固定，不能通过配置扩大；`hold` 期间 `napcat.*` 一律返回 `Disabled during hold`，`agent.*` 不受限制。
 - 目标为 `owner_qq` / `master_qq` 的 `admin` / `destructive` action 在启动校验时必须出现在拒绝表中，缺失则启动失败。
 - `[budget].guard_usd_per_day` 必须为非负数（0 = 不限制）；超过后只降级 guard，不影响主循环。
-- `[budget]` 的数值必须为非负整数/浮点数（0 = 不限制）；`turn_tokens` 必须 ≤ `turn_context_budget`。
+- `[budget]` 的数值必须为非负整数/浮点数（0 = 不限制）。`turn_tokens` 是**累计用量**（一个回合内所有请求的输入+输出之和），`compact.turn_context_budget` 是**单次请求的工作集**；两者量纲不同，不设大小关系。默认 `turn_tokens = 150000` 可以大于 `turn_context_budget = 120000`。
 - `[gate].mode` 只能是 `trusted` / `auto` / `approve`；`max_per_minute` 必须为正数；`llm_review = true` 时审查模型必须可用。
 - `[storage].encryption` 只能是 `xchacha20poly1305` / `none`，且必须与数据库 `meta` 中记录的模式一致；加密模式下 `~/.sbot/key` 必须存在、格式正确且 canary 校验通过；`none` 启动时警告。
 - `[storage].max_*_bytes` 必须为非负整数（0 = 不限制）；`message_retention_days` / `session_retention_days` 必须为非负整数（0 = 不按年龄删除）；`storage.path` 必须可创建且可写。

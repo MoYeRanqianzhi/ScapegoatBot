@@ -1,0 +1,58 @@
+{
+  "providers": {
+    "anthropic": {
+      "name": "Anthropic",
+      "api": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "timeout_secs": 120,
+      "max_retries": 2,
+      "models": [
+        {
+          "id": "claude-opus-5-5",
+          "name": "Claude Opus 5.5",
+          "reasoning": true,
+          "thinking_levels": ["low", "medium", "high", "xhigh", "max"],
+          "default_thinking_level": "high",
+          "input": ["text", "image"],
+          "context_window": 1000000,
+          "max_tokens": 128000,
+          "capabilities": ["tools", "vision", "server_tools.web_search", "server_tools.web_fetch"],
+          "cost": { "input": 4.0, "output": 20.0 }
+        },
+        {
+          "id": "claude-haiku-5-5",
+          "name": "Claude Haiku 5.5",
+          "reasoning": true,
+          "thinking_levels": ["low", "medium", "high", "max"],
+          "default_thinking_level": "medium",
+          "input": ["text", "image"],
+          "context_window": 200000,
+          "max_tokens": 16384,
+          "capabilities": ["tools", "vision"],
+          "cost": { "input": 1.0, "output": 5.0 }
+        }
+      ]
+    },
+    "deepseek": {
+      "name": "DeepSeek",
+      "api": "chat",
+      "base_url": "https://api.deepseek.com/v1",
+      "timeout_secs": 120,
+      "max_retries": 2,
+      "models": [
+        {
+          "id": "deepseek-chat",
+          "name": "DeepSeek Chat",
+          "reasoning": false,
+          "thinking_levels": [],
+          "default_thinking_level": "",
+          "input": ["text"],
+          "context_window": 64000,
+          "max_tokens": 8192,
+          "capabilities": ["tools"],
+          "cost": { "input": 0.28, "output": 0.42 }
+        }
+      ]
+    }
+  }
+}
