@@ -192,13 +192,12 @@ pub async fn read_limited(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_owned();
-    if let Some(length) = response.content_length() {
-        if length > max_bytes {
+    if let Some(length) = response.content_length()
+        && length > max_bytes {
             return Err(format!(
                 "response is {length} bytes; the limit is {max_bytes}"
             ));
         }
-    }
     let mut response = response;
     let mut out = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {

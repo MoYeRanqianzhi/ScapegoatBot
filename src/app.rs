@@ -579,6 +579,7 @@ async fn build_agent(
 
     let history = Arc::new(Mutex::new(Vec::new()));
     let ops = Arc::new(RuntimeOps {
+        runner: std::sync::OnceLock::new(),
         gate: Arc::clone(&gate),
         vfs: Arc::clone(&vfs),
         sessions: Arc::clone(&sessions),
@@ -662,8 +663,8 @@ async fn build_agent(
             || (matches!(backend, crate::config::WebBackend::Auto)
                 && protocol == crate::config::models::Protocol::Chat)
     };
-    if !search_server && use_tool_backend(config.tools.web_search.backend) {
-        if let Some(key) = auth
+    if !search_server && use_tool_backend(config.tools.web_search.backend)
+        && let Some(key) = auth
             .tools
             .web_search
             .api_key
@@ -678,9 +679,8 @@ async fn build_agent(
                 Err(error) => warn!(%error, "cannot register WebSearch"),
             }
         }
-    }
-    if !fetch_server && use_tool_backend(config.tools.web_fetch.backend) {
-        if let Some(key) = auth
+    if !fetch_server && use_tool_backend(config.tools.web_fetch.backend)
+        && let Some(key) = auth
             .tools
             .web_fetch
             .api_key
@@ -696,7 +696,6 @@ async fn build_agent(
                 Err(error) => warn!(%error, "cannot register WebFetch"),
             }
         }
-    }
 
     let gateway: Option<Arc<dyn NapcatGateway>> = qq
         .as_ref()
@@ -746,6 +745,8 @@ async fn build_agent(
             chat_history_limit: 20,
             hooks: config.hooks.context.clone(),
             server_tools,
+            turn_context_budget: config.compaction.turn_context_budget,
+            keep_recent_tokens: config.compaction.keep_recent_tokens,
         },
         history,
         Arc::clone(&ai_enabled),
@@ -753,8 +754,9 @@ async fn build_agent(
     )
     .await?;
 
-    // monitor 只有在 runner 就绪后才能投递。
+    // runner 就绪后才能投递 monitor、执行手动压缩。
     let _ = sink.runner.set(Arc::clone(&runner));
+    let _ = ops.runner.set(Arc::clone(&runner));
     crate::monitor::load_config_monitors(&monitors, &config.monitor).await?;
 
     let filter = MessageFilter::from_config(&config.filter);

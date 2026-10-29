@@ -345,11 +345,10 @@ async fn deliver_once(
     }
     {
         let mut last = monitor.last_delivery.lock().expect("monitor lock");
-        if let Some(previous) = *last {
-            if previous.elapsed() < monitor.min_interval {
+        if let Some(previous) = *last
+            && previous.elapsed() < monitor.min_interval {
                 return;
             }
-        }
         *last = Some(std::time::Instant::now());
     }
 

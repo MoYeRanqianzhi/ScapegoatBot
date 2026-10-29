@@ -55,6 +55,10 @@ pub struct RunnerConfig {
     pub hooks: Vec<crate::config::ContextHookConfig>,
     /// 交给 provider 执行的服务端工具。
     pub server_tools: Vec<crate::providers::ServerToolKind>,
+    /// 单回合工作集上限；超过则先压缩。
+    pub turn_context_budget: u32,
+    /// 压缩后保留的最近 token 数。
+    pub keep_recent_tokens: u32,
 }
 
 /// 回合执行器。
@@ -75,6 +79,8 @@ pub struct Runner {
     /// 已提交的全局 transcript（内存镜像）。
     history: Arc<Mutex<Vec<AgentMessage>>>,
     system: Vec<SystemBlock>,
+    /// 压缩互斥：同一时刻只允许一次。
+    compaction_lock: Mutex<()>,
 }
 
 impl Runner {
@@ -138,6 +144,7 @@ impl Runner {
             config,
             history,
             system,
+            compaction_lock: Mutex::new(()),
         }))
     }
 
@@ -198,6 +205,55 @@ impl Runner {
                 inbox
             },
         }
+    }
+
+    /// 立即压缩：摘要旧消息，轮转新分段，写入摘要与保留窗口。
+    ///
+    /// 设计 §8.1：摘要块固定包含 `previous_session`，当前分段的路径由 runtime 注入。
+    pub async fn compact_now(&self, reason: &str) -> Result<serde_json::Value> {
+        let _guard = self.compaction_lock.lock().await;
+        let history = self.history.lock().await.clone();
+        let (old, keep) = crate::session::compaction::split_for_compaction(
+            &history,
+            self.config.keep_recent_tokens as usize,
+        );
+        if old.is_empty() {
+            return Ok(serde_json::json!({
+                "compacted": false,
+                "reason": "nothing older than the retention window",
+            }));
+        }
+        let input = crate::session::compaction::render_for_summary(&old, 80_000);
+        let previous = self.sessions.current()?;
+        let summary = crate::session::compaction::summarize(
+            &*self.provider,
+            &self.config.model,
+            &input,
+            4096,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("compaction request failed: {error}"))?;
+
+        let summary_message = AgentMessage::System {
+            text: format!(
+                "[checkpoint summary | previous_session=/sessions/{} | reason={reason}]\n{summary}",
+                previous.file
+            ),
+        };
+        let next = self.sessions.rotate()?;
+        let mut new_history = vec![summary_message];
+        new_history.extend(keep);
+        self.sessions.append(&new_history)?;
+        let kept_messages = new_history.len() - 1;
+        *self.history.lock().await = new_history;
+
+        Ok(serde_json::json!({
+            "compacted": true,
+            "previous_session": previous.file,
+            "current_session": next.file,
+            "summary_bytes": summary.len(),
+            "kept_messages": kept_messages,
+        }))
     }
 
     /// 控制通道输入：`sbot chat` 注入的一句话。
@@ -362,6 +418,16 @@ impl Runner {
         };
         let base = working.len();
 
+        // 2.5) 超过工作集上限时先压缩，再重新载入历史副本。
+        let estimated = crate::session::compaction::estimate_messages(&working);
+        if estimated > self.config.turn_context_budget as usize {
+            if let Err(error) = self.compact_now("auto").await {
+                warn!(%error, "automatic compaction failed");
+            } else {
+                working = self.history.lock().await.clone();
+            }
+        }
+
         // 3) 组装本回合的即时提示。
         let mut prompts = vec![AgentMessage::user(self.runtime_context(chat).render())];
         if let Some(pending) = self.pending_history(chat, first_batch_id) {
@@ -468,6 +534,8 @@ pub fn summarize(outcome: &LoopOutcome) -> String {
 
 /// `agent.*` 操作的运行时实现。
 pub struct RuntimeOps {
+    /// 压缩与上下文操作需要 runner；构造顺序决定了这里只能后置注入。
+    pub runner: std::sync::OnceLock<Arc<Runner>>,
     pub gate: Arc<Gate>,
     pub vfs: Arc<VfsStore>,
     pub sessions: Arc<SessionStore>,
@@ -562,7 +630,14 @@ impl crate::tools::api::AgentOps for RuntimeOps {
     }
 
     async fn compact(&self) -> Result<serde_json::Value, String> {
-        Err("compaction is not available in this build".to_owned())
+        let runner = self
+            .runner
+            .get()
+            .ok_or_else(|| "the runner is not ready yet".to_owned())?;
+        runner
+            .compact_now("manual")
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn clear_context(&self) -> Result<serde_json::Value, String> {
@@ -835,6 +910,8 @@ mod tests {
                 chat_history_limit: 10,
                 hooks: crate::config::HooksConfig::default().context,
                 server_tools: Vec::new(),
+                turn_context_budget: 120_000,
+                keep_recent_tokens: 20_000,
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -982,6 +1059,8 @@ mod tests {
                 chat_history_limit: 10,
                 hooks: crate::config::HooksConfig::default().context,
                 server_tools: Vec::new(),
+                turn_context_budget: 120_000,
+                keep_recent_tokens: 20_000,
             },
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(AtomicBool::new(false)),
@@ -1013,5 +1092,130 @@ mod tests {
         );
         let _ = Usage::default();
         let _ = messages.usage().unwrap();
+    }
+
+    #[tokio::test]
+    async fn compact_now_summarizes_and_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let key = Arc::new(MasterKey::from_bytes([8u8; 32]));
+        let vfs = Arc::new(
+            VfsStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                dir.path().join("data"),
+                Limits::default(),
+            )
+            .unwrap(),
+        );
+        let messages = Arc::new(
+            MessageStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                dir.path().join("data"),
+                0,
+                EncryptionMode::XChaCha20Poly1305,
+            )
+            .unwrap(),
+        );
+        let sessions = Arc::new(
+            SessionStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                dir.path().join("data"),
+                0,
+                EncryptionMode::XChaCha20Poly1305,
+            )
+            .unwrap(),
+        );
+        let turn_buffer = Arc::new(TurnBufferStore::new(
+            Arc::clone(&db),
+            Arc::clone(&key),
+            EncryptionMode::XChaCha20Poly1305,
+        ));
+        let gate = Arc::new(Gate::from_config(
+            &GuardConfig {
+                enabled: true,
+                mode: GuardMode::Shadow,
+                backend: GuardBackend::Off,
+                threshold: 0.9,
+                ..GuardConfig::default()
+            },
+            None,
+            None,
+            crate::security::gate::hold_path(dir.path()),
+        ));
+        let tools = Arc::new(crate::tools::ToolRegistry::new(Arc::clone(&vfs), None));
+        let provider = Arc::new(FakeProvider {
+            script: StdMutex::new(
+                vec![vec![
+                    ProviderEvent::TextDelta("## Facts\ncompacted".to_owned()),
+                    ProviderEvent::Stop {
+                        reason: StopReason::EndTurn,
+                        refusal: None,
+                    },
+                ]]
+                .into(),
+            ),
+        });
+        let history = Arc::new(Mutex::new(Vec::new()));
+        let runner = Runner::new(
+            provider,
+            tools,
+            gate,
+            vfs,
+            messages,
+            Arc::clone(&sessions),
+            turn_buffer,
+            None,
+            RunnerConfig {
+                model: "fake".to_owned(),
+                mode: AgentMode::StandIn,
+                account_qq: 10000,
+                owner_qq: 10000,
+                master_qq: 10000,
+                owner_name: String::new(),
+                session_scope: "shared".to_owned(),
+                receive_scopes: vec!["*".to_owned()],
+                send_scopes: vec!["*".to_owned()],
+                gate_mode: GateMode::Auto,
+                max_tokens: 256,
+                thinking: ThinkingOptions::default(),
+                max_steps: 4,
+                retry: crate::agent::agent_loop::RetryPolicy::default(),
+                chat_history_limit: 10,
+                hooks: crate::config::HooksConfig::default().context,
+                server_tools: Vec::new(),
+                turn_context_budget: 120_000,
+                keep_recent_tokens: 5,
+            },
+            Arc::clone(&history),
+            Arc::new(AtomicBool::new(true)),
+            dir.path().join("ESTOP"),
+        )
+        .await
+        .unwrap();
+
+        {
+            let mut shared = history.lock().await;
+            for index in 0..20 {
+                shared.push(AgentMessage::user(format!("old message {index}")));
+            }
+        }
+        let previous = sessions.current().unwrap();
+        let value = runner.compact_now("test").await.unwrap();
+        assert_eq!(value["compacted"], true);
+        assert_eq!(value["previous_session"], previous.file);
+        let current = sessions.current().unwrap();
+        assert_ne!(current.file, previous.file);
+        let new_history = history.lock().await;
+        match &new_history[0] {
+            AgentMessage::System { text } => {
+                assert!(text.contains("previous_session=/sessions/"));
+                assert!(text.contains("compacted"));
+            }
+            other => panic!("expected a summary system message, got {other:?}"),
+        }
+        assert!(new_history.len() < 21);
     }
 }

@@ -8,6 +8,7 @@
 //! - `transcript_files` 只是可重建索引；`/sessions` 视图由内容动态渲染。
 //! - 每次压缩成功后轮转新分段（Phase 5 调用 [`SessionStore::rotate`]）。
 
+pub mod compaction;
 pub mod turn_buffer;
 
 use std::io::{BufRead, BufReader, Write};

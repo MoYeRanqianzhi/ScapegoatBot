@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::agent::ToolResult;
 use crate::vfs::sqlite::VfsStore;
-use crate::vfs::{FileContent, Vfs, VfsPath};
+use crate::vfs::{FileContent, VfsPath};
 
 use super::{Tool, ToolContext, arg_opt_str, arg_str, object_schema};
 
@@ -117,6 +117,7 @@ mod tests {
     use super::*;
     use crate::storage::Database;
     use crate::storage::crypto::MasterKey;
+    use crate::vfs::Vfs;
     use crate::vfs::quota::Limits;
 
     fn setup() -> (SkillTool, Arc<VfsStore>) {
