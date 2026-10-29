@@ -1,6 +1,6 @@
 [package]
 name = "scapegoat-bot"
-version = "0.1.0-alpha.1"
+version = "0.2.0-alpha.1"
 edition = "2024"
 description = "ScapegoatBot - 一个 QQ Agent，代替用户像真人一样回复消息"
 license = "MIT"
@@ -8,47 +8,54 @@ repository = "https://github.com/MoYeRanqianzhi/ScapegoatBot"
 homepage = "https://github.com/MoYeRanqianzhi/ScapegoatBot"
 authors = ["墨叶染千枝"]
 
-# 二进制目标：生成名为 sbot 的可执行文件
 [[bin]]
 name = "sbot"
 path = "src/main.rs"
 
 [dependencies]
-# 命令行参数解析（derive 模式）
+# 命令行参数解析（derive 模式）。CLI 是独立客户端，通过 IPC 与守护进程通信。
 clap = { version = "4", features = ["derive"] }
-# NapCatLink SDK — QQ 机器人 WebSocket 客户端（使用 crates.io 已发布版本）
-napcat-link = "0.1.0-alpha.2"
-# 异步运行时
+# 异步运行时：守护进程、IPC、WebSocket、数据库都跑在 tokio 上。
 tokio = { version = "1", features = ["full"] }
-# HTTP 客户端，用于调用 LLM API
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-# 序列化 / 反序列化
+# 序列化 / 反序列化：IPC 帧、auth.json、models.json、审计记录。
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# TOML 解析（用于配置文件和 Skill 清单文件）
+# TOML 解析：sbot.toml。写入用 toml_edit 以保留用户注释。
 toml = "0.8"
-# 异步 trait 支持
-async-trait = "0.1"
-# 错误处理
+toml_edit = "0.22"
+# 错误处理。
 anyhow = "1"
 thiserror = "2"
-# 日志与追踪
+# 日志与追踪。
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# 时间处理
-chrono = "0.4"
-# 能力安全的文件系统访问（将读写限制在 workspace 目录内）
-cap-std = "3"
-# 跨平台磁盘空间查询（写入前检查可用空间，防止 Agent 填满磁盘）
-fs2 = "0.4"
-# Base64 编码（ReadImage 工具将图片编码为 base64 供多模态 LLM 识别）
-base64 = "0.22"
-# 嵌入式 SQLite 数据库（消息图片注册表等持久化存储）
+# 时间处理：消息分区、审计时间戳、定时器。
+chrono = { version = "0.4", features = ["serde"] }
+# 嵌入式 SQLite 数据库：VFS、索引、账本、审计。
 rusqlite = { version = "0.32", features = ["bundled"] }
-rand = "0.10.0"
-# HTML 转 Markdown（Fetch 工具将网页内容转为 LLM 友好的 Markdown 格式）
-htmd = "0.5"
+# 内容加密：XChaCha20-Poly1305（设计 §6.6）。
+chacha20poly1305 = "0.10"
+# 从主密钥派生分域密钥。
+hkdf = "0.12"
+sha2 = "0.10"
+# 密钥材料的密码学安全随机源。
+getrandom = "0.3"
+# 单实例文件锁。
+fs2 = "0.4"
+# 定位用户主目录（~/.sbot）。
+dirs = "6"
+# 过滤器正则（sbot.toml 的 [filter].ignore_patterns）。
+regex = "1"
+# 十六进制编码：主密钥文件与哈希摘要。
+hex = "0.4"
+# Unix 域套接字权限、Windows 管道 DACL 需要平台 API。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
 
 [dev-dependencies]
-# 临时目录（用于 ImageStore 等模块的单元测试）
+# 临时目录：配置、存储、IPC 的单元测试。
 tempfile = "3"
