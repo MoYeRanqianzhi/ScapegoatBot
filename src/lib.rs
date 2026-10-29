@@ -14,6 +14,8 @@ pub mod ipc;
 // MCP 可选，默认关闭；启用时由 app 连接 stdio 服务器。
 #[allow(dead_code)]
 pub mod mcp;
+// 后台复盘：记忆候选与 /STYLE.md；只在空闲时运行。
+pub mod memory;
 pub mod monitor;
 pub mod paths;
 // 提示词在 Phase 5 由 runner 使用；Phase 4 已完成组装与测试。

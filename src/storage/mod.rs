@@ -240,6 +240,18 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     CREATE INDEX memory_entries_kind ON memory_entries(kind);
     "#,
     ),
+    (
+        7,
+        "skill usage",
+        // 技能使用记录；curator 只归档长期未用技能，不删除。
+        r#"
+    CREATE TABLE skill_usage (
+        name      TEXT PRIMARY KEY,
+        last_used TEXT NOT NULL,
+        uses      INTEGER NOT NULL
+    );
+    "#,
+    ),
 ];
 
 /// 数据库句柄。

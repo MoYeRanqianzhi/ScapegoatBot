@@ -126,6 +126,10 @@ pub struct SubagentRequest {
     /// 续聊时携带的历史（不含本次任务）。
     pub history: Vec<AgentMessage>,
     pub max_steps: u32,
+    /// 当前深度；根代理为 0。
+    pub depth: u32,
+    /// 允许的最大深度。
+    pub max_depth: u32,
 }
 
 /// 子代理执行器；由 runtime 实现。
@@ -252,6 +256,11 @@ pub struct AgentInstance {
     pub label: String,
     pub kind: String,
     pub created_at: DateTime<Utc>,
+    /// 续聊时复用，避免自定义定义在第二轮丢失。
+    system: String,
+    tools: Vec<&'static str>,
+    max_steps: u32,
+    depth: u32,
     status: Mutex<InstanceStatus>,
     history: Mutex<Vec<AgentMessage>>,
     result: Mutex<Option<String>>,
@@ -346,9 +355,16 @@ impl AgentHub {
         kind: Option<&str>,
         agent: Option<&str>,
         task: String,
+        depth: u32,
     ) -> Result<serde_json::Value> {
         if !self.config.enabled {
             anyhow::bail!("swarm is disabled in [swarm].enabled");
+        }
+        if depth >= self.config.max_depth {
+            anyhow::bail!(
+                "swarm depth limit reached ({depth} of {})",
+                self.config.max_depth
+            );
         }
         if task.trim().is_empty() {
             anyhow::bail!("task must not be empty");
@@ -411,6 +427,10 @@ impl AgentHub {
                 .map(|kind| kind.as_str().to_owned())
                 .unwrap_or_else(|| "custom".to_owned()),
             created_at: Utc::now(),
+            system: system.clone(),
+            tools: tools.clone(),
+            max_steps,
+            depth,
             status: Mutex::new(InstanceStatus::Running),
             history: Mutex::new(vec![AgentMessage::user(&task)]),
             result: Mutex::new(None),
@@ -426,6 +446,8 @@ impl AgentHub {
             tools,
             history: Vec::new(),
             max_steps,
+            depth,
+            max_depth: self.config.max_depth,
         };
         let runner = Arc::clone(&self.runner);
         tokio::spawn(async move {
@@ -469,14 +491,18 @@ impl AgentHub {
         };
         *instance.status.lock().await = InstanceStatus::Running;
         *instance.result.lock().await = None;
+        let system = format!(
+            "{}\n\n# Your role\nContinue the previous task. Keep the same boundaries.",
+            instance.system
+        );
         let request = SubagentRequest {
-            // 续聊沿用同一套公共提示；定义正文已包含在首轮，无法从实例复原，
-            // 因此这里只使用通用子代理提示。
-            system: format!("{SUBAGENT_COMMON}\n\n# Your role\nContinue the previous task."),
+            system,
             task: text,
-            tools: AgentType::General.tools(false),
+            tools: instance.tools.clone(),
             history,
-            max_steps: self.config.default_max_steps,
+            max_steps: instance.max_steps,
+            depth: instance.depth,
+            max_depth: self.config.max_depth,
         };
         let runner = Arc::clone(&self.runner);
         tokio::spawn(async move {
@@ -681,7 +707,7 @@ mod tests {
         let runner = Arc::new(FakeRunner::default());
         let hub = hub(Arc::clone(&runner) as Arc<dyn SubagentRunner>);
         let spawned = hub
-            .spawn(Some("explore"), None, "find it".to_owned())
+            .spawn(Some("explore"), None, "find it".to_owned(), 0)
             .await
             .unwrap();
         let id = spawned["id"].as_str().unwrap().to_owned();
@@ -695,6 +721,16 @@ mod tests {
         let list = hub.check(None).await.unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1);
         assert!(hub.list().await["definitions"].is_array());
+    }
+
+    #[tokio::test]
+    async fn rejects_spawn_past_max_depth() {
+        let hub = hub(Arc::new(FakeRunner::default()) as Arc<dyn SubagentRunner>);
+        let error = hub
+            .spawn(None, None, "too deep".to_owned(), hub.config.max_depth)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("depth limit"), "{error}");
     }
 
     #[tokio::test]
@@ -719,8 +755,11 @@ mod tests {
             Arc::clone(&hub.vfs),
             hub.host_dir.clone(),
         );
-        hub.spawn(None, None, "one".to_owned()).await.unwrap();
-        let error = hub.spawn(None, None, "two".to_owned()).await.unwrap_err();
+        hub.spawn(None, None, "one".to_owned(), 0).await.unwrap();
+        let error = hub
+            .spawn(None, None, "two".to_owned(), 0)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("concurrency"));
     }
 }
