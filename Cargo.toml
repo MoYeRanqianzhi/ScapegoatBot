@@ -17,6 +17,8 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 # 异步运行时：守护进程、IPC、WebSocket、数据库都跑在 tokio 上。
 tokio = { version = "1", features = ["full"] }
+# NapCatLink SDK：QQ 机器人 WebSocket 客户端（项目自有代码，固定 alpha.2）。
+napcat-link = "=0.1.0-alpha.2"
 # HTTP 客户端：provider 与 Jev 判定器。
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 # 流式读取 SSE 与并行工具执行。
@@ -52,6 +54,8 @@ fs2 = "0.4"
 dirs = "6"
 # 过滤器正则（sbot.toml 的 [filter].ignore_patterns）。
 regex = "1"
+# Base64：加密后的 JSONL 行。
+base64 = "0.22"
 # 十六进制编码：主密钥文件与哈希摘要。
 hex = "0.4"
 # VFS 路径的 Unicode NFC 规范化（设计 §6.3）。
@@ -67,3 +71,5 @@ windows-sys = { version = "0.59", features = [
 [dev-dependencies]
 # 临时目录：配置、存储、IPC 的单元测试。
 tempfile = "3"
+# 暂停时钟：队列去抖与定时器测试。
+tokio = { version = "1", features = ["test-util"] }

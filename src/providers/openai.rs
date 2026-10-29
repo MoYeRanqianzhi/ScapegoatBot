@@ -238,12 +238,14 @@ impl StreamState {
                 // 若服务端只给完整参数（没有 delta），在这里补发一次。
                 if let Some(arguments) = payload.get("arguments").and_then(Value::as_str)
                     && let Some((index, _, length)) = &self.open_call
-                        && *length == 0 && !arguments.is_empty() {
-                            out.push(ProviderEvent::ToolCallArgumentsDelta {
-                                index: *index,
-                                delta: arguments.to_owned(),
-                            });
-                        }
+                    && *length == 0
+                    && !arguments.is_empty()
+                {
+                    out.push(ProviderEvent::ToolCallArgumentsDelta {
+                        index: *index,
+                        delta: arguments.to_owned(),
+                    });
+                }
                 self.open_call = None;
             }
             "response.output_text.delta" => {

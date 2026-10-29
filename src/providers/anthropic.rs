@@ -211,19 +211,22 @@ impl StreamState {
                 match block_type {
                     "text" => {
                         if let Some(text) = block.get("text").and_then(Value::as_str)
-                            && !text.is_empty() {
-                                out.push(ProviderEvent::TextDelta(text.to_owned()));
-                            }
+                            && !text.is_empty()
+                        {
+                            out.push(ProviderEvent::TextDelta(text.to_owned()));
+                        }
                     }
                     "thinking" => {
                         if let Some(text) = block.get("thinking").and_then(Value::as_str)
-                            && !text.is_empty() {
-                                out.push(ProviderEvent::ThinkingDelta(text.to_owned()));
-                            }
+                            && !text.is_empty()
+                        {
+                            out.push(ProviderEvent::ThinkingDelta(text.to_owned()));
+                        }
                         if let Some(signature) = block.get("signature").and_then(Value::as_str)
-                            && !signature.is_empty() {
-                                out.push(ProviderEvent::ThinkingSignature(signature.to_owned()));
-                            }
+                            && !signature.is_empty()
+                        {
+                            out.push(ProviderEvent::ThinkingSignature(signature.to_owned()));
+                        }
                     }
                     "tool_use" => {
                         out.push(ProviderEvent::ToolCallStart {
@@ -309,9 +312,11 @@ impl StreamState {
                     self.refusal = Some(refusal_from(details));
                 }
                 if let Some(reason) = self.stop_reason
-                    && reason == StopReason::Refusal && self.refusal.is_none() {
-                        self.refusal = Some(RefusalDetails::default());
-                    }
+                    && reason == StopReason::Refusal
+                    && self.refusal.is_none()
+                {
+                    self.refusal = Some(RefusalDetails::default());
+                }
             }
             "message_stop" => {
                 if !self.stop_sent {

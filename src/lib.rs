@@ -19,6 +19,12 @@ pub mod providers;
 #[allow(dead_code)]
 pub mod security;
 pub mod storage;
+// QQ 接入与消息队列在 Phase 4/5 接上运行时；Phase 3 已完成实现与单元测试。
+#[allow(dead_code)]
+pub mod qq;
+#[allow(dead_code)]
+pub mod session;
+
 // VFS 的完整接口（读写/编辑/复制/回收站/二进制）在 Phase 4 由文件工具调用；
 // 在此之前生产路径只用到 `usage`，其余方法只被单元测试覆盖，因此整体允许 dead_code。
 #[allow(dead_code)]

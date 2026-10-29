@@ -101,14 +101,12 @@ pub struct ToolSpec {
 }
 
 /// 思考配置。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ThinkingOptions {
     pub enabled: bool,
     /// 统一 effort 级别；`None` 表示不发送。
     pub effort: Option<String>,
 }
-
 
 /// 服务端工具类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

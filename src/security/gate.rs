@@ -199,15 +199,17 @@ impl JevJudge {
     pub fn parse_score(root: &Value) -> Option<f32> {
         // 官方响应：{"answers": {"dangerous": {"type":"noul","noul":0.98}}}
         if let Some(Value::Number(number)) = root.pointer("/answers/dangerous/noul")
-            && let Some(value) = number.as_f64() {
-                return Some(value.clamp(0.0, 1.0) as f32);
-            }
+            && let Some(value) = number.as_f64()
+        {
+            return Some(value.clamp(0.0, 1.0) as f32);
+        }
         // 兼容字段差异：按 answers/results/data 里的第一个答案找 noul / probability。
         for key in ["answers", "results", "data"] {
             if let Some(value) = root.get(key)
-                && let Some(found) = find_number(value, &["noul", "probability", "p"]) {
-                    return Some(found);
-                }
+                && let Some(found) = find_number(value, &["noul", "probability", "p"])
+            {
+                return Some(found);
+            }
         }
         find_number(root, &["noul", "probability", "p"])
     }
@@ -219,9 +221,10 @@ fn find_number(value: &Value, keys: &[&str]) -> Option<f32> {
         Value::Object(map) => {
             for key in keys {
                 if let Some(Value::Number(number)) = map.get(*key)
-                    && let Some(value) = number.as_f64() {
-                        return Some(value.clamp(0.0, 1.0) as f32);
-                    }
+                    && let Some(value) = number.as_f64()
+                {
+                    return Some(value.clamp(0.0, 1.0) as f32);
+                }
             }
             for child in map.values() {
                 if let Some(found) = find_number(child, keys) {
@@ -463,9 +466,10 @@ impl Gate {
                 verdict.score,
                 &verdict.backend,
                 &reason,
-            ) {
-                warn!(%error, "cannot record the security event");
-            }
+            )
+        {
+            warn!(%error, "cannot record the security event");
+        }
         debug!(?checkpoint, allowed, "safety gate evaluated");
 
         GateDecision {

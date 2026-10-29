@@ -7,6 +7,7 @@
 //! VFS、消息索引、发送账本等表在各自阶段追加迁移，**只增不改**。
 
 pub mod crypto;
+pub mod messages;
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -119,6 +120,107 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         created_at TEXT NOT NULL
     );
     CREATE INDEX security_events_created ON security_events(created_at);
+    "#,
+    ),
+    (
+        4,
+        "phase3: message index, inbox state, cursors, outbound ledger",
+        r#"
+    -- JSONL 是事实来源，本表是可重建索引（设计 §8.2）。
+    CREATE TABLE message_files (
+        path       TEXT PRIMARY KEY,
+        scope      TEXT NOT NULL,
+        peer       INTEGER NOT NULL,
+        month      TEXT NOT NULL,
+        day        TEXT NOT NULL,
+        count      INTEGER NOT NULL DEFAULT 0,
+        bytes      INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX message_files_month ON message_files(scope, peer, month);
+
+    CREATE TABLE messages (
+        chat        TEXT NOT NULL,
+        message_id  INTEGER NOT NULL,
+        sender      TEXT NOT NULL,
+        ts          TEXT NOT NULL,
+        day         TEXT NOT NULL,
+        file_path   TEXT NOT NULL,
+        line_no     INTEGER NOT NULL,
+        reply_to    INTEGER,
+        is_self     INTEGER NOT NULL,
+        backfilled  INTEGER NOT NULL DEFAULT 0,
+        recalled    INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (chat, message_id)
+    );
+    CREATE INDEX messages_chat_ts ON messages(chat, ts);
+    CREATE INDEX messages_day ON messages(day);
+
+    -- 收件箱状态：unread / read / dismissed。
+    CREATE TABLE inbox_state (
+        chat       TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        state      TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (chat, message_id)
+    );
+    CREATE INDEX inbox_state_state ON inbox_state(state);
+
+    -- 断线补消息的双轨游标。
+    CREATE TABLE chat_cursors (
+        chat            TEXT PRIMARY KEY,
+        last_message_id INTEGER NOT NULL,
+        last_ts         TEXT NOT NULL,
+        updated_at      TEXT NOT NULL
+    );
+
+    -- 发送账本：先登记再发送，未确认的发送重启后先查账本与历史。
+    CREATE TABLE outbound_intents (
+        id         TEXT PRIMARY KEY,
+        chat       TEXT NOT NULL,
+        intent     TEXT NOT NULL,
+        status     TEXT NOT NULL,
+        message_id INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+    CREATE INDEX outbound_intents_chat ON outbound_intents(chat, status);
+    "#,
+    ),
+    (
+        5,
+        "phase3: transcript segments, turn buffer, checkpoints",
+        r#"
+    -- transcript 分段索引；事实来源是 sessions/*.jsonl，本表可重建。
+    CREATE TABLE transcript_files (
+        file          TEXT PRIMARY KEY,
+        file_id       TEXT NOT NULL,
+        prev_file     TEXT,
+        base_seq      INTEGER NOT NULL DEFAULT 0,
+        started_at    TEXT NOT NULL,
+        ended_at      TEXT,
+        message_count INTEGER NOT NULL DEFAULT 0,
+        bytes         INTEGER NOT NULL DEFAULT 0,
+        pruned_at     TEXT
+    );
+    CREATE INDEX transcript_files_started ON transcript_files(started_at);
+
+    -- 回合缓冲：assistant/tool 块在回合结束时才提交到分段。
+    CREATE TABLE turn_buffer (
+        turn_id TEXT NOT NULL,
+        seq     INTEGER NOT NULL,
+        line    TEXT NOT NULL,
+        state   TEXT NOT NULL,
+        PRIMARY KEY (turn_id, seq)
+    );
+
+    -- 压缩检查点；Phase 5 写入。
+    CREATE TABLE compaction_checkpoints (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_file  TEXT NOT NULL,
+        summary_enc BLOB NOT NULL,
+        created_at TEXT NOT NULL
+    );
     "#,
     ),
 ];

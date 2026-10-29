@@ -246,13 +246,15 @@ impl StreamState {
         let delta = &choice["delta"];
 
         if let Some(text) = delta.get("content").and_then(Value::as_str)
-            && !text.is_empty() {
-                out.push(ProviderEvent::TextDelta(text.to_owned()));
-            }
+            && !text.is_empty()
+        {
+            out.push(ProviderEvent::TextDelta(text.to_owned()));
+        }
         if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str)
-            && !reasoning.is_empty() {
-                out.push(ProviderEvent::ThinkingDelta(reasoning.to_owned()));
-            }
+            && !reasoning.is_empty()
+        {
+            out.push(ProviderEvent::ThinkingDelta(reasoning.to_owned()));
+        }
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for call in calls {
                 let index = call.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -270,12 +272,13 @@ impl StreamState {
                     });
                 }
                 if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
-                    && !arguments.is_empty() {
-                        out.push(ProviderEvent::ToolCallArgumentsDelta {
-                            index,
-                            delta: arguments.to_owned(),
-                        });
-                    }
+                    && !arguments.is_empty()
+                {
+                    out.push(ProviderEvent::ToolCallArgumentsDelta {
+                        index,
+                        delta: arguments.to_owned(),
+                    });
+                }
             }
         }
 
