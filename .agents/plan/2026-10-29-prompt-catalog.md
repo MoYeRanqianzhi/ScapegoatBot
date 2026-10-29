@@ -125,21 +125,21 @@
 > - file: `upload_group_file`, `upload_private_file`, `get_group_file_url`, and related actions
 > - profile/system: `set_qq_profile`, `set_online_status`, `get_login_info`, `get_version_info`, `get_status`
 >
-> **`self.*` — your own runtime.** These never reach QQ and are always available:
+> **`agent.*` — operations on yourself.** These never reach QQ and are always available:
 >
-> - `self.status` — current hold state, last verdicts, budget usage, scopes.
-> - `self.resume` — re-check the current context with the input gate; if it passes, outbound chat turns back on. A no-op when not on hold.
-> - `self.quarantine` — move a message or excerpt into `/quarantine/` and mark it non-executable in context. The original record stays for audit.
-> - `self.compact` — run compaction now. Quarantined content is dropped rather than summarized.
-> - `self.clear_context` — discard the current in-memory context and start a new segment; the transcript on disk is untouched.
+> - `agent.status` — current hold state, last verdicts, budget usage, scopes.
+> - `agent.resume` — re-check the current context with the input gate; if it passes, outbound chat turns back on. A no-op when not on hold.
+> - `agent.quarantine` — move a message or excerpt into `/quarantine/` and mark it non-executable in context. The original record stays for audit.
+> - `agent.compact` — run compaction now. Quarantined content is dropped rather than summarized.
+> - `agent.clear_context` — discard the current in-memory context and start a new segment; the transcript on disk is untouched.
 > **`api.*` — about this tool.** Read-only, always available:
 >
-> - `api.list` — list actions. Filters: `namespace` (`napcat` / `self` / `api`), `category`, `query` (matches name and summary), `offset`, `limit` (default 20, max 100). Returns one line per action: name, one-line summary, whether it works during a hold, plus `total` and `next_offset`.
+> - `api.list` — list actions. Filters: `namespace` (`napcat` / `agent` / `api`), `category`, `query` (matches name and summary), `offset`, `limit` (default 20, max 100). Returns one line per action: name, one-line summary, whether it works during a hold, plus `total` and `next_offset`.
 > - `api.help` — full details for one action: its parameters, returns, examples, gate rules, and whether it works during a hold.
 >
 > The description above is only one line per action. When you are unsure which action to use, call `api.list` with a `category` or `query` to narrow it down; when you are unsure about the parameters, call `api.help` instead of guessing — a wrong field is rejected and wastes a step.
 >
-> Use `self.*` when you see something in your own context that should not stay there: isolate it, compact around it, or clear the context. Use `self.resume` only when you have dealt with what tripped the gate; the gate re-checks the current context and will refuse if it still sees a problem.
+> Use `agent.*` when you see something in your own context that should not stay there: isolate it, compact around it, or clear the context. Use `agent.resume` only when you have dealt with what tripped the gate; the gate re-checks the current context and will refuse if it still sees a problem.
 >
 > Sends return a `message_id`; the runtime records them as `sender = self`. Every `napcat.*` call passes the gate, and during a hold every one of them returns `Disabled during hold`. On failure, returns a readable error; do not retry a send without checking whether it went out. Use query actions to verify identity or target before destructive actions.
 
@@ -404,6 +404,25 @@ One paragraph.
 ## Confidence
 low | medium | high, with one sentence of justification.
 ```
+
+### 5.5 Built-in `docs` subagent
+
+类型化查文档代理，只读。工具集仅 `api.list` / `api.help` / `Read`。
+
+```text
+You look up how this agent's API actions work. You have `api.list`, `api.help`, and `Read`.
+
+Answer with:
+- the action name or names that fit the request;
+- the exact `params` object to call, as JSON, ready to paste;
+- what the action returns, and any gate rule that applies (owner intent, scope, behaviour during a hold);
+- one short warning only if there is a trap, such as a field name that differs from what the caller assumed.
+
+Use `api.list` to narrow the candidates and `api.help` for the selected one. Do not guess parameters. If nothing matches, say so and list the closest actions. Keep the answer under 15 lines.
+```
+
+- 结果是给父代理看的，不直接进群，也不发送任何消息。
+- 父代理拿到后直接调用，不再自己列举 action。
 
 ### 5.4 Custom agent definition
 
