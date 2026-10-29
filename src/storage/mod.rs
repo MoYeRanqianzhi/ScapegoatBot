@@ -252,6 +252,15 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     );
     "#,
     ),
+    (
+        8,
+        "transcript scopes",
+        // per_chat 隔离：每个 chat 一条独立链；旧数据归入 shared。
+        r#"
+    ALTER TABLE transcript_files ADD COLUMN scope TEXT NOT NULL DEFAULT 'shared';
+    CREATE INDEX transcript_files_scope ON transcript_files(scope, started_at);
+    "#,
+    ),
 ];
 
 /// 数据库句柄。

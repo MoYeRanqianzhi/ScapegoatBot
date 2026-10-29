@@ -55,6 +55,8 @@ pub struct SessionStore {
     root: PathBuf,
     max_bytes: u64,
     encryption: EncryptionMode,
+    /// `None` = 全局视图（列出全部分段）；`Some` = 某个 chat 的隔离链。
+    scope: Option<String>,
 }
 
 impl SessionStore {
@@ -74,7 +76,35 @@ impl SessionStore {
             root,
             max_bytes,
             encryption,
+            scope: None,
         })
+    }
+
+    /// 为某个 chat 构造隔离的链；共享文件与索引，按 `scope` 过滤。
+    pub fn for_scope(&self, scope: &str) -> Self {
+        Self {
+            db: Arc::clone(&self.db),
+            key: Arc::clone(&self.key),
+            root: self.root.clone(),
+            max_bytes: self.max_bytes,
+            encryption: self.encryption,
+            scope: Some(scope.to_owned()),
+        }
+    }
+
+    /// 当前作用域名；全局视图按 `shared` 处理。
+    fn scope_name(&self) -> &str {
+        self.scope.as_deref().unwrap_or("shared")
+    }
+
+    /// 数据库中已有的作用域（用于 per_chat 崩溃恢复）。
+    pub fn scopes(&self) -> Result<Vec<String>> {
+        let conn = self.db.lock();
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT COALESCE(scope, 'shared') FROM transcript_files ORDER BY 1",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.filter_map(Result::ok).collect())
     }
 
     /// 当前（未关闭）分段；不存在时创建一个。
@@ -83,8 +113,9 @@ impl SessionStore {
             let conn = self.db.lock();
             conn.query_row(
                 "SELECT file FROM transcript_files
-                 WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1",
-                [],
+                 WHERE ended_at IS NULL AND COALESCE(scope, 'shared') = ?1
+                 ORDER BY started_at DESC LIMIT 1",
+                params![self.scope_name()],
                 |row| row.get(0),
             )
             .optional()?
@@ -171,16 +202,32 @@ impl SessionStore {
         Ok(messages)
     }
 
-    /// 列出全部分段（从新到旧）。
+    /// 列出分段（从新到旧）；全局视图列出全部，隔离视图只列自己的链。
     pub fn list(&self) -> Result<Vec<SessionFile>> {
         let conn = self.db.lock();
-        let mut statement = conn.prepare(
-            "SELECT file, file_id, prev_file, started_at, ended_at, message_count, bytes
-             FROM transcript_files ORDER BY started_at DESC",
-        )?;
-        let rows = statement
-            .query_map([], row_to_file)?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut rows = match &self.scope {
+            None => {
+                let mut statement = conn.prepare(
+                    "SELECT file, file_id, prev_file, started_at, ended_at, message_count, bytes
+                     FROM transcript_files ORDER BY started_at DESC",
+                )?;
+                statement
+                    .query_map([], row_to_file)?
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            Some(scope) => {
+                let mut statement = conn.prepare(
+                    "SELECT file, file_id, prev_file, started_at, ended_at, message_count, bytes
+                     FROM transcript_files
+                     WHERE COALESCE(scope, 'shared') = ?1
+                     ORDER BY started_at DESC",
+                )?;
+                statement
+                    .query_map(params![scope], row_to_file)?
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        rows.shrink_to_fit();
         Ok(rows)
     }
 
@@ -257,15 +304,24 @@ impl SessionStore {
         Ok(out)
     }
 
-    /// 用量：字节数与消息条数。
+    /// 用量：字节数与消息条数；隔离视图只统计本链。
     pub fn usage(&self) -> Result<(u64, u64)> {
         let conn = self.db.lock();
-        let (bytes, count) = conn.query_row(
-            "SELECT COALESCE(SUM(bytes), 0), COALESCE(SUM(message_count), 0)
-             FROM transcript_files WHERE pruned_at IS NULL",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        let (bytes, count) = match &self.scope {
+            None => conn.query_row(
+                "SELECT COALESCE(SUM(bytes), 0), COALESCE(SUM(message_count), 0)
+                 FROM transcript_files WHERE pruned_at IS NULL",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?,
+            Some(scope) => conn.query_row(
+                "SELECT COALESCE(SUM(bytes), 0), COALESCE(SUM(message_count), 0)
+                 FROM transcript_files
+                 WHERE pruned_at IS NULL AND COALESCE(scope, 'shared') = ?1",
+                params![scope],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?,
+        };
         Ok((bytes, count))
     }
 
@@ -286,8 +342,9 @@ impl SessionStore {
                 conn.query_row(
                     "SELECT file, started_at, bytes FROM transcript_files
                      WHERE ended_at IS NOT NULL AND pruned_at IS NULL
+                       AND COALESCE(scope, 'shared') = ?1
                      ORDER BY started_at ASC LIMIT 1",
-                    [],
+                    params![self.scope_name()],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?
@@ -336,8 +393,10 @@ impl SessionStore {
         Ok(conn
             .query_row(
                 "SELECT file FROM transcript_files
-                 WHERE ended_at IS NOT NULL ORDER BY started_at DESC LIMIT 1",
-                [],
+                 WHERE ended_at IS NOT NULL
+                   AND COALESCE(scope, 'shared') = ?1
+                 ORDER BY started_at DESC LIMIT 1",
+                params![self.scope_name()],
                 |row| row.get(0),
             )
             .optional()?)
@@ -346,8 +405,14 @@ impl SessionStore {
     /// 创建新分段。
     fn create(&self, prev_file: Option<&str>) -> Result<SessionFile> {
         let started_at = Utc::now();
+        let prefix = self.scope.as_ref().map(|scope| {
+            let mut escaped = scope.replace([':', '/', '\\'], "-");
+            escaped.push('-');
+            escaped
+        });
+        let prefix = prefix.unwrap_or_default();
         let file = format!(
-            "{}-{}.jsonl",
+            "{prefix}{}-{}.jsonl",
             started_at.format("%Y%m%dT%H%M%SZ"),
             std::process::id() % 1000
         );
@@ -356,7 +421,7 @@ impl SessionStore {
         if path.exists() {
             // 同一秒内多次创建时追加随机后缀，保持字典序。
             let file = format!(
-                "{}-{}.jsonl",
+                "{prefix}{}-{}.jsonl",
                 started_at.format("%Y%m%dT%H%M%SZ"),
                 hex::encode(&file_id.as_bytes()[file_id.len().saturating_sub(4)..])
             );
@@ -400,9 +465,15 @@ impl SessionStore {
         };
         let conn = self.db.lock();
         conn.execute(
-            "INSERT INTO transcript_files (file, file_id, prev_file, started_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![info.file, info.file_id, info.prev_file, info.started_at],
+            "INSERT INTO transcript_files (file, file_id, prev_file, started_at, scope)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                info.file,
+                info.file_id,
+                info.prev_file,
+                info.started_at,
+                self.scope_name()
+            ],
         )?;
         Ok(info)
     }
@@ -618,5 +689,36 @@ mod tests {
         let second = store.rotate().unwrap();
         let list = store.list().unwrap();
         assert_eq!(list[0].file, second.file);
+    }
+
+    #[test]
+    fn per_chat_scopes_have_separate_chains() {
+        let (store, _dir) = store();
+        let group = store.for_scope("group-1");
+        let private = store.for_scope("private-2");
+        group
+            .append(&[AgentMessage::user("group message")])
+            .unwrap();
+        private
+            .append(&[AgentMessage::user("private message")])
+            .unwrap();
+
+        let group_current = group.current().unwrap();
+        let private_current = private.current().unwrap();
+        assert_ne!(group_current.file, private_current.file);
+        assert!(group_current.file.starts_with("group-1-"));
+        assert!(private_current.file.starts_with("private-2-"));
+        assert_eq!(group.list().unwrap().len(), 1);
+        assert_eq!(private.list().unwrap().len(), 1);
+        assert_eq!(store.list().unwrap().len(), 2);
+        let scopes = store.scopes().unwrap();
+        assert!(scopes.contains(&"group-1".to_owned()));
+        assert!(scopes.contains(&"private-2".to_owned()));
+
+        let group_messages = group.read_segment(&group_current.file).unwrap();
+        assert_eq!(group_messages.len(), 1);
+        assert!(
+            matches!(&group_messages[0], AgentMessage::User { text } if text.contains("group message"))
+        );
     }
 }

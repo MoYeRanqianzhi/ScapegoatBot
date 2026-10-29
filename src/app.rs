@@ -165,10 +165,6 @@ impl Runtime {
         let auth_path = paths.resolve(&loaded.config.auth_file, &loaded.dir);
         let auth = AuthFile::load_optional(&auth_path)?;
         report_missing_credentials(&loaded.config, &auth);
-        // per_chat 尚未实现：明确告警，避免配置看起来生效但实际仍是 shared。
-        if loaded.config.session.scope == SessionScope::PerChat {
-            warn!("session.scope = per_chat is not implemented in this build; using shared");
-        }
 
         let instance_lock = InstanceLock::acquire(&paths.instance_lock())?;
         let key = Arc::new(MasterKey::load_or_create(paths.key_file())?);

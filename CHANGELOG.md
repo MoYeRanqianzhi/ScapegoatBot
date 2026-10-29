@@ -5,7 +5,7 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.2.0-alpha.8] - 2026-10-30
+## [0.2.0-alpha.9] - 2026-10-30
 
 0.2 是完整重写：旧 0.1 的模块划分、数据结构与调用方式全部放弃，按
 `.agents/plan/2026-10-28-rebuild-design.md` 重新实现。量化对比见
@@ -39,8 +39,8 @@
 ### 已知限制
 
 - **后台复盘**：空闲时从 transcript 提取记忆候选（只追加、来源 `self`）、更新 `/STYLE.md`；技能使用记录 + curator 归档长期未用技能（不删除，`pinned` 跳过）。
+- **`per_chat` 会话隔离**：每个 chat 一条独立 transcript 链与历史，压缩/轮转/保留/崩溃恢复按 chat 执行；迁移 v8 增加 `scope` 列。
 - **子代理嵌套**：`max_depth` 深度限制；`Agent message` 续聊复用原定义的提示、工具集与步数；`Agent spawn` 的 `monitor` 参数与 `deliver.to = <spawn_id>` / `agent:<name>` 把事件绑定到子代理实例。
-- 未实现：`per_chat` 会话隔离（启动时告警并使用 shared）。
 - `/config` 写入支持白名单键并原子落盘；`[filter]` 与 `[queue]` 写入立即热更新（`max_concurrent` 的信号量上限需重启）。
 - 真实 Chat 端点与真实 Jev 的测试默认 `#[ignore]`，需要环境变量显式启用。
 
