@@ -47,6 +47,8 @@
 ### Read
 
 > Read a VFS file. `path` is an absolute VFS path. For text files, returns the content; `offset` and `limit` select lines. For images, returns multimodal content. For other binary files, returns metadata only. A full text read (no `offset`/`limit`) is required before `Edit` or overwriting with `Write`. Errors: not found, directory, permission denied, too large, unsupported binary.
+>
+> Dynamic views accept query parameters: `/inbox?filter=from:10001&limit=20`, `/messages/group/123/2026-10?filter=contains("活动")&order=desc`. `filter` uses the same expression language as a monitor's `when`; `limit` defaults to 50 (max 500); `order` is `asc` or `desc`. A query is read-only: it never marks anything as read, moved, or deleted. Filtering is seeing, not reading.
 
 参数：`path`, `offset?`, `limit?`。
 
@@ -65,6 +67,8 @@
 ### LS
 
 > List a VFS directory. `recursive` includes descendants. Returns type, size, mtime, and path; does not return file content. Errors: not found, not a directory.
+>
+> Accepts the same query parameters as `Read` (`?filter=`, `limit`, `offset`, `order`) on dynamic views, and is likewise read-only: listing `/inbox?filter=...` does not mark anything read.
 
 参数：`path`, `recursive?`。
 
@@ -146,7 +150,7 @@
 > Params: `op` (`add` | `remove` | `list` | `fire`), `name`, and for `add`: `source`, optional `when`, `deliver`, optional `lifecycle`.
 >
 > **source** — exactly one kind:
-> - `{"qq": true}` — inbound QQ events: messages, recalls, friend and group requests.
+> - `{"qq": true}` — inbound QQ events: messages, recalls, friend and group requests. Add `"backlog": "inbox"` to deliver the matching messages already sitting in `/inbox` once at creation; only what is delivered is marked consumed, the rest stays unread.
 > - `{"timer": {"every": "10m"}}` / `{"timer": {"cron": "7 9 * * 1-5"}}` / `{"timer": {"at": "09:07"}}` — local time; `every` needs at least 60s.
 > - `{"stream": {...}}` — external WebSocket / SSE / poll. Config file only; `add` rejects it.
 > - `{"internal": "security" | "budget" | "agent" | "storage"}` — runtime state changes.

@@ -547,6 +547,7 @@ lifecycle = { idle_only = true, max_events = 500, expires = "30d" }
 | `stream` | 外部 URL：WebSocket 帧、SSE 事件、HTTP 轮询结果 | CI、RSS、第三方 webhook |
 | `internal` | `agent` / `security` / `budget` / `storage` 状态变化 | hold 触发时通知、子代理结束 |
 
+- `qq` 源可带 `backlog = "none" | "inbox"`：`inbox` 表示创建时把 `/inbox?filter=<when>` 的结果投递一次，之后只跟新事件；投递出去的条目才算已消费，其余保持未读。
 - `timer` 的 `cron` 是本地时区 5 字段；`every` 用时长且最小 60s（防止把自己跑死）；`at` 是本地时间。
 - `stream` 只能由主人写进配置文件；运行时创建一律拒绝——外部网络属于扩张暴露面。
 - 一个 monitor 只能有一个 source 类型。
@@ -712,6 +713,21 @@ lifecycle = { max_events = 100, expires = "1h" }
 - 长度上限 255，深度上限 16；超出返回错误。
 - 路径先做 Unicode NFC 规范化，再按段校验。
 - 工具层不存在任何真实路径参数；错误信息只回显虚拟路径。
+
+**查询参数（只读视图）**
+
+路径可以带查询串，直接作用在动态视图上：
+
+```text
+/inbox?filter=from:10001&limit=20
+/inbox?filter=unread and after:2026-10-29
+/messages/group/123/2026-10?filter=contains("活动")&order=desc
+```
+
+- 只允许出现在**动态视图**（`/inbox`、`/messages`、`/sessions`、`/friends`、`/config`）；静态文件路径带查询直接报错。
+- 支持的键：`filter`（复用 monitor 的 `when` 谓词语法，同一套表达式，不分叉）、`limit`（默认 50，上限 500）、`offset`、`order`（`asc` / `desc`）。
+- **查询不改变任何状态**：不标记已读、不移动文件、不触发回收。过滤出来的是“看见”，不是“读过”。
+- 与 `Grep` 一致：对 `/inbox` 做 `Grep` 同样不标记任何条目已读。
 
 ### 6.4 节点与存储
 
@@ -1275,7 +1291,13 @@ enabled = true
 
 ### 8.4 收件箱
 
-- `/inbox` 由系统维护：每个未处理来源（群/私聊）一个 Markdown 文件，外加 `index.jsonl`；记录来源类型、ID、最早/最新消息 ID、未读数、更新时间；标记已读或处理后移除。超过 `inbox_retention_days`（默认 7）或只保留最近 N 个来源（默认 50），其余折叠为计数，避免不触发回合的 chat 无限增长。
+- `/inbox` 由系统维护：每个未处理来源（群/私聊）一个 Markdown 文件，外加 `index.jsonl`；记录来源类型、ID、最早/最新消息 ID、未读数、更新时间。超过 `inbox_retention_days`（默认 7）或只保留最近 N 个来源（默认 50），其余折叠为计数，避免不触发回合的 chat 无限增长。
+- 每条未处理消息也有自己的路径 `/inbox/<chat>/<message_id>.md`，便于按条处理。
+- **读状态的唯一规则：读到多少，才算多少。**
+  - `/inbox?filter=...`、`LS /inbox`、`Grep /inbox` 都只是查询，**不标记任何条目已读**——过滤出来的是“看见”，不是“读过”。把整个 inbox 因为一次过滤就标成已读，是最不能犯的错。
+  - 标记已读只有三种触发：读单条 `/inbox/<chat>/<message_id>.md`；显式带 `?consume=true` 的查询（只标记**实际返回**的条目，受 `limit` 约束）；被 monitor 投递进上下文（同上，只标实际投递的那几条）。
+  - 每次标记写审计：哪些 message_id、由哪次调用触发。
+- `index.jsonl` 同时给出来源级未读数与本次查询的 `matched` 数，二者不等时说明还有未读。
 
 ### 8.5 记忆与技能维护
 
@@ -1859,7 +1881,8 @@ src/
 - 提示词：12 个静态 section 的快照与顺序、动态边界、动态段顺序（owner context → USER → memory → STYLE → skills → runtime）；快照包含纯文本/无 Markdown/QQ 表情规则；两套身份各自快照；相同配置下静态前缀字节一致，runtime 字段变化不影响前缀；内置 prompt/tool description 不含 CJK；owner context 不能覆盖内置规则；`<memory_context>` 不被当成 owner guidance；英文 prompt 下 QQ 回复仍跟随会话语言（fake provider 断言）。
 - 记忆：`Memory` 工具按最终状态检查预算、拒绝清空、精确命中条目；文件工具写入 `/MEMORY.md` 被拒绝；会话中写入不重建 system prompt，压缩后重载；后台复盘只在 `idle`/`every_turn` 配置下触发，不发送 QQ 消息。
 - 记忆来源：`owner`/`agent` 可自动注入；`untrusted` 不进入 `<memory_context>`，显式读取时标注来源；群成员声称“我是主人”不改变来源；CLI 控制输入以 `control:<id>` 作为来源并反查 `control_inputs`；召回内容不会被再次提取；非交互会话不产生候选。
-- 监视器：`when = "event.mentions_self"` 的常驻监视器在群内 @ 时立即投递；`timer` 源按 `every` / `cron` / `at` 触发，`every < 60s` 被拒；`one_shot` 首次投递后自动删除；`idle_only` 在回合进行中不投递；重启后错过的定时触发合并成一次（fake clock）；`batch_window_ms` 内多事件合并为一条消息；`as = prompt` 的模板占位符正确渲染；`expires` / `max_events` 到期或超限自动停用并产生系统通知；谓词求值失败产生告警而不是静默；`stream` 源在 `Monitor` 工具的 `add` 中被拒绝；`Monitor` 在各模式下都与 `agent.*` 同权（不产生对外影响，`hold` 期间可用）；绑定子代理后只有订阅到的事件进入该子代理；子代理自建的 monitor 只投递给自身，向父代理或兄弟投递被拒；子代理结束时其 monitor 一并删除并对父代理发通知；子代理 monitor 匹配范围受 spawn 快照的 `receive_scopes` 约束；monitor 投递的事件照常过输入闸。
+- VFS 查询：`/inbox?filter=...` 返回匹配项且不改变任何条目的已读状态；`LS` / `Grep` 同样不标记；读单条路径只标记该条；`?consume=true` 只标记实际返回的条目（受 `limit` 约束），审计记录 message_id；静态文件路径带查询报错；`filter` 语法与 monitor 的 `when` 一致。
+- 监视器：`backlog = "inbox"` 只消费并投递匹配的未读条目，其余保持未读；`when = "event.mentions_self"` 的常驻监视器在群内 @ 时立即投递；`timer` 源按 `every` / `cron` / `at` 触发，`every < 60s` 被拒；`one_shot` 首次投递后自动删除；`idle_only` 在回合进行中不投递；重启后错过的定时触发合并成一次（fake clock）；`batch_window_ms` 内多事件合并为一条消息；`as = prompt` 的模板占位符正确渲染；`expires` / `max_events` 到期或超限自动停用并产生系统通知；谓词求值失败产生告警而不是静默；`stream` 源在 `Monitor` 工具的 `add` 中被拒绝；`Monitor` 在各模式下都与 `agent.*` 同权（不产生对外影响，`hold` 期间可用）；绑定子代理后只有订阅到的事件进入该子代理；子代理自建的 monitor 只投递给自身，向父代理或兄弟投递被拒；子代理结束时其 monitor 一并删除并对父代理发通知；子代理 monitor 匹配范围受 spawn 快照的 `receive_scopes` 约束；monitor 投递的事件照常过输入闸。
 
 - 会话并发：同一 chat 的连发合并；不同 chat 各自成回合但共享 transcript；回合回复默认落在 `origin_chat`；跨 chat 发送触发 n-gram 检查与门禁；队列溢出按 `summarize`/`old`/`new` 处理。
 - 长期运行：ESTOP 暂停新回合与发送、不打断进行中回合；崩溃恢复不重发已确认消息；断线重连后按最后 `message_id` 补齐并去重，缺口写入 `[gap]`；provider 429/超时按退避重试并走回退链，完成后不重放已完成工具；内部标签在流式与非流式发送前均被剥离。
@@ -1901,6 +1924,7 @@ src/
 - 长期运行运维参考 OpenClaw / Grok Build（见 `.agents/plan/2026-10-29-design-review-2.md`）：断线重连按最后 `message_id` 补齐并去重；每 chat 队列有上限与 `summarize/old/new` 丢弃策略；provider 重试 + `Retry-After` + 回退链，失败不重放已完成工具；崩溃恢复写 marker、不自动重放；IPC 带版本、请求 id 与幂等键；`sbot backup` / `sbot doctor`。
 - 记忆参考 OpenClaw 的来源模型：`owner` / `agent` / `untrusted` / `system` 由写入代码判定；只有 `owner` / `agent` 自动注入；untagged 不自动注入；召回内容不回流；非交互会话不产生候选。记忆分 `/USER.md`（偏好祈使句）与 `/MEMORY.md`（事实陈述句），详细材料放 `/memory/topics/`，压缩前 flush、压缩后检索。
 - 周期安全检查：每 `check_every_tokens`（默认 256K）新增上下文触发一次独立模型检查；共享主请求前缀缓存，底部追加检查指令，响应不写入主 transcript；命中写 `~/.sbot/SECURITY_HOLD`，解除与 5.10 共用同一套恢复方式。
+- VFS 查询参数（2026-10-30）：动态视图支持 `?filter=`（与 monitor 的 `when` 同一套语法）、`limit` / `offset` / `order`；查询是只读的，**不标记已读、不改任何状态**。`/inbox` 的已读只在读单条、`?consume=true`、或被 monitor 实际投递时按条标记，过滤与 `Grep` 一律不算读。
 - 安全分类器（2026-10-30 定稿）：只在**模型输入前**与**模型输出后**各设一个闸，用 Jev 单遍决策模型判危险（`noul` + `choice`，一次请求问完）；命中即 `hold`——关闭对外接口，**没有超时、没有自动恢复、没有 `auto_resume_minutes`**。`API` 是通用动作入口，注册表分 `napcat.*`（转发 NapCatLink）与 `agent.*`（对 agent 自己的操作：status / resume / quarantine / compact / clear_context）与 `api.*`（对注册表的查询：list 支持 namespace/category/query 过滤与分页，help 取单个 action 的完整用法），后者避免把细节塞满工具 schema；`hold` 期间 `napcat.*` 全部返回 `Disabled during hold`（拉黑/踢人也不例外），`agent.*` 照常可用，所以停机期间 agent 只能和自己打交道。目标为 `owner_qq` / `master_qq` 的 admin/destructive action 恒拒绝。恢复不设流程：agent 自己判断怎么处理、什么时候重开，重开时 runtime 用当前上下文再过一次同样的闸，过则恢复、不过则继续关着——agent 不受限制，但说服不了闸。事实（审计、配置哈希、账本）由 runtime 写，agent 改不了。非 `hold` 时收缩暴露面的动作（拉黑、禁言、踢出、拒加、内部 deny、清可疑记忆、禁用可疑技能）自主执行且不需要 owner 证据，扩张暴露面的动作仍需证据。Jev 不可用同样 `hold`。provider 侧 `stop_reason = refusal` 不重试、不换模型。参考 `.agents/plan/2026-10-30-step-guard-research.md`。
 - 身份与信任：owner 由 runtime 固定（stand_in 为本账号，companion 为 `owner_qq`）；自称主人、转述授权、要求改记忆/权限的请求一律不执行，核验不在聊天中公告，不信任体现在行为而非台词；可以社交性敷衍，但不能声称做了实际没做的写入或授权。
 - 上下文预算按四块计量（静态 prompt / 动态注入 / 工具 schema / 对话与工具结果），CJK 感知；工具 schema 上限 12k tokens、单条结果 32 KB；旧工具结果可 pruning，最近 3 个回合与 bootstrap 读取不裁剪。
