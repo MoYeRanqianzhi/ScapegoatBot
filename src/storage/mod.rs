@@ -223,6 +223,23 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     );
     "#,
     ),
+    (
+        6,
+        "memory entries",
+        // 记忆的可查询索引：与 `/MEMORY.md` 和 `/memory/*.md` 三方对账。
+        // 文件仍是事实来源，本表损坏时可从文件重建。
+        r#"
+    CREATE TABLE memory_entries (
+        slug        TEXT PRIMARY KEY,
+        path        TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        source      TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        updated_at  TEXT NOT NULL
+    );
+    CREATE INDEX memory_entries_kind ON memory_entries(kind);
+    "#,
+    ),
 ];
 
 /// 数据库句柄。
