@@ -9,6 +9,7 @@
 //! 检查在 runtime（Phase 5）；这里先让每个工具把“它需要什么”写清楚，
 //! 便于 `api.help`、审计与未来的策略表读取。
 
+pub mod agent;
 pub mod api;
 pub mod download;
 pub mod fs;
@@ -107,6 +108,29 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)
+    }
+
+    /// 复制注册表，只保留 `allowed` 中的工具；上下文（VFS/视图）沿用。
+    ///
+    /// 子代理用它实现“工具集是父代理的子集”。
+    pub fn filtered(&self, allowed: &[&'static str]) -> Self {
+        let mut tools = BTreeMap::new();
+        for name in allowed {
+            if let Some(tool) = self.tools.get(name) {
+                tools.insert(*name, Arc::clone(tool));
+            }
+        }
+        Self {
+            tools,
+            vfs: self.vfs.clone(),
+            views: self.views.clone(),
+        }
+    }
+
+    /// 删除一个工具，返回是否存在（用于子代理去掉 `API` 发送能力）。
+    pub fn without(mut self, name: &str) -> Self {
+        self.tools.remove(name);
+        self
     }
 
     /// 全部工具声明，顺序稳定（BTreeMap）。

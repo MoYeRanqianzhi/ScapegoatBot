@@ -234,13 +234,12 @@ impl ProviderError {
         body: &str,
     ) -> Self {
         let mut error = Self::from_status(status, body);
-        if let Some(headers) = headers {
-            if let Some(raw) = headers
+        if let Some(headers) = headers
+            && let Some(raw) = headers
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
-            {
-                error.retry_after_ms = parse_retry_after(raw);
-            }
+        {
+            error.retry_after_ms = parse_retry_after(raw);
         }
         error
     }

@@ -11,6 +11,9 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod ipc;
+// MCP 可选，默认关闭；启用时由 app 连接 stdio 服务器。
+#[allow(dead_code)]
+pub mod mcp;
 pub mod monitor;
 pub mod paths;
 // 提示词在 Phase 5 由 runner 使用；Phase 4 已完成组装与测试。
@@ -31,6 +34,9 @@ pub mod tools;
 pub mod qq;
 #[allow(dead_code)]
 pub mod session;
+// 子代理：定义、实例与生命周期；由 `Agent` 工具驱动。
+#[allow(dead_code)]
+pub mod swarm;
 
 // VFS 的完整接口（读写/编辑/复制/回收站/二进制）在 Phase 4 由文件工具调用；
 // 在此之前生产路径只用到 `usage`，其余方法只被单元测试覆盖，因此整体允许 dead_code。

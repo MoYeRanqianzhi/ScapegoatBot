@@ -17,7 +17,9 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, warn};
 
 use crate::agent::queue::{TurnHandler, TurnInput};
-use crate::agent::{AgentEvent, AgentLoop, AgentMessage, FallbackProvider, LoopConfig, LoopOutcome, SteeringQueue};
+use crate::agent::{
+    AgentEvent, AgentLoop, AgentMessage, FallbackProvider, LoopConfig, LoopOutcome, SteeringQueue,
+};
 use crate::config::{AgentMode, GateMode};
 use crate::prompt::{self, RuntimeContext};
 use crate::providers::{Provider, SystemBlock, ThinkingOptions};
@@ -294,14 +296,10 @@ impl Runner {
         let previous = self.sessions.current()?;
         // 摘要使用当前 provider 的 API model id；锁在 await 前释放。
         let slot = self.provider_snapshot();
-        let summary = crate::session::compaction::summarize(
-            &*slot.provider,
-            &slot.api_model,
-            &input,
-            4096,
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("compaction request failed: {error}"))?;
+        let summary =
+            crate::session::compaction::summarize(&*slot.provider, &slot.api_model, &input, 4096)
+                .await
+                .map_err(|error| anyhow::anyhow!("compaction request failed: {error}"))?;
 
         let summary_message = AgentMessage::System {
             text: format!(
@@ -608,6 +606,68 @@ impl TurnHandler for Runner {
         steering: mpsc::UnboundedReceiver<AgentMessage>,
     ) -> Result<()> {
         self.execute(input, steering).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::swarm::SubagentRunner for Runner {
+    /// 运行一个子代理回合。
+    ///
+    /// 与主回合共享 provider 槽位、回退链与安全闸，但：
+    /// - 工具集是父注册表的子集；
+    /// - 有自己的历史，不写 transcript / turn buffer；
+    /// - 不注入 owner context / USER / memory / skills。
+    async fn run_subagent(&self, request: crate::swarm::SubagentRequest) -> Result<String> {
+        let slot = self.provider_snapshot();
+        let tools = Arc::new(self.tools.filtered(&request.tools));
+        let system = vec![SystemBlock {
+            text: request.system,
+            cache: false,
+        }];
+        let loop_ = AgentLoop::new_with_fallbacks(
+            Arc::clone(&slot.provider),
+            self.fallbacks.clone(),
+            tools,
+            Arc::clone(&self.gate),
+            LoopConfig {
+                model: slot.api_model,
+                system,
+                max_tokens: slot.max_tokens,
+                thinking: slot.thinking,
+                server_tools: Vec::new(),
+                max_steps: request.max_steps,
+                retry: self.config.retry,
+                max_state_chars: 32_000,
+            },
+        );
+        let mut history = request.history;
+        history.push(AgentMessage::user(request.task));
+        let (tx, mut rx) = mpsc::channel(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut steering = SteeringQueue::default();
+        let outcome = loop_
+            .run(&mut history, Vec::new(), &mut steering, &tx)
+            .await;
+        drop(tx);
+        let _ = drain.await;
+
+        if outcome.stop_reason == crate::agent::StopReason::Refusal {
+            anyhow::bail!("the subagent request was refused by the provider");
+        }
+        let text = history
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                AgentMessage::Assistant(assistant) if !assistant.text().trim().is_empty() => {
+                    Some(assistant.text())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            anyhow::bail!("the subagent returned no text");
+        }
+        Ok(text)
     }
 }
 

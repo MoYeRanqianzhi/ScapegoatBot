@@ -25,6 +25,7 @@ use crate::config::{
     AgentMode, AuthFile, EncryptionMode, LoadedConfig, ModelsFile, SbotConfig, SessionScope,
 };
 use crate::ipc::{self, AiAction, Handler, Request, RequestBody, Response};
+use crate::mcp::{McpManager, McpTool};
 use crate::monitor::{MonitorDelivery, MonitorManager, MonitorSink};
 use crate::paths::SbotPaths;
 use crate::providers::{Provider, ServerToolKind, ThinkingOptions, build_provider};
@@ -38,6 +39,7 @@ use crate::storage::Database;
 use crate::storage::crypto::MasterKey;
 use crate::storage::messages::MessageStore;
 use crate::tools::ToolRegistry;
+use crate::tools::agent::{AgentTool, HubHandle};
 use crate::tools::api::{AgentOps, ApiTool, NapcatGateway};
 use crate::tools::download::DownloadTool;
 use crate::tools::memory::MemoryTool;
@@ -178,7 +180,10 @@ impl Runtime {
         // 启动校验：索引文件数与磁盘不一致时重建（索引只是缓存）。
         match messages.index_file_counts() {
             Ok((disk, indexed)) if disk != indexed => {
-                warn!(disk, indexed, "message index file count mismatch; rebuilding");
+                warn!(
+                    disk,
+                    indexed, "message index file count mismatch; rebuilding"
+                );
                 match messages.rebuild_index() {
                     Ok(repaired) => info!(repaired, "message index rebuilt"),
                     Err(error) => warn!(%error, "message index rebuild failed"),
@@ -242,6 +247,7 @@ impl Runtime {
             master_qq,
             Arc::clone(&ai_enabled),
             paths.estop_file(),
+            paths.resolve(&loaded.config.swarm.agents_dir, &loaded.dir),
         )
         .await?;
 
@@ -381,9 +387,7 @@ impl Runtime {
         let api_model = reference.model.id.clone();
         let thinking = ThinkingOptions {
             enabled: reference.model.reasoning,
-            effort: if reference.model.reasoning
-                && !config.agent.thinking_level.trim().is_empty()
-            {
+            effort: if reference.model.reasoning && !config.agent.thinking_level.trim().is_empty() {
                 Some(config.agent.thinking_level.clone())
             } else {
                 None
@@ -442,14 +446,14 @@ impl Runtime {
         if let Err(error) = persist_agent_setting(&loaded.path, "thinking_level", level) {
             warn!(%error, "cannot persist agent.thinking_level; change is runtime-only");
         }
-        if let Some(agent) = self.agent.read().expect("agent lock poisoned").as_ref() {
-            if let Ok(mut slot) = agent.runner.provider_slot().write() {
-                slot.thinking.effort = if reference.model.reasoning {
-                    Some(level.to_owned())
-                } else {
-                    None
-                };
-            }
+        if let Some(agent) = self.agent.read().expect("agent lock poisoned").as_ref()
+            && let Ok(mut slot) = agent.runner.provider_slot().write()
+        {
+            slot.thinking.effort = if reference.model.reasoning {
+                Some(level.to_owned())
+            } else {
+                None
+            };
         }
         Ok(json!({ "thinking_level": level }))
     }
@@ -612,6 +616,7 @@ async fn build_agent(
     master_qq: u64,
     ai_enabled: Arc<AtomicBool>,
     estop_file: PathBuf,
+    agents_dir: PathBuf,
 ) -> Result<Option<Arc<AgentRuntime>>> {
     let config = &loaded.config;
     let provider: Arc<dyn Provider> = match build_provider(models, auth, &config.agent.model) {
@@ -696,16 +701,33 @@ async fn build_agent(
     let mut tools = ToolRegistry::new(Arc::clone(&vfs), Some(views));
     crate::tools::fs::register(&mut tools);
     tools.register(Arc::new(SkillTool::new(Arc::clone(&vfs))));
+    // Agent 工具先注册；hub 需要 runner，稍后注入。
+    let hub_handle = Arc::new(HubHandle::new());
+    if config.swarm.enabled {
+        tools.register(Arc::new(AgentTool::new(Arc::clone(&hub_handle))));
+    }
+    if config.mcp.enabled {
+        let manager = Arc::new(McpManager::connect(&config.mcp).await);
+        let count = manager.tools().await.len();
+        if count == 0 {
+            warn!("MCP is enabled but no server exposed any tool");
+        } else {
+            info!(tools = count, "MCP tools registered");
+        }
+        tools.register(Arc::new(McpTool::new(manager)));
+    }
     tools.register(Arc::new(MonitorTool::new(Arc::clone(&monitors))));
     if config.memory.enabled {
-        tools.register(Arc::new(MemoryTool::new(
-            Arc::clone(&vfs),
-            config.memory.max_entry_chars,
-            config.memory.max_index_lines,
-            config.memory.max_index_bytes,
-            config.memory.user_max_chars,
-        )
-        .with_db(Arc::clone(&db))));
+        tools.register(Arc::new(
+            MemoryTool::new(
+                Arc::clone(&vfs),
+                config.memory.max_entry_chars,
+                config.memory.max_index_lines,
+                config.memory.max_index_bytes,
+                config.memory.user_max_chars,
+            )
+            .with_db(Arc::clone(&db)),
+        ));
     }
     let download_policy = NetPolicy {
         allowed_domains: config.tools.download.allowed_domains.clone(),
@@ -754,39 +776,41 @@ async fn build_agent(
             || (matches!(backend, crate::config::WebBackend::Auto)
                 && protocol == crate::config::models::Protocol::Chat)
     };
-    if !search_server && use_tool_backend(config.tools.web_search.backend)
+    if !search_server
+        && use_tool_backend(config.tools.web_search.backend)
         && let Some(key) = auth
             .tools
             .web_search
             .api_key
             .value()
             .filter(|_| !config.tools.web_search.base_url.trim().is_empty())
-        {
-            match WebBackend::new(config.tools.web_search.base_url.clone(), key) {
-                Ok(backend) => tools.register(Arc::new(WebSearchTool::new(
-                    Arc::new(backend),
-                    config.tools.web_search.count,
-                ))),
-                Err(error) => warn!(%error, "cannot register WebSearch"),
-            }
+    {
+        match WebBackend::new(config.tools.web_search.base_url.clone(), key) {
+            Ok(backend) => tools.register(Arc::new(WebSearchTool::new(
+                Arc::new(backend),
+                config.tools.web_search.count,
+            ))),
+            Err(error) => warn!(%error, "cannot register WebSearch"),
         }
-    if !fetch_server && use_tool_backend(config.tools.web_fetch.backend)
+    }
+    if !fetch_server
+        && use_tool_backend(config.tools.web_fetch.backend)
         && let Some(key) = auth
             .tools
             .web_fetch
             .api_key
             .value()
             .filter(|_| !config.tools.web_fetch.base_url.trim().is_empty())
-        {
-            match WebBackend::new(config.tools.web_fetch.base_url.clone(), key) {
-                Ok(backend) => tools.register(Arc::new(WebFetchTool::new(
-                    Arc::new(backend),
-                    config.tools.web_fetch.max_content_tokens,
-                    download_policy,
-                ))),
-                Err(error) => warn!(%error, "cannot register WebFetch"),
-            }
+    {
+        match WebBackend::new(config.tools.web_fetch.base_url.clone(), key) {
+            Ok(backend) => tools.register(Arc::new(WebFetchTool::new(
+                Arc::new(backend),
+                config.tools.web_fetch.max_content_tokens,
+                download_policy,
+            ))),
+            Err(error) => warn!(%error, "cannot register WebFetch"),
         }
+    }
 
     let gateway: Option<Arc<dyn NapcatGateway>> = qq
         .as_ref()
@@ -849,6 +873,18 @@ async fn build_agent(
     // runner 就绪后才能投递 monitor、执行手动压缩。
     let _ = sink.runner.set(Arc::clone(&runner));
     let _ = ops.runner.set(Arc::clone(&runner));
+    // 子代理 hub 以 runner 为执行器；Agent 工具通过句柄读取。
+    if config.swarm.enabled {
+        let hub = crate::swarm::AgentHub::new(
+            Arc::clone(&runner) as Arc<dyn crate::swarm::SubagentRunner>,
+            config.swarm.clone(),
+            Arc::clone(&vfs),
+            agents_dir,
+        );
+        if hub_handle.set(hub).is_err() {
+            warn!("subagent hub was already initialized");
+        }
+    }
     crate::monitor::load_config_monitors(&monitors, &config.monitor, Some(&messages)).await?;
 
     let filter = MessageFilter::from_config(&config.filter);

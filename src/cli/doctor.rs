@@ -60,7 +60,11 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
 
     let loaded = match SbotConfig::load(&config_path) {
         Ok(loaded) => {
-            report.ok(format!("config: {} (version {})", config_path.display(), loaded.config.version));
+            report.ok(format!(
+                "config: {} (version {})",
+                config_path.display(),
+                loaded.config.version
+            ));
             loaded
         }
         Err(error) => {
@@ -77,7 +81,11 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
                 match ModelsFile::load(&user_path) {
                     Ok(overlay) => {
                         models.merge(overlay);
-                        report.ok(format!("models: {} (+ {})", "embedded", user_path.display()));
+                        report.ok(format!(
+                            "models: {} (+ {})",
+                            "embedded",
+                            user_path.display()
+                        ));
                     }
                     Err(error) => report.error(format!("models: {error}")),
                 }
@@ -111,7 +119,11 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
                 .agent
                 .available_models
                 .iter()
-                .filter_map(|reference| reference.split_once('/').map(|(provider, _)| provider.to_owned()));
+                .filter_map(|reference| {
+                    reference
+                        .split_once('/')
+                        .map(|(provider, _)| provider.to_owned())
+                });
             let missing = auth.missing_providers(referenced);
             if missing.is_empty() {
                 report.ok("auth: all referenced providers have keys");
@@ -227,7 +239,12 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
         report.warn("agent.owner_qq is 0: owner-only rules fall back to the login account");
     }
     if loaded.config.agent.master != "self"
-        && loaded.config.agent.master.parse::<u64>().map_or(true, |qq| qq == 0)
+        && loaded
+            .config
+            .agent
+            .master
+            .parse::<u64>()
+            .map_or(true, |qq| qq == 0)
     {
         report.error("agent.master: must be \"self\" or a non-zero QQ number");
     }
@@ -284,7 +301,9 @@ fn check_indexes(conn: &Connection, data_dir: &std::path::Path, report: &mut Rep
     }
 
     let session_rows: u64 = conn
-        .query_row("SELECT COUNT(*) FROM transcript_files", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM transcript_files", [], |row| {
+            row.get(0)
+        })
         .unwrap_or(0);
     let session_files = count_files(&data_dir.join("sessions"), Some("jsonl"));
     if session_rows == session_files {
@@ -325,9 +344,8 @@ fn check_blobs(conn: &Connection, data_dir: &std::path::Path, report: &mut Repor
     let query = conn.prepare("SELECT node_id, COUNT(*) FROM vfs_chunks GROUP BY node_id");
     match query {
         Ok(mut statement) => {
-            let rows = statement.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, u64>(1)?))
-            });
+            let rows =
+                statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, u64>(1)?)));
             if let Ok(rows) = rows {
                 for (node_id, expected) in rows.flatten() {
                     known.insert(node_id);
@@ -412,14 +430,15 @@ fn check_memory(conn: &Connection, key: &MasterKey, report: &mut Report) {
         report.warn("memory: /MEMORY.md has no content");
         return;
     };
-    let Some(text) =
-        crate::vfs::sqlite::decrypt_node_text(key, index_id, index_version, &sealed)
+    let Some(text) = crate::vfs::sqlite::decrypt_node_text(key, index_id, index_version, &sealed)
     else {
         report.error("memory: cannot decrypt /MEMORY.md with this key");
         return;
     };
-    let indexed: std::collections::BTreeSet<String> =
-        text.lines().filter_map(crate::tools::memory::index_slug).collect();
+    let indexed: std::collections::BTreeSet<String> = text
+        .lines()
+        .filter_map(crate::tools::memory::index_slug)
+        .collect();
 
     let memory_dir: Option<i64> = conn
         .query_row(
@@ -448,7 +467,10 @@ fn check_memory(conn: &Connection, key: &MasterKey, report: &mut Report) {
     let missing: Vec<&String> = indexed.difference(&files).collect();
     let orphans: Vec<&String> = files.difference(&indexed).collect();
     if missing.is_empty() && orphans.is_empty() {
-        report.ok(format!("memory: {} entr(ies) indexed and present", indexed.len()));
+        report.ok(format!(
+            "memory: {} entr(ies) indexed and present",
+            indexed.len()
+        ));
     } else {
         if !missing.is_empty() {
             report.warn(format!(

@@ -9,10 +9,10 @@
 |------|-----:|------|
 | 旧代码总量 | 19,715 行 / 41 文件 | 基线口径 |
 | 复用（reused） | **0 行（0.0%）** | 旧模块划分、数据结构与调用方式全部放弃 |
-| 重写（rewritten/split/merged） | **15,411 行（78.2%）** | 职责相同、实现重写 |
-| 废弃（dropped） | **4,304 行（21.8%）** | 对应职责在 0.2 中尚未提供 |
-| 新实现总量 | **27,770 行 / 61 文件** | 含内联单元测试 |
-| 无旧对应职责的新增模块 | 约 **10,052 行（36.2%）** | VFS、IPC、安全闸、monitor、备份/诊断等 |
+| 重写（rewritten/split/merged） | **19,217 行（97.5%）** | 职责相同、实现重写 |
+| 废弃（dropped） | **498 行（2.5%）** | 对应职责在 0.2 中尚未提供 |
+| 新实现总量 | **29,380 行 / 61 文件** | 含内联单元测试 |
+| 无旧对应职责的新增模块 | 约 **10,052 行（34.2%）** | VFS、IPC、安全闸、monitor、备份/诊断等 |
 
 **结构性重写率 = 100%**（复用 0 行）。这与设计 §14「旧 0.1 归档，不迁移」一致；本报告用于量化改动，而不是以复用率评价质量。
 
@@ -31,9 +31,9 @@
 | `control_server.rs`（172） | rewritten | `ipc/{windows,unix}.rs`（命名管道/UDS） |
 | `group_role.rs`（260） | dropped | 群角色同步未在 0.2 实现 |
 | `main.rs`（1252） | rewritten | `main.rs` + `app.rs`（薄入口 + 运行时装配） |
-| `mcp/manager.rs`（365） | dropped | 0.2 暂未实现 MCP |
-| `mcp/mod.rs`（157） | dropped | 同上 |
-| `mcp/transport.rs`（211） | dropped | 同上 |
+| `mcp/manager.rs`（365） | rewritten | `mcp/*`（stdio JSON-RPC、工具发现） |
+| `mcp/mod.rs`（157） | rewritten | 同上 |
+| `mcp/transport.rs`（211） | rewritten | 同上（stdio 传输） |
 | `message_format.rs`（463） | rewritten | `qq/format.rs`、`qq/event.rs` |
 | `prompt.rs`（1076） | rewritten | `prompt/*` + `assets/system_prompt_v4.template.txt`（静态/动态边界、hooks） |
 | `providers/anthropic.rs`（1534） | rewritten | `providers/anthropic.rs`（新请求体、自适应 thinking、SSE） |
@@ -48,12 +48,12 @@
 | `storage/message_index.rs`（606） | rewritten | `storage/messages.rs` |
 | `storage/mod.rs`（208） | rewritten | `storage/mod.rs`（迁移 v1–v6、canary） |
 | `storage/session.rs`（709） | rewritten | `session/*`（分段链、turn buffer、压缩检查点） |
-| `swarm/dispatch.rs`（1212） | dropped | 0.2 暂未实现 swarm |
-| `swarm/mod.rs`（631） | dropped | 同上 |
-| `swarm/prompt.rs`（262） | dropped | 同上 |
-| `swarm/runner.rs`（425） | dropped | 同上 |
-| `swarm/tools.rs`（412） | dropped | 同上 |
-| `swarm/types.rs`（131） | dropped | 同上 |
+| `swarm/dispatch.rs`（1212） | rewritten | `swarm/*` + `tools/agent.rs`（单层子代理） |
+| `swarm/mod.rs`（631） | rewritten | 同上 |
+| `swarm/prompt.rs`（262） | rewritten | `swarm::SUBAGENT_COMMON` |
+| `swarm/runner.rs`（425） | rewritten | `Runner::run_subagent` |
+| `swarm/tools.rs`（412） | rewritten | `ToolRegistry::filtered` + 类型工具集 |
+| `swarm/types.rs`（131） | rewritten | `swarm::AgentType` / `AgentDefinition` |
 | `tools/fetch.rs`（467） | rewritten | `tools/web.rs`、`tools/net.rs`（SSRF 策略） |
 | `tools/message.rs`（175） | merged | `tools/api.rs` |
 | `tools/mod.rs`（148） | rewritten | `tools/mod.rs`（Tool trait、权限声明、执行模式） |
@@ -68,13 +68,13 @@
 
 ```
 复用率   = 0 / 19,715                       = 0.0%
-重写率   = 15,411 / 19,715                  = 78.2%
-废弃率   = 4,304 / 19,715                   = 21.8%
-新增率   = 10,052 / 27,770                  = 36.2%
+重写率   = 19,217 / 19,715                  = 97.5%
+废弃率   = 498 / 19,715                     = 2.5%
+新增率   = 10,052 / 29,380                  = 34.2%
 结构重写 = (复用 0) → 全部旧职责由新代码承担  = 100%
 ```
 
-废弃部分全部来自 0.2 尚未实现的职责（MCP 733 行、swarm 3,073 行、群角色 260 行、图片注册表 238 行）。这些不是“删掉不管”：MCP 与 swarm 的设计仍在 `.agents/plan/2026-10-28-rebuild-design.md` 中，未实现部分在 README「已知限制」中如实列出。
+废弃部分只剩群角色同步（260 行）与旧图片注册表（238 行）：群角色由 NapCat 的实时查询替代，图片由 VFS `blobs/` 承担。
 
 ## 新增职责（无旧文件对应）
 

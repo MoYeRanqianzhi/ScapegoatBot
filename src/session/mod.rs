@@ -204,11 +204,10 @@ impl SessionStore {
     /// 只保留最近 [`CHECKPOINT_KEEP`] 条，避免无限增长。
     pub fn record_checkpoint(&self, from_file: &str, summary: &str) -> Result<()> {
         let sealed = match self.encryption {
-            EncryptionMode::XChaCha20Poly1305 => self.key.seal(
-                CHECKPOINT_PURPOSE,
-                from_file.as_bytes(),
-                summary.as_bytes(),
-            )?,
+            EncryptionMode::XChaCha20Poly1305 => {
+                self.key
+                    .seal(CHECKPOINT_PURPOSE, from_file.as_bytes(), summary.as_bytes())?
+            }
             EncryptionMode::None => summary.as_bytes().to_vec(),
         };
         let conn = self.db.lock();
@@ -247,8 +246,7 @@ impl SessionStore {
                     let plain = self
                         .key
                         .open(CHECKPOINT_PURPOSE, from_file.as_bytes(), &sealed)?;
-                    String::from_utf8(plain)
-                        .context("checkpoint summary is not valid UTF-8")?
+                    String::from_utf8(plain).context("checkpoint summary is not valid UTF-8")?
                 }
                 EncryptionMode::None => {
                     String::from_utf8(sealed).context("checkpoint summary is not valid UTF-8")?
