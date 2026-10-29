@@ -7,6 +7,7 @@
 | 文档 | 内容 |
 |------|------|
 | [refactor-report.md](refactor-report.md) | 0.1 → 0.2 重构率、逐文件归属与计算 |
+| [live-testing.md](live-testing.md) | 真实 Jev / Chat API、守护进程回合与实机结果 |
 | [prompt-maintenance.md](prompt-maintenance.md) | 系统提示词与所有模型面文本的维护规则 |
 | [../../.agents/plan/2026-10-28-rebuild-design.md](../../.agents/plan/2026-10-28-rebuild-design.md) | 重构总设计 |
 | [../../.agents/plan/2026-10-29-prompt-catalog.md](../../.agents/plan/2026-10-29-prompt-catalog.md) | 模型面文本清单 |

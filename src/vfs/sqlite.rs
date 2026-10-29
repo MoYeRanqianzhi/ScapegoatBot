@@ -83,6 +83,7 @@ impl VfsStore {
             "/memory/topics",
             "/memory/notes",
             "/agents",
+            "/skills",
             "/trash",
             "/tmp",
         ] {
@@ -1346,6 +1347,7 @@ mod tests {
             "/memory/topics",
             "/memory/notes",
             "/agents",
+            "/skills",
             "/trash",
             "/tmp",
         ] {
