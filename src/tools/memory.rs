@@ -328,8 +328,10 @@ fn validate_slug(raw: &str) -> Result<String, ToolResult> {
     Ok(raw.to_owned())
 }
 
-fn index_slug(line: &str) -> Option<String> {
-    // 匹配 `- [Title](memory/<slug>.md) — hook`。
+/// 从一行索引里提取 slug，例如 `- [Title](memory/<slug>.md) — hook`。
+///
+/// `sbot doctor` 与写入路径共用同一解析，避免两处规则漂移。
+pub(crate) fn index_slug(line: &str) -> Option<String> {
     let start = line.find("](memory/")? + "](memory/".len();
     let rest = &line[start..];
     let end = rest.find(".md)")?;

@@ -270,9 +270,7 @@ impl VfsStore {
         self.key
             .seal(BLOB_PURPOSE, aad.as_bytes(), plain)
             .map_err(VfsError::from)
-    }
-
-    /// 按行读取文本；`offset` / `limit` 单位是行。
+    }    /// 按行读取文本；`offset` / `limit` 单位是行。
     ///
     /// 与 [`Vfs::read`] 的区别：这里直接给出模型习惯的行号语义。
     /// 带 offset/limit 的读取仍记为 partial，不满足编辑前置条件。
@@ -1298,6 +1296,21 @@ impl VfsStore {
             }
         }
     }
+}
+
+/// 只读解密节点文本，供 `sbot doctor` 对账使用。
+///
+/// 与 [`VfsStore::open_text`] 使用同一用途域与 AAD；不写 `vfs_reads`，
+/// 因此不会把诊断行为伪装成模型读过文件。
+pub(crate) fn decrypt_node_text(
+    key: &MasterKey,
+    id: i64,
+    version: u64,
+    sealed: &[u8],
+) -> Option<String> {
+    let aad = format!("vfs:{id}:{version}");
+    let plain = key.open(TEXT_PURPOSE, aad.as_bytes(), sealed).ok()?;
+    String::from_utf8(plain).ok()
 }
 
 #[cfg(test)]

@@ -416,6 +416,13 @@ impl Database {
     }
 }
 
+/// 校验 canary（`sbot doctor` 只读路径使用）。
+pub fn verify_canary(key: &MasterKey, sealed: &[u8]) -> bool {
+    key.open(CANARY_PURPOSE, CANARY_PURPOSE.as_bytes(), sealed)
+        .map(|plain| plain == CANARY_PLAINTEXT)
+        .unwrap_or(false)
+}
+
 /// RFC3339 UTC 时间戳，所有 `created_at` 统一用这个格式。
 pub fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
