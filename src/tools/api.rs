@@ -378,8 +378,10 @@ impl Tool for ApiTool {
                         if let (Some(id), Some(chat), Some(messages)) =
                             (&ledger_id, Self::chat_of(spec, &params), &self.messages)
                         {
-                            let message_id =
-                                response.pointer("/data/message_id").and_then(Value::as_i64);
+                            let message_id = response
+                                .get("message_id")
+                                .or_else(|| response.pointer("/data/message_id"))
+                                .and_then(Value::as_i64);
                             let _ = messages.finish_send(id, "sent", message_id);
                             if spec.category == Category::Message {
                                 let self_message = self_message_from_params(chat, &params);

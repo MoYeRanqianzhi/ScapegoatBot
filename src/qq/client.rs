@@ -54,30 +54,19 @@ impl QqClient {
     }
 
     /// 原始 action 调用（`API` 工具与内部查询共用）。
+    ///
+    /// NapCatLink 返回的是 OneBot 响应中的 `data` 字段（错误已由库转成 `Err`），
+    /// 因此这里直接返回 `data`，不再二次解包。
     pub async fn call(&self, action: &str, params: Value) -> Result<Value> {
-        let response = self
-            .link
+        self.link
             .call_api(action, params)
             .await
-            .with_context(|| format!("NapCat action {action} failed"))?;
-        // OneBot 11 公共返回：`retcode != 0` 表示失败。
-        if let Some(retcode) = response.get("retcode").and_then(Value::as_i64)
-            && retcode != 0
-        {
-            let message = response
-                .get("message")
-                .or_else(|| response.get("wording"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown NapCat error");
-            bail!("NapCat action {action} returned retcode {retcode}: {message}");
-        }
-        Ok(response)
+            .with_context(|| format!("NapCat action {action} failed"))
     }
 
     /// 查询登录账号。
     pub async fn login_info(&self) -> Result<LoginInfo> {
-        let response = self.call("get_login_info", Value::Null).await?;
-        let data = response.get("data").cloned().unwrap_or(Value::Null);
+        let data = self.call("get_login_info", Value::Null).await?;
         let user_id = data
             .get("user_id")
             .and_then(Value::as_u64)
@@ -111,7 +100,7 @@ impl QqClient {
         };
         let response = self.call(action, params).await?;
         response
-            .pointer("/data/message_id")
+            .get("message_id")
             .and_then(Value::as_i64)
             .ok_or_else(|| anyhow::anyhow!("{action} did not return message_id"))
     }
