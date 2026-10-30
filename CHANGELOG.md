@@ -5,7 +5,7 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.2.0-alpha.11] - 2026-10-30
+## [0.2.0-alpha.12] - 2026-10-30
 
 0.2 是完整重写：旧 0.1 的模块划分、数据结构与调用方式全部放弃，按
 `.agents/plan/2026-10-28-rebuild-design.md` 重新实现。量化对比见
