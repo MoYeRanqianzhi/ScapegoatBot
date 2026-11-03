@@ -451,7 +451,9 @@ impl Runner {
         let failures = self
             .compaction_failures
             .load(std::sync::atomic::Ordering::Relaxed);
-        if self.config.compaction_max_failures > 0 && failures >= self.config.compaction_max_failures {
+        if self.config.compaction_max_failures > 0
+            && failures >= self.config.compaction_max_failures
+        {
             warn!(
                 failures,
                 "automatic compaction is disabled after repeated failures"
@@ -653,13 +655,9 @@ impl Runner {
 
     /// 自动压缩阈值：配置的工作集上限与模型窗口减去预留后的较小者。
     fn compaction_budget(&self) -> usize {
-        let reserve = u64::from(self.config.reserve_tokens)
-            .saturating_add(u64::from(self.config.max_tokens));
-        let by_window = self
-            .config
-            .context_window
-            .saturating_sub(reserve)
-            .max(1) as usize;
+        let reserve =
+            u64::from(self.config.reserve_tokens).saturating_add(u64::from(self.config.max_tokens));
+        let by_window = self.config.context_window.saturating_sub(reserve).max(1) as usize;
         by_window
             .min(self.config.turn_context_budget as usize)
             .max(self.config.keep_recent_tokens as usize + 1)
@@ -733,8 +731,7 @@ impl Runner {
                     crate::security::review::Risk::High | crate::security::review::Risk::Critical
                 ) && (outcome.complied
                     || outcome.risk == crate::security::review::Risk::Critical);
-                self.gate
-                    .record_event(!blocked, score, "review", &reason);
+                self.gate.record_event(!blocked, score, "review", &reason);
                 match outcome.risk {
                     crate::security::review::Risk::Low => debug!(%reason, "security review"),
                     crate::security::review::Risk::Medium => {
@@ -2296,7 +2293,10 @@ mod tests {
 
         let committed = history.lock().await.clone();
         // 压缩后历史从摘要块开始，且本回合的回复被提交（不会因 base 错位而 panic/丢块）。
-        assert!(matches!(committed.first(), Some(AgentMessage::System { .. })));
+        assert!(matches!(
+            committed.first(),
+            Some(AgentMessage::System { .. })
+        ));
         assert!(committed.iter().any(|message| matches!(
             message,
             AgentMessage::Assistant(assistant)
@@ -2374,14 +2374,16 @@ mod tests {
             crate::security::gate::hold_path(dir.path()),
         ));
         let provider = Arc::new(FakeProvider {
-            script: StdMutex::new(vec![vec![
-                ProviderEvent::TextDelta("ok".to_owned()),
-                ProviderEvent::Stop {
-                    reason: StopReason::EndTurn,
-                    refusal: None,
-                },
-            ]]
-            .into()),
+            script: StdMutex::new(
+                vec![vec![
+                    ProviderEvent::TextDelta("ok".to_owned()),
+                    ProviderEvent::Stop {
+                        reason: StopReason::EndTurn,
+                        refusal: None,
+                    },
+                ]]
+                .into(),
+            ),
         });
         let tools = Arc::new(crate::tools::ToolRegistry::new(Arc::clone(&vfs), None));
         let history = Arc::new(Mutex::new(Vec::new()));

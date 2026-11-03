@@ -1867,4 +1867,3 @@ fn action_allowed_on(event: HookEvent, action: HookAction) -> bool {
             | (ConfigChange, Log)
     )
 }
-

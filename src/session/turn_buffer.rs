@@ -324,8 +324,12 @@ mod tests {
     async fn buffer_roundtrip_and_commit() {
         let (buffer, sessions, _dir) = setup();
         let turn = "t1";
-        buffer.append(turn, 0, "shared", &AgentMessage::user("hi")).unwrap();
-        buffer.append(turn, 1, "shared", &assistant_with_call("c1")).unwrap();
+        buffer
+            .append(turn, 0, "shared", &AgentMessage::user("hi"))
+            .unwrap();
+        buffer
+            .append(turn, 1, "shared", &assistant_with_call("c1"))
+            .unwrap();
         assert_eq!(buffer.load(turn).unwrap().len(), 2);
         assert_eq!(buffer.open_turns("shared").unwrap(), vec![turn.to_owned()]);
 
@@ -342,8 +346,12 @@ mod tests {
     async fn recovery_fills_missing_tool_results() {
         let (buffer, sessions, _dir) = setup();
         let turn = "t2";
-        buffer.append(turn, 0, "shared", &AgentMessage::user("go")).unwrap();
-        buffer.append(turn, 1, "shared", &assistant_with_call("c1")).unwrap();
+        buffer
+            .append(turn, 0, "shared", &AgentMessage::user("go"))
+            .unwrap();
+        buffer
+            .append(turn, 1, "shared", &assistant_with_call("c1"))
+            .unwrap();
         // 故意不写工具结果。
 
         let recovered = buffer.recover_open(&sessions, "shared").await.unwrap();
@@ -365,8 +373,12 @@ mod tests {
     #[tokio::test]
     async fn recovery_only_replays_the_matching_scope() {
         let (buffer, sessions, _dir) = setup();
-        buffer.append("ta", 0, "group-1", &AgentMessage::user("from group one")).unwrap();
-        buffer.append("tb", 0, "group-2", &AgentMessage::user("from group two")).unwrap();
+        buffer
+            .append("ta", 0, "group-1", &AgentMessage::user("from group one"))
+            .unwrap();
+        buffer
+            .append("tb", 0, "group-2", &AgentMessage::user("from group two"))
+            .unwrap();
 
         let one = sessions.for_scope("group-1");
         assert_eq!(buffer.recover_open(&one, "group-1").await.unwrap(), 1);

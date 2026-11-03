@@ -21,7 +21,11 @@ impl Views {
         Ok(entries)
     }
 
-    pub(super) fn list_message_peer(&self, scope: &str, peer: &str) -> Result<Vec<ViewEntry>, VfsError> {
+    pub(super) fn list_message_peer(
+        &self,
+        scope: &str,
+        peer: &str,
+    ) -> Result<Vec<ViewEntry>, VfsError> {
         let scope = normalize_scope(scope)?;
         let chat = chat_from(scope, peer)?;
         let mut entries = Vec::new();
@@ -107,4 +111,3 @@ impl Views {
     // /inbox
     // ---------------------------------------------------------------------
 }
-

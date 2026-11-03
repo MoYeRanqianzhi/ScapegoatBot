@@ -741,7 +741,13 @@ mod tests {
         let runner = Arc::new(FakeRunner::default());
         let hub = hub(Arc::clone(&runner) as Arc<dyn SubagentRunner>);
         let spawned = hub
-            .spawn(Some("explore"), None, "find it".to_owned(), 0, Default::default())
+            .spawn(
+                Some("explore"),
+                None,
+                "find it".to_owned(),
+                0,
+                Default::default(),
+            )
             .await
             .unwrap();
         let id = spawned["id"].as_str().unwrap().to_owned();
@@ -761,9 +767,15 @@ mod tests {
     async fn deliver_to_routes_by_label_and_restarts() {
         let runner = Arc::new(FakeRunner::default());
         let hub = hub(Arc::clone(&runner) as Arc<dyn SubagentRunner>);
-        hub.spawn(Some("explore"), None, "first".to_owned(), 0, Default::default())
-            .await
-            .unwrap();
+        hub.spawn(
+            Some("explore"),
+            None,
+            "first".to_owned(),
+            0,
+            Default::default(),
+        )
+        .await
+        .unwrap();
         let id = hub.check(None).await.unwrap().as_array().unwrap()[0]["id"]
             .as_str()
             .unwrap()
@@ -787,7 +799,13 @@ mod tests {
     async fn rejects_spawn_past_max_depth() {
         let hub = hub(Arc::new(FakeRunner::default()) as Arc<dyn SubagentRunner>);
         let error = hub
-            .spawn(None, None, "too deep".to_owned(), hub.config.max_depth, Default::default())
+            .spawn(
+                None,
+                None,
+                "too deep".to_owned(),
+                hub.config.max_depth,
+                Default::default(),
+            )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("depth limit"), "{error}");
@@ -815,7 +833,9 @@ mod tests {
             Arc::clone(&hub.vfs),
             hub.host_dir.clone(),
         );
-        hub.spawn(None, None, "one".to_owned(), 0, Default::default()).await.unwrap();
+        hub.spawn(None, None, "one".to_owned(), 0, Default::default())
+            .await
+            .unwrap();
         let error = hub
             .spawn(None, None, "two".to_owned(), 0, Default::default())
             .await

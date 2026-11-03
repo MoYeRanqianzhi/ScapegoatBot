@@ -1099,7 +1099,8 @@ impl Vfs for VfsStore {
         // 可以绕过 `max_vfs_bytes` / 节点上限。
         let (add_bytes, add_nodes) = Self::subtree_usage(&tx, source.id)?;
         let (bytes, nodes) = self.active_usage(&tx)?;
-        self.quota.check_growth(bytes, nodes, add_bytes, add_nodes)?;
+        self.quota
+            .check_growth(bytes, nodes, add_bytes, add_nodes)?;
         self.quota.check_disk(&self.storage)?;
 
         let target_parent = self.ensure_parent(&tx, to, &now())?;
@@ -1109,7 +1110,6 @@ impl Vfs for VfsStore {
         tx.commit()?;
         Ok(())
     }
-
 
     fn usage(&self) -> Result<Usage, VfsError> {
         let conn = self.db.lock();
@@ -1649,7 +1649,9 @@ mod tests {
             min_free_bytes: 0,
             ..Limits::default()
         });
-        store.write_text(&path("/a.md"), "0123456789", None).unwrap();
+        store
+            .write_text(&path("/a.md"), "0123456789", None)
+            .unwrap();
         // 10 + 10 = 20，仍在配额内。
         store.copy(&path("/a.md"), &path("/b.md")).unwrap();
         // 再复制 10 字节会超过 25。
