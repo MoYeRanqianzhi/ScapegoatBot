@@ -9,6 +9,7 @@
 - [子代理审查汇总（2026-10-29）](plan/2026-10-29-subagent-review.md) -- 架构/提示词/安全三份评审、P0 修复与最终评估
 - [Prompt Catalog（2026-10-29）](plan/2026-10-29-prompt-catalog.md) -- 工具/压缩/子代理/门禁/复盘/错误提示的英文稿
 - [安全分类器参考（2026-10-30）](plan/2026-10-30-step-guard-research.md) -- Claude 的输入/输出分类器、Jev 单遍决策模型及其能力边界
+- [0.2 代码审查（2026-11-03）](plan/2026-11-03-code-review.md) -- alpha.12 的 P0/P1 缺陷、上帝结构、注释与文档漂移及修复顺序
 - [旧架构总览（重构前）](memory/legacy-architecture.md) -- 模块结构、数据流、会话/沙箱/MCP/Swarm/安全设计
 - [旧工具参考（重构前）](memory/legacy-tools-reference.md) -- 43 个内置工具的分组、数量与实现位置
 - [旧消息状态设计（重构前）](memory/legacy-message-state.md) -- Raw/Wrapped/Compact/Linked 判定与 CQ XML 格式
