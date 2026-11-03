@@ -148,6 +148,90 @@ pub struct Runtime {
     _instance_lock: InstanceLock,
 }
 
+/// 启动时要打开的全部存储句柄。
+struct Stores {
+    db: Arc<Database>,
+    key: Arc<MasterKey>,
+    vfs: Arc<VfsStore>,
+    messages: Arc<MessageStore>,
+    sessions: Arc<SessionStore>,
+    turn_buffer: Arc<TurnBufferStore>,
+}
+
+/// 打开数据库、密钥与三套存储，并做启动对账。
+fn open_stores(paths: &SbotPaths, loaded: &LoadedConfig) -> Result<Stores> {
+    let key = Arc::new(MasterKey::load_or_create(paths.key_file())?);
+    let data_dir = paths.resolve(&loaded.config.storage.path, &loaded.dir);
+    std::fs::create_dir_all(&data_dir)
+        .with_context(|| format!("cannot create storage path {}", data_dir.display()))?;
+    let db = Arc::new(Database::open(data_dir.join("data.db"))?);
+    db.ensure_key(&key)?;
+
+    if loaded.config.storage.encryption == EncryptionMode::None {
+        warn!("storage.encryption = \"none\": data is stored in plaintext (debug only)");
+    }
+
+    let vfs = Arc::new(VfsStore::from_config(
+        Arc::clone(&db),
+        Arc::clone(&key),
+        data_dir.clone(),
+        &loaded.config.storage,
+    )?);
+    let messages = Arc::new(MessageStore::open(
+        Arc::clone(&db),
+        Arc::clone(&key),
+        data_dir.clone(),
+        loaded.config.storage.max_message_bytes,
+        loaded.config.storage.encryption,
+    )?);
+    // 重启核对发送账本：久悬的 pending 可能已经发出，标记为 unknown。
+    match messages.mark_stale_intents(600) {
+        Ok(0) => {}
+        Ok(stale) => warn!(
+            stale,
+            "marked stale outbound intents as unknown; check /messages before resending"
+        ),
+        Err(error) => warn!(%error, "cannot reconcile the outbound intent ledger"),
+    }
+
+    // 启动校验：索引文件数与磁盘不一致时重建（索引只是缓存）。
+    match messages.index_file_counts() {
+        Ok((disk, indexed)) if disk != indexed => {
+            warn!(
+                disk,
+                indexed, "message index file count mismatch; rebuilding"
+            );
+            match messages.rebuild_index() {
+                Ok(repaired) => info!(repaired, "message index rebuilt"),
+                Err(error) => warn!(%error, "message index rebuild failed"),
+            }
+        }
+        Ok(_) => {}
+        Err(error) => warn!(%error, "cannot compare the message index with the JSONL files"),
+    }
+    let sessions = Arc::new(SessionStore::open(
+        Arc::clone(&db),
+        Arc::clone(&key),
+        data_dir.clone(),
+        loaded.config.storage.max_session_bytes,
+        loaded.config.storage.encryption,
+    )?);
+    let turn_buffer = Arc::new(TurnBufferStore::new(
+        Arc::clone(&db),
+        Arc::clone(&key),
+        loaded.config.storage.encryption,
+    ));
+
+    Ok(Stores {
+        db,
+        key,
+        vfs,
+        messages,
+        sessions,
+        turn_buffer,
+    })
+}
+
 impl Runtime {
     /// 启动运行时。
     pub async fn start(config_path: Option<PathBuf>) -> Result<()> {
@@ -169,67 +253,13 @@ impl Runtime {
         report_missing_credentials(&loaded.config, &auth);
 
         let instance_lock = InstanceLock::acquire(&paths.instance_lock())?;
-        let key = Arc::new(MasterKey::load_or_create(paths.key_file())?);
-        let data_dir = paths.resolve(&loaded.config.storage.path, &loaded.dir);
-        std::fs::create_dir_all(&data_dir)
-            .with_context(|| format!("cannot create storage path {}", data_dir.display()))?;
-        let db = Arc::new(Database::open(data_dir.join("data.db"))?);
-        db.ensure_key(&key)?;
-
-        if loaded.config.storage.encryption == EncryptionMode::None {
-            warn!("storage.encryption = \"none\": data is stored in plaintext (debug only)");
-        }
-
-        let vfs = Arc::new(VfsStore::from_config(
-            Arc::clone(&db),
-            Arc::clone(&key),
-            data_dir.clone(),
-            &loaded.config.storage,
-        )?);
-        let messages = Arc::new(MessageStore::open(
-            Arc::clone(&db),
-            Arc::clone(&key),
-            data_dir.clone(),
-            loaded.config.storage.max_message_bytes,
-            loaded.config.storage.encryption,
-        )?);
-        // 重启核对发送账本：久悬的 pending 可能已经发出，标记为 unknown。
-        match messages.mark_stale_intents(600) {
-            Ok(0) => {}
-            Ok(stale) => warn!(
-                stale,
-                "marked stale outbound intents as unknown; check /messages before resending"
-            ),
-            Err(error) => warn!(%error, "cannot reconcile the outbound intent ledger"),
-        }
-
-        // 启动校验：索引文件数与磁盘不一致时重建（索引只是缓存）。
-        match messages.index_file_counts() {
-            Ok((disk, indexed)) if disk != indexed => {
-                warn!(
-                    disk,
-                    indexed, "message index file count mismatch; rebuilding"
-                );
-                match messages.rebuild_index() {
-                    Ok(repaired) => info!(repaired, "message index rebuilt"),
-                    Err(error) => warn!(%error, "message index rebuild failed"),
-                }
-            }
-            Ok(_) => {}
-            Err(error) => warn!(%error, "cannot compare the message index with the JSONL files"),
-        }
-        let sessions = Arc::new(SessionStore::open(
-            Arc::clone(&db),
-            Arc::clone(&key),
-            data_dir.clone(),
-            loaded.config.storage.max_session_bytes,
-            loaded.config.storage.encryption,
-        )?);
-        let turn_buffer = Arc::new(TurnBufferStore::new(
-            Arc::clone(&db),
-            Arc::clone(&key),
-            loaded.config.storage.encryption,
-        ));
+        let stores = open_stores(&paths, &loaded)?;
+        let db = Arc::clone(&stores.db);
+        let key = Arc::clone(&stores.key);
+        let vfs = Arc::clone(&stores.vfs);
+        let messages = Arc::clone(&stores.messages);
+        let sessions = Arc::clone(&stores.sessions);
+        let turn_buffer = Arc::clone(&stores.turn_buffer);
 
         let gate = Arc::new(Gate::from_config(
             &loaded.config.security.guard,
