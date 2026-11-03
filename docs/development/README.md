@@ -31,19 +31,20 @@
 | `vfs/` | VFS 路径、SQLite 后端、配额 | `VfsStore`、`VfsPath` |
 | `providers/` | 三种协议、SSE、回退 | `build_provider`、`AgentLoop::new_with_fallbacks` |
 | `agent/` | 循环、消息/事件、队列、runner | `AgentLoop`、`Runner` |
-| `security/` | 规则层、Jev、hold、审计 | `Gate` |
+| `security/` | 内容闸、Jev/llm 分类器、周期检查、动作门禁、hold、审计 | `Gate`、`ActionGate`、`SecurityReviewer` |
 | `qq/` | 事件归一化、格式、过滤、重连 | `QqClient`、`MessageFilter` |
 | `session/` | 分段、turn buffer、压缩 | `SessionStore`、`compaction` |
 | `tools/actions.rs` | 40 个 API action 的注册表数据 | `specs()` |
 | `tools/api.rs` | `API` 工具的执行、作用域、hold、发送账本 | `ApiTool` |
-| `tools/` | Tool trait、文件/记忆/技能/下载/Web/Monitor/视图 | `ToolRegistry` |
+| `tools/` | Tool trait、文件/记忆/技能/下载/Web/Monitor | `ToolRegistry` |
+| `tools/views/` | 动态视图：messages/inbox/sessions/contacts/config/system | `Views` |
 | `monitor/` | qq/timer/internal 源、cron、投递 | `MonitorManager` |
 | `ipc/` | 命名管道 / UDS、帧协议 | `Endpoint`、`Client` |
 
 ## 结构约定
 
 - 单函数尽量 <200 行、单结构字段尽量 <20；超了就按职责拆（`tools/actions.rs`、
-  `config/sections.rs`、`app::assemble_tools` 是先例）。
+  `config/sections.rs`、`tools/views/*`、`app::assemble_tools`、`ScopeCache` 是先例）。
 - 模型面文本（system prompt、工具描述、错误）保持英文；代码注释用中文。
 - 不要在文档或注释里承诺未实现的行为；未实现项集中写在
   [`../guide/limits.md`](../guide/limits.md)。
@@ -54,4 +55,5 @@
 - 新增存储字段必须追加迁移，不能改已发布的迁移。
 - 新增工具要声明参数 schema、执行模式与 `Permission`；对外工具要在 hold 期间拒绝。
 - `config.example.toml` 由 `tests/config_example.rs` 校验：改配置 schema 时同步改样例。
-- 提交前至少运行 `cargo test --all-targets`、`cargo clippy --all-targets -- -D warnings`。
+- 提交前至少运行 `cargo fmt --check`、`cargo test --all-targets`、
+  `cargo clippy --all-targets -- -D warnings`；CI 会跑同样三项。

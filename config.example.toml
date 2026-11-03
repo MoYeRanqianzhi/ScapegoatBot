@@ -152,10 +152,10 @@ enabled = false
 source = { qq = true }
 when = "event.type == 'message' and event.mentions_self"
 deliver = { to = "main", as = "event", batch_window_ms = 200 }
-lifecycle = { idle_only = false, max_events = 1000, expires = "0" }
+lifecycle = { idle_only = false, max_events = 1000, expires = "0", catch_up = "coalesce" }
 
 [security]
-# 周期检查字段已解析但当前版本未实现。
+# 周期安全检查：每新增这么多 token，在回合边界跑一次独立模型检查。
 check_every_tokens = 262144
 check_on_compaction = true
 check_overlap_tokens = 4096
@@ -166,7 +166,7 @@ check_timeout_secs = 60
 enabled = true
 # shadow 只记录；enforce 命中即 hold。启用 enforce 前先配好分类器。
 mode = "shadow"
-# jev / off；llm 未实现。
+# jev / llm / off；llm 复用主 provider。
 backend = "jev"
 model = ""
 # Jev 端点；enforce 下必须非空，否则每个回合都会被 hold。
@@ -186,7 +186,7 @@ round_trip_wall_secs = 600
 guard_usd_per_day = 0.20
 
 [gate]
-# 当前版本只解析，逐动作审批与频率限制尚未实现。
+# trusted / auto / approve；approve 用 `sbot gate approve <id>` 确认。
 mode = "auto"
 max_per_minute = 20
 llm_review = false
@@ -196,7 +196,7 @@ reserve_tokens = 16384
 turn_context_budget = 120000
 keep_recent_tokens = 20000
 max_failures = 3
-# 以下字段已解析但当前版本未生效。
+# 压缩前提取记忆、压缩后注入记忆索引、裁剪旧工具结果。
 memory_flush = true
 post_compact_recall = true
 prune = true

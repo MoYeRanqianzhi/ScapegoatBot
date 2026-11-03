@@ -18,8 +18,14 @@ QQ 消息，用可配置的 LLM 生成回复，并把所有状态集中在本机
   自定义定义；独立上下文、工具集强制为父代理子集、支持嵌套与 monitor 绑定。
 - **动态视图**：`/messages`、`/inbox`、`/sessions`、`/friends`、`/groups`、
   `/config`、`/system` 由运行时生成，不落盘，支持 `filter` / `limit` / `offset`。
-- **安全闸**：规则层（凭据形态、提示注入）+ Jev 分类器；`shadow` 只记录，
+- **安全闸**：输入/输出两层规则 + 分类器（Jev 或主模型）；`shadow` 只记录，
   `enforce` 命中即永久 `hold`，直到用真实上下文复核通过。
+- **动作门禁 `[gate]`**：每次 `napcat.*` 调用都过速率、重复/跨群/@all 规则，
+  可选 LLM 审查；`approve` 模式下变更动作需主人在 CLI 确认。
+- **owner intent**：跨 chat 发送、加好友、改资料等扩张动作必须由 runtime 证据支持；
+  同 chat 回复不需要。
+- **周期安全检查**：每 `check_every_tokens` 用独立模型检查注入/社工与是否已照做；
+  `high + complied` 暂停外发，`critical` 暂停新回合。
 - **准入过滤**：`[filter]` 是拒收门；被拒消息不写 JSONL、不进 inbox、不进
   transcript，monitor 也看不到。
 - **存储加密**：XChaCha20-Poly1305，密钥在 `~/.sbot/key`；SQLite 索引明文，
@@ -104,6 +110,7 @@ url = "ws://127.0.0.1:3001"
 | `sbot chat "<text>" [--scope ...]` | 从控制通道给 agent 一句话 |
 | `sbot pause` / `resume` | 写 / 删除 `ESTOP`，暂停新回合 |
 | `sbot security status\|resume` | 查看 hold 与最近安全事件 / 重新过闸 |
+| `sbot gate pending\|approve\|reject` | `approve` 模式的待确认动作与裁决 |
 | `sbot model set <provider/id>` / `list` | 热切换主模型（下一回合生效） |
 | `sbot effort set <level>` / `list` | 热切换 effort |
 | `sbot backup [--output DIR]` | SQLite 快照 + 文件归档；**包含主密钥** |
@@ -114,10 +121,12 @@ url = "ws://127.0.0.1:3001"
 
 ## 安全模型
 
-- **两步闸**：输入与输出各过一遍；规则层先行，Jev 分类器补充。`enforce` 模式命中后
-  写 `SECURITY_HOLD`，所有 `napcat.*` 与 Download/Web/MCP 被拒绝，只有 `agent.*`
-  自管理可用。默认是 `shadow`（只记录）；启用 `enforce` 前请配好分类器或显式
-  `backend = "off"`。
+- **两层内容闸**：输入与输出各过一遍；规则层先行，Jev 或主模型分类器补充。
+  `enforce` 命中后写 `SECURITY_HOLD`，所有 `napcat.*` 与 Download/Web/MCP 被拒绝，
+  只有 `agent.*` 自管理可用。默认 `shadow`（只记录）；启用 `enforce` 前请配好分类器
+  或显式 `backend = "off"`。
+- **动作门禁**：`trusted` / `auto` / `approve`；`auto` 拦截速率超限、同 chat 重复、
+  跨群同文与无 owner intent 的 @全体；`approve` 通过 `sbot gate` 一次性批准。
 - **恢复**：`agent.resume` / `sbot security resume` 用真实被判内容重新过闸，通过才解除；
   没有超时与自动恢复。
 - **主人保护**：针对 `owner_qq` / `master_qq` 的踢人、禁言等 destructive action
@@ -144,15 +153,18 @@ url = "ws://127.0.0.1:3001"
   写入会校验并原子落盘，但只有 `[filter]` 与 `[queue]` 立即热更新
   （`max_concurrent` 的信号量上限需重启）。
 - 尚未提供旧 0.1 数据迁移；0.2 从空存储开始。
-- `[gate]` 的逐动作审批、周期安全检查、若干 `[compaction]` 调优键尚未实现；
-  清单见 [docs/guide/limits.md](docs/guide/limits.md)。
+- 已知边界（审批通道、启发式规则、WebFetch 后端抓取、群级动作保护等）见
+  [docs/guide/limits.md](docs/guide/limits.md)。
 
 ## 测试
 
 ```bash
+cargo fmt --check
 cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
+
+CI（GitHub Actions）运行同样的三项检查。
 
 真实 API 测试默认忽略，需要显式环境变量：
 
@@ -172,11 +184,12 @@ src/
   app.rs           守护进程装配、IPC、QQ 管线、工具装配
   agent/           循环、消息/事件、回合队列、runner
   providers/       Anthropic / Chat / Responses、SSE、fallback
-  security/        规则层、Jev、hold、审计
+  security/        内容闸、Jev/llm 分类器、周期检查、动作门禁、hold、审计
   qq/              事件归一化、格式、过滤、重连
   session/         分段、turn buffer、压缩
   vfs/             路径、SQLite 后端、配额、动态视图契约
   tools/           Tool trait、actions 注册表、文件/API/记忆/技能/下载/Web/Monitor
+  tools/views/     动态视图：messages/inbox/sessions/contacts/config/system
   storage/         迁移、加密、消息归档
   monitor/         事件源、cron、投递
   ipc/             命名管道 / UDS
