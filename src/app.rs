@@ -630,106 +630,45 @@ impl AgentRuntime {
 // Agent 装配
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
-async fn build_agent(
-    loaded: &LoadedConfig,
-    config_handle: Arc<RwLock<LoadedConfig>>,
-    models: &ModelsFile,
-    auth: &AuthFile,
+/// 装配工具表所需的运行时句柄；参数太多，打包成结构体。
+struct ToolAssembly<'a> {
+    config: &'a SbotConfig,
+    auth: &'a AuthFile,
+    model_ref: crate::config::models::ModelRef<'a>,
     db: Arc<Database>,
     vfs: Arc<VfsStore>,
     messages: Arc<MessageStore>,
-    sessions: Arc<SessionStore>,
-    turn_buffer: Arc<TurnBufferStore>,
     gate: Arc<Gate>,
+    views: Arc<Views>,
+    monitors: Arc<MonitorManager>,
+    ops: Arc<RuntimeOps>,
     qq: Option<Arc<QqClient>>,
-    self_id: u64,
     owner_qq: u64,
     master_qq: u64,
-    ai_enabled: Arc<AtomicBool>,
-    estop_file: PathBuf,
-    agents_dir: PathBuf,
-) -> Result<Option<Arc<AgentRuntime>>> {
-    let config = &loaded.config;
-    let provider: Arc<dyn Provider> = match build_provider(models, auth, &config.agent.model) {
-        Ok(provider) => provider,
-        Err(error) => {
-            warn!(%error, model = %config.agent.model, "cannot build a provider");
-            return Ok(None);
-        }
-    };
-    let Some(model_ref) = models.find(&config.agent.model) else {
-        anyhow::bail!("model {} disappeared from models.json", config.agent.model);
-    };
-    // 回退链：每个模型单独构造 provider（协议/密钥可能不同）。
-    let fallbacks: Vec<crate::agent::FallbackProvider> = config
-        .agent
-        .fallback_models
-        .iter()
-        .filter_map(|reference| {
-            let Some(def) = models.find(reference) else {
-                warn!(model = %reference, "fallback model is not defined in models.json");
-                return None;
-            };
-            match build_provider(models, auth, reference) {
-                Ok(provider) => Some(crate::agent::FallbackProvider {
-                    model: def.model.id.clone(),
-                    provider,
-                    max_tokens: def.model.max_tokens.min(config.agent.max_output_tokens),
-                }),
-                Err(error) => {
-                    warn!(%error, model = %reference, "cannot build a fallback provider");
-                    None
-                }
-            }
-        })
-        .collect();
-    let thinking = ThinkingOptions {
-        enabled: model_ref.model.reasoning,
-        effort: if model_ref.model.reasoning && !config.agent.thinking_level.is_empty() {
-            Some(config.agent.thinking_level.clone())
-        } else {
-            None
-        },
-    };
+}
 
-    let history = Arc::new(Mutex::new(Vec::new()));
-    let ops = Arc::new(RuntimeOps {
-        runner: std::sync::OnceLock::new(),
-        gate: Arc::clone(&gate),
-        vfs: Arc::clone(&vfs),
-        sessions: Arc::clone(&sessions),
-        messages: Arc::clone(&messages),
-        db: Some(Arc::clone(&db)),
-        history: Arc::clone(&history),
-        model: Arc::new(std::sync::RwLock::new(config.agent.model.clone())),
+/// 注册全部内置工具，返回注册表与 provider 侧声明的服务端工具。
+///
+/// 与 `build_agent` 分开：装配顺序（hub → MCP → monitor → API）是这里的主要
+/// 复杂度，放在一个短函数里更容易核对。
+async fn assemble_tools(
+    assembly: ToolAssembly<'_>,
+) -> (Arc<ToolRegistry>, Vec<ServerToolKind>, Arc<HubHandle>) {
+    let ToolAssembly {
+        config,
+        auth,
+        model_ref,
+        db,
+        vfs,
+        messages,
+        gate,
+        views,
+        monitors,
+        ops,
+        qq,
         owner_qq,
         master_qq,
-        receive_scopes: config.agent.receive_scopes.clone(),
-        send_scopes: config.agent.send_scopes.clone(),
-        estop_file: estop_file.clone(),
-    });
-
-    let views = Arc::new(
-        Views::new(
-            Arc::clone(&vfs),
-            Arc::clone(&messages),
-            Arc::clone(&sessions),
-            qq.clone(),
-        )
-        .with_context(ViewContext {
-            config: Some(Arc::clone(&config_handle)),
-            models: Some(models.clone()),
-            gate: Some(Arc::clone(&gate)),
-            ai_enabled: Some(Arc::clone(&ai_enabled)),
-            estop_file: Some(estop_file.clone()),
-            started_at: Some(chrono::Utc::now()),
-            db: Some(Arc::clone(&db)),
-        }),
-    );
-    let sink = Arc::new(RunnerSink::default());
-    let monitors = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
-
+    } = assembly;
     let mut tools =
         ToolRegistry::new(Arc::clone(&vfs), Some(Arc::clone(&views))).with_gate(Arc::clone(&gate));
     crate::tools::fs::register(&mut tools);
@@ -902,6 +841,126 @@ async fn build_agent(
         .read_only(),
     );
     let tools = Arc::new(tools.with_read_only_api(read_only_api));
+
+    (tools, server_tools, hub_handle)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_agent(
+    loaded: &LoadedConfig,
+    config_handle: Arc<RwLock<LoadedConfig>>,
+    models: &ModelsFile,
+    auth: &AuthFile,
+    db: Arc<Database>,
+    vfs: Arc<VfsStore>,
+    messages: Arc<MessageStore>,
+    sessions: Arc<SessionStore>,
+    turn_buffer: Arc<TurnBufferStore>,
+    gate: Arc<Gate>,
+    qq: Option<Arc<QqClient>>,
+    self_id: u64,
+    owner_qq: u64,
+    master_qq: u64,
+    ai_enabled: Arc<AtomicBool>,
+    estop_file: PathBuf,
+    agents_dir: PathBuf,
+) -> Result<Option<Arc<AgentRuntime>>> {
+    let config = &loaded.config;
+    let provider: Arc<dyn Provider> = match build_provider(models, auth, &config.agent.model) {
+        Ok(provider) => provider,
+        Err(error) => {
+            warn!(%error, model = %config.agent.model, "cannot build a provider");
+            return Ok(None);
+        }
+    };
+    let Some(model_ref) = models.find(&config.agent.model) else {
+        anyhow::bail!("model {} disappeared from models.json", config.agent.model);
+    };
+    // 回退链：每个模型单独构造 provider（协议/密钥可能不同）。
+    let fallbacks: Vec<crate::agent::FallbackProvider> = config
+        .agent
+        .fallback_models
+        .iter()
+        .filter_map(|reference| {
+            let Some(def) = models.find(reference) else {
+                warn!(model = %reference, "fallback model is not defined in models.json");
+                return None;
+            };
+            match build_provider(models, auth, reference) {
+                Ok(provider) => Some(crate::agent::FallbackProvider {
+                    model: def.model.id.clone(),
+                    provider,
+                    max_tokens: def.model.max_tokens.min(config.agent.max_output_tokens),
+                }),
+                Err(error) => {
+                    warn!(%error, model = %reference, "cannot build a fallback provider");
+                    None
+                }
+            }
+        })
+        .collect();
+    let thinking = ThinkingOptions {
+        enabled: model_ref.model.reasoning,
+        effort: if model_ref.model.reasoning && !config.agent.thinking_level.is_empty() {
+            Some(config.agent.thinking_level.clone())
+        } else {
+            None
+        },
+    };
+
+    let history = Arc::new(Mutex::new(Vec::new()));
+    let ops = Arc::new(RuntimeOps {
+        runner: std::sync::OnceLock::new(),
+        gate: Arc::clone(&gate),
+        vfs: Arc::clone(&vfs),
+        sessions: Arc::clone(&sessions),
+        messages: Arc::clone(&messages),
+        db: Some(Arc::clone(&db)),
+        history: Arc::clone(&history),
+        model: Arc::new(std::sync::RwLock::new(config.agent.model.clone())),
+        owner_qq,
+        master_qq,
+        receive_scopes: config.agent.receive_scopes.clone(),
+        send_scopes: config.agent.send_scopes.clone(),
+        estop_file: estop_file.clone(),
+    });
+
+    let views = Arc::new(
+        Views::new(
+            Arc::clone(&vfs),
+            Arc::clone(&messages),
+            Arc::clone(&sessions),
+            qq.clone(),
+        )
+        .with_context(ViewContext {
+            config: Some(Arc::clone(&config_handle)),
+            models: Some(models.clone()),
+            gate: Some(Arc::clone(&gate)),
+            ai_enabled: Some(Arc::clone(&ai_enabled)),
+            estop_file: Some(estop_file.clone()),
+            started_at: Some(chrono::Utc::now()),
+            db: Some(Arc::clone(&db)),
+        }),
+    );
+    let sink = Arc::new(RunnerSink::default());
+    let monitors = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+
+    let (tools, server_tools, hub_handle) = assemble_tools(ToolAssembly {
+        config,
+        auth,
+        model_ref,
+        db: Arc::clone(&db),
+        vfs: Arc::clone(&vfs),
+        messages: Arc::clone(&messages),
+        gate: Arc::clone(&gate),
+        views: Arc::clone(&views),
+        monitors: Arc::clone(&monitors),
+        ops: Arc::clone(&ops),
+        qq: qq.clone(),
+        owner_qq,
+        master_qq,
+    })
+    .await;
 
     let runner = Runner::new_with_fallbacks(
         provider,
