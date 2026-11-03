@@ -391,9 +391,14 @@ impl Tool for ApiTool {
                     }
                     Err(error) => {
                         if let (Some(id), Some(messages)) = (&ledger_id, &self.messages) {
-                            let _ = messages.finish_send(id, "failed", None);
+                            // 超时/断线可能发生在对方已收到之后；标 unknown，
+                            // 不要把它当成“肯定没发出去”再重试一次。
+                            let _ = messages.finish_send(id, "unknown", None);
                         }
-                        ToolResult::error(error)
+                        ToolResult::error(format!(
+                            "{error}
+[ledger] the send outcome is unconfirmed; check the chat                              history before retrying."
+                        ))
                     }
                 }
             }

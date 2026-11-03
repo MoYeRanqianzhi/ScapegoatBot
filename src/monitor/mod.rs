@@ -24,8 +24,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+use crate::config::CatchUp;
 use crate::qq::event::QqEvent;
 use crate::qq::format;
+use crate::storage::Database;
 
 /// 单个 monitor 同时等待投递的任务上限。
 ///
@@ -178,12 +180,17 @@ struct Monitor {
     last_delivery: Mutex<Option<std::time::Instant>>,
     cancelled: AtomicBool,
     origin: &'static str,
+    /// 定时源错过触发时的处理方式。
+    catch_up: CatchUp,
+    /// 记录上次触发时间，供重启后补投。
+    db: Option<Arc<Database>>,
 }
 
 /// 管理器。
 pub struct MonitorManager {
     monitors: RwLock<HashMap<String, Arc<Monitor>>>,
     sink: Arc<dyn MonitorSink>,
+    db: std::sync::RwLock<Option<Arc<Database>>>,
 }
 
 impl MonitorManager {
@@ -191,7 +198,13 @@ impl MonitorManager {
         Arc::new(Self {
             monitors: RwLock::new(HashMap::new()),
             sink,
+            db: std::sync::RwLock::new(None),
         })
+    }
+
+    /// 接入数据库：定时源把上次触发时间写进 `meta`，重启后可补投。
+    pub fn set_db(&self, db: Arc<Database>) {
+        *self.db.write().unwrap_or_else(|e| e.into_inner()) = Some(db);
     }
 
     /// 新增一个 monitor。运行时创建默认有界（2h、50 次）由调用方给出。
@@ -211,6 +224,7 @@ impl MonitorManager {
         idle_only: bool,
         batch_window: Duration,
         target: Option<String>,
+        catch_up: CatchUp,
     ) -> Result<()> {
         {
             let mut monitors = self.monitors.write().await;
@@ -241,6 +255,8 @@ impl MonitorManager {
                 last_delivery: Mutex::new(None),
                 cancelled: AtomicBool::new(false),
                 origin: "runtime",
+                catch_up,
+                db: self.db.read().unwrap_or_else(|e| e.into_inner()).clone(),
             });
             monitors.insert(name.clone(), Arc::clone(&monitor));
             drop(monitors);
@@ -524,6 +540,22 @@ async fn deliver_once(
 /// 启动定时循环。
 fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, timer: TimerSpec) {
     tokio::spawn(async move {
+        let now = Local::now();
+        // 重启补投：只补一次（`coalesce`），`skip` 直接放弃。
+        if monitor.catch_up == CatchUp::Coalesce
+            && let Some(last) = read_last_fire(monitor.db.as_ref(), &monitor.name)
+        {
+            let missed = missed_occurrences(&timer, last, now);
+            if missed > 0 {
+                let event = MonitorEvent {
+                    text: format!("[timer catch-up] {missed} missed occurrence(s)"),
+                    ..MonitorEvent::default()
+                };
+                deliver_once(&monitor, &*sink, Some(&event), missed).await;
+            }
+        }
+        write_last_fire(monitor.db.as_ref(), &monitor.name, now);
+
         loop {
             if monitor.cancelled.load(Ordering::SeqCst) {
                 break;
@@ -561,6 +593,7 @@ fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, timer: TimerSp
             if monitor.cancelled.load(Ordering::SeqCst) {
                 break;
             }
+            write_last_fire(monitor.db.as_ref(), &monitor.name, Local::now());
             deliver_once(&monitor, &*sink, None, 1).await;
             if monitor.one_shot
                 || monitor.cancelled.load(Ordering::SeqCst)
@@ -570,6 +603,82 @@ fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, timer: TimerSp
             }
         }
     });
+}
+
+fn last_fire_key(name: &str) -> String {
+    format!("monitor.last:{name}")
+}
+
+fn read_last_fire(db: Option<&Arc<Database>>, name: &str) -> Option<DateTime<Local>> {
+    let db = db?;
+    let raw = db.meta_get(&last_fire_key(name)).ok()??;
+    let text = String::from_utf8(raw).ok()?;
+    let timestamp: i64 = text.trim().parse().ok()?;
+    DateTime::from_timestamp(timestamp, 0).map(|utc| utc.with_timezone(&Local))
+}
+
+fn write_last_fire(db: Option<&Arc<Database>>, name: &str, at: DateTime<Local>) {
+    let Some(db) = db else {
+        return;
+    };
+    let _ = db.meta_set(
+        &last_fire_key(name),
+        at.timestamp().to_string().as_bytes(),
+    );
+}
+
+/// 计算 `last` 到 `now` 之间错过的触发次数（有上限，避免长停机扫太久）。
+pub(crate) fn missed_occurrences(
+    timer: &TimerSpec,
+    last: DateTime<Local>,
+    now: DateTime<Local>,
+) -> u64 {
+    if now <= last {
+        return 0;
+    }
+    match timer {
+        TimerSpec::Every(period) => {
+            let seconds = (now - last).num_seconds().max(0) as u64;
+            (seconds / period.as_secs().max(1)).min(1_000)
+        }
+        TimerSpec::At { hour, minute } => {
+            let mut count = 0u64;
+            let mut day = last.date_naive();
+            let end = now.date_naive();
+            let mut guard = 0;
+            while day <= end && guard < 400 {
+                if let Some(naive) = day.and_hms_opt(*hour, *minute, 0)
+                    && let Some(at) = Local.from_local_datetime(&naive).single()
+                    && at > last
+                    && at <= now
+                {
+                    count += 1;
+                }
+                let Some(next) = day.succ_opt() else {
+                    break;
+                };
+                day = next;
+                guard += 1;
+            }
+            count
+        }
+        TimerSpec::Cron(expression) => {
+            let Ok(cron) = CronSchedule::parse(expression) else {
+                return 0;
+            };
+            let mut at = last.with_second(0).unwrap_or(last) + chrono::Duration::minutes(1);
+            let mut count = 0u64;
+            let mut guard = 0;
+            while at <= now && guard < 1_440 {
+                if cron.matches(at) {
+                    count += 1;
+                }
+                at += chrono::Duration::minutes(1);
+                guard += 1;
+            }
+            count
+        }
+    }
 }
 
 fn next_local_time(hour: u32, minute: u32) -> Option<Duration> {
@@ -745,6 +854,7 @@ pub async fn load_config_monitors(
                 } else {
                     Some(monitor.deliver.to.clone())
                 },
+                monitor.lifecycle.catch_up,
             )
             .await?;
 
@@ -867,6 +977,39 @@ mod tests {
         assert!(schedule.next_delay(Local::now()).unwrap() <= Duration::from_secs(60));
     }
 
+    #[test]
+    fn catch_up_counts_missed_occurrences() {
+        let last = Local.with_ymd_and_hms(2026, 11, 4, 0, 0, 0).unwrap();
+        let now = last + chrono::Duration::minutes(5);
+        assert_eq!(
+            missed_occurrences(&TimerSpec::Every(Duration::from_secs(60)), last, now),
+            5
+        );
+        assert_eq!(
+            missed_occurrences(&TimerSpec::Cron("* * * * *".to_owned()), last, now),
+            5
+        );
+        // 时间倒过来不计。
+        assert_eq!(
+            missed_occurrences(&TimerSpec::Every(Duration::from_secs(60)), now, last),
+            0
+        );
+        // 每天固定时刻：跨两天补两次。
+        let last = Local.with_ymd_and_hms(2026, 11, 2, 10, 0, 0).unwrap();
+        let now = Local.with_ymd_and_hms(2026, 11, 4, 10, 30, 0).unwrap();
+        assert_eq!(
+            missed_occurrences(
+                &TimerSpec::At {
+                    hour: 9,
+                    minute: 0
+                },
+                last,
+                now
+            ),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn qq_monitor_delivers_matching_events_only() {
         let sink = Arc::new(RecordingSink::default());
@@ -886,6 +1029,7 @@ mod tests {
                 false,
                 Duration::ZERO,
                 None,
+                CatchUp::Coalesce,
             )
             .await
             .unwrap();
@@ -929,6 +1073,7 @@ mod tests {
                 false,
                 Duration::ZERO,
                 None,
+                CatchUp::Coalesce,
             )
             .await
             .unwrap();
@@ -959,6 +1104,7 @@ mod tests {
                 false,
                 Duration::ZERO,
                 None,
+                CatchUp::Coalesce,
             )
             .await
             .unwrap();
@@ -987,6 +1133,7 @@ mod tests {
                 false,
                 Duration::from_millis(50),
                 None,
+                CatchUp::Coalesce,
             )
             .await
             .unwrap();
@@ -1032,6 +1179,7 @@ mod tests {
                 true,
                 Duration::ZERO,
                 None,
+                CatchUp::Coalesce,
             )
             .await
             .unwrap();

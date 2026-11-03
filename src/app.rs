@@ -193,6 +193,16 @@ impl Runtime {
             loaded.config.storage.max_message_bytes,
             loaded.config.storage.encryption,
         )?);
+        // 重启核对发送账本：久悬的 pending 可能已经发出，标记为 unknown。
+        match messages.mark_stale_intents(600) {
+            Ok(0) => {}
+            Ok(stale) => warn!(
+                stale,
+                "marked stale outbound intents as unknown; check /messages before resending"
+            ),
+            Err(error) => warn!(%error, "cannot reconcile the outbound intent ledger"),
+        }
+
         // 启动校验：索引文件数与磁盘不一致时重建（索引只是缓存）。
         match messages.index_file_counts() {
             Ok((disk, indexed)) if disk != indexed => {
@@ -382,6 +392,7 @@ impl Runtime {
                 "bytes": bytes,
                 "count": count,
             })),
+            "unconfirmed_sends": self.messages.unconfirmed_sends().map(|rows| rows.len()).unwrap_or(0),
             "sessions": self.sessions.usage().ok().map(|(bytes, count)| json!({
                 "bytes": bytes,
                 "count": count,
@@ -1032,6 +1043,7 @@ async fn build_agent(
     );
     let sink = Arc::new(RunnerSink::default());
     let monitors = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+    monitors.set_db(Arc::clone(&db));
 
     let (tools, server_tools, hub_handle, approvals) = assemble_tools(ToolAssembly {
         config,
@@ -1053,6 +1065,38 @@ async fn build_agent(
     .await;
 
     let security_review = security_reviewer(&config.security, models, auth, &provider, model_ref);
+    let last_activity = Arc::new(std::sync::atomic::AtomicI64::new(
+        chrono::Utc::now().timestamp(),
+    ));
+    let memory_flush = if config.compaction.memory_flush {
+        Some(Arc::new(crate::memory::MemoryFlusher::new(
+            Arc::clone(&provider),
+            model_ref.model.id.clone(),
+            Arc::clone(&vfs),
+            Some(Arc::clone(&db)),
+            config.memory.clone(),
+        )))
+    } else {
+        None
+    };
+    let compaction = if config.agent.compaction_model.trim().is_empty() {
+        None
+    } else {
+        match build_provider(models, auth, config.agent.compaction_model.trim()) {
+            Ok(provider) => models
+                .find(config.agent.compaction_model.trim())
+                .map(|found| {
+                    Arc::new(crate::agent::runner::CompactionModel {
+                        provider,
+                        model: found.model.id.clone(),
+                    })
+                }),
+            Err(error) => {
+                warn!(%error, model = %config.agent.compaction_model, "cannot build the compaction provider");
+                None
+            }
+        }
+    };
     let runner = Runner::new_with_fallbacks(
         provider,
         fallbacks,
@@ -1095,6 +1139,15 @@ async fn build_agent(
             check_every_tokens: config.security.check_every_tokens,
             check_overlap_tokens: config.security.check_overlap_tokens,
             check_on_compaction: config.security.check_on_compaction,
+            context_window: model_ref.model.context_window,
+            reserve_tokens: config.compaction.reserve_tokens,
+            prune: config.compaction.prune,
+            prune_soft_limit: config.compaction.prune_soft_limit,
+            prune_keep_turns: config.compaction.prune_keep_turns,
+            memory_flush,
+            post_compact_recall: config.compaction.post_compact_recall,
+            compaction,
+            last_activity: Arc::clone(&last_activity),
         },
         Arc::clone(&history),
         Arc::clone(&ai_enabled),
@@ -1141,6 +1194,7 @@ async fn build_agent(
         memory: config.memory.clone(),
         style: config.style.clone(),
         ai_enabled: Arc::clone(&ai_enabled),
+        last_activity,
     });
 
     let runtime = Arc::new(AgentRuntime {

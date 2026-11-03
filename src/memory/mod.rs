@@ -10,7 +10,8 @@
 //! - 模型面文本为英文，解析失败只记日志，不写半成品。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -21,7 +22,7 @@ use crate::agent::AgentMessage;
 use crate::agent::queue::ChatQueue;
 use crate::agent::runner::SharedProviderSlot;
 use crate::config::{MemoryConfig, MemoryReviewMode, StyleConfig};
-use crate::providers::{ContentBlock, LlmRequest, ProviderMessage, Role, SystemBlock};
+use crate::providers::{ContentBlock, LlmRequest, Provider, ProviderMessage, Role, SystemBlock};
 use crate::storage::Database;
 use crate::tools::memory::{MemoryLimits, ReviewEntry, apply_review};
 use crate::vfs::Vfs;
@@ -56,33 +57,58 @@ pub struct ReviewerConfig {
     pub memory: MemoryConfig,
     pub style: StyleConfig,
     pub ai_enabled: Arc<AtomicBool>,
+    /// 最近一次回合活动时间（unix 秒）；`idle` 模式据此判断空闲。
+    pub last_activity: Arc<AtomicI64>,
 }
 
 /// 启动后台复盘循环；`review = off` 时立即返回。
+///
+/// - `every_turn`：每 5 秒看一次，transcript 有新增就复盘；
+/// - `idle`：每 30 秒看一次，要求没有活跃回合、空闲至少 `idle_minutes`，
+///   且距上次复盘至少 `review_interval_minutes`。
 pub fn spawn(config: ReviewerConfig) {
     if config.memory.review == MemoryReviewMode::Off {
         return;
     }
-    let interval = std::time::Duration::from_secs(
-        u64::from(config.memory.review_interval_minutes.max(1)) * 60,
-    );
+    let every_turn = config.memory.review == MemoryReviewMode::EveryTurn;
+    let idle = Duration::from_secs(u64::from(config.memory.idle_minutes.max(1)) * 60);
+    let interval = Duration::from_secs(u64::from(config.memory.review_interval_minutes.max(1)) * 60);
+    let tick = if every_turn {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(30)
+    };
     tokio::spawn(async move {
         let mut last_reviewed = 0usize;
+        let mut last_review = Instant::now() - interval;
         loop {
-            tokio::time::sleep(interval).await;
+            tokio::time::sleep(tick).await;
             if !config.ai_enabled.load(Ordering::Relaxed) {
-                continue;
-            }
-            if config.queue.active_turns().await > 0 {
                 continue;
             }
             let history = config.history.lock().await.clone();
             if history.len() <= last_reviewed || history.is_empty() {
                 continue;
             }
+            if every_turn {
+                // 每回合：只要求没有正在跑的回合，避免抢上下文。
+                if config.queue.active_turns().await > 0 {
+                    continue;
+                }
+            } else {
+                if config.queue.active_turns().await > 0 {
+                    continue;
+                }
+                let idle_for = chrono::Utc::now().timestamp()
+                    - config.last_activity.load(Ordering::Relaxed);
+                if idle_for < idle.as_secs() as i64 || last_review.elapsed() < interval {
+                    continue;
+                }
+            }
             match review_once(&config, &history).await {
                 Ok(()) => {
                     last_reviewed = history.len();
+                    last_review = Instant::now();
                 }
                 Err(error) => warn!(%error, "background memory review failed"),
             }
@@ -90,17 +116,83 @@ pub fn spawn(config: ReviewerConfig) {
     });
 }
 
+/// 压缩前的静默记忆提取器（`[compaction].memory_flush`）。
+///
+/// 与后台复盘共用同一套解析与落盘逻辑，但不改 `/STYLE.md`。
+pub struct MemoryFlusher {
+    provider: Arc<dyn Provider>,
+    model: String,
+    vfs: Arc<VfsStore>,
+    db: Option<Arc<Database>>,
+    memory: MemoryConfig,
+}
+
+impl MemoryFlusher {
+    pub fn new(
+        provider: Arc<dyn Provider>,
+        model: impl Into<String>,
+        vfs: Arc<VfsStore>,
+        db: Option<Arc<Database>>,
+        memory: MemoryConfig,
+    ) -> Self {
+        Self {
+            provider,
+            model: model.into(),
+            vfs,
+            db,
+            memory,
+        }
+    }
+
+    /// 从历史里提取并写入记忆，返回新增条数。
+    pub async fn flush(&self, history: &[AgentMessage]) -> Result<usize> {
+        run_review(
+            &self.provider,
+            &self.model,
+            &self.vfs,
+            self.db.as_ref(),
+            &self.memory,
+            None,
+            history,
+        )
+        .await
+    }
+}
+
 /// 执行一次复盘。
 async fn review_once(config: &ReviewerConfig, history: &[AgentMessage]) -> Result<()> {
-    let recent: Vec<AgentMessage> = history.iter().rev().take(80).rev().cloned().collect();
-    let input = crate::session::compaction::render_for_summary(&recent, 60_000);
     let slot = config
         .provider
         .read()
         .expect("provider slot lock poisoned")
         .clone();
+    run_review(
+        &slot.provider,
+        &slot.api_model,
+        &config.vfs,
+        config.db.as_ref(),
+        &config.memory,
+        Some(&config.style),
+        history,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// 复盘的核心：请求模型、解析 JSON、写记忆（可选写风格）。
+async fn run_review(
+    provider: &Arc<dyn Provider>,
+    model: &str,
+    vfs: &Arc<VfsStore>,
+    db: Option<&Arc<Database>>,
+    memory: &MemoryConfig,
+    style: Option<&StyleConfig>,
+    history: &[AgentMessage],
+) -> Result<usize> {
+    let recent: Vec<AgentMessage> = history.iter().rev().take(80).rev().cloned().collect();
+    let input = crate::session::compaction::render_for_summary(&recent, 60_000);
     let request = LlmRequest {
-        model: slot.api_model.clone(),
+        model: model.to_owned(),
         system: vec![SystemBlock {
             text: REVIEW_SYSTEM.to_owned(),
             cache: false,
@@ -114,8 +206,7 @@ async fn review_once(config: &ReviewerConfig, history: &[AgentMessage]) -> Resul
         thinking: Default::default(),
         server_tools: Vec::new(),
     };
-    let mut receiver = slot
-        .provider
+    let mut receiver = provider
         .stream(request)
         .await
         .context("review request failed")?;
@@ -141,12 +232,12 @@ async fn review_once(config: &ReviewerConfig, history: &[AgentMessage]) -> Resul
     let value: Value = serde_json::from_str(json).context("review output is not valid JSON")?;
 
     let limits = MemoryLimits {
-        max_entry_chars: config.memory.max_entry_chars as usize,
-        max_index_lines: config.memory.max_index_lines as usize,
-        max_index_bytes: config.memory.max_index_bytes as usize,
+        max_entry_chars: memory.max_entry_chars as usize,
+        max_index_lines: memory.max_index_lines as usize,
+        max_index_bytes: memory.max_index_bytes as usize,
     };
     let mut entries = Vec::new();
-    if config.memory.enabled
+    if memory.enabled
         && let Some(memories) = value.get("memories").and_then(Value::as_array)
     {
         for memory in memories.iter().take(5) {
@@ -178,37 +269,32 @@ async fn review_once(config: &ReviewerConfig, history: &[AgentMessage]) -> Resul
             });
         }
     }
-    let added = apply_review(&config.vfs, config.db.as_deref(), &limits, &entries)
-        .context("cannot apply reviewed memories")?;
+    let added = apply_review(vfs, db.map(|db| db.as_ref()), &limits, &entries).context("cannot apply reviewed memories")?;
     if added > 0 {
         info!(added, "background review added memories");
     }
 
-    if config.style.enabled
-        && let Some(style) = value.get("style").and_then(Value::as_str)
+    if let Some(style) = style
+        && style.enabled
+        && let Some(value) = value.get("style").and_then(Value::as_str)
     {
-        let style = style.trim();
-        if !style.is_empty() {
-            let mut text: String = style
-                .chars()
-                .take(config.style.max_chars as usize)
-                .collect();
-            if style.chars().count() > config.style.max_chars as usize {
+        let value = value.trim();
+        if !value.is_empty() {
+            let mut text: String = value.chars().take(style.max_chars as usize).collect();
+            if value.chars().count() > style.max_chars as usize {
                 text.push('…');
             }
-            let path = VfsPath::parse(&config.style.profile_path)
+            let path = VfsPath::parse(&style.profile_path)
                 .unwrap_or_else(|_| VfsPath::parse("/STYLE.md").expect("valid"));
-            if config.vfs.stat(&path).is_ok() {
-                let _ = config.vfs.read_lines(&path, None, None);
+            if vfs.stat(&path).is_ok() {
+                let _ = vfs.read_lines(&path, None, None);
             }
-            config
-                .vfs
-                .write_text(&path, &text, None)
+            vfs.write_text(&path, &text, None)
                 .context("cannot write the style profile")?;
             debug!(chars = text.chars().count(), "style profile updated");
         }
     }
-    Ok(())
+    Ok(added)
 }
 
 /// 从模型输出中提取 JSON 对象；容忍 ```json 代码围栏。

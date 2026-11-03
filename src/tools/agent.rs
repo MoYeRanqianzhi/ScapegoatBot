@@ -160,6 +160,7 @@ impl AgentTool {
                 idle_only,
                 batch_window,
                 Some(id.to_owned()),
+                crate::config::CatchUp::Coalesce,
             )
             .await?;
         Ok(name)

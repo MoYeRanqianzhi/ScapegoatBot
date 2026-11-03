@@ -68,6 +68,12 @@ pub struct LoopConfig {
     pub retry: RetryPolicy,
     /// 输入闸的 state 截断长度（字符）。
     pub max_state_chars: usize,
+    /// 是否裁剪较早的工具结果（降低长回合的成本）。
+    pub prune: bool,
+    /// 单条旧工具结果保留的字符数。
+    pub prune_soft_limit: usize,
+    /// 最近多少个“回合起点”不裁剪。
+    pub prune_keep_turns: u32,
 }
 
 impl Default for LoopConfig {
@@ -81,6 +87,9 @@ impl Default for LoopConfig {
             max_steps: 64,
             retry: RetryPolicy::default(),
             max_state_chars: 32_000,
+            prune: false,
+            prune_soft_limit: 4_000,
+            prune_keep_turns: 3,
         }
     }
 }
@@ -212,6 +221,13 @@ impl AgentLoop {
 
             loop {
                 drain_incoming(steering, &mut incoming);
+                if self.config.prune {
+                    prune_tool_results(
+                        history,
+                        self.config.prune_keep_turns as usize,
+                        self.config.prune_soft_limit,
+                    );
+                }
                 turns += 1;
                 if turns > self.config.max_steps {
                     send(
@@ -860,6 +876,47 @@ fn render_assistant(assistant: &AssistantMessage) -> String {
     out
 }
 
+/// 裁剪较早的工具结果：保留最近 `keep_turns` 个回合起点之后的原文，
+/// 更早的 `Tool` 消息只留前 `soft_limit` 个字符。
+///
+/// 只缩短内容、不删除消息：tool_use/tool_result 仍成对，provider 不会 400。
+pub(crate) fn prune_tool_results(
+    history: &mut [AgentMessage],
+    keep_turns: usize,
+    soft_limit: usize,
+) {
+    if soft_limit == 0 {
+        return;
+    }
+    // 保留最后 `keep_turns` 个回合；第 N 个（从后往前）User 消息之前的内容
+    // 属于更早的回合，可以裁剪。回合数不足时什么都不裁。
+    let keep_turns = keep_turns.max(1);
+    let mut seen = 0usize;
+    let mut boundary = 0usize;
+    for (index, message) in history.iter().enumerate().rev() {
+        if matches!(message, AgentMessage::User { .. }) {
+            seen += 1;
+            if seen == keep_turns {
+                boundary = index;
+                break;
+            }
+        }
+    }
+    if boundary == 0 {
+        return;
+    }
+    for message in history.iter_mut().take(boundary) {
+        if let AgentMessage::Tool(result) = message
+            && result.content.chars().count() > soft_limit
+        {
+            let mut trimmed: String = result.content.chars().take(soft_limit).collect();
+            trimmed.push_str("
+[tool result trimmed]");
+            result.content = trimmed;
+        }
+    }
+}
+
 /// 渲染上下文作为闸的 `state`，只保留尾部。
 fn render_state(history: &[AgentMessage], max_chars: usize) -> String {
     let mut out = String::new();
@@ -1482,5 +1539,51 @@ mod tests {
             AgentMessage::Assistant(assistant)
                 if assistant.content.iter().any(|block| matches!(block, AssistantBlock::ToolCall(_)))
         )));
+    }
+
+    #[test]
+    fn prune_shortens_only_old_tool_results() {
+        let long = "x".repeat(100);
+        let mut history = vec![
+            AgentMessage::user("turn 1"),
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![AssistantBlock::ToolCall(crate::agent::message::ToolCall {
+                    id: "old".to_owned(),
+                    name: "Read".to_owned(),
+                    arguments: serde_json::json!({"path": "/a"}),
+                })],
+                stop_reason: StopReason::ToolUse,
+                usage: Usage::default(),
+                refusal: None,
+            }),
+            AgentMessage::Tool(ToolResultMessage {
+                tool_call_id: "old".to_owned(),
+                tool_name: "Read".to_owned(),
+                content: long.clone(),
+                is_error: false,
+            }),
+            AgentMessage::user("turn 2"),
+            AgentMessage::Tool(ToolResultMessage {
+                tool_call_id: "recent".to_owned(),
+                tool_name: "Read".to_owned(),
+                content: long.clone(),
+                is_error: false,
+            }),
+        ];
+
+        prune_tool_results(&mut history, 1, 20);
+        match &history[2] {
+            AgentMessage::Tool(result) => {
+                assert!(result.content.starts_with(&"x".repeat(20)));
+                assert!(result.content.ends_with("[tool result trimmed]"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // 最近的回合与工具结果不受影响。
+        assert_eq!(history.len(), 5);
+        match &history[4] {
+            AgentMessage::Tool(result) => assert_eq!(result.content, long),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
