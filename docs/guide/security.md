@@ -171,6 +171,10 @@ sbot gate reject g1
 - `["*"]` = 不限制；
 - 否则只允许列出的 `group:<gid>` / `private:<qq>`。
 
+`[agent].receive_scopes` 控制能读哪些 chat：消息视图、收件箱、联系人视图与带
+`group_id` / `user_id` 的 API 查询都会过滤；空列表 = 拒绝一切读取。`get_msg` 只有
+`message_id`，无法判定 chat，仍可读取（见 limits.md）。
+
 ## 网络
 
 - `Download` / `WebFetch` 在请求前校验协议、域名与解析后的公网地址；

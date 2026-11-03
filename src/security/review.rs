@@ -120,6 +120,9 @@ impl SecurityReviewer {
         let deadline = tokio::time::Instant::now() + self.timeout;
         let mut text = String::new();
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err("security review timed out".to_owned());
+            }
             let event = tokio::time::timeout_at(deadline, receiver.recv())
                 .await
                 .map_err(|_| "security review timed out".to_owned())?

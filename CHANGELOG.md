@@ -5,6 +5,43 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.15] - 2026-11-04
+
+第二轮审查：修掉 alpha.14 新代码里的边界问题，并把两个“配置写了但不生效”的
+安全/资源项接上。数据库无新迁移。
+
+### 修复
+
+- **记忆复盘在压缩后停摆**：压缩会把 transcript 截短，`last_reviewed` 不回落时
+  会永远认为“没有新增”；长度回退时重置基线。
+- **发送记录早于结果**：门禁在调用 gateway 前就写入“已发送”，一次超时会让重试被
+  重复规则挡住。改为只在成功后 `note_send`，失败/超时不再污染记录；短应答
+  （<12 字符）不参与同 chat 重复判定。
+- **主人通知被误拦**：给 `master_qq` 的私聊是通知通道，现在即使没有 owner intent
+  也放行（仍受发送范围、门禁与 hold 约束）。
+- **超时只包住单次读取**：安全审查/LLM 判定在事件持续到达时可以绕过总超时；
+  三个循环都增加固定 deadline 检查。
+- **模型未声明上下文窗口**：`context_window = 0` 不再把压缩阈值压到 1，回退到
+  `turn_context_budget`。
+- **保留天数未执行**：`message_retention_days` / `session_retention_days` 之前只有
+  `/system` 展示。消息在 append 时、会话在 rotate/启动时真正清理过期分段。
+- **工具结果无上限**：`[tools].max_result_bytes` 现在截断单次工具结果（按字符边界），
+  避免一次 Read/Grep 撑爆上下文。
+- **`receive_scopes` 只在 prompt 里**：消息/收件箱/联系人视图与带 `group_id`/
+  `user_id` 的 API 查询现在按范围过滤；越界读取返回 NotFound。
+
+### 文档
+
+- `limits.md` 增加仍未执行的 `[budget]`、`[hooks.events]`、`max_schema_tokens`、
+  monitor `cc`/`on_missing`，以及 `get_msg` 无法按 chat 过滤的边界。
+
+### 测试
+
+- 新增：压缩后复盘基线、成功/失败发送与短应答、master 通知、保留天数、
+  工具结果截断、视图与 API 的 receive scope。
+- `cargo test --all-targets`：316 项通过（2 项真实 API 测试默认忽略）；
+  `cargo fmt --check`、`clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.14] - 2026-11-04
 
 补齐 alpha.13 文档里列出的未实现项，并完成结构收尾。数据库无新迁移。

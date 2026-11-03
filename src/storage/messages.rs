@@ -89,6 +89,8 @@ pub struct MessageStore {
     /// 串行化写入：行号 = 已提交行数，取号与写入必须在同一个临界区，
     /// 否则两个并发 append 会拿到同一个行号（AAD 相同，读到错误的消息）。
     append_lock: Mutex<()>,
+    /// 按年龄清理旧月份；0 = 只按配额。
+    retention_days: u32,
 }
 
 impl MessageStore {
@@ -109,7 +111,14 @@ impl MessageStore {
             max_bytes,
             encryption,
             append_lock: Mutex::new(()),
+            retention_days: 0,
         })
+    }
+
+    /// 设置按年龄清理的天数（0 = 关闭）；启动时也可调用 [`Self::enforce_retention`]。
+    pub fn with_retention_days(mut self, days: u32) -> Self {
+        self.retention_days = days;
+        self
     }
 
     /// 追加一条消息；已存在（同 chat + message_id）时返回 `false`。
@@ -971,6 +980,10 @@ impl MessageStore {
 
     /// 写入前腾出空间。
     fn make_room(&self) -> Result<()> {
+        // 先按年龄清理；`retention_days = 0` 时不做任何事。
+        if self.retention_days > 0 {
+            self.enforce_retention(self.retention_days)?;
+        }
         if self.max_bytes == 0 {
             return Ok(());
         }
@@ -978,7 +991,7 @@ impl MessageStore {
         if bytes <= self.max_bytes {
             return Ok(());
         }
-        let report = self.enforce_retention(0)?;
+        let report = self.enforce_retention(self.retention_days)?;
         let (bytes, _) = self.usage()?;
         if bytes > self.max_bytes {
             warn!(
@@ -1325,6 +1338,33 @@ mod tests {
         let (disk, indexed) = store.index_file_counts().unwrap();
         assert_eq!(disk, indexed);
         assert_eq!(disk, 1);
+    }
+
+    #[test]
+    fn configured_retention_days_clean_on_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let key = Arc::new(MasterKey::from_bytes([13u8; 32]));
+        let store = MessageStore::open(
+            db,
+            key,
+            dir.path().to_path_buf(),
+            0,
+            EncryptionMode::XChaCha20Poly1305,
+        )
+        .unwrap()
+        .with_retention_days(30);
+        let chat = ChatId::Group(1);
+        let mut old = message(chat, 1, "old");
+        old.time = Utc::now() - chrono::Duration::days(90);
+        store.append(&old).unwrap();
+
+        let mut current = message(chat, 2, "new");
+        current.time = Utc::now();
+        store.append(&current).unwrap();
+
+        assert!(store.load(chat, 1).unwrap().is_none());
+        assert!(store.load(chat, 2).unwrap().is_some());
     }
 
     #[test]

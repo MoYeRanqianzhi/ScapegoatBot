@@ -71,7 +71,7 @@ pub struct Views {
 }
 
 /// `/config` 与 `/system` 的只读上下文。
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct ViewContext {
     /// 当前配置；`SetModel` / `SetEffort` 会原地更新。
     pub config: Option<Arc<std::sync::RwLock<LoadedConfig>>>,
@@ -81,6 +81,23 @@ pub struct ViewContext {
     pub estop_file: Option<PathBuf>,
     pub started_at: Option<DateTime<Utc>>,
     pub db: Option<Arc<Database>>,
+    /// 允许读取的 chat；`["*"]` = 全部，空 = 拒绝一切。
+    pub receive_scopes: Vec<String>,
+}
+
+impl Default for ViewContext {
+    fn default() -> Self {
+        Self {
+            config: None,
+            models: None,
+            gate: None,
+            ai_enabled: None,
+            estop_file: None,
+            started_at: None,
+            db: None,
+            receive_scopes: vec!["*".to_owned()],
+        }
+    }
 }
 
 impl Views {
@@ -291,12 +308,38 @@ impl Views {
         Ok(out)
     }
 
+    #[cfg(test)]
+    fn messages_store(&self) -> Arc<MessageStore> {
+        Arc::clone(&self.messages)
+    }
+
+    /// 当前 `[agent].receive_scopes` 是否允许读取该 chat。
+    pub(super) fn receive_allows(&self, chat: ChatId) -> bool {
+        let chat = chat.to_string();
+        self.context
+            .receive_scopes
+            .iter()
+            .any(|scope| scope == "*" || scope == &chat)
+    }
+
+    /// 越界读取按 NotFound 处理，不泄露该 chat 是否存在。
+    pub(super) fn ensure_receive(&self, chat: ChatId) -> Result<(), VfsError> {
+        if self.receive_allows(chat) {
+            Ok(())
+        } else {
+            Err(VfsError::NotFound(format!(
+                "{chat}: outside receive_scopes"
+            )))
+        }
+    }
+
     /// `/inbox` 的忽略语义：`dismiss` 不删除消息本体。
     pub fn dismiss(&self, target: &ParsedTarget) -> Result<usize, VfsError> {
         let path = &target.path;
         match path.segments() {
             [root, chat] if root == "inbox" => {
                 let chat = parse_chat_segment(chat)?;
+                self.ensure_receive(chat)?;
                 let ids: Vec<i64> = self
                     .messages
                     .inbox_for_chat(chat, InboxState::Unread)
@@ -308,6 +351,7 @@ impl Views {
             }
             [root, chat, id] if root == "inbox" && id.ends_with(".md") => {
                 let chat = parse_chat_segment(chat)?;
+                self.ensure_receive(chat)?;
                 if id == "index.md" {
                     let ids: Vec<i64> = self
                         .messages
@@ -337,6 +381,9 @@ impl Views {
                 };
                 let mut total = 0;
                 for message in self.messages.unread(None).map_err(storage)? {
+                    if !self.receive_allows(message.chat) {
+                        continue;
+                    }
                     if filter_matches_message(filter, &message, Some(InboxState::Unread)) {
                         total += self
                             .messages
@@ -796,5 +843,35 @@ mod tests {
             .write_config(&target("/config/agent/thinking_level"), "\"low\"")
             .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn receive_scopes_filter_views() {
+        let (views, _dir) = views();
+        let store = views.messages_store();
+        store
+            .append(&message(crate::qq::event::ChatId::Group(1), 1, "one"))
+            .unwrap();
+        store
+            .append(&message(crate::qq::event::ChatId::Group(2), 2, "two"))
+            .unwrap();
+
+        let scoped = views.with_context(ViewContext {
+            receive_scopes: vec!["group:1".to_owned()],
+            ..ViewContext::default()
+        });
+        let listed = scoped.list(&target("/messages/groups")).await.unwrap();
+        let paths: Vec<&str> = listed.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(paths, vec!["/messages/groups/1"]);
+
+        let day = format!("{}", chrono::Local::now().format("%Y-%m"));
+        assert!(
+            scoped
+                .read(&target(&format!("/messages/groups/2/{day}/04.md")))
+                .await
+                .is_err()
+        );
+        assert!(!scoped.receive_allows(crate::qq::event::ChatId::Group(2)));
+        assert!(scoped.receive_allows(crate::qq::event::ChatId::Group(1)));
     }
 }

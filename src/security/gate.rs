@@ -358,6 +358,9 @@ new content:
         let deadline = tokio::time::Instant::now() + self.timeout;
         let mut text = String::new();
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(GateError::Request("llm judge timed out".to_owned()));
+            }
             let event = tokio::time::timeout_at(deadline, receiver.recv())
                 .await
                 .map_err(|_| GateError::Request("llm judge timed out".to_owned()))?

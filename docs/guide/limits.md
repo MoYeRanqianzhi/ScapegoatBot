@@ -11,6 +11,10 @@
 | `[style].sample_retention_days` | 未实现 | 原始样本不按天数清理 |
 | `models.json` 的 `default_thinking_level` | 未实现 | effort 必须显式配置 |
 | `[agent].compaction_model` | 仅在非空时用于摘要 | 空 = 主模型（默认） |
+| `[budget]` 全部键 | 只解析、不执行 | 没有每日 token/USD、每回合、每 chat 小时限额 |
+| `[hooks.events]` | 只解析、不执行 | BeforeSend 的 rewrite/block 不会运行 |
+| `[tools].max_schema_tokens` | 未实现 | 工具 schema 不按 token 预算裁剪 |
+| `[monitor].deliver.cc` / `on_missing` | 未实现 | 不会抄送父级或按缺失策略处理 |
 
 ## 安全边界
 
@@ -24,6 +28,8 @@
   配置的后端执行，内容在复核前已经被取走。不要把敏感目标交给不可信后端。
 - **加密边界**：防的是拿到 `data.db` / 文件但没有 `key`；不防同机管理员、
   进程内存读取，也不防拿到备份（备份含 key）。
+- **`receive_scopes` 的边界**：消息视图、收件箱、联系人视图与带 `group_id`/`user_id` 的
+  API 查询已按范围过滤；`napcat.get_msg` 只有 `message_id`、无法判定 chat，仍可读取。
 - **VFS 不是沙箱**：它隔离的是模型与宿主文件系统，不隔离网络。
 
 ## 协议与接入

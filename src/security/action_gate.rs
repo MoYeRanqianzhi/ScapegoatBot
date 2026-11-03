@@ -252,6 +252,9 @@ impl ActionReviewer for LlmActionReviewer {
         let mut text = String::new();
         let deadline = tokio::time::Instant::now() + self.timeout;
         loop {
+            if tokio::time::Instant::now() >= deadline {
+                return Err("review timed out".to_owned());
+            }
             let event = tokio::time::timeout_at(deadline, receiver.recv())
                 .await
                 .map_err(|_| "review timed out".to_owned())?
@@ -380,14 +383,18 @@ impl ActionGate {
         if content.trim().is_empty() {
             return Ok(());
         }
+        // 短应答（“好的”“哈哈”）重复是正常对话，不按重复处理。
+        let content_short = content.chars().count() < 12;
         let mut sends = self.sends.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         sends.retain(|record| now.duration_since(record.at) <= MASS_WINDOW);
-        if sends.iter().any(|record| {
-            record.chat == chat
-                && record.content == content
-                && now.duration_since(record.at) <= DUPLICATE_WINDOW
-        }) {
+        if !content_short
+            && sends.iter().any(|record| {
+                record.chat == chat
+                    && record.content == content
+                    && now.duration_since(record.at) <= DUPLICATE_WINDOW
+            })
+        {
             return Err(
                 "the same message was already sent to this chat within 30s; do not repeat it"
                     .to_owned(),
@@ -408,12 +415,24 @@ impl ActionGate {
                 targets.len()
             ));
         }
+        Ok(())
+    }
+
+    /// 记录一次**成功**的发送；失败/超时不应触发重复与跨群规则，
+    /// 否则一次临时错误会让重试被自己的记录挡住。
+    pub fn note_send(&self, params: &Value, chat: &str) {
+        let content = message_content(params);
+        if content.trim().is_empty() {
+            return;
+        }
+        let mut sends = self.sends.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        sends.retain(|record| now.duration_since(record.at) <= MASS_WINDOW);
         sends.push_back(SendRecord {
             at: now,
             chat: chat.to_owned(),
             content,
         });
-        Ok(())
     }
 
     /// 执行一次门禁判定。
@@ -613,6 +632,7 @@ mod tests {
                 .await
                 .is_allowed()
         );
+        gate.note_send(&message, "group:1");
 
         let duplicate = json!({"group_id": 1, "message": "same long content for three groups"});
         assert!(matches!(
@@ -621,11 +641,28 @@ mod tests {
             ActionDecision::Block(_)
         ));
 
+        // 短应答重复不拦。
+        let short = json!({"group_id": 1, "message": "好的"});
+        assert!(
+            gate.check(spec("napcat.send_group_msg"), &short, &evidence)
+                .await
+                .is_allowed()
+        );
+        gate.note_send(&short, "group:1");
+        assert!(
+            gate.check(spec("napcat.send_group_msg"), &short, &evidence)
+                .await
+                .is_allowed()
+        );
+
         for group in [2, 3] {
             let params = json!({"group_id": group, "message": "broadcast text across groups"});
-            let _ = gate
-                .check(spec("napcat.send_group_msg"), &params, &evidence)
-                .await;
+            assert!(
+                gate.check(spec("napcat.send_group_msg"), &params, &evidence)
+                    .await
+                    .is_allowed()
+            );
+            gate.note_send(&params, &format!("group:{group}"));
         }
         let params = json!({"group_id": 4, "message": "broadcast text across groups"});
         assert!(matches!(
