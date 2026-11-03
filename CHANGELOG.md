@@ -34,13 +34,17 @@
   `unknown` 并提示先查历史，避免重复发送；`status` 暴露未确认数量。
 - **网络加固**：`Download` 使用只返回公网地址的自定义 DNS 解析器（关闭 rebinding
   TOCTOU）；`WebFetch` 复核后端返回的 `final_url`。
+- **群级破坏动作**：全员禁言、退群、解散群会改变主人所在群的可达性，改为要求
+  owner intent（没有用户目标可做硬保护）。
+- **MCP 分页**：`tools/list` 达到 10 页上限时告警，不再静默截断。
 
 ### 变更
 
 - `tools/views.rs` 拆为 `views/{messages,inbox,sessions,contacts,config,system}.rs`。
 - `Runner` 的 per-chat 缓存收进 `ScopeCache`；`Runtime::start` 的存储初始化与启动对账
   抽到 `open_stores`。
-- 全仓 `cargo fmt`；新增 GitHub Actions CI（fmt、clippy -D warnings、tests）。
+- 全仓 `cargo fmt`；新增 GitHub Actions CI（Ubuntu 上 fmt/clippy/tests，Windows 上
+  clippy/tests）。
 - 文档同步：`docs/guide` 的配置/安全/限制/使用/记忆页与 README 更新；
   `limits.md` 只保留仍存在的边界。
 
@@ -54,7 +58,7 @@
 - 新增：动作门禁（速率/重复/跨群/@all/审批/LLM 审查）、owner intent 放行与拒绝、
   LLM judge 安装、周期检查的 hold/pause、工具结果裁剪、monitor 补投计数、
   账本核对、DNS 解析过滤、views 拆分后的既有用例。
-- `cargo test --all-targets`：310 项通过（2 项真实 API 测试默认忽略）；
+- `cargo test --all-targets`：311 项通过（2 项真实 API 测试默认忽略）；
   `cargo clippy --all-targets -- -D warnings` 与 `cargo fmt --check` 通过。
 
 ## [0.2.0-alpha.13] - 2026-11-04

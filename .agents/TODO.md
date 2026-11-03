@@ -10,7 +10,6 @@
 - [ ] `auto` 门禁的内容级规则：跨 chat 5-gram 重叠、媒体 `origin_chat` 校验、
       `context_sources` 追踪（设计 §5.6 / §5.8）。当前只有频率/重复/跨群/@all 启发式。
 - [ ] 周期检查复用主请求的逐字节前缀缓存（设计 §5.9）：当前是独立窗口。
-- [ ] 群级破坏动作（全员禁言/退群/解散）的归属校验；当前没有用户目标，不做 owner 保护。
 - [ ] 评估 `[security.guard].max_state_tokens` / `delta_every_tokens`：实现窗口控制，
       或从配置 schema 删除，避免继续作为无效配置存在。
 - [ ] 评估 `[style].sample_retention_days` 与 `models.json.default_thinking_level`：
@@ -19,14 +18,12 @@
 ## 运行与数据
 
 - [ ] WebFetch 改为本地抓取（或对后端做逐跳重定向协议），消除“先取内容后复核”。
-- [ ] MCP `tools/list` 分页上限 10 页后静默截断：改为显式告警或继续翻页。
 - [ ] `Agent message` 发给运行中的子代理只入历史、当前回合不读取：明确语义或实现中断。
 - [ ] 长跑/压测：alpha.14 的周期检查与压缩预算需要真实流量验证；记录到
       `docs/development/live-testing.md`。
 
 ## 工程
 
-- [ ] CI 增加 Windows job（命名管道、Windows DACL 路径目前只在本地验证）。
 - [ ] 观察 `cargo clippy` 的 MSRV 与依赖升级；`napcat-link` 固定在 alpha.2。
 
 ## 文档

@@ -8,7 +8,7 @@ metadata:
   last_verified: 2026-11-04
 ---
 
-当前版本：`0.2.0-alpha.14`（`main`）。数据库迁移到 v9；测试 310 项通过，
+当前版本：`0.2.0-alpha.14`（`main`）。数据库迁移到 v9；测试 311 项通过，
 `cargo fmt --check`、`clippy -D warnings` 通过；CI 已接入 GitHub Actions。
 
 alpha.13 修掉了 2026-11-03 审查的 P0/P1 主体；alpha.14 补齐了当时列为未实现的项：

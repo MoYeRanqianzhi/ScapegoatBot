@@ -918,6 +918,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn group_wide_destructive_actions_require_owner_intent() {
+        let gateway = Arc::new(FakeGateway::default());
+        let tool = tool(Some(gateway.clone()), None);
+        for (action, params) in [
+            (
+                "napcat.set_group_whole_ban",
+                json!({"group_id": 1, "enable": true}),
+            ),
+            ("napcat.set_group_leave", json!({"group_id": 1})),
+            ("napcat.set_group_dismiss", json!({"group_id": 1})),
+        ] {
+            let result = tool
+                .execute(
+                    &intent_ctx("group:1"),
+                    json!({"action": action, "params": params}),
+                )
+                .await;
+            assert!(result.is_error, "{action} should require owner intent");
+            assert!(result.content.contains("owner_intent_required"));
+        }
+        assert!(gateway.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn profile_changes_require_owner_intent() {
         let gateway = Arc::new(FakeGateway::default());
         let tool = tool(Some(gateway.clone()), None);
