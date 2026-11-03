@@ -210,7 +210,7 @@ pub enum Order {
 /// 动态视图查询参数（设计 §6.3）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewQuery {
-    /// 与 monitor `when` 同一套谓词语法；此处只保存原文，求值在 Phase 4。
+    /// 与 monitor `when` 同一套谓词语法；此处只保存原文，求值在视图层。
     pub filter: Option<String>,
     /// 默认 50，上限 500。
     pub limit: usize,

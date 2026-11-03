@@ -76,7 +76,7 @@ impl AuthFile {
             .filter(Secret::is_present)
     }
 
-    /// 安全分类器的 key（`security.guard.api_key`）；Phase 5 的输入/输出闸使用。
+    /// 安全分类器的 key（`security.guard.api_key`）；输入/输出闸使用。
     #[allow(dead_code)]
     pub fn guard_key(&self) -> Option<Secret> {
         Some(self.security.guard.api_key.clone()).filter(Secret::is_present)

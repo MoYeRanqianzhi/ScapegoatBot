@@ -406,7 +406,7 @@ impl VfsStore {
         Ok(result)
     }
 
-    /// 读取某个二进制分块（供 Phase 4 的 `Download` / 发送文件流式使用）。
+    /// 读取某个二进制分块（供 `Download` 与发送文件流式使用）。
     #[allow(dead_code)]
     pub fn read_blob_chunk(&self, path: &VfsPath, idx: u64) -> Result<Vec<u8>, VfsError> {
         let conn = self.db.lock();

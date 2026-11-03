@@ -5,7 +5,7 @@
 //! - `add` / `remove` / `list` / `fire`；
 //! - 运行时创建默认有界：`expires = 2h`、`max_events = 50`、`idle_only = true`；
 //! - 拒绝 `stream` 源（外部网络只能由主人写进配置文件）；
-//! - 一次性子代理的 monitor 绑定由 Phase 6 接入；当前只支持 `deliver.to = "main"`。
+//! - `deliver.to` 支持 `main`、`<spawn_id>` 与 `agent:<name>`；绑定随子代理结束删除。
 
 use std::sync::Arc;
 use std::time::Duration;

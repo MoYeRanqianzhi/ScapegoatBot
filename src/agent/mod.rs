@@ -36,7 +36,7 @@ pub enum ExecutionMode {
 
 /// 工具执行器。
 ///
-/// Phase 4 的 `ToolRegistry` 实现它；Phase 2 的测试用 fake 实现。
+/// 运行时的 `ToolRegistry` 实现它；测试用 fake 实现。
 #[async_trait::async_trait]
 pub trait ToolExecutor: Send + Sync {
     /// 当前可用工具声明，顺序稳定（影响 prompt 缓存）。
