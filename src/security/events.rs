@@ -21,6 +21,8 @@ pub enum Checkpoint {
     Input,
     /// 模型输出后、副作用前。
     Output,
+    /// 单次 `napcat.*` 调用的门禁（`[gate]`）。
+    Gate,
 }
 
 impl Checkpoint {
@@ -28,6 +30,7 @@ impl Checkpoint {
         match self {
             Self::Input => "input",
             Self::Output => "output",
+            Self::Gate => "gate",
         }
     }
 }
@@ -82,10 +85,10 @@ pub fn recent(db: &Arc<Database>, limit: u32) -> anyhow::Result<Vec<SecurityEven
             let checkpoint: String = row.get(1)?;
             Ok(SecurityEvent {
                 id: row.get(0)?,
-                checkpoint: if checkpoint == "output" {
-                    Checkpoint::Output
-                } else {
-                    Checkpoint::Input
+                checkpoint: match checkpoint.as_str() {
+                    "output" => Checkpoint::Output,
+                    "gate" => Checkpoint::Gate,
+                    _ => Checkpoint::Input,
                 },
                 allowed: row.get::<_, i32>(2)? != 0,
                 score: row.get::<_, f64>(3)? as f32,

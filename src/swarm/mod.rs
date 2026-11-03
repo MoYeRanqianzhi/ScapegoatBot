@@ -132,6 +132,8 @@ pub struct SubagentRequest {
     pub max_depth: u32,
     /// 只读：`API` 只保留 `api.*` 查询（docs 与不可发送的自定义子代理）。
     pub read_only: bool,
+    /// 继承自 spawn 调用方的回合证据；跨 chat 发送与 owner intent 检查依赖它。
+    pub evidence: crate::agent::TurnEvidence,
 }
 
 /// 子代理执行器；由 runtime 实现。
@@ -263,6 +265,8 @@ pub struct AgentInstance {
     tools: Vec<&'static str>,
     /// 该实例的 `API` 是否是只读视图；续聊时保持一致。
     read_only: bool,
+    /// spawn 时继承的回合证据；续聊沿用。
+    evidence: crate::agent::TurnEvidence,
     max_steps: u32,
     depth: u32,
     status: Mutex<InstanceStatus>,
@@ -360,6 +364,7 @@ impl AgentHub {
         agent: Option<&str>,
         task: String,
         depth: u32,
+        evidence: crate::agent::TurnEvidence,
     ) -> Result<serde_json::Value> {
         if !self.config.enabled {
             anyhow::bail!("swarm is disabled in [swarm].enabled");
@@ -437,6 +442,7 @@ impl AgentHub {
             system: system.clone(),
             tools: tools.clone(),
             read_only,
+            evidence: evidence.clone(),
             max_steps,
             depth,
             status: Mutex::new(InstanceStatus::Running),
@@ -457,6 +463,7 @@ impl AgentHub {
             depth,
             max_depth: self.config.max_depth,
             read_only,
+            evidence,
         };
         let runner = Arc::clone(&self.runner);
         tokio::spawn(async move {
@@ -513,6 +520,7 @@ impl AgentHub {
             depth: instance.depth,
             max_depth: self.config.max_depth,
             read_only: instance.read_only,
+            evidence: instance.evidence.clone(),
         };
         let runner = Arc::clone(&self.runner);
         tokio::spawn(async move {
@@ -733,7 +741,7 @@ mod tests {
         let runner = Arc::new(FakeRunner::default());
         let hub = hub(Arc::clone(&runner) as Arc<dyn SubagentRunner>);
         let spawned = hub
-            .spawn(Some("explore"), None, "find it".to_owned(), 0)
+            .spawn(Some("explore"), None, "find it".to_owned(), 0, Default::default())
             .await
             .unwrap();
         let id = spawned["id"].as_str().unwrap().to_owned();
@@ -753,7 +761,7 @@ mod tests {
     async fn deliver_to_routes_by_label_and_restarts() {
         let runner = Arc::new(FakeRunner::default());
         let hub = hub(Arc::clone(&runner) as Arc<dyn SubagentRunner>);
-        hub.spawn(Some("explore"), None, "first".to_owned(), 0)
+        hub.spawn(Some("explore"), None, "first".to_owned(), 0, Default::default())
             .await
             .unwrap();
         let id = hub.check(None).await.unwrap().as_array().unwrap()[0]["id"]
@@ -779,7 +787,7 @@ mod tests {
     async fn rejects_spawn_past_max_depth() {
         let hub = hub(Arc::new(FakeRunner::default()) as Arc<dyn SubagentRunner>);
         let error = hub
-            .spawn(None, None, "too deep".to_owned(), hub.config.max_depth)
+            .spawn(None, None, "too deep".to_owned(), hub.config.max_depth, Default::default())
             .await
             .unwrap_err();
         assert!(error.to_string().contains("depth limit"), "{error}");
@@ -807,9 +815,9 @@ mod tests {
             Arc::clone(&hub.vfs),
             hub.host_dir.clone(),
         );
-        hub.spawn(None, None, "one".to_owned(), 0).await.unwrap();
+        hub.spawn(None, None, "one".to_owned(), 0, Default::default()).await.unwrap();
         let error = hub
-            .spawn(None, None, "two".to_owned(), 0)
+            .spawn(None, None, "two".to_owned(), 0, Default::default())
             .await
             .unwrap_err();
         assert!(error.to_string().contains("concurrency"));

@@ -75,6 +75,12 @@ pub enum RequestBody {
     SecurityStatus,
     /// agent 请求解除 `hold`：runtime 用当前上下文重新过闸。
     SecurityResume,
+    /// `[gate]` approve 模式：列出待确认请求。
+    GatePending,
+    /// 批准一个待确认请求（一次性放行）。
+    GateApprove { approval: String },
+    /// 拒绝一个待确认请求。
+    GateReject { approval: String },
 }
 
 /// `ai` 子命令。

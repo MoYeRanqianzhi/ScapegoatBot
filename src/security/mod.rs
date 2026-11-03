@@ -8,6 +8,7 @@
 //! 闸按 `[security.guard].mode` 运行：`shadow` 只记录，`enforce` 命中即 hold；
 //! `agent.resume` 的重开路径接上。
 
+pub mod action_gate;
 pub mod events;
 pub mod gate;
 

@@ -34,6 +34,41 @@ pub enum ExecutionMode {
     Sequential,
 }
 
+/// 一次回合的运行时证据。
+///
+/// 模型自报的“主人同意了”不算证据；这里只放 runtime 能核实的事实：
+/// - `owner_intent`：本回合由控制通道触发，或触发批次里有 owner_qq 的非 self 消息；
+/// - `origin_chat`：触发本回合的 chat（`group:<id>` / `private:<qq>` / `control` /
+///   `monitor`）。同 chat 回复属于“有明确理由”，跨 chat 发送才需要 owner intent。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnEvidence {
+    pub owner_intent: bool,
+    pub origin_chat: Option<String>,
+}
+
+impl TurnEvidence {
+    pub fn owner(origin: impl Into<String>) -> Self {
+        Self {
+            owner_intent: true,
+            origin_chat: Some(origin.into()),
+        }
+    }
+
+    pub fn chat(origin: impl Into<String>) -> Self {
+        Self {
+            owner_intent: false,
+            origin_chat: Some(origin.into()),
+        }
+    }
+
+    pub fn monitor() -> Self {
+        Self {
+            owner_intent: false,
+            origin_chat: Some("monitor".to_owned()),
+        }
+    }
+}
+
 /// 工具执行器。
 ///
 /// 运行时的 `ToolRegistry` 实现它；测试用 fake 实现。

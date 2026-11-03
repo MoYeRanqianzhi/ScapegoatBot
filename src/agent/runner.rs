@@ -20,6 +20,7 @@ use tracing::{debug, warn};
 use crate::agent::queue::{TurnHandler, TurnInput};
 use crate::agent::{
     AgentEvent, AgentLoop, AgentMessage, FallbackProvider, LoopConfig, LoopOutcome, SteeringQueue,
+    TurnEvidence,
 };
 use crate::config::{AgentMode, GateMode};
 use crate::prompt::{self, RuntimeContext};
@@ -116,6 +117,32 @@ pub struct Runner {
     compaction_lock: Mutex<()>,
     /// 连续自动压缩失败次数；达到上限后不再自动尝试。
     compaction_failures: std::sync::atomic::AtomicU32,
+}
+
+/// 把回合证据注入每次工具调用。
+///
+/// `ToolExecutor` 的签名不带上下文；runner 每个回合包一层，把
+/// owner intent 与 origin_chat 传给 `API` 门禁。
+struct TurnExecutor {
+    registry: Arc<ToolRegistry>,
+    evidence: TurnEvidence,
+}
+
+#[async_trait::async_trait]
+impl crate::agent::ToolExecutor for TurnExecutor {
+    fn specs(&self) -> Vec<crate::providers::ToolSpec> {
+        self.registry.specs()
+    }
+
+    fn execution_mode(&self, name: &str) -> crate::agent::ExecutionMode {
+        self.registry.execution_mode(name)
+    }
+
+    async fn execute(&self, call: &crate::agent::ToolCall) -> crate::agent::ToolResult {
+        self.registry
+            .execute_with_evidence(call, self.evidence.clone())
+            .await
+    }
 }
 
 impl Runner {
@@ -529,6 +556,23 @@ impl Runner {
         let _ = self.hub.set(hub);
     }
 
+    /// 触发批次里是否有主人本人的消息（转发/引用不算）。
+    fn evidence_for_batch(
+        &self,
+        chat: ChatId,
+        messages: &[crate::qq::event::QqMessage],
+    ) -> TurnEvidence {
+        let owner = self.config.owner_qq;
+        let owner_intent = owner != 0
+            && messages
+                .iter()
+                .any(|message| !message.is_self && message.sender.qq == Some(owner));
+        TurnEvidence {
+            owner_intent,
+            origin_chat: Some(chat.to_string()),
+        }
+    }
+
     /// 取一份 provider 快照；调用方在 await 前调用，避免跨 await 持有锁。
     fn provider_snapshot(&self) -> ProviderSlot {
         self.slot
@@ -587,11 +631,20 @@ impl Runner {
         };
         let prompts = vec![AgentMessage::user(runtime.render())];
 
+        let evidence = if origin == "control" {
+            TurnEvidence::owner(origin)
+        } else {
+            TurnEvidence::monitor()
+        };
+        let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {
+            registry: Arc::clone(&self.tools),
+            evidence,
+        });
         let slot = self.provider_snapshot();
         let loop_ = AgentLoop::new_with_fallbacks(
             Arc::clone(&slot.provider),
             self.fallbacks.clone(),
-            Arc::clone(&self.tools) as Arc<dyn crate::agent::ToolExecutor>,
+            executor,
             Arc::clone(&self.gate),
             LoopConfig {
                 model: slot.api_model.clone(),
@@ -677,6 +730,7 @@ impl Runner {
             return Ok(());
         }
         let chat = input.chat;
+        let inbound_messages = input.messages.clone();
         let sessions = self.session_for(chat).await;
         let history = self.history_for(chat).await;
         let turn_id = new_turn_id();
@@ -728,12 +782,17 @@ impl Runner {
             )));
         }
 
-        // 4) 运行循环。
+        // 4) 运行循环。工具执行器带上本回合证据。
         let slot = self.provider_snapshot();
+        let evidence = self.evidence_for_batch(chat, &inbound_messages);
+        let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {
+            registry: Arc::clone(&self.tools),
+            evidence,
+        });
         let loop_ = AgentLoop::new_with_fallbacks(
             Arc::clone(&slot.provider),
             self.fallbacks.clone(),
-            Arc::clone(&self.tools) as Arc<dyn crate::agent::ToolExecutor>,
+            executor,
             Arc::clone(&self.gate),
             LoopConfig {
                 model: slot.api_model.clone(),
@@ -837,7 +896,11 @@ impl crate::swarm::SubagentRunner for Runner {
                 request.depth + 1,
             )));
         }
-        let tools = Arc::new(tools);
+        let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {
+            registry: Arc::new(tools),
+            evidence: request.evidence.clone(),
+        });
+        let tools = executor;
         let system = vec![SystemBlock {
             text: request.system,
             cache: false,
