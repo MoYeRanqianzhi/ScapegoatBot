@@ -88,6 +88,10 @@ pub fn spawn(config: ReviewerConfig) {
                 continue;
             }
             let history = config.history.lock().await.clone();
+            // 压缩会把历史截短；长度回退时重置基线，否则之后永远认为“没有新增”。
+            if history.len() < last_reviewed {
+                last_reviewed = 0;
+            }
             if history.len() <= last_reviewed || history.is_empty() {
                 continue;
             }

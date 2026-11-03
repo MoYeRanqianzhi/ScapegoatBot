@@ -223,6 +223,7 @@ key 放 `auth.json`：
 
 - `[budget]`：`daily_tokens`、`daily_usd`、`turn_tokens`、`chat_sends_per_hour`、
   `chat_turns_per_hour`、`round_trip_wall_secs`、`guard_usd_per_day`。
+  **当前只解析、不执行**；需要硬预算时请用 provider 侧限额。
 - `[gate]`：每次 `napcat.*` 调用都过门禁。
   - `trusted`：直接放行，只统计速率。
   - `auto`（默认）：每分钟调用上限 `max_per_minute`；发送规则拦截 30 秒内同 chat 重复、
@@ -233,6 +234,7 @@ key 放 `auth.json`：
     `sbot gate pending` 查看队列，`sbot gate reject <id>` 拒绝。
 - `[hooks.context]`：`name`、`path`、`kind`、`when`、`inject`、`max_bytes`；
   自定义注入到 system prompt 的上下文文件。
+- `[hooks.events]`：**当前只解析、不执行**（BeforeSend 的 rewrite/block 尚未接线）。
 
 ## models.json
 

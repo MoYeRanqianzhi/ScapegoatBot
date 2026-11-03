@@ -16,7 +16,10 @@ impl Views {
         let scope = normalize_scope(scope)?;
         let mut entries = Vec::new();
         for peer in self.messages.peers(scope).map_err(storage)? {
-            entries.push(dir_entry(&format!("/messages/{scope}/{peer}")));
+            let chat = chat_from(scope, &peer.to_string())?;
+            if self.receive_allows(chat) {
+                entries.push(dir_entry(&format!("/messages/{scope}/{peer}")));
+            }
         }
         Ok(entries)
     }
@@ -28,6 +31,7 @@ impl Views {
     ) -> Result<Vec<ViewEntry>, VfsError> {
         let scope = normalize_scope(scope)?;
         let chat = chat_from(scope, peer)?;
+        self.ensure_receive(chat)?;
         let mut entries = Vec::new();
         for month in self.messages.months(chat).map_err(storage)? {
             entries.push(dir_entry(&format!("/messages/{scope}/{peer}/{month}")));
@@ -43,6 +47,7 @@ impl Views {
     ) -> Result<Vec<ViewEntry>, VfsError> {
         let scope = normalize_scope(scope)?;
         let chat = chat_from(scope, peer)?;
+        self.ensure_receive(chat)?;
         let mut entries = Vec::new();
         for day in self.messages.days(chat, month).map_err(storage)? {
             let dd = day.rsplit('-').next().unwrap_or(&day);
@@ -55,13 +60,23 @@ impl Views {
 
     pub(super) fn read_messages_digest(
         &self,
-        _filter: Option<&str>,
-        _limit: usize,
+        filter: Option<&str>,
+        limit: usize,
     ) -> Result<ViewRead, VfsError> {
         let counts = self.messages.unread_counts().map_err(storage)?;
         let mut out = String::from("# Unread messages\n");
+        let mut rendered = 0usize;
         for (chat, count) in counts {
+            if rendered >= limit {
+                break;
+            }
+            if !self.receive_allows(chat)
+                || filter.is_some_and(|filter| !chat.to_string().contains(filter))
+            {
+                continue;
+            }
             out.push_str(&format!("- {chat}: {count} unread\n"));
+            rendered += 1;
         }
         if out.trim_end() == "# Unread messages" {
             out.push_str("- nothing unread\n");
@@ -82,6 +97,7 @@ impl Views {
     ) -> Result<ViewRead, VfsError> {
         let scope = normalize_scope(scope)?;
         let chat = chat_from(scope, peer)?;
+        self.ensure_receive(chat)?;
         let date = format!("{month}-{day:0>2}");
         let messages = self
             .messages

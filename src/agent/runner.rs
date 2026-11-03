@@ -655,9 +655,14 @@ impl Runner {
 
     /// 自动压缩阈值：配置的工作集上限与模型窗口减去预留后的较小者。
     fn compaction_budget(&self) -> usize {
-        let reserve =
-            u64::from(self.config.reserve_tokens).saturating_add(u64::from(self.config.max_tokens));
-        let by_window = self.config.context_window.saturating_sub(reserve).max(1) as usize;
+        // `context_window = 0` 表示模型没有声明窗口；只用配置的工作集上限。
+        let by_window = if self.config.context_window == 0 {
+            self.config.turn_context_budget as usize
+        } else {
+            let reserve = u64::from(self.config.reserve_tokens)
+                .saturating_add(u64::from(self.config.max_tokens));
+            self.config.context_window.saturating_sub(reserve).max(1) as usize
+        };
         by_window
             .min(self.config.turn_context_budget as usize)
             .max(self.config.keep_recent_tokens as usize + 1)

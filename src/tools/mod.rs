@@ -110,6 +110,8 @@ pub struct ToolRegistry {
     gate: Option<Arc<crate::security::gate::Gate>>,
     /// 只读 `API` 的替身；docs 等子代理用。
     read_only_api: Option<Arc<dyn Tool>>,
+    /// 单次工具结果的字节上限；0 = 不限制。
+    max_result_bytes: usize,
 }
 
 impl ToolRegistry {
@@ -126,7 +128,14 @@ impl ToolRegistry {
             views,
             gate: None,
             read_only_api: None,
+            max_result_bytes: 0,
         }
+    }
+
+    /// 截断超长工具结果，避免一次 `Read`/`Grep` 把上下文撑爆。
+    pub fn with_max_result_bytes(mut self, bytes: usize) -> Self {
+        self.max_result_bytes = bytes;
+        self
     }
 
     /// 提供只读 `API` 实例；`read_only()` 会用它替换完整版本。
@@ -178,6 +187,7 @@ impl ToolRegistry {
             views: self.views.clone(),
             gate: self.gate.clone(),
             read_only_api: self.read_only_api.clone(),
+            max_result_bytes: self.max_result_bytes,
         }
     }
 
@@ -241,7 +251,8 @@ impl ToolRegistry {
         let mut context = ToolContext::new(vfs, self.views.clone());
         context.gate = self.gate.clone();
         context.evidence = evidence;
-        tool.execute(&context, call.arguments.clone()).await
+        let result = tool.execute(&context, call.arguments.clone()).await;
+        truncate_result(result, self.max_result_bytes)
     }
 }
 
@@ -323,6 +334,24 @@ pub fn render_content(path: &VfsPath, content: FileContent) -> String {
     }
 }
 
+/// 按字节上限截断工具结果；按字符边界切，避免破坏 UTF-8。
+fn truncate_result(mut result: ToolResult, limit: usize) -> ToolResult {
+    if limit == 0 || result.content.len() <= limit {
+        return result;
+    }
+    let mut cut = limit;
+    while cut > 0 && !result.content.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    result.content.truncate(cut);
+    result.content.push_str(
+        "
+
+[result truncated: exceeded tools.max_result_bytes]",
+    );
+    result
+}
+
 /// 工具声明里常见的参数骨架：避免每个工具重复写。
 pub fn object_schema(properties: Value, required: &[&str]) -> Value {
     json!({
@@ -345,6 +374,18 @@ mod tests {
         assert!(arg_opt_bool(&args, "flag").unwrap());
         assert!(!arg_opt_bool(&args, "missing").unwrap());
         assert!(arg_str(&args, "missing").is_err());
+    }
+
+    #[test]
+    fn long_tool_results_are_truncated_on_char_boundaries() {
+        let result = ToolResult::ok("你".repeat(10));
+        let truncated = truncate_result(result, 10);
+        assert!(truncated.content.starts_with("你你你"));
+        assert!(truncated.content.contains("result truncated"));
+        assert!(std::str::from_utf8(truncated.content.as_bytes()).is_ok());
+        // 未超限时原样返回。
+        let small = truncate_result(ToolResult::ok("ok"), 10);
+        assert_eq!(small.content, "ok");
     }
 
     #[test]

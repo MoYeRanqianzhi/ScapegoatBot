@@ -57,6 +57,8 @@ pub struct SessionStore {
     encryption: EncryptionMode,
     /// `None` = 全局视图（列出全部分段）；`Some` = 某个 chat 的隔离链。
     scope: Option<String>,
+    /// 按年龄清理已关闭的分段；0 = 只按配额。
+    retention_days: u32,
 }
 
 impl SessionStore {
@@ -77,6 +79,7 @@ impl SessionStore {
             max_bytes,
             encryption,
             scope: None,
+            retention_days: 0,
         })
     }
 
@@ -89,7 +92,14 @@ impl SessionStore {
             max_bytes: self.max_bytes,
             encryption: self.encryption,
             scope: Some(scope.to_owned()),
+            retention_days: self.retention_days,
         }
+    }
+
+    /// 设置按年龄清理的天数（0 = 关闭）。
+    pub fn with_retention_days(mut self, days: u32) -> Self {
+        self.retention_days = days;
+        self
     }
 
     /// 当前作用域名；全局视图按 `shared` 处理。
@@ -241,7 +251,14 @@ impl SessionStore {
                 params![Utc::now().to_rfc3339(), current.file],
             )?;
         }
-        self.create(Some(&current.file))
+        let next = self.create(Some(&current.file))?;
+        // 轮转后顺手清理过期的已关闭分段；当前分段不会被删除。
+        if self.retention_days > 0
+            && let Err(error) = self.enforce_retention(self.retention_days)
+        {
+            warn!(%error, "cannot enforce transcript retention");
+        }
+        Ok(next)
     }
 
     /// 记录一次压缩检查点（加密存储）。

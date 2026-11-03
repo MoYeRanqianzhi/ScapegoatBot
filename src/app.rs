@@ -177,13 +177,21 @@ fn open_stores(paths: &SbotPaths, loaded: &LoadedConfig) -> Result<Stores> {
         data_dir.clone(),
         &loaded.config.storage,
     )?);
-    let messages = Arc::new(MessageStore::open(
-        Arc::clone(&db),
-        Arc::clone(&key),
-        data_dir.clone(),
-        loaded.config.storage.max_message_bytes,
-        loaded.config.storage.encryption,
-    )?);
+    let messages = Arc::new(
+        MessageStore::open(
+            Arc::clone(&db),
+            Arc::clone(&key),
+            data_dir.clone(),
+            loaded.config.storage.max_message_bytes,
+            loaded.config.storage.encryption,
+        )?
+        .with_retention_days(loaded.config.storage.message_retention_days),
+    );
+    if loaded.config.storage.message_retention_days > 0
+        && let Err(error) = messages.enforce_retention(loaded.config.storage.message_retention_days)
+    {
+        warn!(%error, "cannot enforce message retention at startup");
+    }
     // 重启核对发送账本：久悬的 pending 可能已经发出，标记为 unknown。
     match messages.mark_stale_intents(600) {
         Ok(0) => {}
@@ -209,13 +217,21 @@ fn open_stores(paths: &SbotPaths, loaded: &LoadedConfig) -> Result<Stores> {
         Ok(_) => {}
         Err(error) => warn!(%error, "cannot compare the message index with the JSONL files"),
     }
-    let sessions = Arc::new(SessionStore::open(
-        Arc::clone(&db),
-        Arc::clone(&key),
-        data_dir.clone(),
-        loaded.config.storage.max_session_bytes,
-        loaded.config.storage.encryption,
-    )?);
+    let sessions = Arc::new(
+        SessionStore::open(
+            Arc::clone(&db),
+            Arc::clone(&key),
+            data_dir.clone(),
+            loaded.config.storage.max_session_bytes,
+            loaded.config.storage.encryption,
+        )?
+        .with_retention_days(loaded.config.storage.session_retention_days),
+    );
+    if loaded.config.storage.session_retention_days > 0
+        && let Err(error) = sessions.enforce_retention(loaded.config.storage.session_retention_days)
+    {
+        warn!(%error, "cannot enforce transcript retention at startup");
+    }
     let turn_buffer = Arc::new(TurnBufferStore::new(
         Arc::clone(&db),
         Arc::clone(&key),
@@ -754,8 +770,9 @@ async fn assemble_tools(
         provider,
         api_model,
     } = assembly;
-    let mut tools =
-        ToolRegistry::new(Arc::clone(&vfs), Some(Arc::clone(&views))).with_gate(Arc::clone(&gate));
+    let mut tools = ToolRegistry::new(Arc::clone(&vfs), Some(Arc::clone(&views)))
+        .with_gate(Arc::clone(&gate))
+        .with_max_result_bytes(config.tools.max_result_bytes);
     crate::tools::fs::register(&mut tools);
     tools.register(Arc::new(
         SkillTool::new(Arc::clone(&vfs)).with_db(Arc::clone(&db)),
@@ -929,7 +946,8 @@ async fn assemble_tools(
             config.agent.send_scopes.clone(),
             Some(Arc::clone(&messages)),
         )
-        .with_action_gate(Arc::clone(&action_gate)),
+        .with_action_gate(Arc::clone(&action_gate))
+        .with_receive_scopes(config.agent.receive_scopes.clone()),
     ));
     // 子代理（docs、未开 allow_send 的自定义定义）拿到的是只读副本：
     // 同一个工具名，但只允许 api.list / api.help。
@@ -1064,6 +1082,7 @@ async fn build_agent(
             estop_file: Some(estop_file.clone()),
             started_at: Some(chrono::Utc::now()),
             db: Some(Arc::clone(&db)),
+            receive_scopes: config.agent.receive_scopes.clone(),
         }),
     );
     let sink = Arc::new(RunnerSink::default());

@@ -22,6 +22,7 @@ impl Views {
         Ok(list
             .iter()
             .filter_map(|friend| friend.get("user_id").and_then(serde_json::Value::as_u64))
+            .filter(|qq| self.receive_allows(ChatId::Private(*qq)))
             .map(|qq| dir_entry(&format!("/friends/{qq}")))
             .collect())
     }
@@ -42,6 +43,7 @@ impl Views {
         Ok(list
             .iter()
             .filter_map(|group| group.get("group_id").and_then(serde_json::Value::as_u64))
+            .filter(|gid| self.receive_allows(ChatId::Group(*gid)))
             .map(|gid| dir_entry(&format!("/groups/{gid}")))
             .collect())
     }
@@ -51,6 +53,10 @@ impl Views {
         _scope: &str,
         peer: &str,
     ) -> Result<Vec<ViewEntry>, VfsError> {
+        let qq: u64 = peer
+            .parse()
+            .map_err(|_| VfsError::NotFound(format!("/friends/{peer}")))?;
+        self.ensure_receive(ChatId::Private(qq))?;
         Ok(vec![
             text_entry(&format!("/friends/{peer}/profile.md")),
             text_entry(&format!("/friends/{peer}/info.json")),
@@ -59,6 +65,10 @@ impl Views {
     }
 
     pub(super) async fn list_group(&self, group: &str) -> Result<Vec<ViewEntry>, VfsError> {
+        let gid: u64 = group
+            .parse()
+            .map_err(|_| VfsError::NotFound(format!("/groups/{group}")))?;
+        self.ensure_receive(ChatId::Group(gid))?;
         Ok(vec![
             text_entry(&format!("/groups/{group}/profile.md")),
             text_entry(&format!("/groups/{group}/info.json")),
@@ -68,6 +78,10 @@ impl Views {
     }
 
     pub(super) async fn list_group_members(&self, group: &str) -> Result<Vec<ViewEntry>, VfsError> {
+        let gid: u64 = group
+            .parse()
+            .map_err(|_| VfsError::NotFound(format!("/groups/{group}")))?;
+        self.ensure_receive(ChatId::Group(gid))?;
         let Some(client) = &self.client else {
             return Err(VfsError::Offline("/groups members".to_owned()));
         };
@@ -96,6 +110,10 @@ impl Views {
         peer: &str,
     ) -> Result<ViewRead, VfsError> {
         let path = VfsPath::parse(&format!("/friends/{peer}"))?;
+        let qq: u64 = peer
+            .parse()
+            .map_err(|_| VfsError::NotFound(path.to_string()))?;
+        self.ensure_receive(ChatId::Private(qq))?;
         let Some(client) = &self.client else {
             return Err(VfsError::Offline(format!("/friends/{peer}")));
         };
@@ -130,6 +148,10 @@ impl Views {
         file: &str,
     ) -> Result<ViewRead, VfsError> {
         let _ = file;
+        let gid: u64 = group
+            .parse()
+            .map_err(|_| VfsError::NotFound(format!("/groups/{group}")))?;
+        self.ensure_receive(ChatId::Group(gid))?;
         let Some(client) = &self.client else {
             return Err(VfsError::Offline(format!("/groups/{group}")));
         };
@@ -161,6 +183,10 @@ impl Views {
         group: &str,
         member: &str,
     ) -> Result<ViewRead, VfsError> {
+        let gid: u64 = group
+            .parse()
+            .map_err(|_| VfsError::NotFound(format!("/groups/{group}")))?;
+        self.ensure_receive(ChatId::Group(gid))?;
         let Some(client) = &self.client else {
             return Err(VfsError::Offline(format!("/groups/{group}/members")));
         };

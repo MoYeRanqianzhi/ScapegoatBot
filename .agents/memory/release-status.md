@@ -8,10 +8,12 @@ metadata:
   last_verified: 2026-11-04
 ---
 
-当前版本：`0.2.0-alpha.14`（`main`）。数据库迁移到 v9；测试 311 项通过，
+当前版本：`0.2.0-alpha.15`（`main`）。数据库迁移到 v9；测试 316 项通过，
 `cargo fmt --check`、`clippy -D warnings` 通过；CI 已接入 GitHub Actions。
 
-alpha.13 修掉了 2026-11-03 审查的 P0/P1 主体；alpha.14 补齐了当时列为未实现的项：
+alpha.13 修掉了 2026-11-03 审查的 P0/P1 主体；alpha.14 补齐了当时列为未实现的项；
+alpha.15 做了第二轮审查，修掉新代码的边界问题（复盘基线、发送记录、总超时、
+保留天数、工具结果上限、receive_scopes 强制）。
 
 - `[gate]`：trusted/auto/approve、速率、重复/跨群同文/@all、`llm_review`、
   IPC 审批（`sbot gate pending/approve/reject`）。
@@ -24,6 +26,9 @@ alpha.13 修掉了 2026-11-03 审查的 P0/P1 主体；alpha.14 补齐了当时�
 - 记忆复盘 idle/every_turn 的真实语义；monitor catch_up；出站账本启动核对；
   Download 的公网 DNS 解析器；WebFetch final_url 复核。
 - 结构：views 拆成 6 个子模块、ScopeCache、open_stores；全仓 rustfmt；CI。
+- alpha.15：压缩后记忆复盘恢复；门禁只在发送成功后记账（短应答豁免）；master
+  私聊通知免 owner intent；审查/判定总超时；`context_window = 0` 回退；保留天数
+  与 `max_result_bytes` 真正执行；`receive_scopes` 覆盖视图与 API 查询。
 
 仍存在的边界（细节见 `docs/guide/limits.md`）：
 
@@ -32,6 +37,8 @@ alpha.13 修掉了 2026-11-03 审查的 P0/P1 主体；alpha.14 补齐了当时�
 - 周期检查使用独立窗口，不与主请求共享前缀缓存。
 - 群级破坏动作（全员禁言/退群/解散）没有用户目标，不做 owner 保护。
 - WebFetch 的抓取由后端完成，内容在 final_url 复核前已被取走。
+- `[budget]` 全部键、`[hooks.events]`、`[tools].max_schema_tokens`、
+  `[monitor].deliver.cc` / `on_missing` 仍未执行；`get_msg` 无法按 chat 过滤。
 - `[security.guard].max_state_tokens` / `delta_every_tokens`、
   `[style].sample_retention_days`、`models.json` 的 `default_thinking_level` 仍未使用。
 

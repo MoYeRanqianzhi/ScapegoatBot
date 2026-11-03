@@ -8,6 +8,9 @@ impl Views {
     pub(super) fn list_inbox_root(&self) -> Result<Vec<ViewEntry>, VfsError> {
         let mut entries = Vec::new();
         for (chat, count) in self.messages.unread_counts().map_err(storage)? {
+            if !self.receive_allows(chat) {
+                continue;
+            }
             entries.push(ViewEntry {
                 path: format!("/inbox/{chat}"),
                 kind: "dir",
@@ -20,6 +23,7 @@ impl Views {
 
     pub(super) fn list_inbox_chat(&self, chat: &str) -> Result<Vec<ViewEntry>, VfsError> {
         let chat = parse_chat_segment(chat)?;
+        self.ensure_receive(chat)?;
         let mut entries = vec![text_entry(&format!("/inbox/group:{}/index.md", chat.id()))];
         if !chat.is_group() {
             entries[0] = text_entry(&format!("/inbox/private:{}/index.md", chat.id()));
@@ -51,6 +55,9 @@ impl Views {
             if rendered >= limit {
                 break;
             }
+            if !self.receive_allows(message.chat) {
+                continue;
+            }
             if filter.is_some_and(|filter| {
                 !filter_matches_message(filter, &message, Some(InboxState::Unread))
             }) {
@@ -80,6 +87,7 @@ impl Views {
         mark_read: bool,
     ) -> Result<ViewRead, VfsError> {
         let chat = parse_chat_segment(chat)?;
+        self.ensure_receive(chat)?;
         let messages = self
             .messages
             .inbox_for_chat(chat, InboxState::Unread)
@@ -115,6 +123,7 @@ impl Views {
         mark_read: bool,
     ) -> Result<ViewRead, VfsError> {
         let chat = parse_chat_segment(chat)?;
+        self.ensure_receive(chat)?;
         let message = self
             .messages
             .load(chat, message_id)
