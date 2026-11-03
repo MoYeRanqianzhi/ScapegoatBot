@@ -183,7 +183,18 @@ impl McpClient {
     async fn list_tools(&mut self) -> Result<Vec<McpToolInfo>> {
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
-        for _ in 0..10 {
+        let mut pages = 0usize;
+        loop {
+            if pages >= 10 {
+                // 不静默截断：服务器工具很多时明确告诉运维。
+                warn!(
+                    server = %self.name,
+                    tools = tools.len(),
+                    "MCP tools/list stopped after 10 pages; remaining tools were not discovered"
+                );
+                break;
+            }
+            pages += 1;
             let mut params = json!({});
             if let Some(cursor) = &cursor {
                 params["cursor"] = json!(cursor);

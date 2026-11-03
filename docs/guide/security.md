@@ -160,8 +160,8 @@ sbot gate reject g1
 
 - 踢人、禁言、改名片、给/撤管理；
 - 目标 QQ 可以是数字或数字字符串；解析失败按拒绝处理，不会跳过保护；
-- 全员禁言、退群、解散群、群公告这类**群级动作没有用户目标**，不做主人保护。
-  如果这些动作风险不可接受，请在 `[agent].send_scopes` / `[filter]` 与提示词层面约束。
+- 全员禁言、退群、解散群没有用户目标，做不了“目标是主人”的判断，但会改变主人所在群
+  的可达性，因此要求 owner intent；群公告同样需要。
 
 ## 发送范围
 
@@ -197,7 +197,7 @@ sbot gate reject g1
 | `auto` 的发送规则 | 基于频率/重复/跨群同文/@all 的启发式，没有跨 chat n-gram 内容比对 |
 | `[security.guard]` 的 `max_state_tokens` / `delta_every_tokens` | 预留，闸使用固定窗口 |
 | 周期检查的缓存复用 | 检查请求是独立窗口，不与主请求逐字节共享前缀 |
-| 群级破坏动作 | 没有用户目标，不做 owner 保护 |
+| 群级破坏动作 | 没有用户目标，靠 owner intent 而不是硬保护 |
 | WebFetch | 后端已经抓取后才复核 `final_url` |
 | `[style].sample_retention_days` / `models.json` 的 `default_thinking_level` | 尚未使用 |
 

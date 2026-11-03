@@ -386,6 +386,11 @@ pub fn specs() -> &'static [ActionSpec] {
                     | "napcat.set_group_name"
                     | "napcat.set_group_admin"
                     | "napcat.send_group_notice"
+                    // 全员禁言/退群/解散会直接改变主人所在群的可达性，
+                    // 同样要求 owner intent（没有用户目标可做硬保护）。
+                    | "napcat.set_group_whole_ban"
+                    | "napcat.set_group_leave"
+                    | "napcat.set_group_dismiss"
             );
             list.push(ActionSpec {
                 action,
