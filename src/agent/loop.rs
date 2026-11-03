@@ -815,7 +815,7 @@ fn push_thinking(blocks: &mut Vec<BlockAccumulator>, delta: &str) {
 }
 
 /// 渲染一条消息为安全闸可读文本。
-fn render_message(message: &AgentMessage) -> String {
+pub(crate) fn render_message(message: &AgentMessage) -> String {
     match message {
         AgentMessage::System { text } => format!("system: {text}\n"),
         AgentMessage::User { text } => format!("user: {text}\n"),

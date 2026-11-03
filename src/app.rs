@@ -236,7 +236,7 @@ impl Runtime {
         if loaded.config.security.guard.enabled
             && loaded.config.security.guard.mode == crate::config::GuardMode::Enforce
             && !gate.classifier_available()
-            && loaded.config.security.guard.backend != crate::config::GuardBackend::Off
+            && loaded.config.security.guard.backend == crate::config::GuardBackend::Jev
         {
             warn!(
                 "security.guard.mode = enforce but no classifier is configured: every new turn \
@@ -977,6 +977,25 @@ async fn build_agent(
         },
     };
 
+    // `backend = "llm"` 需要 provider；在这里把它装进闸。
+    if config.security.guard.enabled
+        && config.security.guard.backend == crate::config::GuardBackend::Llm
+    {
+        let model = if config.security.guard.model.is_empty() {
+            model_ref.model.id.clone()
+        } else {
+            config.security.guard.model.clone()
+        };
+        let judge = crate::security::gate::LlmJudge::new(
+            Arc::clone(&provider),
+            model,
+            std::time::Duration::from_millis(config.security.guard.timeout_ms),
+        );
+        if gate.install_judge(Arc::new(judge)).is_err() {
+            warn!("a guard judge was already installed");
+        }
+    }
+
     let history = Arc::new(Mutex::new(Vec::new()));
     let ops = Arc::new(RuntimeOps {
         runner: std::sync::OnceLock::new(),
@@ -1033,6 +1052,7 @@ async fn build_agent(
     })
     .await;
 
+    let security_review = security_reviewer(&config.security, models, auth, &provider, model_ref);
     let runner = Runner::new_with_fallbacks(
         provider,
         fallbacks,
@@ -1071,6 +1091,10 @@ async fn build_agent(
             turn_context_budget: config.compaction.turn_context_budget,
             keep_recent_tokens: config.compaction.keep_recent_tokens,
             compaction_max_failures: config.compaction.max_failures,
+            security_review,
+            check_every_tokens: config.security.check_every_tokens,
+            check_overlap_tokens: config.security.check_overlap_tokens,
+            check_on_compaction: config.security.check_on_compaction,
         },
         Arc::clone(&history),
         Arc::clone(&ai_enabled),
@@ -1361,6 +1385,40 @@ fn ensure_default_config(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(error) => Err(anyhow::anyhow!("cannot create {}: {error}", path.display())),
     }
+}
+
+/// 按 `[security]` 构造周期检查器；`review_model` 为空时用主模型。
+fn security_reviewer(
+    security: &crate::config::SecurityConfig,
+    models: &ModelsFile,
+    auth: &AuthFile,
+    provider: &Arc<dyn Provider>,
+    model_ref: crate::config::models::ModelRef<'_>,
+) -> Option<Arc<dyn crate::security::review::SecurityCheck>> {
+    if security.check_every_tokens == 0 && !security.check_on_compaction {
+        return None;
+    }
+    let (reviewer, model) = if security.review_model.trim().is_empty() {
+        (Arc::clone(provider), model_ref.model.id.clone())
+    } else {
+        let reference = security.review_model.trim();
+        let Some(found) = models.find(reference) else {
+            warn!(model = %reference, "security.review_model is not defined in models.json");
+            return None;
+        };
+        match build_provider(models, auth, reference) {
+            Ok(provider) => (provider, found.model.id.clone()),
+            Err(error) => {
+                warn!(%error, model = %reference, "cannot build the security review provider");
+                return None;
+            }
+        }
+    };
+    Some(Arc::new(crate::security::review::SecurityReviewer::new(
+        reviewer,
+        model,
+        std::time::Duration::from_secs(security.check_timeout_secs.max(1)),
+    )))
 }
 
 fn load_models(paths: &SbotPaths, loaded: &LoadedConfig) -> Result<ModelsFile> {

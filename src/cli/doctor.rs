@@ -130,16 +130,26 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
             } else {
                 report.warn(format!("auth: missing keys for {missing:?}"));
             }
-            if auth.guard_key().is_none() && loaded.config.security.guard.enabled {
-                report.warn(
-                    "auth: security.guard.api_key is missing; the guard cannot classify content",
-                );
-            }
             let guard = &loaded.config.security.guard;
             if guard.enabled
+                && guard.backend == crate::config::GuardBackend::Jev
+                && auth.guard_key().is_none()
+            {
+                report.warn(
+                    "auth: security.guard.api_key is missing; the Jev classifier is unavailable",
+                );
+            }
+            // llm 后端的判定器由主 provider 提供；只有 jev 依赖 base_url + key。
+            let missing_classifier = match guard.backend {
+                crate::config::GuardBackend::Off => false,
+                crate::config::GuardBackend::Jev => {
+                    auth.guard_key().is_none() || guard.base_url.is_empty()
+                }
+                crate::config::GuardBackend::Llm => false,
+            };
+            if guard.enabled
                 && guard.mode == crate::config::GuardMode::Enforce
-                && guard.backend != crate::config::GuardBackend::Off
-                && (auth.guard_key().is_none() || guard.base_url.is_empty())
+                && missing_classifier
             {
                 report.error(
                     "security.guard.mode = enforce without a configured classifier: every turn \
