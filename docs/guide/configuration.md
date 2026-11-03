@@ -39,6 +39,7 @@ SBOT__NAPCAT__URL=ws://127.0.0.1:3002
 | `available_models` | 见默认 | 白名单；不在其中的模型不可用 |
 | `fallback_models` | `[]` | 主模型失败后的回退链 |
 | `thinking_level` | `high` | 与模型声明的 `thinking_levels` 校验 |
+| `compaction_model` | 空 | 摘要模型；空 = 主模型（当前版本未使用） |
 | `max_output_tokens` | 8192 | 单次回复上限 |
 | `max_steps` | 48 | 单回合工具循环上限 |
 | `master` | `self` | owner 通知目标：`self` 或 QQ 号 |
