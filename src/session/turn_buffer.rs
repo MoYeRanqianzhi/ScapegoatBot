@@ -61,7 +61,16 @@ impl TurnBufferStore {
     }
 
     /// 追加一个块（`seq` 在回合内单调递增）。
-    pub fn append(&self, turn_id: &str, seq: u64, message: &AgentMessage) -> Result<()> {
+    ///
+    /// `scope` 是回合所属的 transcript 作用域（`shared` 或 `group-<id>`）；
+    /// 崩溃恢复按 scope 重放，避免把 A 聊天的未提交块写进 B 的链。
+    pub fn append(
+        &self,
+        turn_id: &str,
+        seq: u64,
+        scope: &str,
+        message: &AgentMessage,
+    ) -> Result<()> {
         let payload = serde_json::to_vec(message)?;
         let line = match self.encryption {
             EncryptionMode::XChaCha20Poly1305 => {
@@ -73,10 +82,10 @@ impl TurnBufferStore {
         };
         let conn = self.db.lock();
         conn.execute(
-            "INSERT INTO turn_buffer (turn_id, seq, line, state)
-             VALUES (?1, ?2, ?3, 'open')
-             ON CONFLICT(turn_id, seq) DO UPDATE SET line = excluded.line",
-            params![turn_id, seq as i64, line],
+            "INSERT INTO turn_buffer (turn_id, seq, scope, line, state)
+             VALUES (?1, ?2, ?3, ?4, 'open')
+             ON CONFLICT(turn_id, seq) DO UPDATE SET line = excluded.line, scope = excluded.scope",
+            params![turn_id, seq as i64, scope, line],
         )?;
         Ok(())
     }
@@ -108,11 +117,23 @@ impl TurnBufferStore {
         Ok(())
     }
 
-    /// 列出未完成的回合。
-    pub fn open_turns(&self) -> Result<Vec<String>> {
+    /// 列出某个作用域里未完成的回合。
+    pub fn open_turns(&self, scope: &str) -> Result<Vec<String>> {
         let conn = self.db.lock();
-        let mut statement =
-            conn.prepare("SELECT DISTINCT turn_id FROM turn_buffer WHERE state = 'open'")?;
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT turn_id FROM turn_buffer WHERE state = 'open' AND scope = ?1",
+        )?;
+        Ok(statement
+            .query_map(params![scope], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 存在未完成回合的作用域（启动恢复用）。
+    pub fn open_scopes(&self) -> Result<Vec<String>> {
+        let conn = self.db.lock();
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT scope FROM turn_buffer WHERE state = 'open' ORDER BY scope ASC",
+        )?;
         Ok(statement
             .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?)
@@ -146,10 +167,10 @@ impl TurnBufferStore {
         Ok(messages.len())
     }
 
-    /// 崩溃恢复：重放所有 open 回合，补合成结果并提交。
-    pub async fn recover_open(&self, sessions: &SessionStore) -> Result<usize> {
+    /// 崩溃恢复：重放该作用域里的 open 回合，补合成结果并提交。
+    pub async fn recover_open(&self, sessions: &SessionStore, scope: &str) -> Result<usize> {
         let mut recovered = 0usize;
-        for turn_id in self.open_turns()? {
+        for turn_id in self.open_turns(scope)? {
             let mut messages: Vec<AgentMessage> = self
                 .load(&turn_id)?
                 .into_iter()
@@ -303,15 +324,15 @@ mod tests {
     async fn buffer_roundtrip_and_commit() {
         let (buffer, sessions, _dir) = setup();
         let turn = "t1";
-        buffer.append(turn, 0, &AgentMessage::user("hi")).unwrap();
-        buffer.append(turn, 1, &assistant_with_call("c1")).unwrap();
+        buffer.append(turn, 0, "shared", &AgentMessage::user("hi")).unwrap();
+        buffer.append(turn, 1, "shared", &assistant_with_call("c1")).unwrap();
         assert_eq!(buffer.load(turn).unwrap().len(), 2);
-        assert_eq!(buffer.open_turns().unwrap(), vec![turn.to_owned()]);
+        assert_eq!(buffer.open_turns("shared").unwrap(), vec![turn.to_owned()]);
 
         let committed = buffer.commit(&sessions, turn).await.unwrap();
         assert_eq!(committed, 2);
         assert!(buffer.load(turn).unwrap().is_empty());
-        assert!(buffer.open_turns().unwrap().is_empty());
+        assert!(buffer.open_turns("shared").unwrap().is_empty());
 
         let current = sessions.current().unwrap();
         assert_eq!(sessions.read_segment(&current.file).unwrap().len(), 2);
@@ -321,11 +342,11 @@ mod tests {
     async fn recovery_fills_missing_tool_results() {
         let (buffer, sessions, _dir) = setup();
         let turn = "t2";
-        buffer.append(turn, 0, &AgentMessage::user("go")).unwrap();
-        buffer.append(turn, 1, &assistant_with_call("c1")).unwrap();
+        buffer.append(turn, 0, "shared", &AgentMessage::user("go")).unwrap();
+        buffer.append(turn, 1, "shared", &assistant_with_call("c1")).unwrap();
         // 故意不写工具结果。
 
-        let recovered = buffer.recover_open(&sessions).await.unwrap();
+        let recovered = buffer.recover_open(&sessions, "shared").await.unwrap();
         assert_eq!(recovered, 1);
 
         let current = sessions.current().unwrap();
@@ -341,11 +362,34 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn recovery_only_replays_the_matching_scope() {
+        let (buffer, sessions, _dir) = setup();
+        buffer.append("ta", 0, "group-1", &AgentMessage::user("from group one")).unwrap();
+        buffer.append("tb", 0, "group-2", &AgentMessage::user("from group two")).unwrap();
+
+        let one = sessions.for_scope("group-1");
+        assert_eq!(buffer.recover_open(&one, "group-1").await.unwrap(), 1);
+        // group-2 的回合还开着，不会被写进 group-1。
+        assert_eq!(buffer.open_turns("group-2").unwrap(), vec!["tb".to_owned()]);
+        let current = one.current().unwrap();
+        let messages = one.read_segment(&current.file).unwrap();
+        assert_eq!(messages.len(), 1);
+        match &messages[0] {
+            AgentMessage::User { text } => assert!(text.contains("group one")),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let two = sessions.for_scope("group-2");
+        assert_eq!(buffer.recover_open(&two, "group-2").await.unwrap(), 1);
+        assert!(buffer.open_scopes().unwrap().is_empty());
+    }
+
     #[test]
     fn buffer_lines_are_encrypted() {
         let (buffer, _sessions, _dir) = setup();
         buffer
-            .append("t3", 0, &AgentMessage::user("secret-marker"))
+            .append("t3", 0, "shared", &AgentMessage::user("secret-marker"))
             .unwrap();
         let conn = buffer.db.lock();
         let line: String = conn

@@ -19,9 +19,10 @@
 //!
 //! 过滤器是准入门：被拒消息根本不会走到这里。
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -85,6 +86,9 @@ pub struct MessageStore {
     max_bytes: u64,
     /// 与 `[storage].encryption` 一致；`none` 只用于调试。
     encryption: EncryptionMode,
+    /// 串行化写入：行号 = 已提交行数，取号与写入必须在同一个临界区，
+    /// 否则两个并发 append 会拿到同一个行号（AAD 相同，读到错误的消息）。
+    append_lock: Mutex<()>,
 }
 
 impl MessageStore {
@@ -104,6 +108,7 @@ impl MessageStore {
             root,
             max_bytes,
             encryption,
+            append_lock: Mutex::new(()),
         })
     }
 
@@ -111,6 +116,10 @@ impl MessageStore {
     ///
     /// 返回 `true` 表示新写入，调用方才应触发去抖与回合。
     pub fn append(&self, message: &QqMessage) -> Result<bool> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let conn = self.db.lock();
         let exists: bool = conn
             .query_row(
@@ -233,13 +242,13 @@ impl MessageStore {
         let Some((file_path, line_no)) = row else {
             return Ok(None);
         };
-        self.read_line(&self.root.join(file_path), line_no as usize)
+        self.read_line(&self.root.join(file_path), line_no as usize, Some(message_id))
     }
 
     /// 某天某 chat 的全部消息（按时间升序）。
     pub fn messages_for_day(&self, chat: ChatId, day: &str) -> Result<Vec<QqMessage>> {
         self.load_indexed(
-            "SELECT file_path, line_no FROM messages
+            "SELECT file_path, line_no, message_id FROM messages
              WHERE chat = ?1 AND day = ?2 ORDER BY ts ASC",
             params![chat.to_string(), day],
         )
@@ -248,7 +257,7 @@ impl MessageStore {
     /// 最近 N 条（按时间升序返回）。
     pub fn recent(&self, chat: ChatId, limit: u32) -> Result<Vec<QqMessage>> {
         let mut messages = self.load_indexed(
-            "SELECT file_path, line_no FROM messages
+            "SELECT file_path, line_no, message_id FROM messages
              WHERE chat = ?1 ORDER BY ts DESC LIMIT ?2",
             params![chat.to_string(), limit],
         )?;
@@ -260,14 +269,14 @@ impl MessageStore {
     pub fn unread(&self, chat: Option<ChatId>) -> Result<Vec<QqMessage>> {
         match chat {
             Some(chat) => self.load_indexed(
-                "SELECT m.file_path, m.line_no FROM messages m
+                "SELECT m.file_path, m.line_no, m.message_id FROM messages m
                  JOIN inbox_state s ON s.chat = m.chat AND s.message_id = m.message_id
                  WHERE m.chat = ?1 AND s.state = 'unread'
                  ORDER BY m.ts ASC",
                 params![chat.to_string()],
             ),
             None => self.load_indexed(
-                "SELECT m.file_path, m.line_no FROM messages m
+                "SELECT m.file_path, m.line_no, m.message_id FROM messages m
                  JOIN inbox_state s ON s.chat = m.chat AND s.message_id = m.message_id
                  WHERE s.state = 'unread'
                  ORDER BY m.ts ASC",
@@ -432,7 +441,7 @@ impl MessageStore {
     /// 读取某天某 chat 的收件箱条目（带状态）。
     pub fn inbox_for_chat(&self, chat: ChatId, state: InboxState) -> Result<Vec<QqMessage>> {
         self.load_indexed(
-            "SELECT m.file_path, m.line_no FROM messages m
+            "SELECT m.file_path, m.line_no, m.message_id FROM messages m
              JOIN inbox_state s ON s.chat = m.chat AND s.message_id = m.message_id
              WHERE m.chat = ?1 AND s.state = ?2 ORDER BY m.ts ASC",
             params![chat.to_string(), state.as_str()],
@@ -517,13 +526,16 @@ impl MessageStore {
 
     /// 从 JSONL 重建索引（设计 §8.2：索引是可重建缓存）。
     ///
-    /// 只补缺失行，不修改已有状态；用于崩溃后或索引损坏时。
+    /// 补 `messages`、`message_files` 与 `inbox_state` 三张表：前两张决定配额、
+    /// 保留与月视图，最后一张决定未读数；只补 `messages` 会让其余视图静默失准。
     pub fn rebuild_index(&self) -> Result<u64> {
         let messages_dir = self.root.join("messages");
         if !messages_dir.exists() {
             return Ok(0);
         }
         let mut repaired = 0u64;
+        // path → (scope, peer, month, day, count, bytes)
+        let mut files: HashMap<String, (String, i64, String, String, u64, u64)> = HashMap::new();
         for entry in walk_files(&messages_dir)? {
             let relative = entry
                 .strip_prefix(&self.root)?
@@ -533,11 +545,26 @@ impl MessageStore {
             let lines: Vec<String> = BufReader::new(file)
                 .lines()
                 .collect::<Result<Vec<_>, _>>()?;
-            for (line_no, line) in lines.iter().enumerate() {
-                if line_no == 0 {
-                    // 文件头。
-                    continue;
-                }
+            let Some(header) = lines
+                .first()
+                .and_then(|line| serde_json::from_str::<Value>(line).ok())
+            else {
+                continue;
+            };
+            let Some(scope) = header.get("scope").and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(peer) = header.get("peer_id").and_then(Value::as_u64) else {
+                continue;
+            };
+            let Some(day) = header.get("date").and_then(Value::as_str) else {
+                continue;
+            };
+            let month = day.get(..7).unwrap_or(day).to_owned();
+            let mut count = 0u64;
+            let mut bytes = 0u64;
+            for (line_no, line) in lines.iter().enumerate().skip(1) {
+                bytes += line.len() as u64 + 1;
                 let Ok(value) = serde_json::from_str::<Value>(line) else {
                     continue;
                 };
@@ -558,6 +585,7 @@ impl MessageStore {
                 let Some(message_id) = value.get("id").and_then(Value::as_i64) else {
                     continue;
                 };
+                count += 1;
                 let already: bool = {
                     let conn = self.db.lock();
                     conn.query_row(
@@ -571,7 +599,7 @@ impl MessageStore {
                 if already {
                     continue;
                 }
-                let Some(message) = self.read_line(&entry, line_no)? else {
+                let Some(message) = self.read_line(&entry, line_no, Some(message_id))? else {
                     continue;
                 };
                 let local = message.time.with_timezone(&Local);
@@ -595,6 +623,55 @@ impl MessageStore {
                 )?;
                 repaired += 1;
             }
+            files.insert(
+                relative,
+                (scope.to_owned(), peer as i64, month, day.to_owned(), count, bytes),
+            );
+        }
+
+        let now = Utc::now().to_rfc3339();
+        {
+            let conn = self.db.lock();
+            // 磁盘上已不存在的文件，其索引行与配额一起清掉。
+            let indexed: Vec<String> = {
+                let mut statement = conn.prepare("SELECT path FROM message_files")?;
+                statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for path in indexed {
+                if !files.contains_key(&path) {
+                    conn.execute("DELETE FROM message_files WHERE path = ?1", params![path])?;
+                }
+            }
+            for (path, (scope, peer, month, day, count, bytes)) in &files {
+                conn.execute(
+                    "INSERT INTO message_files
+                        (path, scope, peer, month, day, count, bytes, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(path) DO UPDATE SET
+                        count = excluded.count,
+                        bytes = excluded.bytes,
+                        updated_at = excluded.updated_at",
+                    params![path, scope, peer, month, day, *count as i64, *bytes as i64, now],
+                )?;
+            }
+            // 没有收件箱行的消息补回默认状态；自身消息默认已读。
+            conn.execute(
+                "INSERT OR IGNORE INTO inbox_state (chat, message_id, state, updated_at)
+                 SELECT chat, message_id,
+                        CASE WHEN is_self = 1 THEN 'read' ELSE 'unread' END,
+                        ?1
+                 FROM messages",
+                params![now],
+            )?;
+            conn.execute(
+                "DELETE FROM inbox_state WHERE NOT EXISTS (
+                     SELECT 1 FROM messages m
+                     WHERE m.chat = inbox_state.chat AND m.message_id = inbox_state.message_id
+                 )",
+                [],
+            )?;
         }
         Ok(repaired)
     }
@@ -656,6 +733,14 @@ impl MessageStore {
                 params![format!("{month}-%")],
             )?;
             conn.execute("DELETE FROM message_files WHERE month = ?1", params![month])?;
+            // 消息行已删，收件箱状态不能留下孤儿，否则未读数会永久虚高。
+            conn.execute(
+                "DELETE FROM inbox_state WHERE NOT EXISTS (
+                     SELECT 1 FROM messages m
+                     WHERE m.chat = inbox_state.chat AND m.message_id = inbox_state.message_id
+                 )",
+                [],
+            )?;
             report.removed_files += files.len() as u64;
             report.removed_messages += count;
             report.freed_bytes += bytes;
@@ -665,16 +750,20 @@ impl MessageStore {
 
     /// 从索引行读取消息；任何一条失败都跳过而不是让整个视图失败。
     fn load_indexed(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<QqMessage>> {
-        let rows: Vec<(String, i64)> = {
+        let rows: Vec<(String, i64, i64)> = {
             let conn = self.db.lock();
             let mut statement = conn.prepare(sql)?;
             statement
-                .query_map(params, |row| Ok((row.get(0)?, row.get(1)?)))?
+                .query_map(params, |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut messages = Vec::with_capacity(rows.len());
-        for (file_path, line_no) in rows {
-            match self.read_line(&self.root.join(&file_path), line_no as usize) {
+        for (file_path, line_no, message_id) in rows {
+            match self.read_line(
+                &self.root.join(&file_path),
+                line_no as usize,
+                Some(message_id),
+            ) {
                 Ok(Some(message)) => messages.push(message),
                 Ok(None) => {}
                 Err(error) => {
@@ -762,7 +851,15 @@ impl MessageStore {
     }
 
     /// 读取某文件的某一行并解密。
-    fn read_line(&self, path: &Path, line_no: usize) -> Result<Option<QqMessage>> {
+    ///
+    /// `expected_id` 用于校验索引行号与文件内容一致：索引可能因崩溃或并发写入
+    /// 落后/错位，解密本身不会发现这种事（AAD 绑定的是行内 id），必须在返回前比对。
+    fn read_line(
+        &self,
+        path: &Path,
+        line_no: usize,
+        expected_id: Option<i64>,
+    ) -> Result<Option<QqMessage>> {
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -780,6 +877,13 @@ impl MessageStore {
             .and_then(Value::as_str)
             .context("message file has no file_id")?
             .to_owned();
+        // 按文件头记录的算法解密：切换 `[storage].encryption` 后旧文件仍然可读。
+        let encryption = match header.get("encryption").and_then(Value::as_str) {
+            Some("none") => EncryptionMode::None,
+            Some("xchacha20poly1305") => EncryptionMode::XChaCha20Poly1305,
+            // 旧文件没有该字段时退回当前配置。
+            _ => self.encryption,
+        };
         let Some(line) = lines.get(line_no) else {
             return Ok(None);
         };
@@ -796,10 +900,22 @@ impl MessageStore {
             .get("id")
             .and_then(Value::as_i64)
             .context("message line has no id")?;
+        if let Some(expected) = expected_id
+            && expected != message_id
+        {
+            warn!(
+                file = %path.display(),
+                line = line_no,
+                expected,
+                actual = message_id,
+                "message index line points at a different message"
+            );
+            return Ok(None);
+        }
         let ct = base64::engine::general_purpose::STANDARD
             .decode(value.get("ct").and_then(Value::as_str).unwrap_or_default())?;
 
-        let plain = match self.encryption {
+        let plain = match encryption {
             EncryptionMode::XChaCha20Poly1305 => {
                 let nonce = base64::engine::general_purpose::STANDARD.decode(
                     value
@@ -1068,6 +1184,132 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_appends_keep_distinct_line_numbers() {
+        let (store, dir) = store();
+        let store = std::sync::Arc::new(store);
+        let chat = ChatId::Group(1);
+        std::thread::scope(|scope| {
+            for id in 1..=16i64 {
+                let store = std::sync::Arc::clone(&store);
+                scope.spawn(move || {
+                    store.append(&message(chat, id, &format!("body-{id}"))).unwrap();
+                });
+            }
+        });
+
+        for id in 1..=16i64 {
+            let loaded = store.load(chat, id).unwrap();
+            assert!(loaded.is_some(), "message {id} disappeared");
+            let loaded = loaded.unwrap();
+            assert_eq!(loaded.message_id, id);
+            match &loaded.segments[0] {
+                crate::qq::event::Segment::Text { text } => assert_eq!(text, &format!("body-{id}")),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+
+        // 文件里除表头外恰好 16 行，没有因为并发写重行号而丢行。
+        let path = dir.path().join("messages/groups/1/2026-10/29.jsonl");
+        let lines = std::fs::read_to_string(path).unwrap().lines().count();
+        assert_eq!(lines, 17);
+    }
+
+    #[test]
+    fn index_drift_does_not_return_the_wrong_message() {
+        let (store, _dir) = store();
+        let chat = ChatId::Group(1);
+        store.append(&message(chat, 1, "first")).unwrap();
+        store.append(&message(chat, 2, "second")).unwrap();
+
+        {
+            // 模拟崩溃后索引错位：id 2 指向 id 1 的行。
+            let conn = store.db.lock();
+            conn.execute(
+                "UPDATE messages SET line_no = 1 WHERE chat = ?1 AND message_id = 2",
+                params![chat.to_string()],
+            )
+            .unwrap();
+        }
+
+        assert!(store.load(chat, 2).unwrap().is_none());
+        assert!(store.recent(chat, 10).unwrap().iter().all(|m| m.message_id != 2));
+    }
+
+    #[test]
+    fn reads_follow_the_file_header_not_the_current_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let key = Arc::new(MasterKey::from_bytes([6u8; 32]));
+        let chat = ChatId::Group(1);
+        let root = dir.path().to_path_buf();
+        {
+            let store = MessageStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                root.clone(),
+                0,
+                EncryptionMode::XChaCha20Poly1305,
+            )
+            .unwrap();
+            store.append(&message(chat, 1, "ciphertext")).unwrap();
+        }
+        // 同一个数据目录按“明文”配置重新打开：文件头写着 xchacha，读取必须照此解密。
+        let reopened = MessageStore::open(db, key, root, 0, EncryptionMode::None).unwrap();
+        let loaded = reopened.load(chat, 1).unwrap().unwrap();
+        match &loaded.segments[0] {
+            crate::qq::event::Segment::Text { text } => assert_eq!(text, "ciphertext"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebuild_restores_file_counts_and_inbox_state() {
+        let (store, _dir) = store();
+        let chat = ChatId::Group(1);
+        store.append(&message(chat, 1, "a")).unwrap();
+        store.append(&message(chat, 2, "b")).unwrap();
+        {
+            let conn = store.db.lock();
+            conn.execute("DELETE FROM message_files", []).unwrap();
+            conn.execute("DELETE FROM inbox_state", []).unwrap();
+            conn.execute("DELETE FROM messages", []).unwrap();
+        }
+        assert!(store.unread(None).unwrap().is_empty());
+
+        assert_eq!(store.rebuild_index().unwrap(), 2);
+        assert_eq!(store.load(chat, 1).unwrap().unwrap().message_id, 1);
+        assert_eq!(
+            store.unread_counts().unwrap(),
+            vec![(chat, 2)]
+        );
+        let (disk, indexed) = store.index_file_counts().unwrap();
+        assert_eq!(disk, indexed);
+        assert_eq!(disk, 1);
+    }
+
+    #[test]
+    fn retention_removes_orphan_inbox_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let key = Arc::new(MasterKey::from_bytes([7u8; 32]));
+        let store = MessageStore::open(
+            db,
+            key,
+            dir.path().to_path_buf(),
+            1,
+            EncryptionMode::XChaCha20Poly1305,
+        )
+        .unwrap();
+        let mut old = message(ChatId::Group(1), 1, "old");
+        old.time = Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap();
+        store.append(&old).unwrap();
+        assert_eq!(store.unread_counts().unwrap().len(), 1);
+
+        store.enforce_retention(0).unwrap();
+        assert!(store.unread_counts().unwrap().is_empty());
+    }
+
+    #[test]
     fn tampered_line_fails_to_decrypt() {
         let (store, dir) = store();
         let chat = ChatId::Group(1);
@@ -1078,7 +1320,9 @@ mod tests {
         let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
         lines.swap(1, 2); // 交换两行：AAD 里的 line_no 不匹配。
         std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
-        assert!(store.load(chat, 1).is_err());
+        // 行内 id 与索引不一致：宁可当作缺失，也不能返回错误的消息。
+        assert!(store.load(chat, 1).unwrap().is_none());
+        assert!(store.load(chat, 2).unwrap().is_none());
     }
 
     #[test]
@@ -1095,11 +1339,13 @@ mod tests {
         )
         .unwrap();
 
+        // 用相对时间，避免测试在跨月后失败：旧消息至少早 40 天，必然落在别的月份。
         let mut old = message(ChatId::Group(1), 1, "old");
-        old.time = Utc.with_ymd_and_hms(2026, 1, 5, 0, 0, 0).unwrap();
+        old.time = Utc::now() - chrono::Duration::days(40);
         store.append(&old).unwrap();
 
-        let current = message(ChatId::Group(1), 2, "now");
+        let mut current = message(ChatId::Group(1), 2, "now");
+        current.time = Utc::now();
         store.append(&current).unwrap();
 
         // `append` 在写入前已经按配额清掉了旧月份；这里再跑一次应无事可做，

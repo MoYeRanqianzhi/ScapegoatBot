@@ -168,7 +168,7 @@ impl Runner {
         let per_chat = config.session_scope == "per_chat";
         // 恢复崩溃前未提交的回合，再载入当前分段。
         if !per_chat {
-            let recovered = turn_buffer.recover_open(&sessions).await?;
+            let recovered = turn_buffer.recover_open(&sessions, "shared").await?;
             if recovered > 0 {
                 warn!(
                     recovered,
@@ -176,13 +176,11 @@ impl Runner {
                 );
             }
         } else {
-            // 每个 chat 的链分别恢复；不为 shared 创建空分段。
-            for scope in sessions.scopes()? {
-                if scope == "shared" {
-                    continue;
-                }
+            // 按 buffer 里记录的作用域恢复：只知道 chat 列表不够，崩溃的回合可能
+            // 属于一个还没有任何已提交分段的 chat。
+            for scope in turn_buffer.open_scopes()? {
                 let scoped = sessions.for_scope(&scope);
-                if let Err(error) = turn_buffer.recover_open(&scoped).await {
+                if let Err(error) = turn_buffer.recover_open(&scoped, &scope).await {
                     warn!(%error, %scope, "cannot recover a per-chat turn");
                 }
             }
@@ -251,6 +249,15 @@ impl Runner {
         match chat {
             ChatId::Group(id) => format!("group-{id}"),
             ChatId::Private(id) => format!("private-{id}"),
+        }
+    }
+
+    /// 当前回合归属的作用域；shared 模式统一记 `shared`。
+    fn scope_name(&self, chat: ChatId) -> String {
+        if self.per_chat {
+            Self::chat_scope(chat)
+        } else {
+            "shared".to_owned()
         }
     }
 
@@ -543,8 +550,10 @@ impl Runner {
         let new_blocks: Vec<AgentMessage> = working[base..].to_vec();
         if !new_blocks.is_empty() {
             let turn_id = new_turn_id();
+            let scope = self.scope_name(chat);
             for (seq, message) in new_blocks.iter().enumerate() {
-                self.turn_buffer.append(&turn_id, seq as u64, message)?;
+                self.turn_buffer
+                    .append(&turn_id, seq as u64, &scope, message)?;
             }
             self.turn_buffer.commit(&sessions, &turn_id).await?;
             history.lock().await.extend(new_blocks);
@@ -624,7 +633,6 @@ impl Runner {
             }
             history.clone()
         };
-        let base = working.len();
 
         // 2.5) 超过工作集上限时先压缩，再重新载入历史副本。
         let estimated = crate::session::compaction::estimate_messages(&working);
@@ -638,6 +646,9 @@ impl Runner {
                 working = history.lock().await.clone();
             }
         }
+        // 压缩会改写 `working`，基点在压缩之后取：否则 `working[base..]` 既会越界，
+        // 也会把保留的旧块重复提交。
+        let base = working.len();
 
         // 3) 组装本回合的即时提示。
         let mut prompts = vec![AgentMessage::user(
@@ -702,8 +713,10 @@ impl Runner {
         // 5) 提交新块：buffer -> transcript -> 共享历史。
         let new_blocks: Vec<AgentMessage> = working[base..].to_vec();
         if !new_blocks.is_empty() {
+            let scope = self.scope_name(chat);
             for (seq, message) in new_blocks.iter().enumerate() {
-                self.turn_buffer.append(&turn_id, seq as u64, message)?;
+                self.turn_buffer
+                    .append(&turn_id, seq as u64, &scope, message)?;
             }
             self.turn_buffer.commit(&sessions, &turn_id).await?;
             let mut history = history.lock().await;
@@ -1655,5 +1668,155 @@ mod tests {
         assert!(private.iter().any(
             |message| matches!(message, AgentMessage::User { text } if text.contains("private two"))
         ));
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_keeps_the_turn_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let key = Arc::new(MasterKey::from_bytes([9u8; 32]));
+        let vfs = Arc::new(
+            VfsStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                dir.path().join("data"),
+                Limits::default(),
+            )
+            .unwrap(),
+        );
+        let messages = Arc::new(
+            MessageStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                dir.path().join("data"),
+                0,
+                EncryptionMode::XChaCha20Poly1305,
+            )
+            .unwrap(),
+        );
+        let sessions = Arc::new(
+            SessionStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                dir.path().join("data"),
+                0,
+                EncryptionMode::XChaCha20Poly1305,
+            )
+            .unwrap(),
+        );
+        let turn_buffer = Arc::new(TurnBufferStore::new(
+            Arc::clone(&db),
+            Arc::clone(&key),
+            EncryptionMode::XChaCha20Poly1305,
+        ));
+        let gate = Arc::new(Gate::from_config(
+            &GuardConfig {
+                enabled: true,
+                mode: GuardMode::Shadow,
+                backend: GuardBackend::Off,
+                threshold: 0.9,
+                ..GuardConfig::default()
+            },
+            None,
+            None,
+            crate::security::gate::hold_path(dir.path()),
+        ));
+        let tools = Arc::new(crate::tools::ToolRegistry::new(Arc::clone(&vfs), None));
+        let provider = Arc::new(FakeProvider {
+            script: StdMutex::new(
+                vec![
+                    vec![
+                        ProviderEvent::TextDelta("## Active chats\nsummary".to_owned()),
+                        ProviderEvent::Stop {
+                            reason: StopReason::EndTurn,
+                            refusal: None,
+                        },
+                    ],
+                    vec![
+                        ProviderEvent::TextDelta("fresh reply".to_owned()),
+                        ProviderEvent::Stop {
+                            reason: StopReason::EndTurn,
+                            refusal: None,
+                        },
+                    ],
+                ]
+                .into(),
+            ),
+        });
+
+        let history = Arc::new(Mutex::new(Vec::new()));
+        {
+            let mut preloaded = history.lock().await;
+            for index in 0..6 {
+                preloaded.push(AgentMessage::user(format!("old context line {index}")));
+            }
+        }
+        let runner = Runner::new(
+            provider,
+            tools,
+            Arc::clone(&gate),
+            Arc::clone(&vfs),
+            Arc::clone(&messages),
+            Arc::clone(&sessions),
+            Arc::clone(&turn_buffer),
+            None,
+            RunnerConfig {
+                model: "fake".to_owned(),
+                mode: AgentMode::StandIn,
+                account_qq: 10000,
+                owner_qq: 10000,
+                master_qq: 10000,
+                owner_name: "Owner".to_owned(),
+                session_scope: "shared".to_owned(),
+                receive_scopes: vec!["*".to_owned()],
+                send_scopes: vec!["*".to_owned()],
+                gate_mode: GateMode::Auto,
+                max_tokens: 256,
+                thinking: ThinkingOptions::default(),
+                max_steps: 4,
+                retry: crate::agent::agent_loop::RetryPolicy::default(),
+                chat_history_limit: 10,
+                hooks: crate::config::HooksConfig::default().context,
+                server_tools: Vec::new(),
+                // 故意压到很小：任何真实上下文都会触发自动压缩。
+                turn_context_budget: 2,
+                keep_recent_tokens: 1,
+            },
+            Arc::clone(&history),
+            Arc::new(AtomicBool::new(true)),
+            dir.path().join("ESTOP"),
+        )
+        .await
+        .unwrap();
+
+        let chat = ChatId::Group(1);
+        let incoming = inbound(chat, 7, "new message");
+        messages.append(&incoming).unwrap();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        runner
+            .handle(
+                TurnInput {
+                    chat,
+                    messages: vec![incoming],
+                    dropped: 0,
+                },
+                rx,
+            )
+            .await
+            .unwrap();
+
+        let committed = history.lock().await.clone();
+        // 压缩后历史从摘要块开始，且本回合的回复被提交（不会因 base 错位而 panic/丢块）。
+        assert!(matches!(committed.first(), Some(AgentMessage::System { .. })));
+        assert!(committed.iter().any(|message| matches!(
+            message,
+            AgentMessage::Assistant(assistant)
+                if assistant.content.iter().any(|block| matches!(
+                    block, crate::agent::message::AssistantBlock::Text { text } if text.contains("fresh reply")
+                ))
+        )));
+        // 摘要 + 保留的最近消息 + 本回合回复，旧的 6 条已被压缩掉。
+        assert!(committed.len() <= 5, "unexpected history: {committed:?}");
+        assert!(sessions.list().unwrap().len() >= 2);
     }
 }
