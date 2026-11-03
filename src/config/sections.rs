@@ -99,7 +99,8 @@ impl Default for AgentConfig {
             ],
             model: "anthropic/claude-opus-5-5".to_owned(),
             thinking_level: "high".to_owned(),
-            compaction_model: "anthropic/claude-haiku-5-5".to_owned(),
+            // 空 = 用主模型；默认值不能把用户没列进白名单的模型塞进来。
+            compaction_model: String::new(),
             max_output_tokens: 8192,
             fallback_models: Vec::new(),
             retry_attempts: 3,

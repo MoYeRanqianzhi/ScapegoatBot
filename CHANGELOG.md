@@ -35,7 +35,8 @@
   `api.list` / `api.help`；工具参数不合法时不再把 `input: null` 写进历史；
   error/refusal 路径补齐未执行的工具结果。
 - **队列**：等待全局并发时不持 per-chat 状态锁；修复批次预约计数泄漏。
-- **配置**：修复默认 `agent.compaction_model = ""` 无法通过校验的问题。
+- **配置**：`agent.compaction_model` 默认改为空（表示用主模型），修复默认值与
+  最小配置无法通过校验、导致 `sbot start` 直接失败的问题。
 
 ### 变更
 
@@ -58,7 +59,7 @@
 - 新增回归测试：自动压缩、并发 append、索引错位、文件头加密、turn buffer 作用域、
   SSE UTF-8 分片、闸的 fail-closed/阈值/resume、只读 API、工具配对、队列预约、
   复制配额、Grep 不标已读、MCP 行上限、示例配置校验。
-- `cargo test --all-targets`：288 项通过（2 项真实 API 测试默认忽略）；
+- `cargo test --all-targets`：289 项通过（2 项真实 API 测试默认忽略）；
   `cargo clippy --all-targets`：无警告。
 
 ## [0.2.0-alpha.12] - 2026-10-30

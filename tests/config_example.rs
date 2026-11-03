@@ -32,6 +32,35 @@ fn default_config_passes_shape_validation() {
 }
 
 #[test]
+fn readme_minimal_config_is_valid() {
+    // README 的“最小可用配置”必须真的能启动。
+    let text = r#"
+version = 1
+
+[agent]
+model = "anthropic/claude-opus-5-5"
+available_models = ["anthropic/claude-opus-5-5"]
+
+[napcat]
+url = "ws://127.0.0.1:3001"
+
+[filter]
+ignore_groups = []
+"#;
+    let config: SbotConfig = toml::from_str(text).expect("minimal config parses");
+    config
+        .validate_shape()
+        .unwrap_or_else(|errors| panic!("minimal config invalid:
+{errors}"));
+    let models =
+        ModelsFile::parse(include_str!("../assets/models.default.json")).expect("default models");
+    config
+        .validate_with_models(&models)
+        .unwrap_or_else(|errors| panic!("minimal config vs models:
+{errors}"));
+}
+
+#[test]
 fn config_example_has_no_credentials() {
     let text = std::fs::read_to_string("config.example.toml").unwrap();
     assert!(!text.contains("sk-"), "no literal key may appear");
