@@ -202,7 +202,7 @@ impl Tool for AgentTool {
         &[Permission::Read]
     }
 
-    async fn execute(&self, _ctx: &ToolContext, args: serde_json::Value) -> ToolResult {
+    async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> ToolResult {
         let hub = match self.hub() {
             Ok(hub) => hub,
             Err(error) => return error,
@@ -224,7 +224,13 @@ impl Tool for AgentTool {
                     return ToolResult::error("type must be general, explore, plan or docs.");
                 }
                 match hub
-                    .spawn(kind, arg_opt_str(&args, "agent"), task, self.depth)
+                    .spawn(
+                        kind,
+                        arg_opt_str(&args, "agent"),
+                        task,
+                        self.depth,
+                        ctx.evidence.clone(),
+                    )
                     .await
                 {
                     Ok(mut value) => {

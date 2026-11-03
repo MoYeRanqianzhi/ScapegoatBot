@@ -68,6 +68,11 @@ pub enum Command {
         #[command(subcommand)]
         action: SecurityCommand,
     },
+    /// `[gate]` 待确认请求：列出、批准、拒绝。
+    Gate {
+        #[command(subcommand)]
+        action: GateCommand,
+    },
     /// 模型热切换。
     Model {
         #[command(subcommand)]
@@ -104,6 +109,22 @@ pub enum SecurityCommand {
     Status,
     /// 用当前上下文重新过闸并尝试解除 hold。
     Resume,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GateCommand {
+    /// 列出等待确认的变更动作。
+    Pending,
+    /// 批准一个请求；批准后 120 秒内可重试一次。
+    Approve {
+        /// 请求 id，例如 `g1`。
+        id: String,
+    },
+    /// 拒绝一个请求。
+    Reject {
+        /// 请求 id，例如 `g1`。
+        id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -179,6 +200,26 @@ async fn run_remote(command: Command, paths: &SbotPaths, config: Option<PathBuf>
             }
             SecurityCommand::Resume => {
                 request(&endpoint, Request::new(RequestBody::SecurityResume)).await
+            }
+        },
+
+        Command::Gate { action } => match action {
+            GateCommand::Pending => {
+                request(&endpoint, Request::new(RequestBody::GatePending)).await
+            }
+            GateCommand::Approve { id: approval } => {
+                request(
+                    &endpoint,
+                    Request::new(RequestBody::GateApprove { approval }),
+                )
+                .await
+            }
+            GateCommand::Reject { id: approval } => {
+                request(
+                    &endpoint,
+                    Request::new(RequestBody::GateReject { approval }),
+                )
+                .await
             }
         },
 

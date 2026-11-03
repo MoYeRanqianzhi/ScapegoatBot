@@ -187,7 +187,7 @@ pub fn specs() -> &'static [ActionSpec] {
             summary: "Poke someone.",
             params: json!({"user_id": {"type": "number"}, "group_id": {"type": "number"}}),
             returns: "OneBot response.",
-            requires_owner_intent: true,
+            requires_owner_intent: false,
             scope_field: Some("user_id"),
             target_field: Some("user_id"),
             destructive: false,
@@ -378,13 +378,22 @@ pub fn specs() -> &'static [ActionSpec] {
                     | "napcat.set_group_card"
                     | "napcat.set_group_admin"
             );
+            // 收缩暴露面（踢/禁言/退群/解散）agent 可自主执行；
+            // 改名片、改群名、发公告、授予权限属于扩张，需要 owner intent。
+            let expands = matches!(
+                action,
+                "napcat.set_group_card"
+                    | "napcat.set_group_name"
+                    | "napcat.set_group_admin"
+                    | "napcat.send_group_notice"
+            );
             list.push(ActionSpec {
                 action,
                 category: Category::Admin,
                 summary,
                 params,
                 returns: "OneBot response.",
-                requires_owner_intent: true,
+                requires_owner_intent: expands,
                 scope_field: Some("group_id"),
                 target_field: if member_target { Some("user_id") } else { None },
                 destructive: true,
@@ -431,7 +440,7 @@ pub fn specs() -> &'static [ActionSpec] {
                 summary,
                 params,
                 returns: "OneBot response.",
-                requires_owner_intent: true,
+                requires_owner_intent: action.starts_with("napcat.upload_"),
                 scope_field: if action.contains("private") {
                     Some("user_id")
                 } else {

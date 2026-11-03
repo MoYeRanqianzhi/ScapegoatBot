@@ -52,6 +52,8 @@ pub struct ToolContext {
     pub views: Option<Arc<views::Views>>,
     /// 安全闸；`None` 只用于单元测试。
     pub gate: Option<Arc<crate::security::gate::Gate>>,
+    /// 本回合的运行时证据（owner intent / origin_chat）；门禁只消费它。
+    pub evidence: crate::agent::TurnEvidence,
 }
 
 impl ToolContext {
@@ -60,7 +62,14 @@ impl ToolContext {
             vfs,
             views,
             gate: None,
+            evidence: crate::agent::TurnEvidence::default(),
         }
+    }
+
+    /// 注入回合证据；`API` 的 owner intent 检查读取它。
+    pub fn with_evidence(mut self, evidence: crate::agent::TurnEvidence) -> Self {
+        self.evidence = evidence;
+        self
     }
 
     /// 注入安全闸；工具据此拒绝 hold 期间的外部访问。
@@ -203,6 +212,21 @@ impl ToolExecutor for ToolRegistry {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
+        self.execute_with_evidence(call, crate::agent::TurnEvidence::default())
+            .await
+    }
+}
+
+impl ToolRegistry {
+    /// 带回合证据执行一次工具调用。
+    ///
+    /// `ToolExecutor` 的签名不带上下文；runner 用 [`crate::agent::TurnEvidence`]
+    /// 包装一层，把 owner intent 与 origin_chat 传进来。
+    pub async fn execute_with_evidence(
+        &self,
+        call: &ToolCall,
+        evidence: crate::agent::TurnEvidence,
+    ) -> ToolResult {
         let Some(tool) = self.get(&call.name) else {
             return ToolResult::error(format!(
                 "Unknown tool {:?}. Available tools: {}",
@@ -216,6 +240,7 @@ impl ToolExecutor for ToolRegistry {
         };
         let mut context = ToolContext::new(vfs, self.views.clone());
         context.gate = self.gate.clone();
+        context.evidence = evidence;
         tool.execute(&context, call.arguments.clone()).await
     }
 }

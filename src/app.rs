@@ -64,6 +64,8 @@ struct AgentRuntime {
     /// 准入过滤器；`/config/filter` 写入后原地替换。
     filter: Arc<RwLock<MessageFilter>>,
     filtered: AtomicU64,
+    /// `[gate]` 的待确认队列；IPC 用它批准/拒绝。
+    approvals: Arc<crate::security::action_gate::ApprovalQueue>,
 }
 
 /// monitor 的投递端：把事件变成一次注入回合。
@@ -389,6 +391,12 @@ impl Runtime {
                 "mode": config.security.guard.mode,
                 "backend": config.security.guard.backend,
             },
+            "gate": {
+                "mode": config.gate.mode,
+                "max_per_minute": config.gate.max_per_minute,
+                "llm_review": config.gate.llm_review,
+                "pending_approvals": agent.as_ref().map_or(0, |agent| agent.approvals.pending_count()),
+            },
         })
     }
 
@@ -607,6 +615,36 @@ impl Runtime {
                     Err(error) => Response::error(id, "hold", error),
                 }
             }
+            RequestBody::GatePending => {
+                let agent = self.agent.read().expect("agent lock poisoned").clone();
+                let Some(agent) = agent else {
+                    return Response::error(id, "not_ready", "no agent runtime is available");
+                };
+                Response::ok(
+                    id,
+                    json!({ "pending": agent.approvals.pending() }),
+                )
+            }
+            RequestBody::GateApprove { approval } => {
+                let agent = self.agent.read().expect("agent lock poisoned").clone();
+                let Some(agent) = agent else {
+                    return Response::error(id, "not_ready", "no agent runtime is available");
+                };
+                match agent.approvals.approve(&approval) {
+                    Ok(payload) => Response::ok(id, payload),
+                    Err(error) => Response::error(id, "gate", error),
+                }
+            }
+            RequestBody::GateReject { approval } => {
+                let agent = self.agent.read().expect("agent lock poisoned").clone();
+                let Some(agent) = agent else {
+                    return Response::error(id, "not_ready", "no agent runtime is available");
+                };
+                match agent.approvals.reject(&approval) {
+                    Ok(payload) => Response::ok(id, payload),
+                    Err(error) => Response::error(id, "gate", error),
+                }
+            }
         }
     }
 }
@@ -645,6 +683,8 @@ struct ToolAssembly<'a> {
     qq: Option<Arc<QqClient>>,
     owner_qq: u64,
     master_qq: u64,
+    provider: Arc<dyn crate::providers::Provider>,
+    api_model: String,
 }
 
 /// 注册全部内置工具，返回注册表与 provider 侧声明的服务端工具。
@@ -653,7 +693,12 @@ struct ToolAssembly<'a> {
 /// 复杂度，放在一个短函数里更容易核对。
 async fn assemble_tools(
     assembly: ToolAssembly<'_>,
-) -> (Arc<ToolRegistry>, Vec<ServerToolKind>, Arc<HubHandle>) {
+) -> (
+    Arc<ToolRegistry>,
+    Vec<ServerToolKind>,
+    Arc<HubHandle>,
+    Arc<crate::security::action_gate::ApprovalQueue>,
+) {
     let ToolAssembly {
         config,
         auth,
@@ -668,6 +713,8 @@ async fn assemble_tools(
         qq,
         owner_qq,
         master_qq,
+        provider,
+        api_model,
     } = assembly;
     let mut tools =
         ToolRegistry::new(Arc::clone(&vfs), Some(Arc::clone(&views))).with_gate(Arc::clone(&gate));
@@ -817,15 +864,37 @@ async fn assemble_tools(
     let gateway: Option<Arc<dyn NapcatGateway>> = qq
         .as_ref()
         .map(|client| Arc::clone(client) as Arc<dyn NapcatGateway>);
-    tools.register(Arc::new(ApiTool::new(
-        gateway.clone(),
-        Some(ops.clone() as Arc<dyn AgentOps>),
-        owner_qq,
-        master_qq,
-        Some(Arc::clone(&gate)),
-        config.agent.send_scopes.clone(),
-        Some(Arc::clone(&messages)),
-    )));
+
+    // `[gate]`：所有 napcat.* 调用都过这里；llm_review 用主 provider。
+    let approvals = crate::security::action_gate::ApprovalQueue::new();
+    let mut action_gate = crate::security::action_gate::ActionGate::new(
+        &config.gate,
+        Arc::clone(&approvals),
+    )
+    .with_db(Arc::clone(&db));
+    if config.gate.llm_review {
+        action_gate = action_gate.with_reviewer(Arc::new(
+            crate::security::action_gate::LlmActionReviewer::new(
+                Arc::clone(&provider),
+                api_model,
+                std::time::Duration::from_secs(10),
+            ),
+        ));
+    }
+    let action_gate = Arc::new(action_gate);
+
+    tools.register(Arc::new(
+        ApiTool::new(
+            gateway.clone(),
+            Some(ops.clone() as Arc<dyn AgentOps>),
+            owner_qq,
+            master_qq,
+            Some(Arc::clone(&gate)),
+            config.agent.send_scopes.clone(),
+            Some(Arc::clone(&messages)),
+        )
+        .with_action_gate(Arc::clone(&action_gate)),
+    ));
     // 子代理（docs、未开 allow_send 的自定义定义）拿到的是只读副本：
     // 同一个工具名，但只允许 api.list / api.help。
     let read_only_api = Arc::new(
@@ -842,7 +911,7 @@ async fn assemble_tools(
     );
     let tools = Arc::new(tools.with_read_only_api(read_only_api));
 
-    (tools, server_tools, hub_handle)
+    (tools, server_tools, hub_handle, approvals)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -945,7 +1014,7 @@ async fn build_agent(
     let sink = Arc::new(RunnerSink::default());
     let monitors = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
 
-    let (tools, server_tools, hub_handle) = assemble_tools(ToolAssembly {
+    let (tools, server_tools, hub_handle, approvals) = assemble_tools(ToolAssembly {
         config,
         auth,
         model_ref,
@@ -959,6 +1028,8 @@ async fn build_agent(
         qq: qq.clone(),
         owner_qq,
         master_qq,
+        provider: Arc::clone(&provider),
+        api_model: model_ref.model.id.clone(),
     })
     .await;
 
@@ -1056,6 +1127,7 @@ async fn build_agent(
         self_id,
         filter: Arc::new(RwLock::new(filter)),
         filtered: AtomicU64::new(0),
+        approvals,
     });
 
     // `/config/filter` 写入后立即替换准入过滤器（弱引用避免循环）。
