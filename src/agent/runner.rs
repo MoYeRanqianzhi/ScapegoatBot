@@ -73,6 +73,28 @@ pub struct RunnerConfig {
     pub check_overlap_tokens: u64,
     /// 压缩前也检查一次。
     pub check_on_compaction: bool,
+    /// 模型上下文窗口；与 `turn_context_budget` 一起决定压缩阈值。
+    pub context_window: u64,
+    /// 压缩预算里预留给输出/系统提示的 token。
+    pub reserve_tokens: u32,
+    /// 是否裁剪旧工具结果。
+    pub prune: bool,
+    pub prune_soft_limit: u32,
+    pub prune_keep_turns: u32,
+    /// 压缩前静默提取 durable facts。
+    pub memory_flush: Option<Arc<crate::memory::MemoryFlusher>>,
+    /// 压缩后把记忆索引写进新分段。
+    pub post_compact_recall: bool,
+    /// 摘要使用独立模型；`None` = 主模型。
+    pub compaction: Option<Arc<CompactionModel>>,
+    /// 最近一次回合活动时间（unix 秒），供记忆复盘判断空闲。
+    pub last_activity: Arc<std::sync::atomic::AtomicI64>,
+}
+
+/// 摘要用的独立 provider 与模型 id。
+pub struct CompactionModel {
+    pub provider: Arc<dyn Provider>,
+    pub model: String,
 }
 
 /// 当前生效的 provider 快照。
@@ -382,7 +404,7 @@ impl Runner {
         sessions: &Arc<SessionStore>,
     ) {
         let estimated = crate::session::compaction::estimate_messages(working);
-        if estimated <= self.config.turn_context_budget as usize {
+        if estimated <= self.compaction_budget() {
             return;
         }
         let failures = self
@@ -524,14 +546,25 @@ impl Runner {
         if self.config.check_on_compaction {
             self.run_security_review(&snapshot).await;
         }
+        // 压缩前把 durable facts 静默写进记忆，避免摘要把它们吞掉。
+        if let Some(flusher) = &self.config.memory_flush
+            && let Err(error) = flusher.flush(&snapshot).await
+        {
+            warn!(%error, "memory flush before compaction failed");
+        }
         let input = crate::session::compaction::render_for_summary(&old, 80_000);
         let previous = sessions.current()?;
-        // 摘要使用当前 provider 的 API model id；锁在 await 前释放。
-        let slot = self.provider_snapshot();
-        let summary =
-            crate::session::compaction::summarize(&*slot.provider, &slot.api_model, &input, 4096)
-                .await
-                .map_err(|error| anyhow::anyhow!("compaction request failed: {error}"))?;
+        // 摘要可以用独立模型；默认仍是主 provider。
+        let (provider, model) = match &self.config.compaction {
+            Some(compaction) => (Arc::clone(&compaction.provider), compaction.model.clone()),
+            None => {
+                let slot = self.provider_snapshot();
+                (slot.provider, slot.api_model)
+            }
+        };
+        let summary = crate::session::compaction::summarize(&*provider, &model, &input, 4096)
+            .await
+            .map_err(|error| anyhow::anyhow!("compaction request failed: {error}"))?;
 
         let summary_message = AgentMessage::System {
             text: format!(
@@ -547,6 +580,26 @@ impl Runner {
             .map_err(|error| anyhow::anyhow!("cannot record the compaction checkpoint: {error}"))?;
         let mut new_history = vec![summary_message];
         new_history.extend(keep);
+        // PostCompact recall：把记忆索引作为新分段的第一条上下文，避免压缩后
+        // 新回合在 system prompt 重建前“失忆”。只读、不标记已读。
+        if self.config.post_compact_recall
+            && let Ok(index) = self
+                .vfs
+                .read_text_unrecorded(&crate::vfs::VfsPath::parse("/MEMORY.md").expect("valid"))
+            && !index.trim().is_empty()
+        {
+            let mut text: String = index.chars().take(8_000).collect();
+            if index.chars().count() > 8_000 {
+                text.push('…');
+            }
+            new_history.push(AgentMessage::System {
+                text: format!(
+                    "<memory_context source=\"post_compact\">
+{text}
+</memory_context>"
+                ),
+            });
+        }
         sessions.append(&new_history)?;
         let kept_messages = new_history.len() - 1;
         *history.lock().await = new_history;
@@ -560,6 +613,20 @@ impl Runner {
             "summary_bytes": summary.len(),
             "kept_messages": kept_messages,
         }))
+    }
+
+    /// 自动压缩阈值：配置的工作集上限与模型窗口减去预留后的较小者。
+    fn compaction_budget(&self) -> usize {
+        let reserve = u64::from(self.config.reserve_tokens)
+            .saturating_add(u64::from(self.config.max_tokens));
+        let by_window = self
+            .config
+            .context_window
+            .saturating_sub(reserve)
+            .max(1) as usize;
+        by_window
+            .min(self.config.turn_context_budget as usize)
+            .max(self.config.keep_recent_tokens as usize + 1)
     }
 
     /// 累计新增上下文 token；到达阈值后在回合边界触发检查。
@@ -785,6 +852,9 @@ impl Runner {
                 max_steps: self.config.max_steps,
                 retry: self.config.retry,
                 max_state_chars: 32_000,
+                prune: self.config.prune,
+                prune_soft_limit: self.config.prune_soft_limit as usize,
+                prune_keep_turns: self.config.prune_keep_turns,
             },
         );
         let (tx, mut rx) = mpsc::channel(256);
@@ -874,6 +944,11 @@ impl Runner {
         let turn_id = new_turn_id();
         let first_batch_id = input.messages.first().map(|message| message.message_id);
 
+        self.config.last_activity.store(
+            chrono::Utc::now().timestamp(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         // 1) 入站消息立即进入 transcript 与共享历史。
         let mut inbound = Vec::with_capacity(input.messages.len());
         for message in &input.messages {
@@ -942,6 +1017,9 @@ impl Runner {
                 max_steps: self.config.max_steps,
                 retry: self.config.retry,
                 max_state_chars: 32_000,
+                prune: self.config.prune,
+                prune_soft_limit: self.config.prune_soft_limit as usize,
+                prune_keep_turns: self.config.prune_keep_turns,
             },
         );
         let (events_tx, mut events_rx) = mpsc::channel(256);
@@ -1062,6 +1140,9 @@ impl crate::swarm::SubagentRunner for Runner {
                 max_steps: request.max_steps,
                 retry: self.config.retry,
                 max_state_chars: 32_000,
+                prune: self.config.prune,
+                prune_soft_limit: self.config.prune_soft_limit as usize,
+                prune_keep_turns: self.config.prune_keep_turns,
             },
         );
         let mut history = request.history;
@@ -1522,6 +1603,15 @@ mod tests {
                 check_every_tokens: 0,
                 check_overlap_tokens: 0,
                 check_on_compaction: false,
+                context_window: 200_000,
+                reserve_tokens: 16_384,
+                prune: false,
+                prune_soft_limit: 4_000,
+                prune_keep_turns: 3,
+                memory_flush: None,
+                post_compact_recall: false,
+                compaction: None,
+                last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -1676,6 +1766,15 @@ mod tests {
                 check_every_tokens: 0,
                 check_overlap_tokens: 0,
                 check_on_compaction: false,
+                context_window: 200_000,
+                reserve_tokens: 16_384,
+                prune: false,
+                prune_soft_limit: 4_000,
+                prune_keep_turns: 3,
+                memory_flush: None,
+                post_compact_recall: false,
+                compaction: None,
+                last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             },
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(AtomicBool::new(false)),
@@ -1808,6 +1907,15 @@ mod tests {
                 check_every_tokens: 0,
                 check_overlap_tokens: 0,
                 check_on_compaction: false,
+                context_window: 200_000,
+                reserve_tokens: 16_384,
+                prune: false,
+                prune_soft_limit: 4_000,
+                prune_keep_turns: 3,
+                memory_flush: None,
+                post_compact_recall: false,
+                compaction: None,
+                last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -1947,6 +2055,15 @@ mod tests {
                 check_every_tokens: 0,
                 check_overlap_tokens: 0,
                 check_on_compaction: false,
+                context_window: 200_000,
+                reserve_tokens: 16_384,
+                prune: false,
+                prune_soft_limit: 4_000,
+                prune_keep_turns: 3,
+                memory_flush: None,
+                post_compact_recall: false,
+                compaction: None,
+                last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             },
             history,
             Arc::new(AtomicBool::new(true)),
@@ -2108,6 +2225,15 @@ mod tests {
                 check_every_tokens: 0,
                 check_overlap_tokens: 0,
                 check_on_compaction: false,
+                context_window: 200_000,
+                reserve_tokens: 16_384,
+                prune: false,
+                prune_soft_limit: 4_000,
+                prune_keep_turns: 3,
+                memory_flush: None,
+                post_compact_recall: false,
+                compaction: None,
+                last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -2257,6 +2383,15 @@ mod tests {
                 check_every_tokens: 1,
                 check_overlap_tokens: 0,
                 check_on_compaction: false,
+                context_window: 200_000,
+                reserve_tokens: 16_384,
+                prune: false,
+                prune_soft_limit: 4_000,
+                prune_keep_turns: 3,
+                memory_flush: None,
+                post_compact_recall: false,
+                compaction: None,
+                last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),

@@ -473,6 +473,22 @@ impl MessageStore {
         Ok(())
     }
 
+    /// 启动核对：超过 `age_secs` 仍是 `pending` 的发送标记为 `unknown`。
+    ///
+    /// 崩溃/超时可能发生在“对方已收到、本地没记下 message_id”之间；不能当作
+    /// 失败自动重试，先标记为不确定，交给 agent 查历史后决定。
+    pub fn mark_stale_intents(&self, age_secs: u64) -> Result<u64> {
+        let cutoff =
+            (Utc::now() - chrono::Duration::seconds(age_secs as i64)).to_rfc3339();
+        let conn = self.db.lock();
+        let changed = conn.execute(
+            "UPDATE outbound_intents SET status = 'unknown', updated_at = ?1
+             WHERE status = 'pending' AND created_at < ?2",
+            params![Utc::now().to_rfc3339(), cutoff],
+        )?;
+        Ok(changed as u64)
+    }
+
     /// 未确认的发送（崩溃恢复时先查它们）。
     pub fn unconfirmed_sends(&self) -> Result<Vec<(String, ChatId, String)>> {
         let conn = self.db.lock();
@@ -1323,6 +1339,26 @@ mod tests {
         // 行内 id 与索引不一致：宁可当作缺失，也不能返回错误的消息。
         assert!(store.load(chat, 1).unwrap().is_none());
         assert!(store.load(chat, 2).unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_pending_sends_become_unknown() {
+        let (store, _dir) = store();
+        let chat = ChatId::Group(1);
+        store.begin_send("i1", chat, "send_group_msg").unwrap();
+        {
+            let conn = store.db.lock();
+            conn.execute(
+                "UPDATE outbound_intents SET created_at = '2020-01-01T00:00:00+00:00' WHERE id = 'i1'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(store.mark_stale_intents(60).unwrap(), 1);
+        // 不是 pending 了，但仍然是“未确认”，不会被误当作可安全重试。
+        let unconfirmed = store.unconfirmed_sends().unwrap();
+        assert_eq!(unconfirmed.len(), 1);
+        assert_eq!(unconfirmed[0].0, "i1");
     }
 
     #[test]

@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use crate::agent::ToolResult;
 
 use super::net::NetPolicy;
-use super::{Permission, Tool, ToolContext, arg_opt_str, arg_opt_u64, arg_str, object_schema};
+use super::{Permission, Tool, ToolContext, arg_opt_u64, arg_str, object_schema};
 
 /// 工具后端。
 #[derive(Clone)]
@@ -238,6 +238,23 @@ impl Tool for WebFetchTool {
                     .get("final_url")
                     .and_then(Value::as_str)
                     .unwrap_or(url.as_str());
+                // 后端负责跟随重定向；返回前复核最终地址，防止它把我们带到内网。
+                if final_url != url.as_str() {
+                    match self.policy.check_url(final_url) {
+                        Ok(parsed) => {
+                            if let Err(error) = self.policy.resolve_public(&parsed).await {
+                                return ToolResult::error(format!(
+                                    "the web backend redirected to {final_url}, which is not                                      allowed: {error}"
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            return ToolResult::error(format!(
+                                "the web backend redirected to {final_url}, which is not                                  allowed: {error}"
+                            ));
+                        }
+                    }
+                }
                 let content_type = value
                     .get("content_type")
                     .and_then(Value::as_str)
@@ -249,12 +266,6 @@ impl Tool for WebFetchTool {
             Err(error) => ToolResult::error(error),
         }
     }
-}
-
-/// 忽略未使用的导入的占位（`arg_opt_str` 供未来查询参数使用）。
-#[allow(dead_code)]
-fn _keep_imports(value: &Value) -> Option<&str> {
-    arg_opt_str(value, "x")
 }
 
 #[cfg(test)]

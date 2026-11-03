@@ -10,6 +10,7 @@
 //! 5. 读取上限由调用方给出，超过即中止。
 
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::Url;
@@ -36,12 +37,39 @@ impl Default for NetPolicy {
     }
 }
 
+/// 只返回公网地址的 DNS 解析器。
+///
+/// `resolve_public` 在请求前解析一次，但 reqwest 连接时会再次解析；攻击者可以
+/// 用 DNS rebinding 让第二次解析落到内网。把过滤下沉到连接层即可闭合这个
+/// TOCTOU 窗口。
+struct PublicOnlyResolver;
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(error)
+                })?
+                .filter(|address| is_public_ip(address.ip()))
+                .collect::<Vec<_>>();
+            if addresses.is_empty() {
+                return Err("host resolves only to non-public addresses".into());
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 impl NetPolicy {
     /// 构造 reqwest 客户端（重定向策略在 `check_hop` 之外由调用方逐跳检查）。
     pub fn client(&self) -> Result<reqwest::Client, String> {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs.max(1)))
             .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::new(PublicOnlyResolver))
             .build()
             .map_err(|error| error.to_string())
     }
@@ -292,6 +320,16 @@ mod tests {
         assert!(policy.check_url("https://evil.example.com/a").is_err());
         assert!(policy.check_url("https://other.com/a").is_err());
         assert!(policy.check_url("file:///etc/passwd").is_err());
+    }
+
+    #[tokio::test]
+    async fn dns_resolver_filters_private_literals() {
+        use reqwest::dns::Resolve;
+        use std::str::FromStr;
+
+        let resolver = PublicOnlyResolver;
+        let private = reqwest::dns::Name::from_str("127.0.0.1").unwrap();
+        assert!(resolver.resolve(private).await.is_err());
     }
 
     #[test]

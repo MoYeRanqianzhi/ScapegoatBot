@@ -217,6 +217,7 @@ impl MonitorTool {
                 idle_only,
                 batch_window,
                 target,
+                crate::config::CatchUp::Coalesce,
             )
             .await
         {
