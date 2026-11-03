@@ -115,7 +115,11 @@ impl Views {
     /// - `/config/<section>/<key>`：叶子值（TOML 字面量）；
     /// - `/config/<section>`：整段覆盖；
     /// - `/config.toml`：整文件，但只读键不得改变。
-    pub(crate) fn write_config(&self, target: &ParsedTarget, content: &str) -> Result<String, VfsError> {
+    pub(crate) fn write_config(
+        &self,
+        target: &ParsedTarget,
+        content: &str,
+    ) -> Result<String, VfsError> {
         let Some(handle) = &self.context.config else {
             return Err(VfsError::Offline(
                 "configuration is not attached".to_owned(),

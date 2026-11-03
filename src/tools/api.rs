@@ -100,10 +100,7 @@ impl ApiTool {
     }
 
     /// 接入 `[gate]`；测试不接时按 trusted 处理。
-    pub fn with_action_gate(
-        mut self,
-        gate: Arc<crate::security::action_gate::ActionGate>,
-    ) -> Self {
+    pub fn with_action_gate(mut self, gate: Arc<crate::security::action_gate::ActionGate>) -> Self {
         self.action_gate = Some(gate);
         self
     }
@@ -134,14 +131,28 @@ impl ApiTool {
                 .get("message_type")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if message_type == "group" || (message_type.is_empty() && params.get("group_id").is_some()) {
-                return params.get("group_id").and_then(qq_number).map(ChatId::Group);
+            if message_type == "group"
+                || (message_type.is_empty() && params.get("group_id").is_some())
+            {
+                return params
+                    .get("group_id")
+                    .and_then(qq_number)
+                    .map(ChatId::Group);
             }
-            return params.get("user_id").and_then(qq_number).map(ChatId::Private);
+            return params
+                .get("user_id")
+                .and_then(qq_number)
+                .map(ChatId::Private);
         }
         match spec.scope_field {
-            Some("group_id") => params.get("group_id").and_then(qq_number).map(ChatId::Group),
-            Some("user_id") => params.get("user_id").and_then(qq_number).map(ChatId::Private),
+            Some("group_id") => params
+                .get("group_id")
+                .and_then(qq_number)
+                .map(ChatId::Group),
+            Some("user_id") => params
+                .get("user_id")
+                .and_then(qq_number)
+                .map(ChatId::Private),
             _ => None,
         }
     }

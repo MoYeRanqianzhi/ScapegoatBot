@@ -109,7 +109,6 @@ impl ModelDef {
     pub fn supports(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|item| item == capability)
     }
-
 }
 
 /// 价格（每百万 token，美元）。

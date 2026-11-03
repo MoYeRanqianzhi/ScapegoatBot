@@ -21,7 +21,9 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::providers::{ContentBlock, LlmRequest, Provider, ProviderEvent, ProviderMessage, Role, SystemBlock};
+use crate::providers::{
+    ContentBlock, LlmRequest, Provider, ProviderEvent, ProviderMessage, Role, SystemBlock,
+};
 
 use crate::config::{GuardBackend, GuardConfig, GuardMode};
 use crate::storage::Database;
@@ -298,11 +300,7 @@ pub struct LlmJudge {
 }
 
 impl LlmJudge {
-    pub fn new(
-        provider: Arc<dyn Provider>,
-        model: impl Into<String>,
-        timeout: Duration,
-    ) -> Self {
+    pub fn new(provider: Arc<dyn Provider>, model: impl Into<String>, timeout: Duration) -> Self {
         Self {
             provider,
             model: model.into(),
@@ -503,7 +501,8 @@ impl Gate {
     /// 写一条安全事件（周期检查等由 runtime 判定的事件）。
     pub fn record_event(&self, allowed: bool, score: f32, backend: &str, reason: &str) {
         if let Some(db) = &self.db
-            && let Err(error) = events::record(db, Checkpoint::Input, allowed, score, backend, reason)
+            && let Err(error) =
+                events::record(db, Checkpoint::Input, allowed, score, backend, reason)
         {
             warn!(%error, "cannot record the security event");
         }
@@ -798,12 +797,7 @@ mod tests {
             threshold: 0.9,
             ..GuardConfig::default()
         };
-        let gate = Gate::from_config(
-            &config,
-            None,
-            None,
-            hold_path(dir.path()),
-        );
+        let gate = Gate::from_config(&config, None, None, hold_path(dir.path()));
         assert!(!gate.classifier_available());
         let decision = gate.check(Checkpoint::Input, "", "hello").await;
         assert!(!decision.allowed);
@@ -863,8 +857,10 @@ mod tests {
     #[test]
     fn llm_verdict_parsing_is_tolerant() {
         assert_eq!(
-            parse_llm_verdict("prefix {\"dangerous\": true, \"score\": 0.8, \"reason\": \"x\"} suffix")
-                .map(|(dangerous, score, _)| (dangerous, score)),
+            parse_llm_verdict(
+                "prefix {\"dangerous\": true, \"score\": 0.8, \"reason\": \"x\"} suffix"
+            )
+            .map(|(dangerous, score, _)| (dangerous, score)),
             Some((true, 0.8))
         );
         assert_eq!(

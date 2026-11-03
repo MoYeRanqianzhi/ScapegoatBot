@@ -661,10 +661,7 @@ impl Runtime {
                 let Some(agent) = agent else {
                     return Response::error(id, "not_ready", "no agent runtime is available");
                 };
-                Response::ok(
-                    id,
-                    json!({ "pending": agent.approvals.pending() }),
-                )
+                Response::ok(id, json!({ "pending": agent.approvals.pending() }))
             }
             RequestBody::GateApprove { approval } => {
                 let agent = self.agent.read().expect("agent lock poisoned").clone();
@@ -908,11 +905,9 @@ async fn assemble_tools(
 
     // `[gate]`：所有 napcat.* 调用都过这里；llm_review 用主 provider。
     let approvals = crate::security::action_gate::ApprovalQueue::new();
-    let mut action_gate = crate::security::action_gate::ActionGate::new(
-        &config.gate,
-        Arc::clone(&approvals),
-    )
-    .with_db(Arc::clone(&db));
+    let mut action_gate =
+        crate::security::action_gate::ActionGate::new(&config.gate, Arc::clone(&approvals))
+            .with_db(Arc::clone(&db));
     if config.gate.llm_review {
         action_gate = action_gate.with_reviewer(Arc::new(
             crate::security::action_gate::LlmActionReviewer::new(
@@ -1377,17 +1372,15 @@ async fn handle_qq_event(
     }
     agent.monitors.on_qq_event(&event).await;
     match event {
-        QqEvent::Message(message) => {
-            match messages.append(&message) {
-                Ok(true) => {
-                    if !message.is_self && !message.backfilled {
-                        agent.queue.ingest(message).await;
-                    }
+        QqEvent::Message(message) => match messages.append(&message) {
+            Ok(true) => {
+                if !message.is_self && !message.backfilled {
+                    agent.queue.ingest(message).await;
                 }
-                Ok(false) => {}
-                Err(error) => warn!(%error, "cannot store an inbound message"),
             }
-        }
+            Ok(false) => {}
+            Err(error) => warn!(%error, "cannot store an inbound message"),
+        },
         QqEvent::Notice(notice) => {
             debug!(kind = %notice.kind, "QQ notice");
         }

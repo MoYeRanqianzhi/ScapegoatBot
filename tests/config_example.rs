@@ -25,10 +25,12 @@ fn config_example_is_valid() {
 fn default_config_passes_shape_validation() {
     // 空 compaction_model 等默认值必须可用；曾经默认配置过不了校验。
     let config = SbotConfig::default();
-    config
-        .validate_shape()
-        .unwrap_or_else(|errors| panic!("default config invalid:
-{errors}"));
+    config.validate_shape().unwrap_or_else(|errors| {
+        panic!(
+            "default config invalid:
+{errors}"
+        )
+    });
 }
 
 #[test]
@@ -48,16 +50,22 @@ url = "ws://127.0.0.1:3001"
 ignore_groups = []
 "#;
     let config: SbotConfig = toml::from_str(text).expect("minimal config parses");
-    config
-        .validate_shape()
-        .unwrap_or_else(|errors| panic!("minimal config invalid:
-{errors}"));
+    config.validate_shape().unwrap_or_else(|errors| {
+        panic!(
+            "minimal config invalid:
+{errors}"
+        )
+    });
     let models =
         ModelsFile::parse(include_str!("../assets/models.default.json")).expect("default models");
     config
         .validate_with_models(&models)
-        .unwrap_or_else(|errors| panic!("minimal config vs models:
-{errors}"));
+        .unwrap_or_else(|errors| {
+            panic!(
+                "minimal config vs models:
+{errors}"
+            )
+        });
 }
 
 #[test]

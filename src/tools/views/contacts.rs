@@ -46,7 +46,11 @@ impl Views {
             .collect())
     }
 
-    pub(super) async fn list_friend(&self, _scope: &str, peer: &str) -> Result<Vec<ViewEntry>, VfsError> {
+    pub(super) async fn list_friend(
+        &self,
+        _scope: &str,
+        peer: &str,
+    ) -> Result<Vec<ViewEntry>, VfsError> {
         Ok(vec![
             text_entry(&format!("/friends/{peer}/profile.md")),
             text_entry(&format!("/friends/{peer}/info.json")),
@@ -86,7 +90,11 @@ impl Views {
             .collect())
     }
 
-    pub(super) async fn read_friend_file(&self, _scope: &str, peer: &str) -> Result<ViewRead, VfsError> {
+    pub(super) async fn read_friend_file(
+        &self,
+        _scope: &str,
+        peer: &str,
+    ) -> Result<ViewRead, VfsError> {
         let path = VfsPath::parse(&format!("/friends/{peer}"))?;
         let Some(client) = &self.client else {
             return Err(VfsError::Offline(format!("/friends/{peer}")));
@@ -116,7 +124,11 @@ impl Views {
         )))
     }
 
-    pub(super) async fn read_group_file(&self, group: &str, file: &str) -> Result<ViewRead, VfsError> {
+    pub(super) async fn read_group_file(
+        &self,
+        group: &str,
+        file: &str,
+    ) -> Result<ViewRead, VfsError> {
         let _ = file;
         let Some(client) = &self.client else {
             return Err(VfsError::Offline(format!("/groups/{group}")));
@@ -144,7 +156,11 @@ impl Views {
         )))
     }
 
-    pub(super) async fn read_group_member(&self, group: &str, member: &str) -> Result<ViewRead, VfsError> {
+    pub(super) async fn read_group_member(
+        &self,
+        group: &str,
+        member: &str,
+    ) -> Result<ViewRead, VfsError> {
         let Some(client) = &self.client else {
             return Err(VfsError::Offline(format!("/groups/{group}/members")));
         };
@@ -169,4 +185,3 @@ impl Views {
     // /config /system
     // ---------------------------------------------------------------------
 }
-

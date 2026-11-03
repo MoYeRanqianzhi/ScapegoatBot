@@ -50,9 +50,7 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
         Box::pin(async move {
             let addresses = tokio::net::lookup_host((host.as_str(), 0))
                 .await
-                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(error)
-                })?
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?
                 .filter(|address| is_public_ip(address.ip()))
                 .collect::<Vec<_>>();
             if addresses.is_empty() {

@@ -242,7 +242,11 @@ impl MessageStore {
         let Some((file_path, line_no)) = row else {
             return Ok(None);
         };
-        self.read_line(&self.root.join(file_path), line_no as usize, Some(message_id))
+        self.read_line(
+            &self.root.join(file_path),
+            line_no as usize,
+            Some(message_id),
+        )
     }
 
     /// 某天某 chat 的全部消息（按时间升序）。
@@ -478,8 +482,7 @@ impl MessageStore {
     /// 崩溃/超时可能发生在“对方已收到、本地没记下 message_id”之间；不能当作
     /// 失败自动重试，先标记为不确定，交给 agent 查历史后决定。
     pub fn mark_stale_intents(&self, age_secs: u64) -> Result<u64> {
-        let cutoff =
-            (Utc::now() - chrono::Duration::seconds(age_secs as i64)).to_rfc3339();
+        let cutoff = (Utc::now() - chrono::Duration::seconds(age_secs as i64)).to_rfc3339();
         let conn = self.db.lock();
         let changed = conn.execute(
             "UPDATE outbound_intents SET status = 'unknown', updated_at = ?1
@@ -641,7 +644,14 @@ impl MessageStore {
             }
             files.insert(
                 relative,
-                (scope.to_owned(), peer as i64, month, day.to_owned(), count, bytes),
+                (
+                    scope.to_owned(),
+                    peer as i64,
+                    month,
+                    day.to_owned(),
+                    count,
+                    bytes,
+                ),
             );
         }
 
@@ -669,7 +679,16 @@ impl MessageStore {
                         count = excluded.count,
                         bytes = excluded.bytes,
                         updated_at = excluded.updated_at",
-                    params![path, scope, peer, month, day, *count as i64, *bytes as i64, now],
+                    params![
+                        path,
+                        scope,
+                        peer,
+                        month,
+                        day,
+                        *count as i64,
+                        *bytes as i64,
+                        now
+                    ],
                 )?;
             }
             // 没有收件箱行的消息补回默认状态；自身消息默认已读。
@@ -1208,7 +1227,9 @@ mod tests {
             for id in 1..=16i64 {
                 let store = std::sync::Arc::clone(&store);
                 scope.spawn(move || {
-                    store.append(&message(chat, id, &format!("body-{id}"))).unwrap();
+                    store
+                        .append(&message(chat, id, &format!("body-{id}")))
+                        .unwrap();
                 });
             }
         });
@@ -1248,7 +1269,13 @@ mod tests {
         }
 
         assert!(store.load(chat, 2).unwrap().is_none());
-        assert!(store.recent(chat, 10).unwrap().iter().all(|m| m.message_id != 2));
+        assert!(
+            store
+                .recent(chat, 10)
+                .unwrap()
+                .iter()
+                .all(|m| m.message_id != 2)
+        );
     }
 
     #[test]
@@ -1294,10 +1321,7 @@ mod tests {
 
         assert_eq!(store.rebuild_index().unwrap(), 2);
         assert_eq!(store.load(chat, 1).unwrap().unwrap().message_id, 1);
-        assert_eq!(
-            store.unread_counts().unwrap(),
-            vec![(chat, 2)]
-        );
+        assert_eq!(store.unread_counts().unwrap(), vec![(chat, 2)]);
         let (disk, indexed) = store.index_file_counts().unwrap();
         assert_eq!(disk, indexed);
         assert_eq!(disk, 1);

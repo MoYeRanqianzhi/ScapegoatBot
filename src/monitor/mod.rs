@@ -384,9 +384,7 @@ impl MonitorManager {
             if !monitor.idle_only {
                 monitor.pending_deliveries.fetch_add(1, Ordering::SeqCst);
                 deliver_once(monitor, &*self.sink, Some(event), 1).await;
-                monitor
-                    .pending_deliveries
-                    .fetch_sub(1, Ordering::SeqCst);
+                monitor.pending_deliveries.fetch_sub(1, Ordering::SeqCst);
                 return;
             }
             let monitor = Arc::clone(monitor);
@@ -416,9 +414,7 @@ impl MonitorManager {
             let texts = std::mem::take(&mut *monitor.batch.lock().expect("monitor lock"));
             monitor.flush_queued.store(false, Ordering::SeqCst);
             if texts.is_empty() {
-                monitor
-                    .pending_deliveries
-                    .fetch_sub(1, Ordering::SeqCst);
+                monitor.pending_deliveries.fetch_sub(1, Ordering::SeqCst);
                 return;
             }
             let event = MonitorEvent {
@@ -426,9 +422,7 @@ impl MonitorManager {
                 ..MonitorEvent::default()
             };
             deliver_once(&monitor, &*sink, Some(&event), texts.len() as u64).await;
-            monitor
-                .pending_deliveries
-                .fetch_sub(1, Ordering::SeqCst);
+            monitor.pending_deliveries.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
@@ -621,10 +615,7 @@ fn write_last_fire(db: Option<&Arc<Database>>, name: &str, at: DateTime<Local>) 
     let Some(db) = db else {
         return;
     };
-    let _ = db.meta_set(
-        &last_fire_key(name),
-        at.timestamp().to_string().as_bytes(),
-    );
+    let _ = db.meta_set(&last_fire_key(name), at.timestamp().to_string().as_bytes());
 }
 
 /// 计算 `last` 到 `now` 之间错过的触发次数（有上限，避免长停机扫太久）。
@@ -998,14 +989,7 @@ mod tests {
         let last = Local.with_ymd_and_hms(2026, 11, 2, 10, 0, 0).unwrap();
         let now = Local.with_ymd_and_hms(2026, 11, 4, 10, 30, 0).unwrap();
         assert_eq!(
-            missed_occurrences(
-                &TimerSpec::At {
-                    hour: 9,
-                    minute: 0
-                },
-                last,
-                now
-            ),
+            missed_occurrences(&TimerSpec::At { hour: 9, minute: 0 }, last, now),
             2
         );
     }

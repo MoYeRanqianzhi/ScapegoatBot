@@ -19,8 +19,10 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::agent::TurnEvidence;
-use crate::config::{GateMode, GateConfig};
-use crate::providers::{ContentBlock, LlmRequest, Provider, ProviderEvent, ProviderMessage, Role, SystemBlock};
+use crate::config::{GateConfig, GateMode};
+use crate::providers::{
+    ContentBlock, LlmRequest, Provider, ProviderEvent, ProviderMessage, Role, SystemBlock,
+};
 use crate::storage::Database;
 use crate::tools::actions::{ActionSpec, Category};
 
@@ -45,7 +47,10 @@ pub enum ActionDecision {
     Allow,
     Block(String),
     /// `approve` 模式：已登记请求，等待主人确认。
-    Pending { id: String, action: String },
+    Pending {
+        id: String,
+        action: String,
+    },
 }
 
 impl ActionDecision {
@@ -114,9 +119,7 @@ impl ApprovalQueue {
         let found = items.values().find(|approval| {
             approval.action == action
                 && approval.params == canonical
-                && approval
-                    .approved_until
-                    .is_some_and(|until| until > now)
+                && approval.approved_until.is_some_and(|until| until > now)
         });
         let Some(found) = found.map(|approval| approval.id.clone()) else {
             return false;
@@ -154,7 +157,9 @@ impl ApprovalQueue {
             return Err(format!("unknown or expired approval request {id:?}"));
         };
         approval.approved_until = Some(Instant::now() + APPROVED_WINDOW);
-        Ok(json!({"approved": id, "action": approval.action, "window_secs": APPROVED_WINDOW.as_secs()}))
+        Ok(
+            json!({"approved": id, "action": approval.action, "window_secs": APPROVED_WINDOW.as_secs()}),
+        )
     }
 
     /// 拒绝一个请求。
@@ -177,7 +182,12 @@ impl ApprovalQueue {
 #[async_trait::async_trait]
 pub trait ActionReviewer: Send + Sync {
     /// `true` = 允许，`false` = 拒绝。错误由调用方按拒绝处理。
-    async fn review(&self, action: &str, params: &Value, evidence: &TurnEvidence) -> Result<bool, String>;
+    async fn review(
+        &self,
+        action: &str,
+        params: &Value,
+        evidence: &TurnEvidence,
+    ) -> Result<bool, String>;
 }
 
 /// 用主 provider 做一次轻量审查。
@@ -373,14 +383,11 @@ impl ActionGate {
         let mut sends = self.sends.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         sends.retain(|record| now.duration_since(record.at) <= MASS_WINDOW);
-        if sends
-            .iter()
-            .any(|record| {
-                record.chat == chat
-                    && record.content == content
-                    && now.duration_since(record.at) <= DUPLICATE_WINDOW
-            })
-        {
+        if sends.iter().any(|record| {
+            record.chat == chat
+                && record.content == content
+                && now.duration_since(record.at) <= DUPLICATE_WINDOW
+        }) {
             return Err(
                 "the same message was already sent to this chat within 30s; do not repeat it"
                     .to_owned(),
@@ -545,9 +552,13 @@ mod tests {
         let params = json!({"group_id": 1, "message": "hi"});
         for _ in 0..5 {
             assert!(
-                gate.check(spec("napcat.send_group_msg"), &params, &TurnEvidence::default())
-                    .await
-                    .is_allowed()
+                gate.check(
+                    spec("napcat.send_group_msg"),
+                    &params,
+                    &TurnEvidence::default()
+                )
+                .await
+                .is_allowed()
             );
         }
     }
@@ -564,18 +575,30 @@ mod tests {
         );
         let query = json!({"group_id": 1});
         assert!(
-            gate.check(spec("napcat.get_group_list"), &query, &TurnEvidence::default())
-                .await
-                .is_allowed()
+            gate.check(
+                spec("napcat.get_group_list"),
+                &query,
+                &TurnEvidence::default()
+            )
+            .await
+            .is_allowed()
         );
         assert!(
-            gate.check(spec("napcat.get_group_list"), &query, &TurnEvidence::default())
-                .await
-                .is_allowed()
+            gate.check(
+                spec("napcat.get_group_list"),
+                &query,
+                &TurnEvidence::default()
+            )
+            .await
+            .is_allowed()
         );
         assert!(matches!(
-            gate.check(spec("napcat.get_group_list"), &query, &TurnEvidence::default())
-                .await,
+            gate.check(
+                spec("napcat.get_group_list"),
+                &query,
+                &TurnEvidence::default()
+            )
+            .await,
             ActionDecision::Block(_)
         ));
     }
@@ -585,17 +608,24 @@ mod tests {
         let gate = auto_gate();
         let evidence = TurnEvidence::default();
         let message = json!({"group_id": 1, "message": "same long content for three groups"});
-        assert!(gate.check(spec("napcat.send_group_msg"), &message, &evidence).await.is_allowed());
+        assert!(
+            gate.check(spec("napcat.send_group_msg"), &message, &evidence)
+                .await
+                .is_allowed()
+        );
 
         let duplicate = json!({"group_id": 1, "message": "same long content for three groups"});
         assert!(matches!(
-            gate.check(spec("napcat.send_group_msg"), &duplicate, &evidence).await,
+            gate.check(spec("napcat.send_group_msg"), &duplicate, &evidence)
+                .await,
             ActionDecision::Block(_)
         ));
 
         for group in [2, 3] {
             let params = json!({"group_id": group, "message": "broadcast text across groups"});
-            let _ = gate.check(spec("napcat.send_group_msg"), &params, &evidence).await;
+            let _ = gate
+                .check(spec("napcat.send_group_msg"), &params, &evidence)
+                .await;
         }
         let params = json!({"group_id": 4, "message": "broadcast text across groups"});
         assert!(matches!(
@@ -616,9 +646,13 @@ mod tests {
             ActionDecision::Block(reason) if reason.contains("@all")
         ));
         assert!(
-            gate.check(spec("napcat.send_group_msg"), &params, &TurnEvidence::owner("control"))
-                .await
-                .is_allowed()
+            gate.check(
+                spec("napcat.send_group_msg"),
+                &params,
+                &TurnEvidence::owner("control")
+            )
+            .await
+            .is_allowed()
         );
     }
 
@@ -642,7 +676,8 @@ mod tests {
             panic!("expected pending");
         };
         assert!(matches!(
-            gate.check(spec("napcat.send_group_msg"), &params, &evidence).await,
+            gate.check(spec("napcat.send_group_msg"), &params, &evidence)
+                .await,
             ActionDecision::Pending { .. }
         ));
         approvals.approve(&id).unwrap();
@@ -653,7 +688,8 @@ mod tests {
         );
         // 一次性：同一批准不能再次放行。
         assert!(matches!(
-            gate.check(spec("napcat.send_group_msg"), &params, &evidence).await,
+            gate.check(spec("napcat.send_group_msg"), &params, &evidence)
+                .await,
             ActionDecision::Pending { .. }
         ));
     }
@@ -687,7 +723,8 @@ mod tests {
             ActionDecision::Block(reason) if reason.contains("no reviewer")
         ));
 
-        let gate = ActionGate::new(&config, ApprovalQueue::new()).with_reviewer(Arc::new(Rejecting));
+        let gate =
+            ActionGate::new(&config, ApprovalQueue::new()).with_reviewer(Arc::new(Rejecting));
         assert!(matches!(
             gate.check(spec("napcat.send_group_msg"), &params, &TurnEvidence::default())
                 .await,

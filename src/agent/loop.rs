@@ -312,14 +312,16 @@ impl AgentLoop {
                     }
                     self.gate
                         .force_hold("provider returned stop_reason=refusal");
-                    let calls: Vec<ToolCall> = assistant.tool_calls().into_iter().cloned().collect();
+                    let calls: Vec<ToolCall> =
+                        assistant.tool_calls().into_iter().cloned().collect();
                     history.push(AgentMessage::Assistant(assistant));
                     append_interrupted(history, &calls, "the provider refused the turn");
                     return conclude(events, total_usage, turns, StopReason::Refusal).await;
                 }
 
                 if stop_reason == StopReason::Error {
-                    let calls: Vec<ToolCall> = assistant.tool_calls().into_iter().cloned().collect();
+                    let calls: Vec<ToolCall> =
+                        assistant.tool_calls().into_iter().cloned().collect();
                     history.push(AgentMessage::Assistant(assistant));
                     append_interrupted(history, &calls, "the provider returned an error");
                     return conclude(events, total_usage, turns, StopReason::Error).await;
@@ -910,8 +912,10 @@ pub(crate) fn prune_tool_results(
             && result.content.chars().count() > soft_limit
         {
             let mut trimmed: String = result.content.chars().take(soft_limit).collect();
-            trimmed.push_str("
-[tool result trimmed]");
+            trimmed.push_str(
+                "
+[tool result trimmed]",
+            );
             result.content = trimmed;
         }
     }
@@ -938,11 +942,7 @@ async fn send(events: &mpsc::Sender<AgentEvent>, event: AgentEvent) {
 ///
 /// Error / Refusal 可能发生在流已经产出 tool_use 之后；直接结束回合会把
 /// 半对消息提交进 transcript，下一次请求就会被 provider 拒绝。
-fn append_interrupted(
-    history: &mut Vec<AgentMessage>,
-    calls: &[ToolCall],
-    reason: &str,
-) {
+fn append_interrupted(history: &mut Vec<AgentMessage>, calls: &[ToolCall], reason: &str) {
     for call in calls {
         history.push(AgentMessage::Tool(ToolResultMessage {
             tool_call_id: call.id.clone(),
@@ -1492,21 +1492,24 @@ mod tests {
 
     #[tokio::test]
     async fn arguments_before_start_are_not_dropped() {
-        let script = vec![vec![
-            ProviderEvent::ToolCallArgumentsDelta {
-                index: 0,
-                delta: r#"{"text":"hi"}"#.to_owned(),
-            },
-            ProviderEvent::ToolCallStart {
-                index: 0,
-                id: "c1".to_owned(),
-                name: "echo".to_owned(),
-            },
-            ProviderEvent::Stop {
-                reason: StopReason::ToolUse,
-                refusal: None,
-            },
-        ], text_response("done")];
+        let script = vec![
+            vec![
+                ProviderEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    delta: r#"{"text":"hi"}"#.to_owned(),
+                },
+                ProviderEvent::ToolCallStart {
+                    index: 0,
+                    id: "c1".to_owned(),
+                    name: "echo".to_owned(),
+                },
+                ProviderEvent::Stop {
+                    reason: StopReason::ToolUse,
+                    refusal: None,
+                },
+            ],
+            text_response("done"),
+        ];
         let (history, tools, outcome) = run_script(script).await;
 
         assert_eq!(outcome.stop_reason, StopReason::EndTurn);

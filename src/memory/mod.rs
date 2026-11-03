@@ -72,7 +72,8 @@ pub fn spawn(config: ReviewerConfig) {
     }
     let every_turn = config.memory.review == MemoryReviewMode::EveryTurn;
     let idle = Duration::from_secs(u64::from(config.memory.idle_minutes.max(1)) * 60);
-    let interval = Duration::from_secs(u64::from(config.memory.review_interval_minutes.max(1)) * 60);
+    let interval =
+        Duration::from_secs(u64::from(config.memory.review_interval_minutes.max(1)) * 60);
     let tick = if every_turn {
         Duration::from_secs(5)
     } else {
@@ -99,8 +100,8 @@ pub fn spawn(config: ReviewerConfig) {
                 if config.queue.active_turns().await > 0 {
                     continue;
                 }
-                let idle_for = chrono::Utc::now().timestamp()
-                    - config.last_activity.load(Ordering::Relaxed);
+                let idle_for =
+                    chrono::Utc::now().timestamp() - config.last_activity.load(Ordering::Relaxed);
                 if idle_for < idle.as_secs() as i64 || last_review.elapsed() < interval {
                     continue;
                 }
@@ -269,7 +270,8 @@ async fn run_review(
             });
         }
     }
-    let added = apply_review(vfs, db.map(|db| db.as_ref()), &limits, &entries).context("cannot apply reviewed memories")?;
+    let added = apply_review(vfs, db.map(|db| db.as_ref()), &limits, &entries)
+        .context("cannot apply reviewed memories")?;
     if added > 0 {
         info!(added, "background review added memories");
     }

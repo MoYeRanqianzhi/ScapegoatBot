@@ -198,9 +198,7 @@ impl Views {
                 let day = day.trim_end_matches(".md");
                 self.read_message_day(scope, peer, month, day, filter.as_deref(), limit, mark_read)
             }
-            [root] if root == "inbox" => {
-                self.read_inbox_root(filter.as_deref(), limit, mark_read)
-            }
+            [root] if root == "inbox" => self.read_inbox_root(filter.as_deref(), limit, mark_read),
             [root, chat] if root == "inbox" => {
                 self.read_inbox_chat(chat, filter.as_deref(), limit, mark_read)
             }
@@ -393,42 +391,6 @@ impl Views {
     // /messages
     // ---------------------------------------------------------------------
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     fn vfs_list_fallback(&self, path: &VfsPath) -> Result<Vec<ViewEntry>, VfsError> {
         let mut out = Vec::new();
         for meta in self.vfs.list(path)? {
@@ -490,10 +452,6 @@ fn parse_chat_segment(segment: &str) -> Result<ChatId, VfsError> {
 fn storage(error: anyhow::Error) -> VfsError {
     VfsError::Storage(error.to_string())
 }
-
-
-
-
 
 fn render_agent_message(message: &AgentMessage) -> String {
     match message {
@@ -693,7 +651,10 @@ mod tests {
     async fn searching_inbox_does_not_clear_unread() {
         let (views, _dir) = views();
         let chat = crate::qq::event::ChatId::Group(42);
-        views.messages.append(&message(chat, 1, "hello there")).unwrap();
+        views
+            .messages
+            .append(&message(chat, 1, "hello there"))
+            .unwrap();
         assert_eq!(views.messages.unread_counts().unwrap(), vec![(chat, 1)]);
 
         let regex = regex::Regex::new("zzz-no-match").unwrap();
@@ -707,7 +668,10 @@ mod tests {
 
         // 真正的 Read 才标记已读。
         let target = target("/inbox/group:42");
-        assert!(matches!(views.read(&target).await.unwrap(), ViewRead::Text(_)));
+        assert!(matches!(
+            views.read(&target).await.unwrap(),
+            ViewRead::Text(_)
+        ));
         assert!(views.messages.unread_counts().unwrap().is_empty());
     }
 
