@@ -9,6 +9,7 @@
 //! 检查在 runtime（Phase 5）；这里先让每个工具把“它需要什么”写清楚，
 //! 便于 `api.help`、审计与未来的策略表读取。
 
+pub mod actions;
 pub mod agent;
 pub mod api;
 pub mod download;
