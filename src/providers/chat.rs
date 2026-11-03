@@ -6,7 +6,7 @@
 //! - 系统提示是 `role: "system"` 消息；
 //! - 工具调用在 `tool_calls` 里，参数以字符串分片下发；
 //! - 工具结果用 `role: "tool"` + `tool_call_id`；
-//! - 没有服务端工具，web 工具走用户配置的 HTTP 后端（Phase 4）。
+//! - 没有服务端工具，web 工具只能走用户配置的 HTTP 后端。
 
 use std::sync::Arc;
 
@@ -127,7 +127,7 @@ fn provider_messages(messages: &[super::ProviderMessage]) -> Vec<Value> {
                     match block {
                         ContentBlock::Text { text } => text_parts.push(text.clone()),
                         ContentBlock::Image { .. } => {
-                            // Chat 的图片格式在不同兼容服务间差异很大；Phase 4 再按模型能力启用。
+                            // Chat 的图片格式在不同兼容服务间差异很大，当前不转换图片。
                             text_parts.push(
                                 "[image omitted: this protocol does not accept inline images]"
                                     .to_owned(),

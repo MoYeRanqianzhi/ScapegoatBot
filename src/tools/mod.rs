@@ -6,8 +6,7 @@
 //! 本模块只定义契约与注册表，具体工具在 `fs` / `api` / `monitor` 等子模块。
 //!
 //! 权限标记（[`Permission`]）是**声明**，不是执行点：真正的门禁与 `hold`
-//! 检查在 runtime（Phase 5）；这里先让每个工具把“它需要什么”写清楚，
-//! 便于 `api.help`、审计与未来的策略表读取。
+//! 检查在 runtime（API 工具与安全闸）；声明用于审计与策略表。
 
 pub mod actions;
 pub mod agent;

@@ -4,7 +4,7 @@
 //!
 //! - Anthropic 支持 `web_search_20260209` / `web_fetch_20260209`（当前模型）；
 //! - OpenAI Responses 支持内置 `web_search`；
-//! - Chat Completions 没有服务端工具，必须走用户配置的 HTTP 后端（Phase 4）。
+//! - Chat Completions 没有服务端工具，必须走用户配置的 HTTP 后端。
 
 use serde_json::{Value, json};
 

@@ -46,7 +46,7 @@ impl NapcatGateway for QqClient {
     }
 }
 
-/// 对 agent 自身的操作；由 runtime 实现（Phase 5 接入压缩与重开）。
+/// 对 agent 自身的操作；由 runtime 实现（压缩、清空上下文等）。
 #[async_trait]
 pub trait AgentOps: Send + Sync {
     async fn status(&self) -> Result<Value, String>;

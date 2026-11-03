@@ -78,13 +78,13 @@ pub enum Command {
         #[command(subcommand)]
         action: EffortAction,
     },
-    /// 备份（Phase 7）。
+    /// 备份：SQLite 快照 + 文件归档（包含主密钥）。
     Backup {
         /// 输出目录；默认 `~/.sbot/backups/<timestamp>`。
         #[arg(long)]
         output: Option<PathBuf>,
     },
-    /// 一致性自检（Phase 7）。
+    /// 只读一致性自检：配置、密钥、索引、记忆对账。
     Doctor,
 }
 

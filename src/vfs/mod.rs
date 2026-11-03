@@ -6,7 +6,7 @@
 //! - [`path`]：路径解析、NFC、查询参数；
 //! - [`sqlite`]：SQLite 后端（文本加密、二进制分块、回收站、Read-before-Edit）；
 //! - [`quota`]：配额与磁盘水位；
-//! - [`dynamic`]：动态视图（`/friends`、`/messages` 等，Phase 3 接入真实数据源）。
+//! - [`dynamic`]：动态视图（`/friends`、`/messages` 等，数据源由运行时提供）。
 //!
 //! 本文件只定义公共类型与 trait，不包含存储细节。
 

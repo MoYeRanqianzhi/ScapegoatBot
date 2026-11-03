@@ -50,7 +50,7 @@ impl SbotPaths {
         self.home.join("sbot.toml")
     }
 
-    /// 模型定义文件 `models.json`；Phase 2 的 `sbot doctor` 会用到。
+    /// 模型定义文件 `models.json`；启动加载与 `sbot doctor` 使用。
     #[allow(dead_code)]
     pub fn models_file(&self) -> PathBuf {
         self.home.join("models.json")
@@ -87,13 +87,13 @@ impl SbotPaths {
         self.home.join("logs")
     }
 
-    /// 共享技能目录；Phase 4 的 `Skill` 工具使用。
+    /// 共享技能目录；`Skill` 工具与 curator 使用。
     #[allow(dead_code)]
     pub fn skills_dir(&self) -> PathBuf {
         self.home.join("skills")
     }
 
-    /// 自定义子代理定义目录；Phase 6 使用。
+    /// 自定义子代理定义目录；`Agent` 工具使用。
     #[allow(dead_code)]
     pub fn agents_dir(&self) -> PathBuf {
         self.home.join("agents")

@@ -110,12 +110,6 @@ impl ModelDef {
         self.capabilities.iter().any(|item| item == capability)
     }
 
-    /// 把统一 effort 映射到供应商实际值；未配置映射时同名透传。
-    /// Phase 2 的 provider 适配层使用。
-    #[allow(dead_code)]
-    pub fn map_thinking_level(&self, level: &str) -> String {
-        level.to_owned()
-    }
 }
 
 /// 价格（每百万 token，美元）。
@@ -128,7 +122,7 @@ pub struct CostDef {
 
 /// 一次解析后的模型引用。
 ///
-/// `provider_name` / `provider` 在 Phase 2 组装请求与 Phase 5 计算成本时使用。
+/// `provider_name` / `provider` 用于组装请求与估算成本。
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct ModelRef<'a> {

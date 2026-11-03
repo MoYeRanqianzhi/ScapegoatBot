@@ -2,7 +2,7 @@
 //!
 //! 设计依据：设计 §3.1。
 //!
-//! 事件同时用于：CLI/日志观测、测试断言、以及 Phase 5 的输入/输出闸挂钩。
+//! 事件同时用于：CLI/日志观测、测试断言与安全闸观测。
 //! 事件只描述“发生了什么”，不包含策略判断。
 
 use serde::{Deserialize, Serialize};
@@ -25,16 +25,12 @@ pub enum AgentEvent {
     MessageEnd { message: AssistantMessage },
     /// 工具开始执行。
     ToolExecutionStart { id: String, name: String },
-    /// 工具执行中的增量输出（目前只有文本）。
-    ToolExecutionUpdate { id: String, delta: String },
     /// 工具结束。
     ToolExecutionEnd {
         id: String,
         name: String,
         is_error: bool,
     },
-    /// 一轮结束。
-    TurnEnd { reason: StopReason },
     /// 运行结束。
     AgentEnd { reason: StopReason, usage: Usage },
     /// 安全闸判定（`shadow` 模式只记录）。

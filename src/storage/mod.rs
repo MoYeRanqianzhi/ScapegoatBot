@@ -2,7 +2,7 @@
 //!
 //! 设计依据：设计 §2.2（IPC 幂等）、§6.4（节点与存储）、§8。
 //!
-//! Phase 0 只建立底座：连接与 PRAGMA、迁移框架、`meta`（含密钥 canary）、
+//! 本模块提供底座：连接与 PRAGMA、迁移框架、`meta`（含密钥 canary）、
 //! `control_inputs`（控制通道输入）与 `idempotency`（请求去重）。
 //! VFS、消息索引、发送账本等表在各自阶段追加迁移，**只增不改**。
 
@@ -214,7 +214,7 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         PRIMARY KEY (turn_id, seq)
     );
 
-    -- 压缩检查点；Phase 5 写入。
+    -- 压缩检查点；压缩成功后写入。
     CREATE TABLE compaction_checkpoints (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         from_file  TEXT NOT NULL,
@@ -429,7 +429,7 @@ impl Database {
         Ok(())
     }
 
-    /// 清理过期幂等记录（默认 5 分钟）；Phase 3 的周期维护任务调用。
+    /// 清理过期幂等记录（默认 5 分钟）；由 IPC 幂等表维护使用。
     #[allow(dead_code)]
     pub fn idempotency_prune(&self, older_than: chrono::Duration) -> Result<usize> {
         let cutoff = (chrono::Utc::now() - older_than).to_rfc3339();

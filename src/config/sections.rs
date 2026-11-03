@@ -157,7 +157,10 @@ impl AgentConfig {
                 format!("{:?} is not in agent.available_models", self.model),
             ));
         }
-        if !self.available_models.contains(&self.compaction_model) {
+        // 空 compaction_model = 用主模型；默认值必须是合法的。
+        if !self.compaction_model.is_empty()
+            && !self.available_models.contains(&self.compaction_model)
+        {
             errors.push(ConfigError::new(
                 "agent.compaction_model",
                 format!(
@@ -238,8 +241,24 @@ impl AgentConfig {
             ));
         }
 
-        for name in std::iter::once(&self.compaction_model).chain(self.fallback_models.iter()) {
-            check_available(models, &self.available_models, name, "agent", errors);
+        // 空 compaction_model 表示“用主模型”，不参与白名单校验。
+        if !self.compaction_model.is_empty() {
+            check_available(
+                models,
+                &self.available_models,
+                &self.compaction_model,
+                "agent.compaction_model",
+                errors,
+            );
+        }
+        for name in &self.fallback_models {
+            check_available(
+                models,
+                &self.available_models,
+                name,
+                "agent.fallback_models",
+                errors,
+            );
         }
 
         if self.max_output_tokens > model.model.max_tokens {

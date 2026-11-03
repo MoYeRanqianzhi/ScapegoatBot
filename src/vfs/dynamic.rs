@@ -8,7 +8,7 @@
 //! - 本地没有时才询问动态提供者；
 //! - 提供者不可用（离线/API 失败）时返回 [`VfsError::Offline`]，而不是空内容。
 //!
-//! Phase 3 会在这里接入 NapCat 与消息存储的实现；Phase 1 先把契约固定下来。
+//! 具体数据源由运行时（消息存储、NapCat）提供；这里只固定契约。
 
 use super::{NodeKind, VfsError, path::VfsPath};
 

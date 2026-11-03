@@ -95,7 +95,7 @@ pub struct LoopOutcome {
 
 /// Steering / follow-up 队列。
 ///
-/// Phase 3 会把它接到聊天队列；Phase 2 先提供最小接口与测试。
+/// 回合输入由聊天队列、控制通道与子代理共用这一接口。
 #[derive(Debug, Default)]
 pub struct SteeringQueue {
     queue: VecDeque<AgentMessage>,
