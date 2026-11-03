@@ -115,6 +115,66 @@ pub struct ProviderSlot {
 /// 共享的 provider 槽位。
 pub type SharedProviderSlot = Arc<std::sync::RwLock<ProviderSlot>>;
 
+/// per_chat 的会话与历史缓存。
+///
+/// 这些状态原本散在 `Runner` 的五个字段里；收进一个结构后，`Runner` 只保留
+/// 真正的运行时句柄，`clear_all_context` 与测试也只需面对一个入口。
+struct ScopeCache {
+    per_chat: bool,
+    sessions: Mutex<HashMap<String, Arc<SessionStore>>>,
+    histories: Mutex<HashMap<String, Arc<Mutex<Vec<AgentMessage>>>>>,
+}
+
+impl ScopeCache {
+    fn new(per_chat: bool) -> Self {
+        Self {
+            per_chat,
+            sessions: Mutex::new(HashMap::new()),
+            histories: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn session_for(&self, scope: &str, base: &Arc<SessionStore>) -> Arc<SessionStore> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(store) = sessions.get(scope) {
+            return Arc::clone(store);
+        }
+        let store = Arc::new(base.for_scope(scope));
+        sessions.insert(scope.to_owned(), Arc::clone(&store));
+        store
+    }
+
+    async fn history_for(
+        &self,
+        scope: &str,
+        base: &Arc<SessionStore>,
+    ) -> Arc<Mutex<Vec<AgentMessage>>> {
+        let mut histories = self.histories.lock().await;
+        if let Some(history) = histories.get(scope) {
+            return Arc::clone(history);
+        }
+        let sessions = Arc::clone(base);
+        let sessions = sessions.for_scope(scope);
+        let messages = sessions
+            .current()
+            .and_then(|current| sessions.read_segment(&current.file))
+            .unwrap_or_default();
+        let history = Arc::new(Mutex::new(messages));
+        histories.insert(scope.to_owned(), Arc::clone(&history));
+        history
+    }
+
+    async fn all_sessions(&self) -> Vec<Arc<SessionStore>> {
+        self.sessions.lock().await.values().cloned().collect()
+    }
+
+    async fn clear_histories(&self) {
+        for history in self.histories.lock().await.values() {
+            history.lock().await.clear();
+        }
+    }
+}
+
 /// 回合执行器。
 pub struct Runner {
     /// 当前 provider；热切换时由 runtime 原地替换。
@@ -137,10 +197,8 @@ pub struct Runner {
     config: RunnerConfig,
     /// 已提交的全局 transcript（内存镜像）。
     history: Arc<Mutex<Vec<AgentMessage>>>,
-    /// `[session].scope = per_chat`：每个 chat 独立的会话链与历史。
-    per_chat: bool,
-    chat_sessions: Mutex<HashMap<String, Arc<SessionStore>>>,
-    chat_histories: Mutex<HashMap<String, Arc<Mutex<Vec<AgentMessage>>>>>,
+    /// per_chat 的会话链与历史缓存；shared 模式不持有任何 per-chat 状态。
+    scopes: ScopeCache,
     /// 静态 + hooks 组成的 system 块；压缩成功后重建（`PostCompact` 语义）。
     system: std::sync::RwLock<Vec<SystemBlock>>,
     /// 压缩互斥：同一时刻只允许一次。
@@ -299,9 +357,7 @@ impl Runner {
             qq,
             config,
             history,
-            per_chat,
-            chat_sessions: Mutex::new(HashMap::new()),
-            chat_histories: Mutex::new(HashMap::new()),
+            scopes: ScopeCache::new(per_chat),
             system: std::sync::RwLock::new(system),
             compaction_lock: Mutex::new(()),
             compaction_failures: std::sync::atomic::AtomicU32::new(0),
@@ -326,7 +382,7 @@ impl Runner {
 
     /// 当前回合归属的作用域；shared 模式统一记 `shared`。
     fn scope_name(&self, chat: ChatId) -> String {
-        if self.per_chat {
+        if self.scopes.per_chat {
             Self::chat_scope(chat)
         } else {
             "shared".to_owned()
@@ -335,37 +391,22 @@ impl Runner {
 
     /// 取该 chat 的分段存储；shared 模式返回全局存储。
     async fn session_for(&self, chat: ChatId) -> Arc<SessionStore> {
-        if !self.per_chat {
+        if !self.scopes.per_chat {
             return Arc::clone(&self.sessions);
         }
-        let scope = Self::chat_scope(chat);
-        let mut sessions = self.chat_sessions.lock().await;
-        if let Some(store) = sessions.get(&scope) {
-            return Arc::clone(store);
-        }
-        let store = Arc::new(self.sessions.for_scope(&scope));
-        sessions.insert(scope, Arc::clone(&store));
-        store
+        self.scopes
+            .session_for(&Self::chat_scope(chat), &self.sessions)
+            .await
     }
 
     /// 取该 chat 的历史句柄；首次访问时从对应分段载入。
     async fn history_for(&self, chat: ChatId) -> Arc<Mutex<Vec<AgentMessage>>> {
-        if !self.per_chat {
+        if !self.scopes.per_chat {
             return Arc::clone(&self.history);
         }
-        let scope = Self::chat_scope(chat);
-        let mut histories = self.chat_histories.lock().await;
-        if let Some(history) = histories.get(&scope) {
-            return Arc::clone(history);
-        }
-        let sessions = self.session_for(chat).await;
-        let messages = sessions
-            .current()
-            .and_then(|current| sessions.read_segment(&current.file))
-            .unwrap_or_default();
-        let history = Arc::new(Mutex::new(messages));
-        histories.insert(scope, Arc::clone(&history));
-        history
+        self.scopes
+            .history_for(&Self::chat_scope(chat), &self.sessions)
+            .await
     }
 
     /// 当前 system 块快照。
@@ -485,7 +526,7 @@ impl Runner {
 
     /// 清空上下文：shared 轮转唯一链；per_chat 轮转所有已打开的链。
     pub async fn clear_all_context(&self) -> Result<serde_json::Value> {
-        if !self.per_chat {
+        if !self.scopes.per_chat {
             let current = self.sessions.current()?;
             let next = self.sessions.rotate()?;
             self.history.lock().await.clear();
@@ -495,10 +536,7 @@ impl Runner {
                 "current_session": next.file,
             }));
         }
-        let stores: Vec<Arc<SessionStore>> = {
-            let sessions = self.chat_sessions.lock().await;
-            sessions.values().cloned().collect()
-        };
+        let stores = self.scopes.all_sessions().await;
         let mut cleared = Vec::new();
         for sessions in stores {
             let current = sessions.current()?;
@@ -508,9 +546,7 @@ impl Runner {
                 "current_session": next.file,
             }));
         }
-        for history in self.chat_histories.lock().await.values() {
-            history.lock().await.clear();
-        }
+        self.scopes.clear_histories().await;
         Ok(serde_json::json!({"cleared": true, "chains": cleared}))
     }
 
@@ -2094,7 +2130,7 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.iter().any(|file| file.file.starts_with("group-1-")));
         assert!(files.iter().any(|file| file.file.starts_with("private-2-")));
-        let histories = runner.chat_histories.lock().await;
+        let histories = runner.scopes.histories.lock().await;
         assert_eq!(histories.len(), 2);
         let group = histories.get("group-1").unwrap().lock().await.clone();
         let private = histories.get("private-2").unwrap().lock().await.clone();
