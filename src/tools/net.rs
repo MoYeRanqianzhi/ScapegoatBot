@@ -154,16 +154,12 @@ fn domain_matches(host: &str, rule: &str) -> bool {
 /// 是否为公网地址。
 pub fn is_public_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            !v4.is_private()
-                && !v4.is_loopback()
-                && !v4.is_link_local()
-                && !v4.is_unspecified()
-                && !v4.is_broadcast()
-                && !v4.is_documentation()
-                && !v4.is_multicast()
-        }
+        IpAddr::V4(v4) => is_public_v4(v4),
         IpAddr::V6(v6) => {
+            // IPv4-mapped / 6to4 / NAT64 里可能藏着内网 IPv4，先还原再判断。
+            if let Some(v4) = embedded_v4(v6) {
+                return is_public_v4(v4);
+            }
             !v6.is_loopback()
                 && !v6.is_unspecified()
                 && !v6.is_multicast()
@@ -171,6 +167,43 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
                 && !is_link_local_v6(v6)
         }
     }
+}
+
+fn is_public_v4(v4: std::net::Ipv4Addr) -> bool {
+    let octets = v4.octets();
+    // 100.64.0.0/10（CGNAT）在 std 里不算 private，但同样不是公网。
+    let cgnat = octets[0] == 100 && (64..=127).contains(&octets[1]);
+    !v4.is_private()
+        && !v4.is_loopback()
+        && !v4.is_link_local()
+        && !v4.is_unspecified()
+        && !v4.is_broadcast()
+        && !v4.is_documentation()
+        && !v4.is_multicast()
+        && !cgnat
+}
+
+/// 从 IPv6 地址里取出嵌入的 IPv4（mapped / 6to4 / NAT64 well-known prefix）。
+fn embedded_v4(ip: std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return Some(mapped);
+    }
+    let segments = ip.segments();
+    let octets = ip.octets();
+    if segments[0] == 0x2002 {
+        return Some(std::net::Ipv4Addr::new(
+            octets[2], octets[3], octets[4], octets[5],
+        ));
+    }
+    if segments[0] == 0x0064
+        && segments[1] == 0xff9b
+        && segments[2..6].iter().all(|segment| *segment == 0)
+    {
+        return Some(std::net::Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    None
 }
 
 fn is_unique_local_v6(ip: std::net::Ipv6Addr) -> bool {
@@ -230,6 +263,21 @@ mod tests {
         }
         assert!(!is_public_ip("::1".parse().unwrap()));
         assert!(!is_public_ip("fc00::1".parse().unwrap()));
+        // 嵌在 IPv6 里的内网 IPv4 不能当成公网。
+        for ip in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:192.168.1.1",
+            "2002:7f00:0001::1",
+            "64:ff9b::7f00:1",
+        ] {
+            assert!(!is_public_ip(ip.parse().unwrap()), "{ip}");
+        }
+        assert!(is_public_ip("::ffff:8.8.8.8".parse().unwrap()));
+        // CGNAT 100.64.0.0/10。
+        assert!(!is_public_ip("100.64.0.1".parse().unwrap()));
+        assert!(!is_public_ip("100.127.255.254".parse().unwrap()));
+        assert!(is_public_ip("100.63.0.1".parse().unwrap()));
     }
 
     #[test]

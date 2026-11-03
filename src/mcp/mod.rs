@@ -28,6 +28,10 @@ use crate::tools::{Permission, Tool, ToolContext};
 
 /// 单个请求的超时。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// 单行 JSON-RPC 的最大字节数；异常服务器不能靠一条超长行把进程内存撑爆。
+const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// 一次 `tools/call` 返回文本的上限；超出部分截断并注明。
+const MAX_RESULT_BYTES: usize = 256 * 1024;
 /// 协议版本：与当前 MCP 规范一致。
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -118,7 +122,7 @@ impl McpClient {
         let read = async {
             loop {
                 buffer.clear();
-                let read = self.reader.read_line(&mut buffer).await?;
+                let read = read_line_limited(&mut self.reader, &mut buffer, MAX_LINE_BYTES).await?;
                 if read == 0 {
                     bail!("MCP server {:?} closed its stdout", self.name);
                 }
@@ -247,8 +251,53 @@ impl McpClient {
         if out.is_empty() {
             out = serde_json::to_string(&result).unwrap_or_default();
         }
+        if out.len() > MAX_RESULT_BYTES {
+            // 按字符边界截断，避免写出半个 UTF-8 字符。
+            let mut cut = MAX_RESULT_BYTES;
+            while cut > 0 && !out.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.truncate(cut);
+            out.push_str("\n[result truncated: MCP output exceeded the limit]");
+        }
         Ok((out, is_error))
     }
+}
+
+/// 读取一行，超过 `limit` 字节直接报错。
+///
+/// `AsyncBufReadExt::read_line` 会先把整行读进内存，异常服务器可以靠一条
+/// 没有换行的超长输出拖垮进程；这里用 `fill_buf` 分块检查。
+async fn read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buffer: &mut String,
+    limit: usize,
+) -> std::io::Result<usize> {
+    let mut raw = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            break;
+        }
+        let (chunk, done) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(position) => (&available[..=position], true),
+            None => (available, false),
+        };
+        let consumed = chunk.len();
+        if raw.len().saturating_add(consumed) > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "MCP response line exceeds the size limit",
+            ));
+        }
+        raw.extend_from_slice(chunk);
+        reader.consume(consumed);
+        if done {
+            break;
+        }
+    }
+    buffer.push_str(&String::from_utf8_lossy(&raw));
+    Ok(raw.len())
 }
 
 impl Drop for McpClient {
@@ -371,7 +420,10 @@ impl Tool for McpTool {
         &[Permission::Network]
     }
 
-    async fn execute(&self, _ctx: &ToolContext, args: Value) -> ToolResult {
+    async fn execute(&self, ctx: &ToolContext, args: Value) -> ToolResult {
+        if ctx.hold_active() {
+            return ToolResult::error("Disabled during hold");
+        }
         let server = args.get("server").and_then(Value::as_str);
         let tool = args.get("tool").and_then(Value::as_str);
         let arguments = args.get("args").cloned().unwrap_or_else(|| json!({}));
@@ -387,6 +439,22 @@ impl Tool for McpTool {
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, duplex};
+
+    #[tokio::test]
+    async fn oversized_response_lines_are_rejected() {
+        let (client_side, server_side) = duplex(64);
+        let (_server_read, mut server_write) = tokio::io::split(server_side);
+        tokio::spawn(async move {
+            let _ = server_write.write_all(&vec![b'x'; 512]).await;
+        });
+        let mut reader = BufReader::new(client_side);
+        let mut buffer = String::new();
+        let error = read_line_limited(&mut reader, &mut buffer, 128)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(buffer.is_empty());
+    }
 
     #[tokio::test]
     async fn speaks_json_rpc_and_reads_tools() {

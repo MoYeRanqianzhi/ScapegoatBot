@@ -113,8 +113,12 @@ impl ChatQueue {
         let token = state.token;
 
         // 如果已有回合在跑，等它结束；否则按去抖窗口触发。
-        // `pending_batches` 只在真正形成批次（`fire`）时增加，避免重复计数。
-        if state.active.is_none() && state.pending_batches == 0 {
+        // 空闲时总是用最新 token 重新计时：旧计时器会因 token 不匹配而作废，
+        // 但它持有的预约由新计时器继承，所以只在没有预约时补一次计数。
+        if state.active.is_none() {
+            if state.pending_batches == 0 {
+                state.pending_batches = 1;
+            }
             drop(states);
             self.schedule(chat, token, config.debounce_ms);
         }
@@ -157,18 +161,22 @@ impl ChatQueue {
     /// 去抖窗口结束：取出一批并启动回合。
     async fn fire(self: &Arc<Self>, chat: ChatId, token: u64) {
         let config = self.config();
-        let (batch, steering_tx, permission) = {
+        let (batch, steering_tx, steering_rx) = {
             let mut states = self.states.lock().await;
             let Some(state) = states.get_mut(&chat) else {
                 return;
             };
-            // 更新的消息到来了：这次计时作废。
-            if state.token != token || state.pending.is_empty() {
+            // 更新的消息到来了：这次计时作废；预约由最新那次计时持有。
+            if state.token != token {
                 return;
             }
-
-            // 批次上限：超出时按丢弃策略处理旧批次（这里只有消息，直接丢最旧）。
+            if state.pending.is_empty() {
+                state.pending_batches = state.pending_batches.saturating_sub(1);
+                return;
+            }
             if state.pending_batches > config.cap_batches {
+                // 批次上限：当前实现每个 chat 同时只有一个排队批次，超出说明
+                // 计数异常；丢掉最旧的消息并记账，避免继续堆积。
                 state.pending.pop_front();
                 state.dropped += 1;
             }
@@ -177,12 +185,6 @@ impl ChatQueue {
             let dropped = std::mem::take(&mut state.dropped);
             let (steering_tx, steering_rx) = mpsc::unbounded_channel();
             state.active = Some(steering_tx.clone());
-            state.pending_batches += 1;
-
-            let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => return,
-            };
             (
                 TurnInput {
                     chat,
@@ -190,11 +192,23 @@ impl ChatQueue {
                     dropped,
                 },
                 steering_tx,
-                (permit, steering_rx),
+                steering_rx,
             )
         };
 
-        let (permit, steering_rx) = permission;
+        // 全局并发可能在锁外等待很久：绝不能持 `states` 锁等信号量，
+        // 否则一个 chat 打满并发就会拖住所有 chat 的 ingest。
+        let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                let mut states = self.states.lock().await;
+                if let Some(state) = states.get_mut(&chat) {
+                    state.active = None;
+                    state.pending_batches = state.pending_batches.saturating_sub(1);
+                }
+                return;
+            }
+        };
         let handler = Arc::clone(&self.handler);
         let queue = Arc::clone(self);
         tokio::spawn(async move {
@@ -216,6 +230,7 @@ impl ChatQueue {
                 if !state.pending.is_empty() {
                     state.token = queue.counter.fetch_add(1, Ordering::Relaxed) + 1;
                     let token = state.token;
+                    // 预约下一批；`fire` 接手后不再重复计数。
                     state.pending_batches += 1;
                     drop(states);
                     // follow-up 不再等待完整去抖窗口，只留一个很小的合并窗口。
@@ -387,6 +402,36 @@ mod tests {
         let calls = handler.calls.lock().unwrap();
         assert_eq!(calls[0].messages.len(), 3);
         assert_eq!(calls[0].dropped, 3);
+    }
+
+    #[tokio::test]
+    async fn follow_up_does_not_leak_the_batch_reservation() {
+        let handler = Arc::new(RecordingHandler {
+            delay_ms: 30,
+            ..RecordingHandler::default()
+        });
+        let mut cfg = config();
+        cfg.debounce_ms = 20;
+        cfg.mode = QueueMode::Followup;
+        let queue = ChatQueue::new(cfg, handler.clone());
+        let chat = ChatId::Group(1);
+
+        queue.ingest(msg(chat, 1)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        // 回合进行中到达：按 followup 留到下一批。
+        queue.ingest(msg(chat, 2)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        {
+            let calls = handler.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1].messages[0].message_id, 2);
+        }
+        let states = queue.states.lock().await;
+        let state = states.get(&chat).unwrap();
+        assert!(state.active.is_none());
+        assert_eq!(state.pending_batches, 0, "batch reservation leaked");
+        assert!(state.pending.is_empty());
     }
 
     #[tokio::test]

@@ -151,6 +151,8 @@ pub struct ApiTool {
     messages: Option<Arc<MessageStore>>,
     /// 发送账本 id 的进程内序号。
     counter: std::sync::atomic::AtomicU64,
+    /// 只读模式：只允许 `api.*` 查询。docs 子代理使用。
+    read_only: bool,
 }
 
 impl ApiTool {
@@ -172,7 +174,14 @@ impl ApiTool {
             send_scopes,
             messages,
             counter: std::sync::atomic::AtomicU64::new(0),
+            read_only: false,
         }
+    }
+
+    /// 只读副本：只暴露 `api.list` / `api.help`，不能发送或执行 QQ 动作。
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     /// 查表。
@@ -184,20 +193,25 @@ impl ApiTool {
     fn target_qq(spec: &ActionSpec, params: &Value) -> Option<u64> {
         spec.target_field
             .and_then(|field| params.get(field))
-            .and_then(Value::as_u64)
+            .and_then(qq_number)
     }
 
     /// 会话（用于发送范围）。
     fn chat_of(spec: &ActionSpec, params: &Value) -> Option<ChatId> {
+        // `send_msg` 同时接受群与私聊，靠 message_type/参数决定目标。
+        if spec.action == "napcat.send_msg" {
+            let message_type = params
+                .get("message_type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if message_type == "group" || (message_type.is_empty() && params.get("group_id").is_some()) {
+                return params.get("group_id").and_then(qq_number).map(ChatId::Group);
+            }
+            return params.get("user_id").and_then(qq_number).map(ChatId::Private);
+        }
         match spec.scope_field {
-            Some("group_id") => params
-                .get("group_id")
-                .and_then(Value::as_u64)
-                .map(ChatId::Group),
-            Some("user_id") => params
-                .get("user_id")
-                .and_then(Value::as_u64)
-                .map(ChatId::Private),
+            Some("group_id") => params.get("group_id").and_then(qq_number).map(ChatId::Group),
+            Some("user_id") => params.get("user_id").and_then(qq_number).map(ChatId::Private),
             _ => None,
         }
     }
@@ -254,7 +268,7 @@ impl Tool for ApiTool {
          napcat.* — QQ operations. Message segments use the array form, for example \
          [{\"type\":\"reply\",\"data\":{\"id\":98765}},{\"type\":\"text\",\"data\":{\"text\":\"hello\"}}]. \
          Do not write CQ codes. Use api.list to browse actions and api.help for one action's full \
-         schema. Every napcat.* call passes the gate, and during a hold every one of them returns \
+         schema. During a hold every napcat.* call returns \
          `Disabled during hold`.\n\n\
          agent.* — operations on yourself; these never reach QQ and are always available: \
          status, resume, quarantine, compact, clear_context.\n\n\
@@ -286,6 +300,11 @@ impl Tool for ApiTool {
             Ok(action) => action,
             Err(error) => return error,
         };
+        if self.read_only && !action.starts_with("api.") {
+            return ToolResult::error(
+                "This subagent is read-only: only api.list and api.help are available.",
+            );
+        }
         let params = args.get("params").cloned().unwrap_or_else(|| json!({}));
 
         // `api.*` 是元查询，直接返回，不进入 action 分派。
@@ -309,13 +328,21 @@ impl Tool for ApiTool {
         };
 
         // 目标为 owner/master 的 admin/destructive action 恒拒绝。
-        if spec.destructive {
-            let target = Self::target_qq(spec, &params);
-            if self.admin_target_is_principal(target) {
+        // 目标字段存在时必须能解析成 QQ 号：解析失败按拒绝处理，不能因为
+        // 模型把 user_id 写成字符串就跳过保护。
+        if spec.destructive
+            && let Some(target) = Self::target_qq(spec, &params)
+        {
+            if self.admin_target_is_principal(Some(target)) {
                 return ToolResult::error(
                     "Refused: the target is the owner or the owner's notification account.",
                 );
             }
+        } else if spec.destructive && spec.target_field.is_some() {
+            return ToolResult::error(format!(
+                "{} requires a numeric QQ in {:?}.",
+                spec.action, spec.target_field
+            ));
         }
 
         match spec.namespace() {
@@ -332,18 +359,24 @@ impl Tool for ApiTool {
                     return ToolResult::error("invalid action name");
                 };
 
-                // 发送作用域检查（fail-closed）。
+                // 发送作用域检查（fail-closed）。召回/表情回应只要 message_id，
+                // 没有 chat 目标，不能因此判为错误。
                 if spec.category == Category::Message {
-                    let Some(chat) = Self::chat_of(spec, &params) else {
-                        return ToolResult::error(format!(
-                            "{} requires a chat target ({:?}).",
-                            spec.action, spec.scope_field
-                        ));
-                    };
-                    if !self.scope_allowed(chat) {
-                        return ToolResult::error(format!(
-                            "Send scope {chat} is not allowed by [agent].send_scopes."
-                        ));
+                    match Self::chat_of(spec, &params) {
+                        Some(chat) => {
+                            if !self.scope_allowed(chat) {
+                                return ToolResult::error(format!(
+                                    "Send scope {chat} is not allowed by [agent].send_scopes."
+                                ));
+                            }
+                        }
+                        None if spec.scope_field.is_some() => {
+                            return ToolResult::error(format!(
+                                "{} requires a chat target ({:?}).",
+                                spec.action, spec.scope_field
+                            ));
+                        }
+                        None => {}
                     }
                 }
 
@@ -551,6 +584,19 @@ fn send_spec(
         },
         destructive: false,
         examples,
+    }
+}
+
+/// 把 QQ 号参数解析成整数：兼容数字与数字字符串（OneBot 两种都接受）。
+///
+/// 解析失败返回 `None`；调用方在保护路径上应把 `None` 当成拒绝。
+fn qq_number(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_i64().and_then(|value| u64::try_from(value).ok())),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
     }
 }
 
@@ -807,6 +853,15 @@ pub fn specs() -> &'static [ActionSpec] {
                 r#"{"group_id":123,"content":"hello"}"#,
             ),
         ] {
+            // 只有真正带 `user_id` 的动作才有“目标用户”；全员禁言/退群/解散群
+            // 作用于整个群，不冒充成用户目标。
+            let member_target = matches!(
+                action,
+                "napcat.set_group_kick"
+                    | "napcat.set_group_ban"
+                    | "napcat.set_group_card"
+                    | "napcat.set_group_admin"
+            );
             list.push(ActionSpec {
                 action,
                 category: Category::Admin,
@@ -815,7 +870,7 @@ pub fn specs() -> &'static [ActionSpec] {
                 returns: "OneBot response.",
                 requires_owner_intent: true,
                 scope_field: Some("group_id"),
-                target_field: Some("user_id"),
+                target_field: if member_target { Some("user_id") } else { None },
                 destructive: true,
                 examples: Box::leak(Box::new([example])),
             });
@@ -1252,6 +1307,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_protection_rejects_string_user_ids_too() {
+        let gateway = Arc::new(FakeGateway::default());
+        let tool = tool(Some(gateway.clone()), None);
+        let result = call(
+            &tool,
+            "napcat.set_group_ban",
+            json!({"group_id": 1, "user_id": "10000", "duration": 600}),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("owner"));
+        assert!(gateway.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_targets_are_rejected_instead_of_skipping_protection() {
+        let gateway = Arc::new(FakeGateway::default());
+        let tool = tool(Some(gateway.clone()), None);
+        let result = call(
+            &tool,
+            "napcat.set_group_kick",
+            json!({"group_id": 1, "user_id": "not-a-qq"}),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(gateway.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn message_actions_without_a_chat_target_work() {
+        let gateway = Arc::new(FakeGateway::default());
+        let tool = tool(Some(gateway.clone()), None);
+        for (action, params) in [
+            ("napcat.delete_msg", json!({"message_id": 55555})),
+            (
+                "napcat.set_msg_emoji_like",
+                json!({"message_id": 55555, "emoji_id": "128077"}),
+            ),
+        ] {
+            let result = call(&tool, action, params).await;
+            assert!(!result.is_error, "{}: {}", action, result.content);
+        }
+        let calls = gateway.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "delete_msg");
+        assert_eq!(calls[1].0, "set_msg_emoji_like");
+    }
+
+    #[tokio::test]
+    async fn send_msg_resolves_the_group_target() {
+        let gateway = Arc::new(FakeGateway::default());
+        let tool = ApiTool::new(
+            Some(gateway.clone()),
+            None,
+            1,
+            1,
+            None,
+            vec!["group:1".to_owned()],
+            None,
+        );
+        let result = call(
+            &tool,
+            "napcat.send_msg",
+            json!({"message_type": "group", "group_id": 1, "message": "hi"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(gateway.calls.lock().unwrap()[0].0, "send_msg");
+
+        // 发送范围外的群仍然拒绝。
+        let result = call(
+            &tool,
+            "napcat.send_msg",
+            json!({"message_type": "group", "group_id": 2, "message": "hi"}),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("send_scopes"));
+    }
+
+    #[tokio::test]
+    async fn whole_group_actions_are_not_mistaken_for_user_targets() {
+        let gateway = Arc::new(FakeGateway::default());
+        let tool = tool(Some(gateway.clone()), None);
+        // 没有 user_id 参数；旧实现会因为“目标是 owner”而错误拒绝或错误放行。
+        let result = call(
+            &tool,
+            "napcat.set_group_whole_ban",
+            json!({"group_id": 1, "enable": true}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(gateway.calls.lock().unwrap()[0].0, "set_group_whole_ban");
+    }
+
+    #[tokio::test]
     async fn sends_to_disallowed_scopes_fail_closed() {
         let gateway = Arc::new(FakeGateway::default());
         let tool = ApiTool::new(
@@ -1272,6 +1423,34 @@ mod tests {
         assert!(result.is_error);
         assert!(result.content.contains("send_scopes"));
         assert!(gateway.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_only_api_cannot_send() {
+        let gateway = Arc::new(FakeGateway::default());
+        let tool = ApiTool::new(
+            Some(gateway.clone()),
+            Some(Arc::new(FakeOps)),
+            10000,
+            10000,
+            None,
+            vec!["*".to_owned()],
+            None,
+        )
+        .read_only();
+
+        let result = call(
+            &tool,
+            "napcat.send_group_msg",
+            json!({"group_id": 1, "message": "hi"}),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("read-only"));
+        assert!(gateway.calls.lock().unwrap().is_empty());
+
+        let result = call(&tool, "api.list", json!({})).await;
+        assert!(!result.is_error, "{}", result.content);
     }
 
     #[tokio::test]

@@ -221,13 +221,7 @@ impl AgentLoop {
                         },
                     )
                     .await;
-                    let outcome = LoopOutcome {
-                        stop_reason: StopReason::Error,
-                        usage: total_usage,
-                        turns,
-                    };
-                    finish(events, &outcome).await;
-                    return outcome;
+                    return conclude(events, total_usage, turns, StopReason::Error).await;
                 }
                 send(events, AgentEvent::TurnStart { turn: turns }).await;
 
@@ -249,13 +243,7 @@ impl AgentLoop {
                     .await;
                     input_delta.clear();
                     if !decision.allowed {
-                        let outcome = LoopOutcome {
-                            stop_reason: StopReason::Aborted,
-                            usage: total_usage,
-                            turns,
-                        };
-                        finish(events, &outcome).await;
-                        return outcome;
+                        return conclude(events, total_usage, turns, StopReason::Aborted).await;
                     }
                 }
 
@@ -272,13 +260,7 @@ impl AgentLoop {
                             },
                         )
                         .await;
-                        let outcome = LoopOutcome {
-                            stop_reason: StopReason::Error,
-                            usage: total_usage,
-                            turns,
-                        };
-                        finish(events, &outcome).await;
-                        return outcome;
+                        return conclude(events, total_usage, turns, StopReason::Error).await;
                     }
                 };
 
@@ -296,13 +278,7 @@ impl AgentLoop {
                 )
                 .await;
                 if !decision.allowed {
-                    let outcome = LoopOutcome {
-                        stop_reason: StopReason::Aborted,
-                        usage: total_usage,
-                        turns,
-                    };
-                    finish(events, &outcome).await;
-                    return outcome;
+                    return conclude(events, total_usage, turns, StopReason::Aborted).await;
                 }
 
                 total_usage.add(assistant.usage);
@@ -320,25 +296,17 @@ impl AgentLoop {
                     }
                     self.gate
                         .force_hold("provider returned stop_reason=refusal");
+                    let calls: Vec<ToolCall> = assistant.tool_calls().into_iter().cloned().collect();
                     history.push(AgentMessage::Assistant(assistant));
-                    let outcome = LoopOutcome {
-                        stop_reason: StopReason::Refusal,
-                        usage: total_usage,
-                        turns,
-                    };
-                    finish(events, &outcome).await;
-                    return outcome;
+                    append_interrupted(history, &calls, "the provider refused the turn");
+                    return conclude(events, total_usage, turns, StopReason::Refusal).await;
                 }
 
                 if stop_reason == StopReason::Error {
+                    let calls: Vec<ToolCall> = assistant.tool_calls().into_iter().cloned().collect();
                     history.push(AgentMessage::Assistant(assistant));
-                    let outcome = LoopOutcome {
-                        stop_reason: StopReason::Error,
-                        usage: total_usage,
-                        turns,
-                    };
-                    finish(events, &outcome).await;
-                    return outcome;
+                    append_interrupted(history, &calls, "the provider returned an error");
+                    return conclude(events, total_usage, turns, StopReason::Error).await;
                 }
 
                 if stop_reason == StopReason::MaxTokens && has_calls {
@@ -358,13 +326,7 @@ impl AgentLoop {
                         input_delta.push_str(&render_message(&AgentMessage::Tool(result.clone())));
                         history.push(AgentMessage::Tool(result));
                     }
-                    let outcome = LoopOutcome {
-                        stop_reason: StopReason::MaxTokens,
-                        usage: total_usage,
-                        turns,
-                    };
-                    finish(events, &outcome).await;
-                    return outcome;
+                    return conclude(events, total_usage, turns, StopReason::MaxTokens).await;
                 }
 
                 let calls: Vec<ToolCall> = assistant.tool_calls().into_iter().cloned().collect();
@@ -608,20 +570,15 @@ impl AgentLoop {
                         slot.push_str(&signature);
                     }
                 }
+                // Start 与 ArgumentsDelta 的先后顺序在不同兼容端点间不一致；
+                // 用占位条目合并，避免参数先到时整段丢弃。
                 ProviderEvent::ToolCallStart { index, id, name } => {
-                    calls.insert(
-                        index,
-                        CallAccumulator {
-                            id,
-                            name,
-                            arguments: String::new(),
-                        },
-                    );
+                    let call = calls.entry(index).or_default();
+                    call.id = id;
+                    call.name = name;
                 }
                 ProviderEvent::ToolCallArgumentsDelta { index, delta } => {
-                    if let Some(call) = calls.get_mut(&index) {
-                        call.arguments.push_str(&delta);
-                    }
+                    calls.entry(index).or_default().arguments.push_str(&delta);
                 }
                 ProviderEvent::ServerToolUse { id, name, input } => {
                     blocks.push(BlockAccumulator::ServerToolUse { id, name, input })
@@ -659,10 +616,28 @@ impl AgentLoop {
 
         // 工具调用按 index 顺序落到块列表末尾；文本/思考块保持到达顺序。
         for (_, call) in calls {
+            if call.id.is_empty() || call.name.is_empty() {
+                // 没有 id 或名字的调用无法配对，也无法执行；丢掉比把
+                // 半截 tool_use 写进历史更安全。
+                warn!(id = %call.id, name = %call.name, "dropping an incomplete tool call");
+                continue;
+            }
             let arguments = if call.arguments.trim().is_empty() {
                 Value::Object(Default::default())
             } else {
-                serde_json::from_str(&call.arguments).unwrap_or(Value::Null)
+                match serde_json::from_str(&call.arguments) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        // 参数被截断/不是合法 JSON：以空对象落库，随后工具会
+                        // 报参数缺失；`Value::Null` 会让部分 provider 直接 400。
+                        warn!(
+                            tool = %call.name,
+                            %error,
+                            "tool arguments are not valid JSON; using an empty object"
+                        );
+                        Value::Object(Default::default())
+                    }
+                }
             };
             blocks.push(BlockAccumulator::ToolCall(ToolCall {
                 id: call.id,
@@ -815,6 +790,7 @@ impl BlockAccumulator {
     }
 }
 
+#[derive(Default)]
 struct CallAccumulator {
     id: String,
     name: String,
@@ -899,6 +875,41 @@ fn render_state(history: &[AgentMessage], max_chars: usize) -> String {
 
 async fn send(events: &mpsc::Sender<AgentEvent>, event: AgentEvent) {
     let _ = events.send(event).await;
+}
+
+/// 把没有执行的工具调用补成错误结果，保持 `tool_use` / `tool_result` 成对。
+///
+/// Error / Refusal 可能发生在流已经产出 tool_use 之后；直接结束回合会把
+/// 半对消息提交进 transcript，下一次请求就会被 provider 拒绝。
+fn append_interrupted(
+    history: &mut Vec<AgentMessage>,
+    calls: &[ToolCall],
+    reason: &str,
+) {
+    for call in calls {
+        history.push(AgentMessage::Tool(ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: format!("Tool call was not executed: {reason}."),
+            is_error: true,
+        }));
+    }
+}
+
+/// 结束回合：发 `AgentEnd` 并返回 outcome，避免每个提前返回点重复三行。
+async fn conclude(
+    events: &mpsc::Sender<AgentEvent>,
+    usage: Usage,
+    turns: u32,
+    stop_reason: StopReason,
+) -> LoopOutcome {
+    let outcome = LoopOutcome {
+        stop_reason,
+        usage,
+        turns,
+    };
+    finish(events, &outcome).await;
+    outcome
 }
 
 async fn finish(events: &mpsc::Sender<AgentEvent>, outcome: &LoopOutcome) {
@@ -1346,6 +1357,130 @@ mod tests {
                 block,
                 AssistantBlock::Text { text } if text == "from backup"
             ))
+        )));
+    }
+
+    fn tool_call_events() -> Vec<ProviderEvent> {
+        vec![
+            ProviderEvent::ToolCallStart {
+                index: 0,
+                id: "c1".to_owned(),
+                name: "echo".to_owned(),
+            },
+            ProviderEvent::ToolCallArgumentsDelta {
+                index: 0,
+                delta: r#"{"text":"hi"}"#.to_owned(),
+            },
+        ]
+    }
+
+    async fn run_script(
+        script: Vec<Vec<ProviderEvent>>,
+    ) -> (Vec<AgentMessage>, Arc<FakeTools>, LoopOutcome) {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = Arc::new(FakeProvider::new(script));
+        let tools = Arc::new(FakeTools::new(false));
+        let gate = gate(dir.path(), GuardMode::Shadow);
+        let agent = AgentLoop::new(provider, tools.clone(), gate, config());
+        let (tx, _rx) = mpsc::channel(128);
+        let mut history = vec![AgentMessage::user("go")];
+        let outcome = agent
+            .run(&mut history, Vec::new(), &mut SteeringQueue::default(), &tx)
+            .await;
+        (history, tools, outcome)
+    }
+
+    #[tokio::test]
+    async fn refusal_after_tool_call_still_pairs_results() {
+        let mut script = tool_call_events();
+        script.push(ProviderEvent::Stop {
+            reason: StopReason::Refusal,
+            refusal: Some(crate::agent::message::RefusalDetails {
+                category: "cyber".to_owned(),
+                explanation: "policy".to_owned(),
+            }),
+        });
+        let (history, tools, outcome) = run_script(vec![script]).await;
+
+        assert_eq!(outcome.stop_reason, StopReason::Refusal);
+        assert!(tools.executed.lock().unwrap().is_empty());
+        let tool_results: Vec<_> = history
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::Tool(result) => Some(result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tool_results.len(), 1);
+        assert!(tool_results[0].is_error);
+        assert_eq!(tool_results[0].tool_call_id, "c1");
+    }
+
+    #[tokio::test]
+    async fn provider_error_after_tool_call_still_pairs_results() {
+        let mut script = tool_call_events();
+        script.push(ProviderEvent::Stop {
+            reason: StopReason::Error,
+            refusal: None,
+        });
+        let (history, tools, outcome) = run_script(vec![script]).await;
+
+        assert_eq!(outcome.stop_reason, StopReason::Error);
+        assert!(tools.executed.lock().unwrap().is_empty());
+        assert!(history.iter().any(|message| matches!(
+            message,
+            AgentMessage::Tool(result) if result.is_error && result.tool_call_id == "c1"
+        )));
+    }
+
+    #[tokio::test]
+    async fn arguments_before_start_are_not_dropped() {
+        let script = vec![vec![
+            ProviderEvent::ToolCallArgumentsDelta {
+                index: 0,
+                delta: r#"{"text":"hi"}"#.to_owned(),
+            },
+            ProviderEvent::ToolCallStart {
+                index: 0,
+                id: "c1".to_owned(),
+                name: "echo".to_owned(),
+            },
+            ProviderEvent::Stop {
+                reason: StopReason::ToolUse,
+                refusal: None,
+            },
+        ], text_response("done")];
+        let (history, tools, outcome) = run_script(script).await;
+
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(tools.executed.lock().unwrap().len(), 1);
+        assert!(history.iter().any(|message| matches!(
+            message,
+            AgentMessage::Tool(result) if !result.is_error && result.content == "echo:hi"
+        )));
+    }
+
+    #[tokio::test]
+    async fn incomplete_tool_calls_are_dropped_instead_of_persisted() {
+        let script = vec![vec![
+            ProviderEvent::ToolCallStart {
+                index: 0,
+                id: String::new(),
+                name: "echo".to_owned(),
+            },
+            ProviderEvent::Stop {
+                reason: StopReason::ToolUse,
+                refusal: None,
+            },
+        ]];
+        let (history, tools, outcome) = run_script(script).await;
+
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert!(tools.executed.lock().unwrap().is_empty());
+        assert!(!history.iter().any(|message| matches!(
+            message,
+            AgentMessage::Assistant(assistant)
+                if assistant.content.iter().any(|block| matches!(block, AssistantBlock::ToolCall(_)))
         )));
     }
 }
