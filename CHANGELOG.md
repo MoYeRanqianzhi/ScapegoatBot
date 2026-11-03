@@ -5,6 +5,58 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.14] - 2026-11-04
+
+补齐 alpha.13 文档里列出的未实现项，并完成结构收尾。数据库无新迁移。
+
+### 新增
+
+- **动作门禁 `[gate]`**：`trusted` / `auto` / `approve`；每分钟速率上限、
+  同 chat 重复发送、跨群同文、无 owner intent 的 @全体；可选 LLM 审查（失败 fail-closed）。
+  `approve` 返回待确认 id，`sbot gate pending/approve/reject` 经 IPC 裁决，
+  批准后 120 秒内可重试一次，60 秒未确认失效。
+- **owner intent 证据**：runtime 生成 `TurnEvidence`（控制通道 / 主人消息 / origin chat），
+  经工具执行器传给 `API` 并在子代理间继承。跨 chat 发送、加好友、改资料、上传文件、
+  改群名片/群名/授予权限/发公告需要证据；收缩动作与同 chat 回复不需要。
+- **`backend = "llm"` 安全分类器**：复用主 provider 做输入/输出判定；`Gate` 支持在
+  provider 就绪后后置注入判定器，装入前 enforce 保持 fail-closed。
+- **周期安全检查**：`check_every_tokens` 在回合边界用 `review_model`（默认主模型）
+  检查注入/社工与是否已照做；`high + complied` 进入 hold，`critical` 暂停新回合
+  （重启从 hold 文件恢复）；超时放行，连续失败告警。
+- **压缩调优**：按模型窗口减 `reserve_tokens` 计算阈值；旧工具结果按
+  `prune_keep_turns` / `prune_soft_limit` 裁剪；压缩前 `memory_flush`；
+  压缩后 `post_compact_recall` 注入记忆索引；`compaction_model` 可用独立模型。
+- **记忆复盘语义**：`idle` 使用 `idle_minutes`，`every_turn` 按 transcript 增量触发；
+  与压缩前 flusher 共用同一套提取/落盘逻辑。
+- **monitor catch_up**：定时源把上次触发时间写进 `meta`，重启后 `coalesce` 补投一次
+  （并说明错过次数），`skip` 放弃；运行时创建的 monitor 不参与。
+- **出站账本核对**：启动时把久悬 `pending` 标为 `unknown`；发送超时/断线也标
+  `unknown` 并提示先查历史，避免重复发送；`status` 暴露未确认数量。
+- **网络加固**：`Download` 使用只返回公网地址的自定义 DNS 解析器（关闭 rebinding
+  TOCTOU）；`WebFetch` 复核后端返回的 `final_url`。
+
+### 变更
+
+- `tools/views.rs` 拆为 `views/{messages,inbox,sessions,contacts,config,system}.rs`。
+- `Runner` 的 per-chat 缓存收进 `ScopeCache`；`Runtime::start` 的存储初始化与启动对账
+  抽到 `open_stores`。
+- 全仓 `cargo fmt`；新增 GitHub Actions CI（fmt、clippy -D warnings、tests）。
+- 文档同步：`docs/guide` 的配置/安全/限制/使用/记忆页与 README 更新；
+  `limits.md` 只保留仍存在的边界。
+
+### 修复
+
+- 发送失败不再被标记为 `failed`（那会诱导重试），改为 `unknown`。
+- `sbot status` 增加 `gate` 与 `unconfirmed_sends`。
+
+### 测试
+
+- 新增：动作门禁（速率/重复/跨群/@all/审批/LLM 审查）、owner intent 放行与拒绝、
+  LLM judge 安装、周期检查的 hold/pause、工具结果裁剪、monitor 补投计数、
+  账本核对、DNS 解析过滤、views 拆分后的既有用例。
+- `cargo test --all-targets`：310 项通过（2 项真实 API 测试默认忽略）；
+  `cargo clippy --all-targets -- -D warnings` 与 `cargo fmt --check` 通过。
+
 ## [0.2.0-alpha.13] - 2026-11-04
 
 审查驱动的一轮修复与文档建设。没有破坏性配置变更；数据库迁移追加到 v9。

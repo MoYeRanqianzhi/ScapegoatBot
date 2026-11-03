@@ -135,7 +135,7 @@ MCP 默认关闭；服务器启动失败只告警，不影响主进程。stdio �
 
 | 节 | 关键键 | 说明 |
 |----|--------|------|
-| `[memory]` | `enabled`、`review = off\|idle\|always`、字符预算 | 记忆索引与后台复盘 |
+| `[memory]` | `enabled`、`review = off\|idle\|every_turn`、`idle_minutes`、`review_interval_minutes`、字符预算 | 记忆索引与后台复盘 |
 | `[skills]` | `enabled`、`curator`、`dirs` | 技能加载与归档 |
 | `[style]` | `enabled`、`profile_path`、`max_chars` | 语气画像 |
 
@@ -164,14 +164,18 @@ lifecycle = { idle_only = false, max_events = 1000 }
 `source` 四选一：`qq` / `timer` / `stream` / `internal`。`timer` 支持 `every`、`at`、
 `cron`（5 字段）。运行时也能通过 `Monitor` 工具增删，但重启即消失；配置文件里的才是常驻。
 
+`lifecycle.catch_up` 控制重启后如何处理错过的定时触发：`coalesce`（默认）补投一次并
+说明错过了多少次，`skip` 直接放弃。上次触发时间写在 `meta` 表，运行时创建的 monitor
+不参与补投。
+
 ### `[security.guard]`
 
 | 键 | 默认 | 说明 |
 |----|------|------|
 | `enabled` | true | 总开关 |
 | `mode` | `shadow` | `shadow` 只记录；`enforce` 命中即 hold |
-| `backend` | `jev` | `jev` 或 `off`（`llm` 未实现，配置会被拒绝） |
-| `base_url` | 空 | Jev 端点；**enforce 下必须配置**，否则每个回合都会被 hold |
+| `backend` | `jev` | `jev` / `llm` / `off`。`llm` 用主 provider 判定，无需 Jev key |
+| `base_url` | 空 | Jev 端点；**jev + enforce 下必须配置**，否则每个回合都会被 hold |
 | `threshold` | 0.9 | 分类器危险概率阈值 |
 | `timeout_ms` | 800 | 单次判定超时 |
 
@@ -182,23 +186,51 @@ key 放 `auth.json`：
 ```
 
 只想跑规则层时显式写 `backend = "off"`，不要在 `enforce` 下留空。
+`backend = "llm"` 复用主 provider：`model` 留空则用主模型，判定提示见
+`src/security/gate.rs` 的 `LLM_JUDGE_SYSTEM`。
+
+### `[security]` 周期检查
+
+| 键 | 默认 | 说明 |
+|----|------|------|
+| `check_every_tokens` | 262144 | 每新增这么多 token，在回合边界跑一次独立检查；0 = 关闭 |
+| `check_on_compaction` | true | 压缩前也检查一次 |
+| `check_overlap_tokens` | 4096 | 检查窗口向前重叠的近似 token |
+| `review_model` | 空 | 检查用模型；空 = 主模型 |
+| `check_timeout_secs` | 60 | 检查超时时间；超时放行、只告警 |
+
+检查结果写 `security_events`，不写 transcript。`high + complied` 暂停外发（hold），
+`critical` 暂停新回合；`medium` 只记录与告警。
 
 ### `[compaction]`
 
 | 键 | 默认 | 说明 |
 |----|------|------|
 | `turn_context_budget` | 120000 | 单回合工作集上限，超过先压缩 |
+| `reserve_tokens` | 16384 | 模型窗口里预留给输出/系统提示的 token |
 | `keep_recent_tokens` | 20000 | 压缩后保留的最近 token |
 | `max_failures` | 3 | 连续自动压缩失败后停止尝试 |
+| `memory_flush` | true | 压缩前静默提取 durable facts |
+| `post_compact_recall` | true | 压缩后把 `/MEMORY.md` 索引写进新分段 |
+| `prune` | true | 裁剪较早的工具结果 |
+| `prune_soft_limit` | 4000 | 单条旧工具结果保留的字符数 |
+| `prune_keep_turns` | 3 | 最近多少个回合不裁剪 |
 
-以下键已解析但**尚未生效**：`reserve_tokens`、`memory_flush`、`post_compact_recall`、
-`prune`、`prune_soft_limit`、`prune_keep_turns`。
+自动压缩阈值 = `min(turn_context_budget, context_window - reserve_tokens - max_output_tokens)`，
+且不低于 `keep_recent_tokens`。摘要默认用主模型；`[agent].compaction_model` 可指定独立模型。
 
 ### `[budget]` / `[gate]` / `[hooks]`
 
 - `[budget]`：`daily_tokens`、`daily_usd`、`turn_tokens`、`chat_sends_per_hour`、
   `chat_turns_per_hour`、`round_trip_wall_secs`、`guard_usd_per_day`。
-- `[gate]`：`mode`、`max_per_minute`、`llm_review`。**当前仅解析，逐动作审批与频率限制尚未实现**。
+- `[gate]`：每次 `napcat.*` 调用都过门禁。
+  - `trusted`：直接放行，只统计速率。
+  - `auto`（默认）：每分钟调用上限 `max_per_minute`；发送规则拦截 30 秒内同 chat 重复、
+    2 分钟内同内容发到 3 个以上 chat、无 owner intent 的 @全体；
+    `llm_review = true` 时对变更类动作追加一次 LLM 审查，失败按拒绝。
+  - `approve`：变更类动作返回 `approval_required` 与请求 id；主人在 CLI 执行
+    `sbot gate approve <id>` 后 120 秒内重试一次即可，60 秒未确认自动失效。
+    `sbot gate pending` 查看队列，`sbot gate reject <id>` 拒绝。
 - `[hooks.context]`：`name`、`path`、`kind`、`when`、`inject`、`max_bytes`；
   自定义注入到 system prompt 的上下文文件。
 

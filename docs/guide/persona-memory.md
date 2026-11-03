@@ -73,11 +73,11 @@ source: control:42
 | 值 | 行为 |
 |----|------|
 | `off` | 不自动整理 |
-| `idle`（默认） | 每 `review_interval_minutes` 检查一次，只在没有活跃回合时运行 |
-| `every_turn` | 当前与 `idle` 走同一条定时循环（尚未实现逐回合触发） |
+| `idle`（默认） | 每 30 秒轮询；要求没有活跃回合、空闲至少 `idle_minutes`、距上次复盘至少 `review_interval_minutes` |
+| `every_turn` | 每 5 秒轮询；transcript 有新增且没有活跃回合就复盘 |
 
-`idle_minutes` 已解析但暂未生效。复盘只追加候选、来源固定 `self`；
-不会删除已有记忆。
+复盘只追加候选、来源固定 `self`；不会删除已有记忆。压缩前若开启
+`[compaction].memory_flush`，会先静默跑一次同样的提取。
 
 ### 写记忆
 
