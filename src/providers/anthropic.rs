@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use crate::agent::message::{RefusalDetails, StopReason, Usage};
 use crate::config::models::Protocol;
 
-use super::sse::SseParser;
+use super::sse::{SseParser, Utf8Stream};
 use super::{
     ContentBlock, EventReceiver, LlmRequest, Provider, ProviderError, ProviderEvent, Role,
     SystemBlock, ThinkingOptions, map_stop_reason, server_tools,
@@ -438,6 +438,8 @@ impl Provider for AnthropicProvider {
 async fn pump(response: reqwest::Response, tx: mpsc::Sender<ProviderEvent>) {
     let mut stream = response.bytes_stream();
     let mut parser = SseParser::new();
+    // 网络 chunk 可能切在多字节字符中间，必须做增量解码。
+    let mut decoder = Utf8Stream::new();
     let mut state = StreamState::default();
     let sender = Arc::new(tx);
 
@@ -454,7 +456,7 @@ async fn pump(response: reqwest::Response, tx: mpsc::Sender<ProviderEvent>) {
                 return;
             }
         };
-        let text = String::from_utf8_lossy(&bytes);
+        let text = decoder.push(&bytes);
         for event in parser.push(&text) {
             for outgoing in state.handle(event) {
                 if sender.send(outgoing).await.is_err() {
@@ -464,6 +466,16 @@ async fn pump(response: reqwest::Response, tx: mpsc::Sender<ProviderEvent>) {
         }
     }
 
+    let tail = decoder.finish();
+    if !tail.is_empty() {
+        for event in parser.push(&tail) {
+            for outgoing in state.handle(event) {
+                if sender.send(outgoing).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
     for event in parser.finish() {
         for outgoing in state.handle(event) {
             if sender.send(outgoing).await.is_err() {

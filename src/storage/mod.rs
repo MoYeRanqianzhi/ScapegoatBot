@@ -261,6 +261,15 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     CREATE INDEX transcript_files_scope ON transcript_files(scope, started_at);
     "#,
     ),
+    (
+        9,
+        "turn buffer scopes",
+        // 崩溃恢复必须知道未提交回合属于哪条 transcript 链；旧行归入 shared。
+        r#"
+    ALTER TABLE turn_buffer ADD COLUMN scope TEXT NOT NULL DEFAULT 'shared';
+    CREATE INDEX turn_buffer_scope ON turn_buffer(scope, state);
+    "#,
+    ),
 ];
 
 /// 数据库句柄。
