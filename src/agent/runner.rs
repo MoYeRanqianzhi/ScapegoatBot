@@ -37,7 +37,7 @@ use crate::vfs::Vfs;
 use crate::vfs::sqlite::VfsStore;
 
 /// 运行配置。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RunnerConfig {
     pub model: String,
     pub mode: AgentMode,
@@ -65,6 +65,14 @@ pub struct RunnerConfig {
     pub keep_recent_tokens: u32,
     /// 连续自动压缩失败多少次后停止尝试（避免每个回合都打一次失败的摘要请求）。
     pub compaction_max_failures: u32,
+    /// 周期安全检查器；`None` = 关闭。
+    pub security_review: Option<Arc<dyn crate::security::review::SecurityCheck>>,
+    /// 每新增这么多 token 在回合边界检查一次；0 = 关闭。
+    pub check_every_tokens: u64,
+    /// 检查窗口向前重叠的近似 token。
+    pub check_overlap_tokens: u64,
+    /// 压缩前也检查一次。
+    pub check_on_compaction: bool,
 }
 
 /// 当前生效的 provider 快照。
@@ -117,6 +125,12 @@ pub struct Runner {
     compaction_lock: Mutex<()>,
     /// 连续自动压缩失败次数；达到上限后不再自动尝试。
     compaction_failures: std::sync::atomic::AtomicU32,
+    /// 自上次周期检查以来新增的 token 估算。
+    unchecked_tokens: std::sync::atomic::AtomicU64,
+    /// 周期检查连续失败次数。
+    review_failures: std::sync::atomic::AtomicU32,
+    /// 周期检查互斥。
+    review_lock: Mutex<()>,
 }
 
 /// 把回合证据注入每次工具调用。
@@ -269,6 +283,9 @@ impl Runner {
             system: std::sync::RwLock::new(system),
             compaction_lock: Mutex::new(()),
             compaction_failures: std::sync::atomic::AtomicU32::new(0),
+            unchecked_tokens: std::sync::atomic::AtomicU64::new(0),
+            review_failures: std::sync::atomic::AtomicU32::new(0),
+            review_lock: Mutex::new(()),
         }))
     }
 
@@ -504,6 +521,9 @@ impl Runner {
                 "reason": "nothing older than the retention window",
             }));
         }
+        if self.config.check_on_compaction {
+            self.run_security_review(&snapshot).await;
+        }
         let input = crate::session::compaction::render_for_summary(&old, 80_000);
         let previous = sessions.current()?;
         // 摘要使用当前 provider 的 API model id；锁在 await 前释放。
@@ -540,6 +560,107 @@ impl Runner {
             "summary_bytes": summary.len(),
             "kept_messages": kept_messages,
         }))
+    }
+
+    /// 累计新增上下文 token；到达阈值后在回合边界触发检查。
+    fn accumulate_review_tokens(&self, tokens: usize) {
+        if self.config.security_review.is_none() || self.config.check_every_tokens == 0 {
+            return;
+        }
+        self.unchecked_tokens
+            .fetch_add(tokens as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 回合边界：达到阈值就同步检查一次。
+    async fn maybe_security_review(&self, history: &Arc<Mutex<Vec<AgentMessage>>>) {
+        if self.config.security_review.is_none() || self.config.check_every_tokens == 0 {
+            return;
+        }
+        if self
+            .unchecked_tokens
+            .load(std::sync::atomic::Ordering::Relaxed)
+            < self.config.check_every_tokens
+        {
+            return;
+        }
+        let _guard = self.review_lock.lock().await;
+        // 拿到锁后重新确认：并发回合可能已经检查过。
+        if self
+            .unchecked_tokens
+            .load(std::sync::atomic::Ordering::Relaxed)
+            < self.config.check_every_tokens
+        {
+            return;
+        }
+        let snapshot = history.lock().await.clone();
+        self.run_security_review(&snapshot).await;
+    }
+
+    /// 用独立模型检查窗口；只写安全事件，不写 transcript。
+    async fn run_security_review(&self, history: &[AgentMessage]) {
+        let Some(checker) = &self.config.security_review else {
+            return;
+        };
+        let window = render_review_window(history, self.config.check_overlap_tokens);
+        match checker.review(&window).await {
+            Ok(outcome) => {
+                self.review_failures
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                self.unchecked_tokens
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                let findings = outcome.findings.join("; ");
+                let reason = format!(
+                    "security review: {} risk, complied={}{}",
+                    outcome.risk.as_str(),
+                    outcome.complied,
+                    if findings.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; {findings}")
+                    }
+                );
+                let score = match outcome.risk {
+                    crate::security::review::Risk::Low => 0.1,
+                    crate::security::review::Risk::Medium => 0.4,
+                    crate::security::review::Risk::High => 0.8,
+                    crate::security::review::Risk::Critical => 1.0,
+                };
+                let blocked = matches!(
+                    outcome.risk,
+                    crate::security::review::Risk::High | crate::security::review::Risk::Critical
+                ) && (outcome.complied
+                    || outcome.risk == crate::security::review::Risk::Critical);
+                self.gate
+                    .record_event(!blocked, score, "review", &reason);
+                match outcome.risk {
+                    crate::security::review::Risk::Low => debug!(%reason, "security review"),
+                    crate::security::review::Risk::Medium => {
+                        warn!(%reason, "security review raised medium risk")
+                    }
+                    crate::security::review::Risk::High if outcome.complied => {
+                        warn!(%reason, "security review: injection appears to have worked");
+                        self.gate.force_hold(&reason);
+                    }
+                    crate::security::review::Risk::High => {
+                        warn!(%reason, "security review raised high risk")
+                    }
+                    crate::security::review::Risk::Critical => {
+                        warn!(%reason, "security review paused the agent");
+                        self.gate.pause_agent(&reason);
+                    }
+                }
+            }
+            Err(error) => {
+                let failures = self
+                    .review_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                // 检查超时/失败按放行处理（设计 §5.9）；连续失败只告警。
+                self.unchecked_tokens
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                warn!(failures, %error, "security review failed; outbound stays allowed");
+            }
+        }
     }
 
     /// 控制通道输入：`sbot chat` 注入的一句话。
@@ -611,6 +732,14 @@ impl Runner {
 
     /// 注入一条上下文消息并跑一个回合（控制通道与 monitor 共用）。
     async fn run_injected(&self, origin: &str, message: AgentMessage) -> Result<LoopOutcome> {
+        if origin != "control" && self.gate.agent_paused() {
+            debug!(%origin, "agent is paused by the security review; skipping this event");
+            return Ok(LoopOutcome {
+                stop_reason: crate::agent::StopReason::Aborted,
+                usage: Default::default(),
+                turns: 0,
+            });
+        }
         let chat = ChatId::Private(self.config.owner_qq);
         let sessions = self.session_for(chat).await;
         let history = self.history_for(chat).await;
@@ -630,6 +759,7 @@ impl Runner {
             ..self.runtime_context(chat, &sessions)
         };
         let prompts = vec![AgentMessage::user(runtime.render())];
+        let prompt_tokens = crate::session::compaction::estimate_messages(&prompts);
 
         let evidence = if origin == "control" {
             TurnEvidence::owner(origin)
@@ -681,8 +811,12 @@ impl Runner {
                     .append(&turn_id, seq as u64, &scope, message)?;
             }
             self.turn_buffer.commit(&sessions, &turn_id).await?;
-            history.lock().await.extend(new_blocks);
+            history.lock().await.extend(new_blocks.clone());
         }
+        self.accumulate_review_tokens(
+            prompt_tokens + crate::session::compaction::estimate_messages(&new_blocks),
+        );
+        self.maybe_security_review(&history).await;
         Ok(outcome)
     }
 
@@ -727,6 +861,10 @@ impl Runner {
         }
         if self.estop_file.exists() {
             debug!(chat = %input.chat, "ESTOP is active; skipping this turn");
+            return Ok(());
+        }
+        if self.gate.agent_paused() {
+            debug!(chat = %input.chat, "agent is paused by the security review; skipping this turn");
             return Ok(());
         }
         let chat = input.chat;
@@ -783,6 +921,7 @@ impl Runner {
         }
 
         // 4) 运行循环。工具执行器带上本回合证据。
+        let prompt_tokens = crate::session::compaction::estimate_messages(&prompts);
         let slot = self.provider_snapshot();
         let evidence = self.evidence_for_batch(chat, &inbound_messages);
         let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {
@@ -841,9 +980,13 @@ impl Runner {
                     .append(&turn_id, seq as u64, &scope, message)?;
             }
             self.turn_buffer.commit(&sessions, &turn_id).await?;
-            let mut history = history.lock().await;
-            history.extend(new_blocks);
+            let mut shared = history.lock().await;
+            shared.extend(new_blocks.clone());
         }
+        self.accumulate_review_tokens(
+            prompt_tokens + crate::session::compaction::estimate_messages(&new_blocks),
+        );
+        self.maybe_security_review(&history).await;
 
         // 6) 已读标记（模拟真人；失败不影响回合结果）。
         if let Some(qq) = &self.qq {
@@ -961,6 +1104,21 @@ pub fn summarize(outcome: &LoopOutcome) -> String {
         outcome.turns,
         outcome.usage.input_tokens + outcome.usage.output_tokens
     )
+}
+
+/// 渲染周期检查窗口：从最新消息向前，直到字符预算。
+fn render_review_window(history: &[AgentMessage], overlap_tokens: u64) -> String {
+    let budget = 48_000usize.saturating_add((overlap_tokens as usize).saturating_mul(4));
+    let mut out = String::new();
+    for message in history.iter().rev() {
+        let rendered = crate::agent::agent_loop::render_message(message);
+        if out.len() + rendered.len() + 1 > budget {
+            break;
+        }
+        out.insert_str(0, &rendered);
+        out.insert(0, '\n');
+    }
+    out
 }
 
 /// `agent.*` 操作的运行时实现。
@@ -1360,6 +1518,10 @@ mod tests {
                 turn_context_budget: 120_000,
                 keep_recent_tokens: 20_000,
                 compaction_max_failures: 3,
+                security_review: None,
+                check_every_tokens: 0,
+                check_overlap_tokens: 0,
+                check_on_compaction: false,
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -1510,6 +1672,10 @@ mod tests {
                 turn_context_budget: 120_000,
                 keep_recent_tokens: 20_000,
                 compaction_max_failures: 3,
+                security_review: None,
+                check_every_tokens: 0,
+                check_overlap_tokens: 0,
+                check_on_compaction: false,
             },
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(AtomicBool::new(false)),
@@ -1638,6 +1804,10 @@ mod tests {
                 turn_context_budget: 120_000,
                 keep_recent_tokens: 5,
                 compaction_max_failures: 3,
+                security_review: None,
+                check_every_tokens: 0,
+                check_overlap_tokens: 0,
+                check_on_compaction: false,
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -1773,6 +1943,10 @@ mod tests {
                 turn_context_budget: 120_000,
                 keep_recent_tokens: 5,
                 compaction_max_failures: 3,
+                security_review: None,
+                check_every_tokens: 0,
+                check_overlap_tokens: 0,
+                check_on_compaction: false,
             },
             history,
             Arc::new(AtomicBool::new(true)),
@@ -1930,6 +2104,10 @@ mod tests {
                 turn_context_budget: 2,
                 keep_recent_tokens: 1,
                 compaction_max_failures: 3,
+                security_review: None,
+                check_every_tokens: 0,
+                check_overlap_tokens: 0,
+                check_on_compaction: false,
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -1967,5 +2145,174 @@ mod tests {
         // 摘要 + 保留的最近消息 + 本回合回复，旧的 6 条已被压缩掉。
         assert!(committed.len() <= 5, "unexpected history: {committed:?}");
         assert!(sessions.list().unwrap().len() >= 2);
+    }
+
+    struct FixedReview(crate::security::review::ReviewOutcome);
+
+    #[async_trait::async_trait]
+    impl crate::security::review::SecurityCheck for FixedReview {
+        async fn review(
+            &self,
+            _window: &str,
+        ) -> Result<crate::security::review::ReviewOutcome, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    async fn runner_with_review(
+        outcome: crate::security::review::ReviewOutcome,
+    ) -> (Arc<Runner>, Arc<Gate>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let key = Arc::new(MasterKey::from_bytes([11u8; 32]));
+        let vfs = Arc::new(
+            VfsStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                dir.path().join("data"),
+                Limits::default(),
+            )
+            .unwrap(),
+        );
+        let messages = Arc::new(
+            MessageStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                dir.path().join("data"),
+                0,
+                EncryptionMode::XChaCha20Poly1305,
+            )
+            .unwrap(),
+        );
+        let sessions = Arc::new(
+            SessionStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                dir.path().join("data"),
+                0,
+                EncryptionMode::XChaCha20Poly1305,
+            )
+            .unwrap(),
+        );
+        let turn_buffer = Arc::new(TurnBufferStore::new(
+            Arc::clone(&db),
+            Arc::clone(&key),
+            EncryptionMode::XChaCha20Poly1305,
+        ));
+        let gate = Arc::new(Gate::from_config(
+            &GuardConfig {
+                enabled: true,
+                mode: GuardMode::Shadow,
+                backend: GuardBackend::Off,
+                threshold: 0.9,
+                ..GuardConfig::default()
+            },
+            None,
+            Some(Arc::clone(&db)),
+            crate::security::gate::hold_path(dir.path()),
+        ));
+        let provider = Arc::new(FakeProvider {
+            script: StdMutex::new(vec![vec![
+                ProviderEvent::TextDelta("ok".to_owned()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    refusal: None,
+                },
+            ]]
+            .into()),
+        });
+        let tools = Arc::new(crate::tools::ToolRegistry::new(Arc::clone(&vfs), None));
+        let history = Arc::new(Mutex::new(Vec::new()));
+        let runner = Runner::new(
+            provider,
+            tools,
+            Arc::clone(&gate),
+            Arc::clone(&vfs),
+            Arc::clone(&messages),
+            Arc::clone(&sessions),
+            Arc::clone(&turn_buffer),
+            None,
+            RunnerConfig {
+                model: "fake".to_owned(),
+                mode: AgentMode::StandIn,
+                account_qq: 10000,
+                owner_qq: 10000,
+                master_qq: 10000,
+                owner_name: String::new(),
+                session_scope: "shared".to_owned(),
+                receive_scopes: vec!["*".to_owned()],
+                send_scopes: vec!["*".to_owned()],
+                gate_mode: GateMode::Auto,
+                max_tokens: 256,
+                thinking: ThinkingOptions::default(),
+                max_steps: 4,
+                retry: crate::agent::agent_loop::RetryPolicy::default(),
+                chat_history_limit: 10,
+                hooks: crate::config::HooksConfig::default().context,
+                server_tools: Vec::new(),
+                turn_context_budget: 120_000,
+                keep_recent_tokens: 20_000,
+                compaction_max_failures: 3,
+                security_review: Some(Arc::new(FixedReview(outcome))),
+                check_every_tokens: 1,
+                check_overlap_tokens: 0,
+                check_on_compaction: false,
+            },
+            Arc::clone(&history),
+            Arc::new(AtomicBool::new(true)),
+            dir.path().join("ESTOP"),
+        )
+        .await
+        .unwrap();
+        (runner, gate, dir)
+    }
+
+    async fn one_turn(runner: &Arc<Runner>, chat: ChatId) {
+        let incoming = inbound(chat, 1, "hello");
+        let (_tx, rx) = mpsc::unbounded_channel();
+        runner
+            .handle(
+                TurnInput {
+                    chat,
+                    messages: vec![incoming],
+                    dropped: 0,
+                },
+                rx,
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn high_risk_plus_compliance_enters_hold() {
+        let (runner, gate, _dir) = runner_with_review(crate::security::review::ReviewOutcome {
+            risk: crate::security::review::Risk::High,
+            complied: true,
+            categories: vec!["injection".to_owned()],
+            findings: vec!["followed a rule change".to_owned()],
+        })
+        .await;
+        one_turn(&runner, ChatId::Group(1)).await;
+        assert!(gate.hold_active());
+        assert!(!gate.agent_paused());
+    }
+
+    #[tokio::test]
+    async fn critical_risk_pauses_new_turns() {
+        let (runner, gate, _dir) = runner_with_review(crate::security::review::ReviewOutcome {
+            risk: crate::security::review::Risk::Critical,
+            complied: false,
+            categories: vec!["exfiltration".to_owned()],
+            findings: Vec::new(),
+        })
+        .await;
+        one_turn(&runner, ChatId::Group(1)).await;
+        assert!(gate.hold_active());
+        assert!(gate.agent_paused());
+
+        // 暂停后新的 QQ 回合被跳过；控制通道仍可工作（这里只验证 QQ 回合）。
+        let before = runner.history().lock().await.len();
+        one_turn(&runner, ChatId::Group(1)).await;
+        assert_eq!(runner.history().lock().await.len(), before);
     }
 }

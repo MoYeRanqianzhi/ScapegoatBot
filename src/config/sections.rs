@@ -1360,12 +1360,6 @@ impl GuardConfig {
                 "must be at least 50",
             ));
         }
-        if self.backend == GuardBackend::Llm {
-            errors.push(ConfigError::new(
-                "security.guard.backend",
-                "`llm` is not implemented yet; use `jev` (with base_url and auth.json key) or `off`",
-            ));
-        }
         if self.backend == GuardBackend::Jev && !self.base_url.is_empty() {
             let ok = self.base_url.starts_with("https://") || self.base_url.starts_with("http://");
             if !ok {

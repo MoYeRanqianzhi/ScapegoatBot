@@ -11,6 +11,7 @@
 pub mod action_gate;
 pub mod events;
 pub mod gate;
+pub mod review;
 
 pub use events::Checkpoint;
 pub use gate::{Gate, GateDecision, GateError, JevJudge, RuleJudge, SafetyJudge, Verdict};
