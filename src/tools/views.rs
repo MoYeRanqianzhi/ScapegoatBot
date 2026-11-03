@@ -164,28 +164,48 @@ impl Views {
 
     /// 读取一个动态文件；内容进入上下文即标记已读。
     pub async fn read(&self, target: &ParsedTarget) -> Result<ViewRead, VfsError> {
+        self.read_internal(target, true).await
+    }
+
+    /// 读取但不标记已读；`Grep` 与 `Stat` 用它。
+    ///
+    /// 工具描述承诺“只扫描的文件不算读过”；搜索时把候选文件整体读一遍
+    /// 不能悄悄把未读清空。
+    pub async fn peek(&self, target: &ParsedTarget) -> Result<ViewRead, VfsError> {
+        self.read_internal(target, false).await
+    }
+
+    async fn read_internal(
+        &self,
+        target: &ParsedTarget,
+        mark_read: bool,
+    ) -> Result<ViewRead, VfsError> {
         let path = &target.path;
         let filter = target.query.as_ref().and_then(|query| query.filter.clone());
         let limit = target.query.as_ref().map(|query| query.limit).unwrap_or(50);
 
         match path.segments() {
             [root] if root == "messages" => self.read_messages_digest(filter.as_deref(), limit),
-            [root] if root == "inbox" => self.read_inbox_root(filter.as_deref(), limit),
             [root] if root == "sessions" => self.read_sessions_digest(),
             [root, scope, peer, month, day] if root == "messages" && day.ends_with(".md") => {
                 let day = day.trim_end_matches(".md");
-                self.read_message_day(scope, peer, month, day, filter.as_deref(), limit)
+                self.read_message_day(scope, peer, month, day, filter.as_deref(), limit, mark_read)
             }
-            [root, chat] if root == "inbox" => self.read_inbox_chat(chat, filter.as_deref(), limit),
+            [root] if root == "inbox" => {
+                self.read_inbox_root(filter.as_deref(), limit, mark_read)
+            }
+            [root, chat] if root == "inbox" => {
+                self.read_inbox_chat(chat, filter.as_deref(), limit, mark_read)
+            }
             [root, chat, id] if root == "inbox" && id.ends_with(".md") => {
                 if id == "index.md" {
-                    self.read_inbox_chat(chat, filter.as_deref(), limit)
+                    self.read_inbox_chat(chat, filter.as_deref(), limit, mark_read)
                 } else {
                     let message_id: i64 = id
                         .trim_end_matches(".md")
                         .parse()
                         .map_err(|_| VfsError::NotFound(path.to_string()))?;
-                    self.read_inbox_message(chat, message_id)
+                    self.read_inbox_message(chat, message_id, mark_read)
                 }
             }
             [root, file] if root == "sessions" => {
@@ -227,7 +247,7 @@ impl Views {
             return Ok(found);
         }
         // 文件本身不在父目录的列举结果里时，构造一个条目。
-        match self.read(&target).await {
+        match self.peek(&target).await {
             Ok(ViewRead::Text(text)) => Ok(ViewEntry {
                 path: path.to_string(),
                 kind: "text",
@@ -350,7 +370,7 @@ impl Views {
                 path: path.clone(),
                 query: None,
             };
-            let Ok(ViewRead::Text(text)) = self.read(&target).await else {
+            let Ok(ViewRead::Text(text)) = self.peek(&target).await else {
                 continue;
             };
             for (line_no, line) in text.lines().enumerate() {
@@ -426,6 +446,7 @@ impl Views {
         Ok(ViewRead::Text(out))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read_message_day(
         &self,
         scope: &str,
@@ -434,6 +455,7 @@ impl Views {
         day: &str,
         filter: Option<&str>,
         limit: usize,
+        mark_read: bool,
     ) -> Result<ViewRead, VfsError> {
         let scope = normalize_scope(scope)?;
         let chat = chat_from(scope, peer)?;
@@ -449,8 +471,10 @@ impl Views {
             }
         }
         selected.truncate(limit);
-        let ids: Vec<i64> = selected.iter().map(|message| message.message_id).collect();
-        self.messages.mark_read(chat, &ids).map_err(storage)?;
+        if mark_read {
+            let ids: Vec<i64> = selected.iter().map(|message| message.message_id).collect();
+            self.messages.mark_read(chat, &ids).map_err(storage)?;
+        }
         Ok(ViewRead::Text(
             selected
                 .iter()
@@ -498,7 +522,12 @@ impl Views {
         Ok(entries)
     }
 
-    fn read_inbox_root(&self, filter: Option<&str>, limit: usize) -> Result<ViewRead, VfsError> {
+    fn read_inbox_root(
+        &self,
+        filter: Option<&str>,
+        limit: usize,
+        mark_read: bool,
+    ) -> Result<ViewRead, VfsError> {
         let mut out = String::from("# Inbox\n");
         let mut rendered = 0usize;
         for message in self.messages.unread(None).map_err(storage)? {
@@ -512,10 +541,12 @@ impl Views {
             }
             out.push_str(&format::render_inbound(&message));
             out.push_str("\n\n");
-            // 内容进入上下文即已读。
-            self.messages
-                .mark_read(message.chat, &[message.message_id])
-                .map_err(storage)?;
+            if mark_read {
+                // 内容进入上下文即已读。
+                self.messages
+                    .mark_read(message.chat, &[message.message_id])
+                    .map_err(storage)?;
+            }
             rendered += 1;
         }
         if rendered == 0 {
@@ -529,6 +560,7 @@ impl Views {
         chat: &str,
         filter: Option<&str>,
         limit: usize,
+        mark_read: bool,
     ) -> Result<ViewRead, VfsError> {
         let chat = parse_chat_segment(chat)?;
         let messages = self
@@ -553,20 +585,29 @@ impl Views {
         if selected.is_empty() {
             out.push_str("Nothing unread.\n");
         }
-        self.messages.mark_read(chat, &selected).map_err(storage)?;
+        if mark_read {
+            self.messages.mark_read(chat, &selected).map_err(storage)?;
+        }
         Ok(ViewRead::Text(out))
     }
 
-    fn read_inbox_message(&self, chat: &str, message_id: i64) -> Result<ViewRead, VfsError> {
+    fn read_inbox_message(
+        &self,
+        chat: &str,
+        message_id: i64,
+        mark_read: bool,
+    ) -> Result<ViewRead, VfsError> {
         let chat = parse_chat_segment(chat)?;
         let message = self
             .messages
             .load(chat, message_id)
             .map_err(storage)?
             .ok_or_else(|| VfsError::NotFound(format!("/inbox/{chat}/{message_id}.md")))?;
-        self.messages
-            .mark_read(chat, &[message_id])
-            .map_err(storage)?;
+        if mark_read {
+            self.messages
+                .mark_read(chat, &[message_id])
+                .map_err(storage)?;
+        }
         Ok(ViewRead::Text(format::render_inbound(&message)))
     }
 
@@ -1481,6 +1522,49 @@ mod tests {
             ..ViewContext::default()
         });
         (views, dir)
+    }
+
+    fn message(chat: crate::qq::event::ChatId, id: i64, text: &str) -> crate::qq::event::QqMessage {
+        crate::qq::event::QqMessage {
+            message_id: id,
+            chat,
+            sender: crate::qq::event::Sender {
+                qq: Some(10001),
+                nickname: "Alice".to_owned(),
+                card: String::new(),
+                role: "member".to_owned(),
+            },
+            time: chrono::Utc::now(),
+            segments: vec![crate::qq::event::Segment::Text {
+                text: text.to_owned(),
+            }],
+            reply_to: None,
+            is_self: false,
+            backfilled: false,
+            raw: serde_json::Value::Null,
+        }
+    }
+
+    #[tokio::test]
+    async fn searching_inbox_does_not_clear_unread() {
+        let (views, _dir) = views();
+        let chat = crate::qq::event::ChatId::Group(42);
+        views.messages.append(&message(chat, 1, "hello there")).unwrap();
+        assert_eq!(views.messages.unread_counts().unwrap(), vec![(chat, 1)]);
+
+        let regex = regex::Regex::new("zzz-no-match").unwrap();
+        let matches = views
+            .grep(&VfsPath::parse("/inbox").unwrap(), &regex, None)
+            .await
+            .unwrap();
+        assert!(matches.is_empty());
+        // 扫描不等于读过。
+        assert_eq!(views.messages.unread_counts().unwrap(), vec![(chat, 1)]);
+
+        // 真正的 Read 才标记已读。
+        let target = target("/inbox/group:42");
+        assert!(matches!(views.read(&target).await.unwrap(), ViewRead::Text(_)));
+        assert!(views.messages.unread_counts().unwrap().is_empty());
     }
 
     fn target(path: &str) -> ParsedTarget {

@@ -62,6 +62,8 @@ pub struct RunnerConfig {
     pub turn_context_budget: u32,
     /// 压缩后保留的最近 token 数。
     pub keep_recent_tokens: u32,
+    /// 连续自动压缩失败多少次后停止尝试（避免每个回合都打一次失败的摘要请求）。
+    pub compaction_max_failures: u32,
 }
 
 /// 当前生效的 provider 快照。
@@ -108,9 +110,12 @@ pub struct Runner {
     per_chat: bool,
     chat_sessions: Mutex<HashMap<String, Arc<SessionStore>>>,
     chat_histories: Mutex<HashMap<String, Arc<Mutex<Vec<AgentMessage>>>>>,
-    system: Vec<SystemBlock>,
+    /// 静态 + hooks 组成的 system 块；压缩成功后重建（`PostCompact` 语义）。
+    system: std::sync::RwLock<Vec<SystemBlock>>,
     /// 压缩互斥：同一时刻只允许一次。
     compaction_lock: Mutex<()>,
+    /// 连续自动压缩失败次数；达到上限后不再自动尝试。
+    compaction_failures: std::sync::atomic::AtomicU32,
 }
 
 impl Runner {
@@ -234,8 +239,9 @@ impl Runner {
             per_chat,
             chat_sessions: Mutex::new(HashMap::new()),
             chat_histories: Mutex::new(HashMap::new()),
-            system,
+            system: std::sync::RwLock::new(system),
             compaction_lock: Mutex::new(()),
+            compaction_failures: std::sync::atomic::AtomicU32::new(0),
         }))
     }
 
@@ -297,8 +303,69 @@ impl Runner {
     }
 
     /// 当前 system 块快照。
-    pub fn system(&self) -> &[SystemBlock] {
-        &self.system
+    pub fn system(&self) -> Vec<SystemBlock> {
+        self.system
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// 重新读取 hooks 并重建 system 块（压缩成功后调用）。
+    fn rebuild_system(&self) {
+        let mut system = vec![SystemBlock {
+            text: prompt::render_static(self.config.mode),
+            cache: true,
+        }];
+        for block in prompt::load_hooks(&self.vfs, &self.config.hooks).render() {
+            system.push(SystemBlock {
+                text: block,
+                cache: false,
+            });
+        }
+        *self
+            .system
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = system;
+    }
+
+    /// 自动压缩：超过工作集上限时压缩，并把 `working` 换成压缩后的历史。
+    ///
+    /// 两种回合（普通消息与控制/monitor 注入）共用，避免只在一边做压缩。
+    async fn maybe_auto_compact(
+        &self,
+        working: &mut Vec<AgentMessage>,
+        history: &Arc<Mutex<Vec<AgentMessage>>>,
+        sessions: &Arc<SessionStore>,
+    ) {
+        let estimated = crate::session::compaction::estimate_messages(working);
+        if estimated <= self.config.turn_context_budget as usize {
+            return;
+        }
+        let failures = self
+            .compaction_failures
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if self.config.compaction_max_failures > 0 && failures >= self.config.compaction_max_failures {
+            warn!(
+                failures,
+                "automatic compaction is disabled after repeated failures"
+            );
+            return;
+        }
+        match self
+            .compact_scope("auto", Arc::clone(history), Arc::clone(sessions))
+            .await
+        {
+            Ok(_) => {
+                self.compaction_failures
+                    .store(0, std::sync::atomic::Ordering::Relaxed);
+                *working = history.lock().await.clone();
+            }
+            Err(error) => {
+                self.compaction_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(%error, "automatic compaction failed");
+            }
+        }
     }
 
     /// 组装运行上下文。
@@ -436,6 +503,8 @@ impl Runner {
         sessions.append(&new_history)?;
         let kept_messages = new_history.len() - 1;
         *history.lock().await = new_history;
+        // PostCompact：hooks 可能依赖刚写入的记忆/技能，重新读盘并重建。
+        self.rebuild_system();
 
         Ok(serde_json::json!({
             "compacted": true,
@@ -508,6 +577,9 @@ impl Runner {
         sessions.append(&[message])?;
 
         let mut working = { history.lock().await.clone() };
+        // 控制/monitor 回合同样可能很长：以前没有压缩，长会话会一直涨到超窗。
+        self.maybe_auto_compact(&mut working, &history, &sessions)
+            .await;
         let base = working.len();
         let runtime = RuntimeContext {
             origin_chat: origin.to_owned(),
@@ -523,7 +595,7 @@ impl Runner {
             Arc::clone(&self.gate),
             LoopConfig {
                 model: slot.api_model.clone(),
-                system: self.system.clone(),
+                system: self.system(),
                 max_tokens: slot.max_tokens,
                 thinking: slot.thinking.clone(),
                 server_tools: self.config.server_tools.clone(),
@@ -635,17 +707,8 @@ impl Runner {
         };
 
         // 2.5) 超过工作集上限时先压缩，再重新载入历史副本。
-        let estimated = crate::session::compaction::estimate_messages(&working);
-        if estimated > self.config.turn_context_budget as usize {
-            if let Err(error) = self
-                .compact_scope("auto", Arc::clone(&history), Arc::clone(&sessions))
-                .await
-            {
-                warn!(%error, "automatic compaction failed");
-            } else {
-                working = history.lock().await.clone();
-            }
-        }
+        self.maybe_auto_compact(&mut working, &history, &sessions)
+            .await;
         // 压缩会改写 `working`，基点在压缩之后取：否则 `working[base..]` 既会越界，
         // 也会把保留的旧块重复提交。
         let base = working.len();
@@ -674,7 +737,7 @@ impl Runner {
             Arc::clone(&self.gate),
             LoopConfig {
                 model: slot.api_model.clone(),
-                system: self.system.clone(),
+                system: self.system(),
                 max_tokens: slot.max_tokens,
                 thinking: slot.thinking.clone(),
                 server_tools: self.config.server_tools.clone(),
@@ -760,6 +823,9 @@ impl crate::swarm::SubagentRunner for Runner {
     async fn run_subagent(&self, request: crate::swarm::SubagentRequest) -> Result<String> {
         let slot = self.provider_snapshot();
         let mut tools = self.tools.filtered(&request.tools);
+        if request.read_only {
+            tools = tools.read_only();
+        }
         // 嵌套 spawn：只有未到 max_depth 且 hub 已注入时，才给子代理 Agent 工具。
         if request.depth + 1 < request.max_depth
             && let Some(hub) = self.hub.get()
@@ -883,31 +949,46 @@ impl crate::tools::api::AgentOps for RuntimeOps {
         if !self.gate.hold_active() {
             return Ok(serde_json::json!({"hold": false, "note": "not on hold"}));
         }
-        let state = {
+        // 复核真实内容：最近一次被判危险的增量 + 当前历史尾部 + hold 原因。
+        // 旧实现只拿固定串 "resume request" 过闸，规则层看不到任何东西，
+        // 于是任何 hold 都能被一次调用清掉。
+        let mut judged = self.gate.flagged_content().unwrap_or_default();
+        {
             let history = self.history.lock().await;
-            history
-                .iter()
-                .rev()
-                .take(12)
-                .map(|message| format!("{message:?}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        let decision = self
-            .gate
-            .check(crate::security::Checkpoint::Input, &state, "resume request")
-            .await;
-        if decision.allowed {
-            self.gate
-                .clear_hold()
-                .map_err(|error| format!("cannot clear the hold file: {error}"))?;
-            Ok(serde_json::json!({"hold": false, "reason": decision.reason}))
-        } else {
-            Err(format!(
-                "The gate still blocks this context: {}",
-                decision.reason
-            ))
+            let mut tail = String::new();
+            for message in history.iter().rev() {
+                let rendered = format!("{message:?}");
+                if tail.len() + rendered.len() > 48_000 {
+                    break;
+                }
+                tail.insert_str(0, &rendered);
+                tail.insert(0, '\n');
+            }
+            judged.push_str(&tail);
         }
+        if judged.trim().is_empty() {
+            return Err(
+                "The gate has no judged content to re-check; the hold stays in place.".to_owned(),
+            );
+        }
+        let reason = self
+            .gate
+            .hold_reason()
+            .unwrap_or_else(|| "security hold".to_owned());
+        let verdict = self.gate.review(&reason, &judged).await;
+        if verdict.dangerous {
+            return Err(format!(
+                "The gate still blocks this context: {}",
+                verdict.reason
+            ));
+        }
+        self.gate
+            .clear_hold()
+            .map_err(|error| format!("cannot clear the hold file: {error}"))?;
+        Ok(serde_json::json!({
+            "hold": false,
+            "reason": verdict.reason,
+        }))
     }
 
     async fn quarantine(&self, params: &serde_json::Value) -> Result<serde_json::Value, String> {
@@ -1215,6 +1296,7 @@ mod tests {
                 server_tools: Vec::new(),
                 turn_context_budget: 120_000,
                 keep_recent_tokens: 20_000,
+                compaction_max_failures: 3,
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -1364,6 +1446,7 @@ mod tests {
                 server_tools: Vec::new(),
                 turn_context_budget: 120_000,
                 keep_recent_tokens: 20_000,
+                compaction_max_failures: 3,
             },
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(AtomicBool::new(false)),
@@ -1491,6 +1574,7 @@ mod tests {
                 server_tools: Vec::new(),
                 turn_context_budget: 120_000,
                 keep_recent_tokens: 5,
+                compaction_max_failures: 3,
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -1625,6 +1709,7 @@ mod tests {
                 server_tools: Vec::new(),
                 turn_context_budget: 120_000,
                 keep_recent_tokens: 5,
+                compaction_max_failures: 3,
             },
             history,
             Arc::new(AtomicBool::new(true)),
@@ -1781,6 +1866,7 @@ mod tests {
                 // 故意压到很小：任何真实上下文都会触发自动压缩。
                 turn_context_budget: 2,
                 keep_recent_tokens: 1,
+                compaction_max_failures: 3,
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),

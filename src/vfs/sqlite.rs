@@ -500,6 +500,22 @@ impl VfsStore {
         Ok((bytes, nodes))
     }
 
+    /// 子树占用的字节与节点数（含目录自身）。
+    fn subtree_usage(conn: &Connection, root_id: i64) -> Result<(u64, u64), VfsError> {
+        let (bytes, nodes): (u64, u64) = conn.query_row(
+            "WITH RECURSIVE sub(id, kind, size) AS (
+                 SELECT id, kind, size FROM vfs_nodes WHERE id = ?1
+                 UNION ALL
+                 SELECT n.id, n.kind, n.size FROM vfs_nodes n JOIN sub s ON n.parent_id = s.id
+             )
+             SELECT COALESCE(SUM(CASE WHEN kind != 'dir' THEN size ELSE 0 END), 0), COUNT(*)
+             FROM sub",
+            [root_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((bytes, nodes))
+    }
+
     /// 文本写入的核心逻辑，要求调用方已持有连接锁与事务。
     fn write_text_tx(
         &self,
@@ -1079,6 +1095,13 @@ impl Vfs for VfsStore {
         if self.lookup(&tx, to)?.is_some() {
             return Err(VfsError::AlreadyExists(to.to_string()));
         }
+        // 复制同样是写入：配额与磁盘水位必须先检查，否则反复复制大文件
+        // 可以绕过 `max_vfs_bytes` / 节点上限。
+        let (add_bytes, add_nodes) = Self::subtree_usage(&tx, source.id)?;
+        let (bytes, nodes) = self.active_usage(&tx)?;
+        self.quota.check_growth(bytes, nodes, add_bytes, add_nodes)?;
+        self.quota.check_disk(&self.storage)?;
+
         let target_parent = self.ensure_parent(&tx, to, &now())?;
         let target_name = to.file_name().expect("non-root path has a name");
         self.copy_node(&tx, &source, target_parent, target_name, to)?;
@@ -1086,6 +1109,7 @@ impl Vfs for VfsStore {
         tx.commit()?;
         Ok(())
     }
+
 
     fn usage(&self) -> Result<Usage, VfsError> {
         let conn = self.db.lock();
@@ -1616,6 +1640,24 @@ mod tests {
             store.read_blob_chunk(&path("/dst/b.bin"), 0).unwrap(),
             b"bytes"
         );
+    }
+
+    #[test]
+    fn copy_respects_the_total_byte_quota() {
+        let (store, _dir) = store_with(Limits {
+            max_total_bytes: 25,
+            min_free_bytes: 0,
+            ..Limits::default()
+        });
+        store.write_text(&path("/a.md"), "0123456789", None).unwrap();
+        // 10 + 10 = 20，仍在配额内。
+        store.copy(&path("/a.md"), &path("/b.md")).unwrap();
+        // 再复制 10 字节会超过 25。
+        assert!(matches!(
+            store.copy(&path("/a.md"), &path("/c.md")).unwrap_err(),
+            VfsError::QuotaExceeded { .. }
+        ));
+        assert!(store.stat(&path("/c.md")).is_err());
     }
 
     #[test]

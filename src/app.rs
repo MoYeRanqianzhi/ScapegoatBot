@@ -229,6 +229,19 @@ impl Runtime {
         if gate.hold_active() {
             warn!("starting while SECURITY_HOLD is active; outbound chat stays disabled");
         }
+        // enforce 但没有可用分类器时，闸会把每条消息都按住；启动时先讲清楚，
+        // 免得主人以为是 NapCat 或模型坏了。
+        if loaded.config.security.guard.enabled
+            && loaded.config.security.guard.mode == crate::config::GuardMode::Enforce
+            && !gate.classifier_available()
+            && loaded.config.security.guard.backend != crate::config::GuardBackend::Off
+        {
+            warn!(
+                "security.guard.mode = enforce but no classifier is configured: every new turn \
+                 will be held. Set security.guard.base_url plus auth.json security.guard.api_key, \
+                 or set security.guard.backend = \"off\" for rules-only enforce"
+            );
+        }
 
         let ai_enabled = Arc::new(AtomicBool::new(true));
         let qq = connect_qq(&loaded.config, &auth).await;
@@ -717,7 +730,8 @@ async fn build_agent(
     let sink = Arc::new(RunnerSink::default());
     let monitors = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
 
-    let mut tools = ToolRegistry::new(Arc::clone(&vfs), Some(Arc::clone(&views)));
+    let mut tools =
+        ToolRegistry::new(Arc::clone(&vfs), Some(Arc::clone(&views))).with_gate(Arc::clone(&gate));
     crate::tools::fs::register(&mut tools);
     tools.register(Arc::new(
         SkillTool::new(Arc::clone(&vfs)).with_db(Arc::clone(&db)),
@@ -865,7 +879,7 @@ async fn build_agent(
         .as_ref()
         .map(|client| Arc::clone(client) as Arc<dyn NapcatGateway>);
     tools.register(Arc::new(ApiTool::new(
-        gateway,
+        gateway.clone(),
         Some(ops.clone() as Arc<dyn AgentOps>),
         owner_qq,
         master_qq,
@@ -873,7 +887,21 @@ async fn build_agent(
         config.agent.send_scopes.clone(),
         Some(Arc::clone(&messages)),
     )));
-    let tools = Arc::new(tools);
+    // 子代理（docs、未开 allow_send 的自定义定义）拿到的是只读副本：
+    // 同一个工具名，但只允许 api.list / api.help。
+    let read_only_api = Arc::new(
+        ApiTool::new(
+            gateway,
+            Some(ops.clone() as Arc<dyn AgentOps>),
+            owner_qq,
+            master_qq,
+            Some(Arc::clone(&gate)),
+            Vec::new(),
+            Some(Arc::clone(&messages)),
+        )
+        .read_only(),
+    );
+    let tools = Arc::new(tools.with_read_only_api(read_only_api));
 
     let runner = Runner::new_with_fallbacks(
         provider,
@@ -912,6 +940,7 @@ async fn build_agent(
             server_tools,
             turn_context_budget: config.compaction.turn_context_budget,
             keep_recent_tokens: config.compaction.keep_recent_tokens,
+            compaction_max_failures: config.compaction.max_failures,
         },
         Arc::clone(&history),
         Arc::clone(&ai_enabled),
@@ -1099,13 +1128,17 @@ async fn handle_qq_event(
     _self_id: u64,
 ) {
     let event = crate::qq::event::normalize(name, data);
+    // 准入过滤必须在 monitor 之前：被拒消息既不应入库，也不应通过 monitor
+    // 进入上下文（否则过滤只剩“不写 JSONL”，挡不住注入）。
+    if let QqEvent::Message(message) = &event
+        && !agent.filter_and_count(message)
+    {
+        debug!(chat = %message.chat, "message rejected by the admission filter");
+        return;
+    }
     agent.monitors.on_qq_event(&event).await;
     match event {
         QqEvent::Message(message) => {
-            if !agent.filter_and_count(&message) {
-                debug!(chat = %message.chat, "message rejected by the admission filter");
-                return;
-            }
             match messages.append(&message) {
                 Ok(true) => {
                     if !message.is_self && !message.backfilled {

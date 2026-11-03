@@ -131,7 +131,20 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
                 report.warn(format!("auth: missing keys for {missing:?}"));
             }
             if auth.guard_key().is_none() && loaded.config.security.guard.enabled {
-                report.warn("auth: security.guard.api_key is missing; the guard runs rules only");
+                report.warn(
+                    "auth: security.guard.api_key is missing; the guard cannot classify content",
+                );
+            }
+            let guard = &loaded.config.security.guard;
+            if guard.enabled
+                && guard.mode == crate::config::GuardMode::Enforce
+                && guard.backend != crate::config::GuardBackend::Off
+                && (auth.guard_key().is_none() || guard.base_url.is_empty())
+            {
+                report.error(
+                    "security.guard.mode = enforce without a configured classifier: every turn \
+                     will be held (set base_url + api_key, or backend = \"off\")",
+                );
             }
         }
         Err(error) => report.error(format!("auth: {error}")),

@@ -82,7 +82,10 @@ impl Tool for DownloadTool {
         &[Permission::Network, Permission::Write]
     }
 
-    async fn execute(&self, _ctx: &ToolContext, args: Value) -> ToolResult {
+    async fn execute(&self, ctx: &ToolContext, args: Value) -> ToolResult {
+        if ctx.hold_active() {
+            return ToolResult::error("Disabled during hold");
+        }
         let raw_url = match arg_str(&args, "url") {
             Ok(url) => url,
             Err(error) => return error,

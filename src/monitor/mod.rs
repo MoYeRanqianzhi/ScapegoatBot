@@ -27,6 +27,11 @@ use tracing::{debug, warn};
 use crate::qq::event::QqEvent;
 use crate::qq::format;
 
+/// 单个 monitor 同时等待投递的任务上限。
+///
+/// `idle_only` 的任务最多等 10 分钟；事件洪泛时不能无限 spawn。
+const MAX_PENDING_DELIVERIES: usize = 8;
+
 /// 投递内容。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorDelivery {
@@ -168,6 +173,8 @@ struct Monitor {
     /// 是否已有 flush 任务在等待。
     flush_queued: AtomicBool,
     delivered: AtomicU64,
+    /// 已 spawn、尚未完成的投递任务数（含等待空闲的）。
+    pending_deliveries: std::sync::atomic::AtomicUsize,
     last_delivery: Mutex<Option<std::time::Instant>>,
     cancelled: AtomicBool,
     origin: &'static str,
@@ -230,6 +237,7 @@ impl MonitorManager {
                 batch: Mutex::new(Vec::new()),
                 flush_queued: AtomicBool::new(false),
                 delivered: AtomicU64::new(0),
+                pending_deliveries: std::sync::atomic::AtomicUsize::new(0),
                 last_delivery: Mutex::new(None),
                 cancelled: AtomicBool::new(false),
                 origin: "runtime",
@@ -348,17 +356,30 @@ impl MonitorManager {
     ///
     /// 投递在独立任务里执行，避免 `idle_only` 等待空闲时阻塞 QQ 事件处理。
     async fn enqueue(&self, monitor: &Arc<Monitor>, event: &MonitorEvent) {
+        if monitor.pending_deliveries.load(Ordering::SeqCst) >= MAX_PENDING_DELIVERIES {
+            debug!(
+                monitor = %monitor.name,
+                "too many pending deliveries; dropping this event"
+            );
+            return;
+        }
         if monitor.batch_window.is_zero() {
             // 无批处理且无需等空闲时直接投递，保持调用方看到同步结果。
             if !monitor.idle_only {
+                monitor.pending_deliveries.fetch_add(1, Ordering::SeqCst);
                 deliver_once(monitor, &*self.sink, Some(event), 1).await;
+                monitor
+                    .pending_deliveries
+                    .fetch_sub(1, Ordering::SeqCst);
                 return;
             }
             let monitor = Arc::clone(monitor);
             let sink = Arc::clone(&self.sink);
             let event = event.clone();
+            monitor.pending_deliveries.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 deliver_once(&monitor, &*sink, Some(&event), 1).await;
+                monitor.pending_deliveries.fetch_sub(1, Ordering::SeqCst);
             });
             return;
         }
@@ -373,11 +394,15 @@ impl MonitorManager {
         }
         let monitor = Arc::clone(monitor);
         let sink = Arc::clone(&self.sink);
+        monitor.pending_deliveries.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
             tokio::time::sleep(monitor.batch_window).await;
             let texts = std::mem::take(&mut *monitor.batch.lock().expect("monitor lock"));
             monitor.flush_queued.store(false, Ordering::SeqCst);
             if texts.is_empty() {
+                monitor
+                    .pending_deliveries
+                    .fetch_sub(1, Ordering::SeqCst);
                 return;
             }
             let event = MonitorEvent {
@@ -385,6 +410,9 @@ impl MonitorManager {
                 ..MonitorEvent::default()
             };
             deliver_once(&monitor, &*sink, Some(&event), texts.len() as u64).await;
+            monitor
+                .pending_deliveries
+                .fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
@@ -409,22 +437,6 @@ async fn deliver_once(
             as_prompt: false,
             text: format!(
                 "system: monitor {:?} expired and was disabled",
-                monitor.name
-            ),
-            system: true,
-        })
-        .await;
-        return;
-    }
-    if monitor.delivered.load(Ordering::Relaxed) >= monitor.max_events {
-        monitor.cancelled.store(true, Ordering::SeqCst);
-        sink.deliver(MonitorDelivery {
-            name: monitor.name.clone(),
-            source: monitor.source.clone(),
-            target: monitor.target.clone(),
-            as_prompt: false,
-            text: format!(
-                "system: monitor {:?} reached its event limit and was disabled",
                 monitor.name
             ),
             system: true,
@@ -473,7 +485,27 @@ async fn deliver_once(
             monitor.name, monitor.source
         ),
     };
-    monitor.delivered.fetch_add(1, Ordering::Relaxed);
+    let previous = monitor.delivered.fetch_add(1, Ordering::SeqCst);
+    if previous >= monitor.max_events {
+        // 回滚预留；并发的两个投递只有一个能拿到最后一个名额。
+        monitor.delivered.fetch_sub(1, Ordering::SeqCst);
+        if !monitor.cancelled.swap(true, Ordering::SeqCst) {
+            sink.deliver(MonitorDelivery {
+                name: monitor.name.clone(),
+                source: monitor.source.clone(),
+                target: monitor.target.clone(),
+                as_prompt: false,
+                text: format!(
+                    "system: monitor {:?} reached its event limit and was disabled",
+                    monitor.name
+                ),
+                system: true,
+            })
+            .await;
+        }
+        return;
+    }
+
     sink.deliver(MonitorDelivery {
         name: monitor.name.clone(),
         source: monitor.source.clone(),

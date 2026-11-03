@@ -130,6 +130,8 @@ pub struct SubagentRequest {
     pub depth: u32,
     /// 允许的最大深度。
     pub max_depth: u32,
+    /// 只读：`API` 只保留 `api.*` 查询（docs 与不可发送的自定义子代理）。
+    pub read_only: bool,
 }
 
 /// 子代理执行器；由 runtime 实现。
@@ -259,6 +261,8 @@ pub struct AgentInstance {
     /// 续聊时复用，避免自定义定义在第二轮丢失。
     system: String,
     tools: Vec<&'static str>,
+    /// 该实例的 `API` 是否是只读视图；续聊时保持一致。
+    read_only: bool,
     max_steps: u32,
     depth: u32,
     status: Mutex<InstanceStatus>,
@@ -376,7 +380,7 @@ impl AgentHub {
             );
         }
 
-        let (label, system, tools, max_steps) = if let Some(agent_name) = agent {
+        let (label, system, tools, max_steps, read_only) = if let Some(agent_name) = agent {
             let definitions = self.definitions().await;
             let definition = definitions
                 .iter()
@@ -404,6 +408,8 @@ impl AgentHub {
                 definition
                     .max_steps
                     .unwrap_or(self.config.default_max_steps),
+                // 自定义定义没开 allow_send 时，`tools = [API]` 也只能查询。
+                !definition.allow_send,
             )
         } else {
             let kind = kind
@@ -415,6 +421,7 @@ impl AgentHub {
                 system,
                 kind.tools(false),
                 self.config.default_max_steps,
+                matches!(kind, AgentType::Docs),
             )
         };
 
@@ -429,6 +436,7 @@ impl AgentHub {
             created_at: Utc::now(),
             system: system.clone(),
             tools: tools.clone(),
+            read_only,
             max_steps,
             depth,
             status: Mutex::new(InstanceStatus::Running),
@@ -448,6 +456,7 @@ impl AgentHub {
             max_steps,
             depth,
             max_depth: self.config.max_depth,
+            read_only,
         };
         let runner = Arc::clone(&self.runner);
         tokio::spawn(async move {
@@ -503,6 +512,7 @@ impl AgentHub {
             max_steps: instance.max_steps,
             depth: instance.depth,
             max_depth: self.config.max_depth,
+            read_only: instance.read_only,
         };
         let runner = Arc::clone(&self.runner);
         tokio::spawn(async move {

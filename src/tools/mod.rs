@@ -50,11 +50,28 @@ pub struct ToolContext {
     /// 动态视图（`/messages`、`/inbox`、`/sessions`、`/friends` 等）。
     /// 测试可以没有；真实运行时一定有。
     pub views: Option<Arc<views::Views>>,
+    /// 安全闸；`None` 只用于单元测试。
+    pub gate: Option<Arc<crate::security::gate::Gate>>,
 }
 
 impl ToolContext {
     pub fn new(vfs: Arc<VfsStore>, views: Option<Arc<views::Views>>) -> Self {
-        Self { vfs, views }
+        Self {
+            vfs,
+            views,
+            gate: None,
+        }
+    }
+
+    /// 注入安全闸；工具据此拒绝 hold 期间的外部访问。
+    pub fn with_gate(mut self, gate: Arc<crate::security::gate::Gate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// 当前是否处于 hold：对外工具一律拒绝，避免绕过 `napcat.*` 的限制。
+    pub fn hold_active(&self) -> bool {
+        self.gate.as_ref().is_some_and(|gate| gate.hold_active())
     }
 }
 
@@ -80,6 +97,10 @@ pub struct ToolRegistry {
     /// 执行上下文；`None` 只用于不依赖 VFS 的测试工具。
     vfs: Option<Arc<VfsStore>>,
     views: Option<Arc<views::Views>>,
+    /// 安全闸；`hold` 期间对外工具统一拒绝。
+    gate: Option<Arc<crate::security::gate::Gate>>,
+    /// 只读 `API` 的替身；docs 等子代理用。
+    read_only_api: Option<Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -94,7 +115,29 @@ impl ToolRegistry {
             tools: BTreeMap::new(),
             vfs: Some(vfs),
             views,
+            gate: None,
+            read_only_api: None,
         }
+    }
+
+    /// 提供只读 `API` 实例；`read_only()` 会用它替换完整版本。
+    pub fn with_read_only_api(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.read_only_api = Some(tool);
+        self
+    }
+
+    /// 把 `API` 换成只允许 `api.*` 的实例。
+    pub fn read_only(mut self) -> Self {
+        if let Some(api) = &self.read_only_api {
+            self.tools.insert("API", Arc::clone(api));
+        }
+        self
+    }
+
+    /// 注入安全闸；`hold` 期间 Download / Web* / MCP 会被拒绝。
+    pub fn with_gate(mut self, gate: Arc<crate::security::gate::Gate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     /// 注册一个工具；同名后注册者覆盖先注册者（用于测试替身）。
@@ -124,6 +167,8 @@ impl ToolRegistry {
             tools,
             vfs: self.vfs.clone(),
             views: self.views.clone(),
+            gate: self.gate.clone(),
+            read_only_api: self.read_only_api.clone(),
         }
     }
 
@@ -169,11 +214,9 @@ impl ToolExecutor for ToolRegistry {
         let Some(vfs) = self.vfs.clone() else {
             return ToolResult::error("Tool registry has no VFS context.");
         };
-        tool.execute(
-            &ToolContext::new(vfs, self.views.clone()),
-            call.arguments.clone(),
-        )
-        .await
+        let mut context = ToolContext::new(vfs, self.views.clone());
+        context.gate = self.gate.clone();
+        tool.execute(&context, call.arguments.clone()).await
     }
 }
 
