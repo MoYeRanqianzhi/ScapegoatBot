@@ -95,4 +95,4 @@
 
 ## 非代码资产
 
-旧 `prompt.md`（7,012 B）、`config.example.toml`（4,876 B）、`llm.example.toml`（6,058 B）已不再作为 0.2 的输入：提示词改为 `assets/system_prompt_v4.template.txt`，配置 schema 以 `src/config/mod.rs` 与 README 为准。旧的示例文件保留在仓库中仅供历史对照，不参与构建。
+旧 `prompt.md`（7,012 B）、`llm.example.toml`（6,058 B）已不再作为 0.2 的输入：提示词改为 `assets/system_prompt_v4.template.txt`，配置 schema 以 `src/config/sections.rs` 与 `docs/guide/configuration.md` 为准。两份旧资产已移到 `docs/archive/0.1/` 仅供历史对照；根目录的 `config.example.toml` 是 0.2 的可运行样例。

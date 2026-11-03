@@ -1,124 +1,214 @@
-# ScapegoatBot 配置文件
+# ScapegoatBot 0.2 配置示例
+#
+# 严格 schema：未知字段会让启动失败；`version` 必须为 1。
+# 完整说明见 docs/guide/configuration.md。
+# 本文件由 tests/config_example.rs 校验：改坏了会让测试失败。
+
+version = 1
+
+# 模型清单与凭据；相对路径按本文件所在目录解析。
+models_file = "~/.sbot/models.json"
+auth_file = "~/.sbot/auth.json"
+
+[ipc]
+# Windows 命名管道名 / Unix socket 文件名；CLI 与进程必须一致。
+name = "scapegoat-bot"
+
+[agent]
+name = "ScapegoatBot"
+# stand_in：使用主人自己的 QQ；companion：使用另一个账号。
+mode = "stand_in"
+# stand_in 留 0 表示用登录账号；companion 必须填且不能等于登录账号。
+owner_qq = 0
+owner_name = ""
+# 主模型与白名单，形式为 provider/id。
+model = "anthropic/claude-opus-5-5"
+available_models = [
+    "anthropic/claude-opus-5-5",
+    "anthropic/claude-haiku-5-5",
+]
+fallback_models = []
+# 与 models.json 的 thinking_levels 校验。
+thinking_level = "high"
+max_output_tokens = 8192
+max_steps = 48
+# owner 通知目标：self 或 QQ 号。
+master = "self"
+# 允许读/发的 chat：group:<gid> / private:<qq> / *；空 = 禁止。
+receive_scopes = ["*"]
+send_scopes = ["*"]
+retry_attempts = 3
+retry_base_ms = 400
+retry_max_ms = 8000
+# 摘要模型；当前版本未使用（摘要走主模型）。
+compaction_model = ""
 
 [napcat]
-# NapCat WebSocket 服务器地址
-ws_url = "ws://127.0.0.1:3001"
-# 认证 Token（与 NapCat 端配置一致，可选）
-# token = "your_token_here"
+# OneBot 11 WebSocket 地址；access token 放 auth.json。
+url = "ws://127.0.0.1:3001"
 
-[whitelist]
-# 可接收消息的群号列表
-recv_groups = []
-# 可接收消息的私聊 QQ 号列表
-recv_privates = []
-# 可发送消息的群号列表（必须是 recv_groups 的子集）
-send_groups = []
-# 可发送消息的私聊 QQ 号列表（必须是 recv_privates 的子集）
-send_privates = []
+[filter]
+# 准入是“拒收”：命中的消息不写 JSONL、不进 inbox、不进 transcript。
+ignore_groups = []
+ignore_users = []
+ignore_patterns = []
+# 群里只有 @ 自己或回复自己时才接收。
+require_mention = false
+
+[session]
+# shared：整个 QQ 号一条 transcript；per_chat：每个 chat 独立。
+scope = "shared"
+
+[queue]
+# steer：回合中到达的消息立即注入；followup / collect 留到下一回合。
+mode = "steer"
+max_concurrent = 4
+cap_messages = 200
+cap_batches = 20
+# summarize / old / new
+drop = "summarize"
+debounce_ms = 3000
 
 [storage]
-# 工作区根目录
-workspace_dir = "./workspace"
-# 单个文件的最大消息条数（超过自动拆分新文件）
-max_messages_per_file = 500
+# 相对配置文件目录；默认即 ~/.sbot/data。
+path = "./data"
+encryption = "xchacha20poly1305"
+max_blob_bytes = 536870912
+max_vfs_bytes = 10737418240
+max_message_bytes = 10737418240
+max_session_bytes = 2147483648
+# 0 = 只按配额清理。
+message_retention_days = 0
+session_retention_days = 0
 
-[identity]
-# 主人账号：填写 QQ 号或 "self"（使用当前登录账号）
-# master = "self"
-# 额外注入的身份文件（相对于 workspace_dir 的路径）
-# extra_files = ["custom/NOTES.md"]
+[tools]
+max_result_bytes = 262144
+max_schema_tokens = 8000
 
-[llm]
-# LLM 模型配置文件路径（相对于 config.toml 所在目录）
-# 该文件定义所有可用的 LLM 模型（包括主代理和子代理使用的模型）
-# 参见 llm.example.toml 了解完整配置格式
-config_file = "llm.toml"
-# 主代理使用的模型名称
-# 必须对应 llm.toml 中某个 [[models]] 的 name 字段
-# 子代理通过 SpawnAgent 的 model 参数引用 llm.toml 中的其他模型
-primary_model = "main"
+[tools.web_search]
+# auto / server / tool；Chat 协议只能用 tool。
+backend = "auto"
+# tool 后端必须配置；key 放 auth.json 的 tools.web_search.api_key。
+base_url = ""
+count = 5
 
-[compaction]
-# 是否启用上下文压缩（当对话过长时自动将历史压缩为摘要）
+[tools.web_fetch]
+backend = "auto"
+base_url = ""
+max_content_tokens = 8000
+
+[tools.download]
+max_bytes = 536870912
+allowed_domains = []
+blocked_domains = []
+
+[mcp]
+# 可选；默认关闭。每个服务器是一个 [[mcp.servers]] 段。
+enabled = false
+
+# [[mcp.servers]]
+# name = "echo"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-everything"]
+# env = { FOO = "bar" }
+# enabled = true
+
+[memory]
 enabled = true
-# 触发压缩的近似总 token 数阈值
-# 包括：系统提示 + 已有摘要 + 对话消息 + 工具定义
-trigger_tokens = 180000
-# 保留为最近后缀的近似 token 预算（这些最新消息保持原样不被压缩）
-keep_recent_tokens = 8000
-# 为摘要生成响应预留的最大 token 数
-reserve_summary_tokens = 4096
-# 拒绝压缩的最少消息数（过少的对话无需压缩）
-min_messages_to_compact = 8
+max_entry_chars = 4000
+max_index_lines = 200
+max_index_bytes = 25000
+user_max_chars = 4000
+# off / idle / every_turn
+review = "idle"
+idle_minutes = 10
+review_interval_minutes = 60
+review_model = ""
+topics = true
 
 [skills]
-# 要扫描的 skill 目录路径列表（支持 ~ 展开为用户主目录）
-# 目录不存在时自动跳过
-# dirs = ["~/my-skills", "/shared/skills"]
+shared_dir = "~/.sbot/skills"
+curator = true
+curator_interval_hours = 168
+curator_min_new_skills = 2
 
-[control]
-# 控制通道端口（CLI 通过此端口与守护进程通信）
-port = 19800
+[style]
+enabled = true
+profile_path = "/STYLE.md"
+max_chars = 2000
+sample_retention_days = 30
 
-# ============================================================================
-# MCP 服务器配置（可选）
-# ============================================================================
-# 通过 MCP (Model Context Protocol) 接入外部工具服务器
-# 每个服务器作为子进程启动，通过 stdin/stdout JSON-RPC 通信
-# 工具命名格式：mcp.<服务器名>.<工具名>
-#
-# 示例：接入 Anthropic 官方文件系统 MCP 服务器
-# [mcp.filesystem]
-# command = "npx"
-# args = ["-y", "@anthropic/mcp-filesystem", "/home/user/docs"]
-# env = {}
-# enabled = true        # 是否启用（默认 true）
-# tool_timeout_secs = 30 # 工具调用超时（默认 30 秒）
-#
-# 示例：接入 GitHub MCP 服务器
-# [mcp.github]
-# command = "npx"
-# args = ["-y", "@anthropic/mcp-github"]
-# env = { "GITHUB_TOKEN" = "ghp_xxx" }
+[swarm]
+enabled = true
+max_depth = 8
+max_concurrency = 16
+agents_dir = "~/.sbot/agents"
+default_max_steps = 32
 
-# ============================================================================
-# Fetch 工具配置（可选）
-# ============================================================================
-# 启用后 Agent 可以获取网页内容（HTML 自动转换为 Markdown）
-# 默认禁用，需要显式启用以允许 Agent 访问网络
-# 内置 SSRF 防护：自动拦截对内网地址的访问
-
-[fetch]
-# 是否启用 Fetch 工具（默认 false）
+# 长期常驻的 monitor；运行时也能用 Monitor 工具增删（重启即消失）。
+[[monitor]]
+name = "at-me"
 enabled = false
-# 域名过滤模式：
-#   "whitelist" — 仅允许访问 domains 列表中的域名
-#   "blacklist" — 禁止访问 domains 列表中的域名（默认）
-# mode = "blacklist"
-# 域名列表（配合 mode 使用）
-# domains = ["evil.com", "malware.site"]
-# HTTP 请求超时（秒）
-# timeout_secs = 30
-# 最大响应体大小（字节，默认 512 KB）
-# max_response_bytes = 524288
-# 最大输出字符数（默认 50000）
-# max_output_chars = 50000
-# 自定义 User-Agent（可选）
-# user_agent = "Mozilla/5.0 (compatible; ScapegoatBot/0.2)"
+source = { qq = true }
+when = "event.type == 'message' and event.mentions_self"
+deliver = { to = "main", as = "event", batch_window_ms = 200 }
+lifecycle = { idle_only = false, max_events = 1000, expires = "0" }
 
-# ============================================================================
-# 蜂群子代理配置（可选）
-# ============================================================================
-# Agent 可以通过 SpawnAgent 工具生成子代理来并行处理任务
-# 每个子代理运行在独立的 tokio 任务上，拥有独立的 LLM 会话
-# 子代理可以调用所有工具，也可以嵌套生成子代理
+[security]
+# 周期检查字段已解析但当前版本未实现。
+check_every_tokens = 262144
+check_on_compaction = true
+check_overlap_tokens = 4096
+review_model = ""
+check_timeout_secs = 60
 
-# [swarm]
-# 是否启用蜂群子代理功能（默认 true）
+[security.guard]
+enabled = true
+# shadow 只记录；enforce 命中即 hold。启用 enforce 前先配好分类器。
+mode = "shadow"
+# jev / off；llm 未实现。
+backend = "jev"
+model = ""
+# Jev 端点；enforce 下必须非空，否则每个回合都会被 hold。
+base_url = ""
+threshold = 0.9
+timeout_ms = 800
+max_state_tokens = 8000
+delta_every_tokens = 200
+
+[budget]
+daily_tokens = 2000000
+daily_usd = 10.0
+turn_tokens = 150000
+chat_sends_per_hour = 60
+chat_turns_per_hour = 120
+round_trip_wall_secs = 600
+guard_usd_per_day = 0.20
+
+[gate]
+# 当前版本只解析，逐动作审批与频率限制尚未实现。
+mode = "auto"
+max_per_minute = 20
+llm_review = false
+
+[compaction]
+reserve_tokens = 16384
+turn_context_budget = 120000
+keep_recent_tokens = 20000
+max_failures = 3
+# 以下字段已解析但当前版本未生效。
+memory_flush = true
+post_compact_recall = true
+prune = true
+prune_soft_limit = 4000
+prune_keep_turns = 3
+
+# 默认已注入 /AGENTS.md、/USER.md、/MEMORY.md、/STYLE.md；需要自定义时取消注释。
+# [[hooks.context]]
+# name = "soul"
+# path = "/SOUL.md"
+# kind = "owner"
+# when = ["SessionStart", "PostCompact"]
+# inject = "system"
+# max_bytes = 32768
 # enabled = true
-# 最大嵌套深度（默认 32）— 子代理可以递归 spawn 子代理的最深层数
-# max_depth = 32
-# 最大并发子代理数（默认 1024）— 所有层级的子代理总数上限
-# tokio 绿色线程极其轻量，1024 并发仅占用约 50MB 内存
-# max_concurrency = 1024
-
