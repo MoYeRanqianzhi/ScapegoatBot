@@ -70,19 +70,39 @@ fn is_cjk(ch: char) -> bool {
     )
 }
 
-/// 估算一组消息。
+/// 一组消息的 token 估算。
+///
+/// 优先使用最近一次 assistant 响应里的真实 `usage` 作为前缀基准，只估算它之后
+/// 的尾部；没有 usage 时才逐条估算。图片按 Claude Code 的保守值 2000 tokens/张
+/// 计入尾部（DeepSeek 等供应商的图片计费以 API 返回的 usage 为准）。
 pub fn estimate_messages(messages: &[AgentMessage]) -> usize {
-    messages
+    let usage_base = messages
         .iter()
-        .map(|message| estimate_tokens(&render_message(message)))
-        .sum::<usize>()
-        + messages
-            .iter()
-            .filter_map(|message| match message {
-                AgentMessage::Tool(result) => Some(result.images.len() * 2000),
-                _ => None,
-            })
-            .sum::<usize>()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            let AgentMessage::Assistant(assistant) = message else {
+                return None;
+            };
+            let usage = &assistant.usage;
+            let tokens = usage.input_tokens
+                + usage.output_tokens
+                + usage.cache_read_tokens
+                + usage.cache_write_tokens;
+            (tokens > 0).then_some((index, tokens as usize))
+        });
+    let start = usage_base.map(|(index, _)| index + 1).unwrap_or(0);
+    let tail = messages[start..]
+        .iter()
+        .map(|message| {
+            estimate_tokens(&render_message(message))
+                + match message {
+                    AgentMessage::Tool(result) => result.images.len() * 2000,
+                    _ => 0,
+                }
+        })
+        .sum::<usize>();
+    usage_base.map(|(_, tokens)| tokens).unwrap_or(0) + tail
 }
 
 /// 切分：返回 `(要摘要的旧消息, 要保留的最近消息)`。
@@ -308,5 +328,33 @@ mod tests {
         let rendered = render_for_summary(&history, 600);
         assert!(rendered.len() <= 900);
         assert!(rendered.contains("older messages omitted"));
+    }
+
+    #[test]
+    fn estimate_uses_actual_usage_and_charges_images() {
+        let assistant = AgentMessage::Assistant(crate::agent::message::AssistantMessage {
+            content: vec![crate::agent::message::AssistantBlock::Text {
+                text: "ok".to_owned(),
+            }],
+            stop_reason: crate::agent::StopReason::EndTurn,
+            usage: crate::agent::message::Usage {
+                input_tokens: 10_000,
+                output_tokens: 200,
+                ..Default::default()
+            },
+            refusal: None,
+        });
+        let image = AgentMessage::Tool(crate::agent::message::ToolResultMessage {
+            tool_call_id: "t".to_owned(),
+            tool_name: "Read".to_owned(),
+            content: "image".to_owned(),
+            is_error: false,
+            images: vec![crate::agent::message::ImageAttachment {
+                mime: "image/png".to_owned(),
+                data_base64: "AA==".to_owned(),
+            }],
+        });
+        let estimate = estimate_messages(&[assistant, image]);
+        assert!(estimate >= 12_200, "estimate was {estimate}");
     }
 }
