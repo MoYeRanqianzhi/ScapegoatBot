@@ -157,10 +157,128 @@ mod tests {
     }
 
     #[test]
+    fn fire_collects_block_and_inject() {
+        let block = hook(HookAction::Block, "", "");
+        let mut inject = hook(HookAction::InjectContext, "", "");
+        inject.event = HookEvent::MessageReceived;
+        inject.text = "remember the rules".to_owned();
+        let mut block = block;
+        block.event = HookEvent::MessageReceived;
+        let outcome = fire(
+            &[block, inject],
+            HookEvent::MessageReceived,
+            Some(ChatId::Group(1)),
+            Some("hi"),
+            None,
+        );
+        assert_eq!(outcome.blocked.as_deref(), Some("nope"));
+        assert_eq!(outcome.injected, vec!["remember the rules"]);
+        assert!(
+            injected(
+                &[hook(HookAction::InjectContext, "", "")],
+                HookEvent::SessionStart
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn match_filters_by_group() {
         let mut params = json!({"group_id": 2, "message": "hello"});
         let mut filtered = hook(HookAction::Block, "", "");
         filtered.match_.group_id = Some(1);
         before_send(&[filtered], ChatId::Group(2), &mut params).unwrap();
     }
+}
+
+/// 除 BeforeSend 之外的事件 hook 结果。
+#[derive(Debug, Default)]
+pub struct HookOutcome {
+    pub blocked: Option<String>,
+    pub injected: Vec<String>,
+    pub notify: Vec<String>,
+}
+
+/// 触发一个事件 hook；`chat` 用于匹配群/私聊条件。
+///
+/// 这里只做与内容无关的动作：`log`、`block`、`inject_context`、`notify`。
+/// `rewrite` 只对 BeforeSend 有定义，其他事件忽略。
+pub fn fire(
+    hooks: &[EventHookConfig],
+    event: HookEvent,
+    chat: Option<ChatId>,
+    text: Option<&str>,
+    tool: Option<&str>,
+) -> HookOutcome {
+    let mut outcome = HookOutcome::default();
+    for hook in hooks
+        .iter()
+        .filter(|hook| hook.enabled && hook.event == event)
+    {
+        if let Some(chat) = chat
+            && !matches(
+                hook,
+                chat,
+                if chat.is_group() { "group" } else { "private" },
+            )
+        {
+            continue;
+        }
+        if hook.match_.group_id.is_some() && chat.is_none() {
+            continue;
+        }
+        if hook.match_.user_id.is_some() && chat.is_none() {
+            continue;
+        }
+        if let Some(name) = &hook.match_.tool_name
+            && tool != Some(name.as_str())
+        {
+            continue;
+        }
+        match hook.action {
+            HookAction::Log => {
+                info!(event = ?event, chat = ?chat, "event hook matched");
+            }
+            HookAction::Block => {
+                if outcome.blocked.is_none() {
+                    outcome.blocked = Some(if hook.reason.trim().is_empty() {
+                        format!("blocked by a {event:?} hook")
+                    } else {
+                        hook.reason.clone()
+                    });
+                }
+            }
+            HookAction::InjectContext => {
+                if !hook.text.trim().is_empty() {
+                    outcome.injected.push(hook.text.clone());
+                } else if !hook.path.trim().is_empty() {
+                    // path 需要 VFS，调用方在能读盘时自行处理；这里只记录。
+                    warn!(path = %hook.path, "inject_context hook path requires the caller");
+                }
+            }
+            HookAction::Notify => {
+                outcome.notify.push(if hook.notify_channel.is_empty() {
+                    "owner".to_owned()
+                } else {
+                    hook.notify_channel.clone()
+                });
+            }
+            HookAction::Rewrite => {}
+        }
+    }
+    let _ = text;
+    outcome
+}
+
+/// 读取某个事件配置的注入文本（用于 system prompt 重建）。
+pub fn injected(hooks: &[EventHookConfig], event: HookEvent) -> Vec<String> {
+    hooks
+        .iter()
+        .filter(|hook| {
+            hook.enabled && hook.event == event && hook.action == HookAction::InjectContext
+        })
+        .map(|hook| hook.text.trim())
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+        .collect()
 }

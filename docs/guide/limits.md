@@ -7,11 +7,7 @@
 
 | 配置 | 现状 | 影响 |
 |------|------|------|
-| `[security.guard].max_state_tokens` / `delta_every_tokens` | 预留 | 闸使用固定窗口 |
-| `[style].sample_retention_days` | 未实现 | 原始样本不按天数清理 |
-| `models.json` 的 `default_thinking_level` | 未实现 | effort 必须显式配置 |
 | `[agent].compaction_model` | 仅在非空时用于摘要 | 空 = 主模型（默认） |
-| `[hooks.events]` 的 BeforeSend 之外 | 未接线 | SessionStart/End、Pre/PostCompact、Stop 等事件不会触发 hook |
 
 ## 安全边界
 
@@ -42,8 +38,11 @@
   单回合 token/墙钟是硬停；每 chat 小时限额只统计成功发送；`guard_usd_per_day` 是
   估算值（Jev 固定单次成本，LLM 按约 3k 输入 + 100 输出估算），耗尽后分类器降级为
   规则层，规则仍生效。
-- **`[hooks.events]` 目前只接线 `BeforeSend`**：`log`/`block`/`rewrite` 生效，
-  `inject_context`/`notify` 对该阶段无定义而忽略；其他事件尚未触发。
+- **`[hooks.events]` 的边界**：所有事件都会触发 `log`/`block`/`inject_context`/`notify`，
+  但 `rewrite` 只在 BeforeSend 生效；`block` 只在 MessageReceived 能阻止内容进入上下文；
+  `inject_context` 只被 SessionStart（system）、MessageReceived（回合内提示）、
+  Pre/PostCompact（摘要输入/新分段）消费；SessionEnd/Stop/ConfigChange 的注入没有去处。
+  `notify` 只支持 `owner`/`master`，且需要 NapCat 已连接。
 - **`[tools].max_schema_tokens`**：超限时把过长描述压到 160 字符；若仅 schema 就超限，
   只告警、不删工具。
 - **monitor 的 `cc` / `on_missing`**：`cc` 在绑定子代理时抄送主代理；`on_missing`

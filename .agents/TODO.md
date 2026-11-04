@@ -10,18 +10,11 @@
 - [ ] `auto` 门禁的内容级规则：跨 chat 5-gram 重叠、媒体 `origin_chat` 校验、
       `context_sources` 追踪（设计 §5.6 / §5.8）。当前只有频率/重复/跨群/@all 启发式。
 - [ ] 周期检查复用主请求的逐字节前缀缓存（设计 §5.9）：当前是独立窗口。
-- [ ] 评估 `[security.guard].max_state_tokens` / `delta_every_tokens`：实现窗口控制，
-      或从配置 schema 删除，避免继续作为无效配置存在。
-- [ ] 评估 `[style].sample_retention_days` 与 `models.json.default_thinking_level`：
-      实现或删除。
 
 ## 配置与能力边界
 
-- [ ] `[hooks.events]` 只接线了 BeforeSend；SessionStart/End、Pre/PostCompact、
-      Stop、MessageReceived、ConfigChange 仍未触发。
-- [ ] `[security.guard].max_state_tokens` / `delta_every_tokens`：实现窗口控制或删除。
-- [ ] `[style].sample_retention_days`、`models.json.default_thinking_level`：实现或删除。
-- [ ] `get_msg` 现在会反查 chat；跨本地不存在的消息仍只能保守拒绝（可接受）。
+- [ ] `[hooks.events]` 的 rewrite 只在 BeforeSend；SessionEnd/Stop/ConfigChange
+      的 inject_context 没有落点。
 
 ## 运行与数据
 

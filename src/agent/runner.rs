@@ -92,6 +92,10 @@ pub struct RunnerConfig {
     pub last_activity: Arc<std::sync::atomic::AtomicI64>,
     /// 运行预算；`None` = 不限制（测试/旧路径）。
     pub budget: Option<Arc<crate::budget::Budget>>,
+    /// 输入/输出闸的 state 截断长度（字符），来自 `guard.max_state_tokens`。
+    pub max_state_chars: usize,
+    /// `[hooks.events]`；BeforeSend 在 API 里执行，其余事件由 Runner 触发。
+    pub event_hooks: Vec<crate::config::EventHookConfig>,
 }
 
 /// 摘要用的独立 provider 与模型 id。
@@ -347,7 +351,7 @@ impl Runner {
             thinking: config.thinking.clone(),
         }));
 
-        Ok(Arc::new(Self {
+        let runner = Arc::new(Self {
             slot,
             fallbacks,
             hub: std::sync::OnceLock::new(),
@@ -370,7 +374,11 @@ impl Runner {
             unchecked_tokens: std::sync::atomic::AtomicU64::new(0),
             review_failures: std::sync::atomic::AtomicU32::new(0),
             review_lock: Mutex::new(()),
-        }))
+        });
+        let _ = runner
+            .fire_hooks(crate::config::HookEvent::SessionStart, None, None)
+            .await;
+        Ok(runner)
     }
 
     /// 共享历史句柄（`agent.*` 操作使用）。
@@ -424,6 +432,38 @@ impl Runner {
     }
 
     /// 重新读取 hooks 并重建 system 块（压缩成功后调用）。
+    /// 触发一个非 BeforeSend 事件；log/block/inject 由调用方处理，notify 直接私聊主人。
+    async fn fire_hooks(
+        &self,
+        event: crate::config::HookEvent,
+        chat: Option<ChatId>,
+        text: Option<&str>,
+    ) -> crate::agent::hooks::HookOutcome {
+        let outcome = crate::agent::hooks::fire(&self.config.event_hooks, event, chat, text, None);
+        for channel in &outcome.notify {
+            if !matches!(channel.as_str(), "owner" | "master") || self.config.master_qq == 0 {
+                continue;
+            }
+            let Some(qq) = &self.qq else {
+                continue;
+            };
+            let body = format!(
+                "[hook {event:?}] {}",
+                text.unwrap_or("no detail")
+                    .chars()
+                    .take(500)
+                    .collect::<String>()
+            );
+            if let Err(error) = qq
+                .send_text(ChatId::Private(self.config.master_qq), &body, None)
+                .await
+            {
+                warn!(%error, ?event, "cannot deliver a hook notification");
+            }
+        }
+        outcome
+    }
+
     fn rebuild_system(&self) {
         let mut system = vec![SystemBlock {
             text: prompt::render_static(self.config.mode),
@@ -434,6 +474,12 @@ impl Runner {
                 text: block,
                 cache: false,
             });
+        }
+        for text in crate::agent::hooks::injected(
+            &self.config.event_hooks,
+            crate::config::HookEvent::SessionStart,
+        ) {
+            system.push(SystemBlock { text, cache: false });
         }
         *self
             .system
@@ -534,6 +580,9 @@ impl Runner {
 
     /// 清空上下文：shared 轮转唯一链；per_chat 轮转所有已打开的链。
     pub async fn clear_all_context(&self) -> Result<serde_json::Value> {
+        let _ = self
+            .fire_hooks(crate::config::HookEvent::SessionEnd, None, None)
+            .await;
         if !self.scopes.per_chat {
             let current = self.sessions.current()?;
             let next = self.sessions.rotate()?;
@@ -590,13 +639,32 @@ impl Runner {
         if self.config.check_on_compaction {
             self.run_security_review(&snapshot).await;
         }
+        let _ = self
+            .fire_hooks(crate::config::HookEvent::PreCompact, None, Some(reason))
+            .await;
         // 压缩前把 durable facts 静默写进记忆，避免摘要把它们吞掉。
         if let Some(flusher) = &self.config.memory_flush
             && let Err(error) = flusher.flush(&snapshot).await
         {
             warn!(%error, "memory flush before compaction failed");
         }
-        let input = crate::session::compaction::render_for_summary(&old, 80_000);
+        let mut input = crate::session::compaction::render_for_summary(&old, 80_000);
+        let pre_compact = crate::agent::hooks::injected(
+            &self.config.event_hooks,
+            crate::config::HookEvent::PreCompact,
+        );
+        if !pre_compact.is_empty() {
+            input.push_str(
+                "
+
+[hook context]
+",
+            );
+            input.push_str(&pre_compact.join(
+                "
+",
+            ));
+        }
         let previous = sessions.current()?;
         // 摘要可以用独立模型；默认仍是主 provider。
         let (provider, model) = match &self.config.compaction {
@@ -624,6 +692,17 @@ impl Runner {
             .map_err(|error| anyhow::anyhow!("cannot record the compaction checkpoint: {error}"))?;
         let mut new_history = vec![summary_message];
         new_history.extend(keep);
+        for text in crate::agent::hooks::injected(
+            &self.config.event_hooks,
+            crate::config::HookEvent::PostCompact,
+        ) {
+            new_history.push(AgentMessage::System {
+                text: format!(
+                    "[hook context | PostCompact]
+{text}"
+                ),
+            });
+        }
         // PostCompact recall：把记忆索引作为新分段的第一条上下文，避免压缩后
         // 新回合在 system prompt 重建前“失忆”。只读、不标记已读。
         if self.config.post_compact_recall
@@ -649,6 +728,13 @@ impl Runner {
         *history.lock().await = new_history;
         // PostCompact：hooks 可能依赖刚写入的记忆/技能，重新读盘并重建。
         self.rebuild_system();
+        let _ = self
+            .fire_hooks(
+                crate::config::HookEvent::PostCompact,
+                None,
+                Some(&next.file),
+            )
+            .await;
 
         Ok(serde_json::json!({
             "compacted": true,
@@ -895,7 +981,7 @@ impl Runner {
                 server_tools: self.config.server_tools.clone(),
                 max_steps: self.config.max_steps,
                 retry: self.config.retry,
-                max_state_chars: 32_000,
+                max_state_chars: self.config.max_state_chars,
                 prune: self.config.prune,
                 prune_soft_limit: self.config.prune_soft_limit as usize,
                 prune_keep_turns: self.config.prune_keep_turns,
@@ -1007,8 +1093,21 @@ impl Runner {
 
         // 1) 入站消息立即进入 transcript 与共享历史。
         let mut inbound = Vec::with_capacity(input.messages.len());
+        let mut hook_context = Vec::new();
         for message in &input.messages {
             let text = format::render_inbound(message);
+            let hook = self
+                .fire_hooks(
+                    crate::config::HookEvent::MessageReceived,
+                    Some(chat),
+                    Some(&text),
+                )
+                .await;
+            hook_context.extend(hook.injected);
+            if let Some(reason) = hook.blocked {
+                warn!(chat = %chat, %reason, "MessageReceived hook dropped this message");
+                continue;
+            }
             let agent_message = AgentMessage::user(text);
             inbound.push(agent_message.clone());
             sessions.append(&[agent_message])?;
@@ -1100,7 +1199,7 @@ impl Runner {
                 server_tools: self.config.server_tools.clone(),
                 max_steps: self.config.max_steps,
                 retry: self.config.retry,
-                max_state_chars: 32_000,
+                max_state_chars: self.config.max_state_chars,
                 prune: self.config.prune,
                 prune_soft_limit: self.config.prune_soft_limit as usize,
                 prune_keep_turns: self.config.prune_keep_turns,
@@ -1149,6 +1248,13 @@ impl Runner {
                 .record_usage(outcome.usage.input_tokens, outcome.usage.output_tokens)
                 .await;
         }
+        let _ = self
+            .fire_hooks(
+                crate::config::HookEvent::Stop,
+                Some(chat),
+                Some(&format!("turn finished: {:?}", outcome.stop_reason)),
+            )
+            .await;
 
         // 5) 提交新块：buffer -> transcript -> 共享历史。
         let new_blocks: Vec<AgentMessage> = working[base..].to_vec();
@@ -1240,7 +1346,7 @@ impl crate::swarm::SubagentRunner for Runner {
                 server_tools: Vec::new(),
                 max_steps: request.max_steps,
                 retry: self.config.retry,
-                max_state_chars: 32_000,
+                max_state_chars: self.config.max_state_chars,
                 prune: self.config.prune,
                 prune_soft_limit: self.config.prune_soft_limit as usize,
                 prune_keep_turns: self.config.prune_keep_turns,
@@ -1726,6 +1832,8 @@ mod tests {
                 compaction: None,
                 last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 budget: None,
+                max_state_chars: 32_000,
+                event_hooks: Vec::new(),
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -1890,6 +1998,8 @@ mod tests {
                 compaction: None,
                 last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 budget: None,
+                max_state_chars: 32_000,
+                event_hooks: Vec::new(),
             },
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(AtomicBool::new(false)),
@@ -2032,6 +2142,8 @@ mod tests {
                 compaction: None,
                 last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 budget: None,
+                max_state_chars: 32_000,
+                event_hooks: Vec::new(),
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -2181,6 +2293,8 @@ mod tests {
                 compaction: None,
                 last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 budget: None,
+                max_state_chars: 32_000,
+                event_hooks: Vec::new(),
             },
             history,
             Arc::new(AtomicBool::new(true)),
@@ -2352,6 +2466,8 @@ mod tests {
                 compaction: None,
                 last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 budget: None,
+                max_state_chars: 32_000,
+                event_hooks: Vec::new(),
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -2516,6 +2632,8 @@ mod tests {
                 compaction: None,
                 last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 budget: None,
+                max_state_chars: 32_000,
+                event_hooks: Vec::new(),
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),

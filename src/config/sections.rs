@@ -844,7 +844,6 @@ pub struct StyleConfig {
     pub enabled: bool,
     pub profile_path: String,
     pub max_chars: u32,
-    pub sample_retention_days: u32,
 }
 
 impl Default for StyleConfig {
@@ -853,7 +852,6 @@ impl Default for StyleConfig {
             enabled: true,
             profile_path: "/STYLE.md".to_owned(),
             max_chars: 2_000,
-            sample_retention_days: 30,
         }
     }
 }
@@ -1315,7 +1313,6 @@ pub struct GuardConfig {
     pub threshold: f64,
     pub timeout_ms: u64,
     pub max_state_tokens: u32,
-    pub delta_every_tokens: u32,
 }
 
 impl Default for GuardConfig {
@@ -1329,7 +1326,6 @@ impl Default for GuardConfig {
             threshold: 0.9,
             timeout_ms: 800,
             max_state_tokens: 8_000,
-            delta_every_tokens: 200,
         }
     }
 }
@@ -1352,12 +1348,6 @@ impl GuardConfig {
             errors.push(ConfigError::new(
                 "security.guard.max_state_tokens",
                 "must be between 1000 and 20000",
-            ));
-        }
-        if self.delta_every_tokens < 50 {
-            errors.push(ConfigError::new(
-                "security.guard.delta_every_tokens",
-                "must be at least 50",
             ));
         }
         if self.backend == GuardBackend::Jev && !self.base_url.is_empty() {

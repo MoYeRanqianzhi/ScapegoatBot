@@ -1060,8 +1060,8 @@ async fn build_agent(
         .collect();
     let thinking = ThinkingOptions {
         enabled: model_ref.model.reasoning,
-        effort: if model_ref.model.reasoning && !config.agent.thinking_level.is_empty() {
-            Some(config.agent.thinking_level.clone())
+        effort: if model_ref.model.reasoning {
+            thinking_effort(&config.agent.thinking_level, model_ref.model)
         } else {
             None
         },
@@ -1196,6 +1196,7 @@ async fn build_agent(
             }
         }
     };
+    let hook_qq = qq.clone();
     let runner = Runner::new_with_fallbacks(
         provider,
         fallbacks,
@@ -1248,6 +1249,8 @@ async fn build_agent(
             compaction,
             last_activity: Arc::clone(&last_activity),
             budget: Some(Arc::clone(&budget)),
+            max_state_chars: config.security.guard.max_state_tokens as usize * 4,
+            event_hooks: config.hooks.events.clone(),
         },
         Arc::clone(&history),
         Arc::clone(&ai_enabled),
@@ -1316,6 +1319,36 @@ async fn build_agent(
                 MessageFilter::from_config(&config.filter);
             agent.queue.reload_config(config.queue.clone());
             info!("filter and queue settings reloaded from /config");
+        }
+        let outcome = crate::agent::hooks::fire(
+            &config.hooks.events,
+            crate::config::HookEvent::ConfigChange,
+            None,
+            None,
+            None,
+        );
+        if let Some(reason) = outcome.blocked {
+            warn!(%reason, "ConfigChange hook requested a block");
+        }
+        if let Some(client) = &hook_qq {
+            for channel in outcome.notify {
+                if !matches!(channel.as_str(), "owner" | "master") || master_qq == 0 {
+                    continue;
+                }
+                let client = Arc::clone(client);
+                tokio::spawn(async move {
+                    if let Err(error) = client
+                        .send_text(
+                            crate::qq::event::ChatId::Private(master_qq),
+                            "[hook ConfigChange] configuration reloaded",
+                            None,
+                        )
+                        .await
+                    {
+                        warn!(%error, "cannot deliver a ConfigChange hook notification");
+                    }
+                });
+            }
         }
     }));
 
@@ -1573,6 +1606,17 @@ fn security_reviewer(
     )))
 }
 
+/// 显式配置优先；否则用模型声明的默认 effort；都没有则关闭 thinking。
+fn thinking_effort(configured: &str, model: &crate::config::models::ModelDef) -> Option<String> {
+    if !configured.is_empty() {
+        Some(configured.to_owned())
+    } else if !model.default_thinking_level.is_empty() {
+        Some(model.default_thinking_level.clone())
+    } else {
+        None
+    }
+}
+
 fn load_models(paths: &SbotPaths, loaded: &LoadedConfig) -> Result<ModelsFile> {
     let mut models =
         ModelsFile::parse(EMBEDDED_MODELS).context("embedded models.default.json is invalid")?;
@@ -1707,4 +1751,22 @@ async fn terminate_signal() {
 #[cfg(not(unix))]
 async fn terminate_signal() {
     std::future::pending::<()>().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_effort_prefers_explicit_then_model_default() {
+        let mut model = crate::config::models::ModelDef {
+            reasoning: true,
+            ..crate::config::models::ModelDef::default()
+        };
+        model.default_thinking_level = "high".to_owned();
+        assert_eq!(thinking_effort("", &model), Some("high".to_owned()));
+        assert_eq!(thinking_effort("low", &model), Some("low".to_owned()));
+        model.default_thinking_level.clear();
+        assert_eq!(thinking_effort("", &model), None);
+    }
 }
