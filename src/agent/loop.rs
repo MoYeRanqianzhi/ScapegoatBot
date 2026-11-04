@@ -1008,6 +1008,12 @@ pub(crate) fn prune_tool_results(
         return;
     }
     for message in history.iter_mut().take(boundary) {
+        if let AgentMessage::User { images, .. } = message
+            && !images.is_empty()
+        {
+            images.clear();
+            continue;
+        }
         if let AgentMessage::Tool(result) = message {
             if !result.images.is_empty() {
                 result.images.clear();

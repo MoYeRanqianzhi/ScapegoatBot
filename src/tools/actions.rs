@@ -539,7 +539,7 @@ pub fn specs() -> &'static [ActionSpec] {
             ),
             (
                 "media.image_resize",
-                "Resize an image into the VFS, preserving aspect ratio.",
+                "Resize an image into the VFS to exactly width x height.",
                 json!({"path": {"type": "string"}, "out": {"type": "string"}, "width": {"type": "number"}, "height": {"type": "number"}}),
                 r#"{"path":"/tmp/a.jpg","out":"/tmp/a-small.jpg","width":640,"height":640}"#,
             ),

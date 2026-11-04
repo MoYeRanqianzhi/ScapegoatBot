@@ -574,7 +574,7 @@ impl SessionStore {
                 sealed.extend_from_slice(&nonce);
                 sealed.extend_from_slice(&ct);
                 let mut plain = None;
-                for candidate in std::iter::once(line_no).chain(1..=65536) {
+                for candidate in std::iter::once(line_no).chain(1..=4096) {
                     let aad = format!("session:{file_id}:{candidate}");
                     if let Ok(value) = self.key.open("session", aad.as_bytes(), &sealed) {
                         plain = Some(value);
