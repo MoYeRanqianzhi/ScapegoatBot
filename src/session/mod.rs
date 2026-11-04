@@ -440,23 +440,31 @@ impl SessionStore {
             escaped
         });
         let prefix = prefix.unwrap_or_default();
-        let file = format!(
-            "{prefix}{}-{}.jsonl",
-            started_at.format("%Y%m%dT%H%M%SZ"),
-            std::process::id() % 1000
-        );
-        let file_id = new_file_id();
-        let path = self.root.join("sessions").join(&file);
-        if path.exists() {
-            // 同一秒内多次创建时追加随机后缀，保持字典序。
-            let file = format!(
-                "{prefix}{}-{}.jsonl",
-                started_at.format("%Y%m%dT%H%M%SZ"),
+        // `create_new` 是原子占位；冲突时换随机后缀重试，避免 exists()+create 的 TOCTOU。
+        for attempt in 0..4 {
+            let file_id = new_file_id();
+            let suffix = if attempt == 0 {
+                (std::process::id() % 1000).to_string()
+            } else {
                 hex::encode(&file_id.as_bytes()[file_id.len().saturating_sub(4)..])
+            };
+            let file = format!(
+                "{prefix}{}-{suffix}.jsonl",
+                started_at.format("%Y%m%dT%H%M%SZ")
             );
-            return self.create_named(file, file_id, prev_file, started_at);
+            match self.create_named(file, file_id, prev_file, started_at) {
+                Ok(info) => return Ok(info),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        self.create_named(file, file_id, prev_file, started_at)
+        anyhow::bail!("cannot allocate a unique transcript file")
     }
 
     fn create_named(
@@ -478,7 +486,10 @@ impl SessionStore {
                 EncryptionMode::None => "none",
             },
         });
-        let mut handle = std::fs::File::create(&path)
+        let mut handle = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
             .with_context(|| format!("cannot create {}", path.display()))?;
         handle.write_all(format!("{header}\n").as_bytes())?;
         handle.flush()?;
@@ -550,8 +561,19 @@ impl SessionStore {
                 let mut sealed = Vec::with_capacity(nonce.len() + ct.len());
                 sealed.extend_from_slice(&nonce);
                 sealed.extend_from_slice(&ct);
-                let aad = format!("session:{file_id}:{line_no}");
-                self.key.open("session", aad.as_bytes(), &sealed)?
+                let mut plain = None;
+                for candidate in std::iter::once(line_no).chain(1..=4096) {
+                    let aad = format!("session:{file_id}:{candidate}");
+                    if let Ok(value) = self.key.open("session", aad.as_bytes(), &sealed) {
+                        plain = Some(value);
+                        break;
+                    }
+                }
+                plain.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "cannot decrypt transcript line {line_no} (tried physical and shifted line numbers)"
+                    )
+                })?
             }
             EncryptionMode::None => ct,
         };

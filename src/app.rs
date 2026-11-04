@@ -125,6 +125,12 @@ impl MonitorSink for RunnerSink {
             }
             return;
         }
+        if let Some(message) = delivery.message.clone()
+            && let Some(queue) = self.queue.get()
+        {
+            queue.ingest(message).await;
+            return;
+        }
         let Some(runner) = self.runner.get() else {
             warn!(monitor = %delivery.name, "monitor delivered before the runner was ready");
             return;

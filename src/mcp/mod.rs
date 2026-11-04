@@ -229,7 +229,11 @@ impl McpClient {
     }
 
     /// 调用一个工具；返回文本内容。
-    pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<(String, bool)> {
+    pub async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<(String, bool, Vec<crate::agent::message::ImageAttachment>)> {
         let result = self
             .request("tools/call", json!({"name": name, "arguments": arguments}))
             .await?;
@@ -238,6 +242,7 @@ impl McpClient {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let mut out = String::new();
+        let mut images = Vec::new();
         if let Some(content) = result.get("content").and_then(Value::as_array) {
             for block in content {
                 match block.get("type").and_then(Value::as_str) {
@@ -247,6 +252,18 @@ impl McpClient {
                                 out.push('\n');
                             }
                             out.push_str(text);
+                        }
+                    }
+                    Some("image") => {
+                        if let Some(data) = block.get("data").and_then(Value::as_str) {
+                            let mime = block
+                                .get("mimeType")
+                                .and_then(Value::as_str)
+                                .unwrap_or("image/png");
+                            images.push(crate::agent::message::ImageAttachment {
+                                mime: mime.to_owned(),
+                                data_base64: data.to_owned(),
+                            });
                         }
                     }
                     Some(kind) => {
@@ -271,7 +288,7 @@ impl McpClient {
             out.truncate(cut);
             out.push_str("\n[result truncated: MCP output exceeded the limit]");
         }
-        Ok((out, is_error))
+        Ok((out, is_error, images))
     }
 }
 
@@ -378,9 +395,9 @@ impl McpManager {
         server: Option<&str>,
         tool: Option<&str>,
         args: Value,
-    ) -> Result<(String, bool)> {
+    ) -> Result<(String, bool, Vec<crate::agent::message::ImageAttachment>)> {
         let (Some(server), Some(tool)) = (server, tool) else {
-            return Ok((self.list().await.to_string(), false));
+            return Ok((self.list().await.to_string(), false, Vec::new()));
         };
         let client = self
             .clients
@@ -439,8 +456,11 @@ impl Tool for McpTool {
         let tool = args.get("tool").and_then(Value::as_str);
         let arguments = args.get("args").cloned().unwrap_or_else(|| json!({}));
         match self.manager.call(server, tool, arguments).await {
-            Ok((text, true)) => ToolResult::error(text),
-            Ok((text, false)) => ToolResult::ok(text),
+            Ok((text, true, _)) => ToolResult::error(text),
+            Ok((text, false, images)) if !images.is_empty() => {
+                ToolResult::with_images(text, images)
+            }
+            Ok((text, false, _)) => ToolResult::ok(text),
             Err(error) => ToolResult::error(error.to_string()),
         }
     }
@@ -513,7 +533,7 @@ mod tests {
         client.tools = client.list_tools().await.unwrap();
         assert_eq!(client.tools().len(), 1);
         assert_eq!(client.tools()[0].name, "echo");
-        let (text, is_error) = client
+        let (text, is_error, _) = client
             .call_tool("echo", json!({"text": "hi"}))
             .await
             .unwrap();

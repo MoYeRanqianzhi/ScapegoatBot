@@ -550,6 +550,24 @@ pub fn specs() -> &'static [ActionSpec] {
                 r#"{"path":"/tmp/a.jpg","out":"/tmp/face.jpg","x":100,"y":50,"width":512,"height":512}"#,
             ),
             (
+                "media.image_rotate",
+                "Rotate an image clockwise by 90/180/270 degrees.",
+                json!({"path": {"type": "string"}, "out": {"type": "string"}, "degrees": {"type": "number"}}),
+                r#"{"path":"/tmp/a.jpg","out":"/tmp/a-rot.jpg","degrees":90}"#,
+            ),
+            (
+                "media.image_thumbnail",
+                "Fit an image inside max_width x max_height, preserving aspect ratio.",
+                json!({"path": {"type": "string"}, "out": {"type": "string"}, "max_width": {"type": "number"}, "max_height": {"type": "number"}}),
+                r#"{"path":"/tmp/a.jpg","out":"/tmp/thumb.jpg","max_width":512,"max_height":512}"#,
+            ),
+            (
+                "media.image_compress",
+                "Re-encode an image as JPEG with a quality value (1-100).",
+                json!({"path": {"type": "string"}, "out": {"type": "string"}, "quality": {"type": "number"}}),
+                r#"{"path":"/tmp/a.png","out":"/tmp/a.jpg","quality":80}"#,
+            ),
+            (
                 "media.image_convert",
                 "Convert an image (png/jpeg/webp) into the VFS.",
                 json!({"path": {"type": "string"}, "out": {"type": "string"}}),

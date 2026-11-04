@@ -53,7 +53,7 @@ impl RetryPolicy {
     /// - provider 返回 `Retry-After` 时优先，但仍受 `max_ms` 限制。
     pub fn delay_ms(&self, attempt: u32, retry_after_ms: Option<u64>) -> u64 {
         if let Some(delay) = retry_after_ms {
-            return delay.min(self.max_ms);
+            return delay;
         }
         match self.mode {
             crate::config::RetryMode::Fixed => self.base_ms.min(self.max_ms),
@@ -709,14 +709,14 @@ impl AgentLoop {
                 match serde_json::from_str(&call.arguments) {
                     Ok(value) => value,
                     Err(error) => {
-                        // 参数被截断/不是合法 JSON：以空对象落库，随后工具会
-                        // 报参数缺失；`Value::Null` 会让部分 provider 直接 400。
+                        // 参数被截断/不是合法 JSON：用 Null 标记，execute_one 会
+                        // 返回错误而不是拿空对象误执行一个有副作用的工具。
                         warn!(
                             tool = %call.name,
                             %error,
-                            "tool arguments are not valid JSON; using an empty object"
+                            "tool arguments are not valid JSON; refusing to execute"
                         );
-                        Value::Object(Default::default())
+                        Value::Null
                     }
                 }
             };
@@ -1676,8 +1676,8 @@ mod tests {
         assert_eq!(stepped.delay_ms(2, None), 800);
         assert_eq!(stepped.delay_ms(3, None), 1_600);
         assert_eq!(stepped.delay_ms(4, None), 2_000);
-        // Retry-After 优先，但受 max 截断。
-        assert_eq!(stepped.delay_ms(1, Some(5_000)), 2_000);
+        // Retry-After 优先，且不截断。
+        assert_eq!(stepped.delay_ms(1, Some(5_000)), 5_000);
 
         let fixed = RetryPolicy {
             mode: crate::config::RetryMode::Fixed,

@@ -443,7 +443,21 @@ async fn pump(response: reqwest::Response, tx: mpsc::Sender<ProviderEvent>) {
     let mut state = StreamState::default();
     let sender = Arc::new(tx);
 
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let chunk =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), stream.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(_) => {
+                    let _ = sender
+                        .send(ProviderEvent::Error(ProviderError::new(
+                            super::ProviderErrorKind::Network,
+                            "stream idle timeout (30s)",
+                        )))
+                        .await;
+                    return;
+                }
+            };
         let bytes = match chunk {
             Ok(bytes) => bytes,
             Err(error) => {
