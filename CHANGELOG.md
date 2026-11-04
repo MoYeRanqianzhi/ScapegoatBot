@@ -5,6 +5,36 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.16] - 2026-11-04
+
+把上一轮列出的“配置写了但不生效”补齐。数据库无新迁移。
+
+### 新增
+
+- **`[budget]` 真正执行**：每日 token/USD 在回合开始检查，超限跳过新回合（消息已入库）；
+  `turn_tokens` / `round_trip_wall_secs` 在循环内硬停；`chat_sends_per_hour` 只统计
+  成功发送；`chat_turns_per_hour` 限制每 chat 新回合；`guard_usd_per_day` 用估算成本，
+  耗尽后分类器降级为规则层（规则仍生效）。
+- **`[hooks.events]` 的 BeforeSend**：`log`、`block`、`rewrite` 接线到 API 发送路径，
+  支持 `group_id` / `user_id` / `message_type` 匹配与 `scope = model|all`。
+- **`[tools].max_schema_tokens`**：超限时把过长描述压到 160 字符；仅 schema 超限则
+  告警而不删工具。
+- **monitor `cc` / `on_missing`**：绑定子代理的投递可抄送主代理；目标缺失时按
+  `drop` / `queue`（最多 60 秒）/ `spawn`（新建 general 子代理）处理。
+- **`get_msg` 的读范围**：通过消息索引反查 chat，查不到且在限制读取时保守拒绝。
+
+### 文档
+
+- `limits.md` 只保留仍存在的边界：BeforeSend 之外的事件 hook、`max_state_tokens`、
+  周期检查缓存、WebFetch 后端抓取、approve 的 IPC-only 确认等。
+
+### 测试
+
+- 新增：预算累计/USD/guard 降级、每 chat 发送上限、BeforeSend block/rewrite/匹配、
+  schema 预算、monitor cc、get_msg 范围。
+- `cargo test --all-targets`：327 项通过（2 项真实 API 测试默认忽略）；
+  `cargo fmt --check`、`clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.15] - 2026-11-04
 
 第二轮审查：修掉 alpha.14 新代码里的边界问题，并把两个“配置写了但不生效”的

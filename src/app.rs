@@ -87,8 +87,39 @@ impl MonitorSink for RunnerSink {
                 warn!(monitor = %delivery.name, target, "subagent monitor delivered before the hub was ready");
                 return;
             };
-            if let Err(error) = hub.deliver_to(target, delivery.text).await {
-                warn!(%error, monitor = %delivery.name, target, "subagent monitor delivery failed");
+            match delivery.on_missing {
+                crate::config::OnMissing::Drop => {
+                    if hub.deliver_to(target, delivery.text.clone()).await.is_err() {
+                        warn!(monitor = %delivery.name, target, "subagent monitor target is missing; dropped");
+                    }
+                }
+                crate::config::OnMissing::Queue => {
+                    for _ in 0..30 {
+                        if hub.deliver_to(target, delivery.text.clone()).await.is_ok() {
+                            return;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    warn!(monitor = %delivery.name, target, "subagent monitor target never appeared; dropped");
+                }
+                crate::config::OnMissing::Spawn => {
+                    if let Err(error) = hub
+                        .spawn(
+                            Some("general"),
+                            None,
+                            format!(
+                                "[monitor {}]
+{}",
+                                delivery.name, delivery.text
+                            ),
+                            0,
+                            crate::agent::TurnEvidence::monitor(),
+                        )
+                        .await
+                    {
+                        warn!(%error, monitor = %delivery.name, "cannot spawn a target for the monitor");
+                    }
+                }
             }
             return;
         }
@@ -739,6 +770,7 @@ struct ToolAssembly<'a> {
     master_qq: u64,
     provider: Arc<dyn crate::providers::Provider>,
     api_model: String,
+    chat_sends_per_hour: u32,
 }
 
 /// 注册全部内置工具，返回注册表与 provider 侧声明的服务端工具。
@@ -769,10 +801,12 @@ async fn assemble_tools(
         master_qq,
         provider,
         api_model,
+        chat_sends_per_hour,
     } = assembly;
     let mut tools = ToolRegistry::new(Arc::clone(&vfs), Some(Arc::clone(&views)))
         .with_gate(Arc::clone(&gate))
-        .with_max_result_bytes(config.tools.max_result_bytes);
+        .with_max_result_bytes(config.tools.max_result_bytes)
+        .with_max_schema_tokens(config.tools.max_schema_tokens);
     crate::tools::fs::register(&mut tools);
     tools.register(Arc::new(
         SkillTool::new(Arc::clone(&vfs)).with_db(Arc::clone(&db)),
@@ -924,7 +958,8 @@ async fn assemble_tools(
     let approvals = crate::security::action_gate::ApprovalQueue::new();
     let mut action_gate =
         crate::security::action_gate::ActionGate::new(&config.gate, Arc::clone(&approvals))
-            .with_db(Arc::clone(&db));
+            .with_db(Arc::clone(&db))
+            .with_chat_send_limit(chat_sends_per_hour);
     if config.gate.llm_review {
         action_gate = action_gate.with_reviewer(Arc::new(
             crate::security::action_gate::LlmActionReviewer::new(
@@ -947,7 +982,8 @@ async fn assemble_tools(
             Some(Arc::clone(&messages)),
         )
         .with_action_gate(Arc::clone(&action_gate))
-        .with_receive_scopes(config.agent.receive_scopes.clone()),
+        .with_receive_scopes(config.agent.receive_scopes.clone())
+        .with_event_hooks(config.hooks.events.clone()),
     ));
     // 子代理（docs、未开 allow_send 的自定义定义）拿到的是只读副本：
     // 同一个工具名，但只允许 api.list / api.help。
@@ -1089,6 +1125,24 @@ async fn build_agent(
     let monitors = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
     monitors.set_db(Arc::clone(&db));
 
+    let guard_cost = match config.security.guard.backend {
+        crate::config::GuardBackend::Off => 0.0,
+        crate::config::GuardBackend::Jev => crate::budget::JEV_CALL_USD,
+        crate::config::GuardBackend::Llm => {
+            // 粗略：一次判定约 3k 输入 + 100 输出 token。
+            let input = 3_000.0 * model_ref.model.cost.input;
+            let output = 100.0 * model_ref.model.cost.output;
+            (input + output) / 1_000_000.0
+        }
+    };
+    let budget = crate::budget::Budget::new(
+        Arc::clone(&db),
+        &config.budget,
+        &model_ref.model.cost,
+        guard_cost,
+    );
+    gate.set_budget(Arc::clone(&budget));
+
     let (tools, server_tools, hub_handle, approvals) = assemble_tools(ToolAssembly {
         config,
         auth,
@@ -1105,6 +1159,7 @@ async fn build_agent(
         master_qq,
         provider: Arc::clone(&provider),
         api_model: model_ref.model.id.clone(),
+        chat_sends_per_hour: budget.chat_sends_per_hour(),
     })
     .await;
 
@@ -1192,6 +1247,7 @@ async fn build_agent(
             post_compact_recall: config.compaction.post_compact_recall,
             compaction,
             last_activity: Arc::clone(&last_activity),
+            budget: Some(Arc::clone(&budget)),
         },
         Arc::clone(&history),
         Arc::clone(&ai_enabled),

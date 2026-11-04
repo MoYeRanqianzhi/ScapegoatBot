@@ -237,6 +237,19 @@ impl MessageStore {
         Ok(true)
     }
 
+    /// 按 message_id 找它所属的 chat；`get_msg` 没有 chat 参数时用它做范围校验。
+    pub fn chat_for_message(&self, message_id: i64) -> Result<Option<ChatId>> {
+        let conn = self.db.lock();
+        let chat: Option<String> = conn
+            .query_row(
+                "SELECT chat FROM messages WHERE message_id = ?1 LIMIT 1",
+                params![message_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(chat.and_then(|chat| ChatId::parse(&chat)))
+    }
+
     /// 按 chat + message_id 读取消息。
     pub fn load(&self, chat: ChatId, message_id: i64) -> Result<Option<QqMessage>> {
         let row: Option<(String, i64)> = {

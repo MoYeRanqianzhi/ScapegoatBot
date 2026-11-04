@@ -161,6 +161,8 @@ impl AgentTool {
                 batch_window,
                 Some(id.to_owned()),
                 crate::config::CatchUp::Coalesce,
+                false,
+                crate::config::OnMissing::Queue,
             )
             .await?;
         Ok(name)

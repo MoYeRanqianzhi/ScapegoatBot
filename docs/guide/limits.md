@@ -11,10 +11,7 @@
 | `[style].sample_retention_days` | 未实现 | 原始样本不按天数清理 |
 | `models.json` 的 `default_thinking_level` | 未实现 | effort 必须显式配置 |
 | `[agent].compaction_model` | 仅在非空时用于摘要 | 空 = 主模型（默认） |
-| `[budget]` 全部键 | 只解析、不执行 | 没有每日 token/USD、每回合、每 chat 小时限额 |
-| `[hooks.events]` | 只解析、不执行 | BeforeSend 的 rewrite/block 不会运行 |
-| `[tools].max_schema_tokens` | 未实现 | 工具 schema 不按 token 预算裁剪 |
-| `[monitor].deliver.cc` / `on_missing` | 未实现 | 不会抄送父级或按缺失策略处理 |
+| `[hooks.events]` 的 BeforeSend 之外 | 未接线 | SessionStart/End、Pre/PostCompact、Stop 等事件不会触发 hook |
 
 ## 安全边界
 
@@ -28,8 +25,8 @@
   配置的后端执行，内容在复核前已经被取走。不要把敏感目标交给不可信后端。
 - **加密边界**：防的是拿到 `data.db` / 文件但没有 `key`；不防同机管理员、
   进程内存读取，也不防拿到备份（备份含 key）。
-- **`receive_scopes` 的边界**：消息视图、收件箱、联系人视图与带 `group_id`/`user_id` 的
-  API 查询已按范围过滤；`napcat.get_msg` 只有 `message_id`、无法判定 chat，仍可读取。
+- **`receive_scopes` 的边界**：`get_msg` 会通过消息索引反查 chat；查不到且在限制读取时
+  保守拒绝。
 - **VFS 不是沙箱**：它隔离的是模型与宿主文件系统，不隔离网络。
 
 ## 协议与接入
@@ -40,6 +37,17 @@
 - MCP 只有 stdio 传输、一个聚合 `MCP` 工具；不支持 HTTP/SSE 传输；
   `tools/list` 分页最多取 10 页，超过会告警并停止发现剩余工具。
 - 不迁移 0.1 数据；0.2 从空存储开始。
+
+- **`[budget]` 的语义**：每日 token/USD 在回合开始检查，超了跳过回合（消息已入库）；
+  单回合 token/墙钟是硬停；每 chat 小时限额只统计成功发送；`guard_usd_per_day` 是
+  估算值（Jev 固定单次成本，LLM 按约 3k 输入 + 100 输出估算），耗尽后分类器降级为
+  规则层，规则仍生效。
+- **`[hooks.events]` 目前只接线 `BeforeSend`**：`log`/`block`/`rewrite` 生效，
+  `inject_context`/`notify` 对该阶段无定义而忽略；其他事件尚未触发。
+- **`[tools].max_schema_tokens`**：超限时把过长描述压到 160 字符；若仅 schema 就超限，
+  只告警、不删工具。
+- **monitor 的 `cc` / `on_missing`**：`cc` 在绑定子代理时抄送主代理；`on_missing`
+  支持 `drop`、`queue`（最多等 60 秒）与 `spawn`（新建 general 子代理处理）。
 
 ## 已知行为细节
 

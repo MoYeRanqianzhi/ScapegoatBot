@@ -429,6 +429,8 @@ pub struct Gate {
     last_flagged: std::sync::Mutex<Option<String>>,
     /// `critical` 安全事件触发的“暂停新回合”；解除 hold 时一起清掉。
     agent_paused: AtomicBool,
+    /// guard 花费预算；超过后跳过分类器、只跑规则层。
+    budget: std::sync::OnceLock<Arc<crate::budget::Budget>>,
 }
 
 impl Gate {
@@ -498,6 +500,7 @@ impl Gate {
             classifier_required: config.enabled && config.backend != GuardBackend::Off,
             last_flagged: std::sync::Mutex::new(None),
             agent_paused: AtomicBool::new(false),
+            budget: std::sync::OnceLock::new(),
         }
     }
 
@@ -509,6 +512,11 @@ impl Gate {
         {
             warn!(%error, "cannot record the security event");
         }
+    }
+
+    /// 接入 guard 预算；只能设置一次。
+    pub fn set_budget(&self, budget: Arc<crate::budget::Budget>) {
+        let _ = self.budget.set(budget);
     }
 
     /// 后置装入分类器（`llm` 后端在 provider 就绪后调用）。
@@ -715,19 +723,40 @@ impl Gate {
                         }
                     }
                 }
-                Some(judge) => match judge.judge(checkpoint, state, delta).await {
-                    Ok(verdict) => verdict,
-                    Err(error) => {
-                        // 不可判定即不安全（设计 §5.10.6）。
-                        warn!(%error, ?checkpoint, "safety classifier failed");
+                Some(judge) => {
+                    let allowed = match self.budget.get() {
+                        Some(budget) => budget.guard_allowed().await,
+                        None => true,
+                    };
+                    if !allowed {
+                        warn!("guard USD budget exhausted; falling back to rules only");
                         Verdict {
-                            dangerous: true,
-                            score: 1.0,
-                            backend: self.backend_name.clone(),
-                            reason: format!("classifier unavailable: {error}"),
+                            dangerous: false,
+                            score: 0.0,
+                            backend: "rules".to_owned(),
+                            reason: "guard budget exhausted; rules only".to_owned(),
+                        }
+                    } else {
+                        match judge.judge(checkpoint, state, delta).await {
+                            Ok(verdict) => {
+                                if let Some(budget) = self.budget.get() {
+                                    budget.record_guard().await;
+                                }
+                                verdict
+                            }
+                            Err(error) => {
+                                // 不可判定即不安全（设计 §5.10.6）。
+                                warn!(%error, ?checkpoint, "safety classifier failed");
+                                Verdict {
+                                    dangerous: true,
+                                    score: 1.0,
+                                    backend: self.backend_name.clone(),
+                                    reason: format!("classifier unavailable: {error}"),
+                                }
+                            }
                         }
                     }
-                },
+                }
             },
         };
 

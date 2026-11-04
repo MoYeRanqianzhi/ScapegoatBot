@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use tracing::warn;
 
 use crate::agent::{ExecutionMode, ToolCall, ToolExecutor, ToolResult};
 use crate::providers::ToolSpec;
@@ -112,6 +113,8 @@ pub struct ToolRegistry {
     read_only_api: Option<Arc<dyn Tool>>,
     /// 单次工具结果的字节上限；0 = 不限制。
     max_result_bytes: usize,
+    /// 全部工具 schema 的近似 token 预算；0 = 不限制。
+    max_schema_tokens: usize,
 }
 
 impl ToolRegistry {
@@ -129,12 +132,19 @@ impl ToolRegistry {
             gate: None,
             read_only_api: None,
             max_result_bytes: 0,
+            max_schema_tokens: 0,
         }
     }
 
     /// 截断超长工具结果，避免一次 `Read`/`Grep` 把上下文撑爆。
     pub fn with_max_result_bytes(mut self, bytes: usize) -> Self {
         self.max_result_bytes = bytes;
+        self
+    }
+
+    /// 限制全部工具 schema 的近似 token；超限时优先压缩描述。
+    pub fn with_max_schema_tokens(mut self, tokens: usize) -> Self {
+        self.max_schema_tokens = tokens;
         self
     }
 
@@ -188,6 +198,7 @@ impl ToolRegistry {
             gate: self.gate.clone(),
             read_only_api: self.read_only_api.clone(),
             max_result_bytes: self.max_result_bytes,
+            max_schema_tokens: self.max_schema_tokens,
         }
     }
 
@@ -199,14 +210,16 @@ impl ToolRegistry {
 
     /// 全部工具声明，顺序稳定（BTreeMap）。
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.tools
+        let specs = self
+            .tools
             .values()
             .map(|tool| ToolSpec {
                 name: tool.name().to_owned(),
                 description: tool.description().to_owned(),
                 input_schema: tool.parameters(),
             })
-            .collect()
+            .collect();
+        apply_schema_budget(specs, self.max_schema_tokens)
     }
 }
 
@@ -334,6 +347,39 @@ pub fn render_content(path: &VfsPath, content: FileContent) -> String {
     }
 }
 
+/// 近似估算 schema 的 token 数（JSON 字节 / 4）。
+fn schema_tokens(specs: &[ToolSpec]) -> usize {
+    specs
+        .iter()
+        .map(|spec| {
+            let schema = serde_json::to_string(&spec.input_schema)
+                .map(|text| text.len())
+                .unwrap_or(0);
+            (spec.description.len() + spec.name.len() + schema) / 4
+        })
+        .sum()
+}
+
+/// 超过 `max_schema_tokens` 时先截短描述，再告警；不丢工具、不改参数 schema。
+fn apply_schema_budget(mut specs: Vec<ToolSpec>, limit: usize) -> Vec<ToolSpec> {
+    if limit == 0 || schema_tokens(&specs) <= limit {
+        return specs;
+    }
+    for spec in &mut specs {
+        if spec.description.chars().count() > 160 {
+            spec.description = spec.description.chars().take(157).collect::<String>() + "...";
+        }
+    }
+    let estimated = schema_tokens(&specs);
+    if estimated > limit {
+        warn!(
+            estimated,
+            limit, "tool schema budget is still exceeded after trimming descriptions"
+        );
+    }
+    specs
+}
+
 /// 按字节上限截断工具结果；按字符边界切，避免破坏 UTF-8。
 fn truncate_result(mut result: ToolResult, limit: usize) -> ToolResult {
     if limit == 0 || result.content.len() <= limit {
@@ -374,6 +420,18 @@ mod tests {
         assert!(arg_opt_bool(&args, "flag").unwrap());
         assert!(!arg_opt_bool(&args, "missing").unwrap());
         assert!(arg_str(&args, "missing").is_err());
+    }
+
+    #[test]
+    fn schema_budget_trims_long_descriptions() {
+        let spec = ToolSpec {
+            name: "x".to_owned(),
+            description: "d".repeat(400),
+            input_schema: json!({"type": "object"}),
+        };
+        let trimmed = apply_schema_budget(vec![spec], 1);
+        assert!(trimmed[0].description.chars().count() <= 160);
+        assert!(trimmed[0].description.ends_with("..."));
     }
 
     #[test]
