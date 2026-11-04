@@ -537,7 +537,7 @@ impl SessionStore {
         };
         Ok(format!(
             "{}\n",
-            json!({"v": LINE_VERSION, "nonce": nonce, "ct": ct})
+            json!({"v": LINE_VERSION, "line": line_no, "nonce": nonce, "ct": ct})
         ))
     }
 

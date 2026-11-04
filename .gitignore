@@ -68,3 +68,6 @@ Desktop.ini
 # .claude/worktrees/。
 /.worktrees/
 /.claude/worktrees/
+
+/vendor/**/target/
+/vendor/**/Cargo.lock

@@ -439,9 +439,15 @@ pub struct QueueConfig {
     pub mode: QueueMode,
     pub max_concurrent: usize,
     pub cap_messages: usize,
+    /// Deprecated: accepted for old configs, no longer used by the inbox wake model.
+    #[serde(default = "default_cap_batches")]
     pub cap_batches: usize,
     pub drop: DropPolicy,
     pub debounce_ms: u64,
+}
+
+fn default_cap_batches() -> usize {
+    20
 }
 
 impl Default for QueueConfig {
@@ -468,12 +474,6 @@ impl QueueConfig {
         if self.cap_messages == 0 {
             errors.push(ConfigError::new(
                 "queue.cap_messages",
-                "must be greater than zero",
-            ));
-        }
-        if self.cap_batches == 0 {
-            errors.push(ConfigError::new(
-                "queue.cap_batches",
                 "must be greater than zero",
             ));
         }

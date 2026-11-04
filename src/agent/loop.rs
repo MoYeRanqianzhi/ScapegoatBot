@@ -50,7 +50,7 @@ impl RetryPolicy {
     ///
     /// - `fixed`：始终 `base_ms`；
     /// - `stepped`：`base_ms * 2^(attempt-1)`，封顶 `max_ms`；
-    /// - provider 返回 `Retry-After` 时优先，但仍受 `max_ms` 限制。
+    /// - provider 返回 `Retry-After` 时优先，不再被 `max_ms` 截断。
     pub fn delay_ms(&self, attempt: u32, retry_after_ms: Option<u64>) -> u64 {
         if let Some(delay) = retry_after_ms {
             return delay;
@@ -576,7 +576,7 @@ impl AgentLoop {
     /// 请求并按“主模型 → 回退链”的顺序重试。
     ///
     /// 每个候选模型先按 [`RetryPolicy`] 重试；全部用尽后换下一个模型。
-    /// `Retry-After` 优先于指数退避，但仍受 `max_ms` 上限约束。
+    /// `Retry-After` 优先于指数退避，不再被 `max_ms` 截断。
     async fn request_with_retry(
         &self,
         request: &LlmRequest,
@@ -619,6 +619,11 @@ impl AgentLoop {
                         }
                         attempt += 1;
                         let backoff = self.config.retry.delay_ms(attempt, error.retry_after_ms);
+                        let jitter = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.subsec_nanos() as u64 % (backoff / 4 + 1))
+                            .unwrap_or(0);
+                        let backoff = backoff.saturating_add(jitter);
                         debug!(attempt, backoff, %error, "retrying provider request");
                         tokio::time::sleep(Duration::from_millis(backoff)).await;
                     }
