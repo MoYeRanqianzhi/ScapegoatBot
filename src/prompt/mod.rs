@@ -33,7 +33,9 @@ pub fn static_prefix(mode: AgentMode) -> &'static str {
     // 模板在编译期已知，切分一次即可。
     static SPLIT: std::sync::OnceLock<(&'static str, &'static str)> = std::sync::OnceLock::new();
     let (static_part, _) = SPLIT.get_or_init(|| {
-        let (before, after) = TEMPLATE
+        // Windows checkout 可能把模板转成 CRLF；提示词必须跨平台逐字节一致。
+        let template: &'static str = Box::leak(TEMPLATE.replace("\r\n", "\n").into_boxed_str());
+        let (before, after) = template
             .split_once(BOUNDARY)
             .expect("template must contain the dynamic boundary");
         (before, after)
