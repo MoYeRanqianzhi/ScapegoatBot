@@ -5,6 +5,19 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.25] - 2026-11-04
+
+用模拟流量补长跑覆盖，关闭剩余 TODO。
+
+### 测试
+
+- 新增 `soak_many_turns_stay_bounded_with_compaction`：fake provider 下连续 300 个
+  回合、持续触发压缩，断言历史长度保持上限内、无 panic；覆盖压缩/轮转/提交路径。
+- MSRV 记录为 Rust 1.85（edition 2024）；`napcat-link` 固定 0.1.0-alpha.2。
+- `cargo test --all-targets`：347 项通过（335 lib + 4 config + 1 live stub +
+  7 NapCat，2 项真实 API 测试默认忽略）；`cargo fmt --check`、
+  `clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.24] - 2026-11-04
 
 补齐最后两个非真实 API 项：审查前缀缓存与剩余 hook 注入。

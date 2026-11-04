@@ -2589,6 +2589,27 @@ mod tests {
     async fn runner_with_review(
         outcome: crate::security::review::ReviewOutcome,
     ) -> (Arc<Runner>, Arc<Gate>, tempfile::TempDir) {
+        runner_with(
+            Some(outcome),
+            vec![vec![
+                ProviderEvent::TextDelta("ok".to_owned()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    refusal: None,
+                },
+            ]],
+            120_000,
+            20_000,
+        )
+        .await
+    }
+
+    async fn runner_with(
+        outcome: Option<crate::security::review::ReviewOutcome>,
+        script: Vec<Vec<ProviderEvent>>,
+        turn_context_budget: u32,
+        keep_recent_tokens: u32,
+    ) -> (Arc<Runner>, Arc<Gate>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_in_memory().unwrap());
         let key = Arc::new(MasterKey::from_bytes([11u8; 32]));
@@ -2638,17 +2659,9 @@ mod tests {
             Some(Arc::clone(&db)),
             crate::security::gate::hold_path(dir.path()),
         ));
+        let has_review = outcome.is_some();
         let provider = Arc::new(FakeProvider {
-            script: StdMutex::new(
-                vec![vec![
-                    ProviderEvent::TextDelta("ok".to_owned()),
-                    ProviderEvent::Stop {
-                        reason: StopReason::EndTurn,
-                        refusal: None,
-                    },
-                ]]
-                .into(),
-            ),
+            script: StdMutex::new(script.into()),
         });
         let tools = Arc::new(crate::tools::ToolRegistry::new(Arc::clone(&vfs), None));
         let history = Arc::new(Mutex::new(Vec::new()));
@@ -2679,11 +2692,14 @@ mod tests {
                 chat_history_limit: 10,
                 hooks: crate::config::HooksConfig::default().context,
                 server_tools: Vec::new(),
-                turn_context_budget: 120_000,
-                keep_recent_tokens: 20_000,
+                turn_context_budget,
+                keep_recent_tokens,
                 compaction_max_failures: 3,
-                security_review: Some(Arc::new(FixedReview(outcome))),
-                check_every_tokens: 1,
+                security_review: outcome.map(|outcome| {
+                    Arc::new(FixedReview(outcome))
+                        as Arc<dyn crate::security::review::SecurityCheck>
+                }),
+                check_every_tokens: if has_review { 1 } else { 0 },
                 check_overlap_tokens: 0,
                 check_on_compaction: false,
                 context_window: 200_000,
@@ -2755,5 +2771,44 @@ mod tests {
         let before = runner.history().lock().await.len();
         one_turn(&runner, ChatId::Group(1)).await;
         assert_eq!(runner.history().lock().await.len(), before);
+    }
+
+    #[tokio::test]
+    async fn soak_many_turns_stay_bounded_with_compaction() {
+        let mut script = Vec::new();
+        for _ in 0..2_000 {
+            script.push(vec![
+                ProviderEvent::TextDelta("ok".to_owned()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    refusal: None,
+                },
+            ]);
+        }
+        let (runner, _gate, _dir) = runner_with(None, script, 6_000, 1_500).await;
+        for id in 1..=300 {
+            let chat = ChatId::Group(1);
+            let incoming = inbound(chat, id, "hello");
+            let (_tx, rx) = mpsc::unbounded_channel();
+            runner
+                .handle(
+                    TurnInput {
+                        chat,
+                        messages: vec![incoming],
+                        dropped: 0,
+                    },
+                    rx,
+                )
+                .await
+                .unwrap();
+        }
+        let history_handle = runner.history();
+        let history = history_handle.lock().await;
+        assert!(!history.is_empty());
+        assert!(
+            history.len() <= 400,
+            "history grew to {} messages despite compaction",
+            history.len()
+        );
     }
 }
