@@ -61,7 +61,7 @@
 
 ## 仍剩余（P2）
 
-- [ ] `prune_tool_results` 修改 in-flight working copy，与已提交 transcript 可能不一致。
-- [ ] `Monitor fire` 被 min_interval 限速时仍返回成功。
+- [x] `prune_tool_results` 只裁剪请求副本，不改写已提交历史。
+- [x] `Monitor fire` 限速时返回错误。
 - [ ] swarm 重启竞态；控制回合无显式并发上限（turn_lock 串行但未限制排队数量）。
 - [ ] 图片自动下载的 QQ 域名白名单需要随 NapCat 实际 CDN 复核。

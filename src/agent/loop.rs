@@ -323,7 +323,25 @@ impl AgentLoop {
                 };
                 send(events, AgentEvent::MessageStart).await;
 
-                let assistant = match self.request_with_retry(&request, events).await {
+                let request_result = if self.config.max_wall_secs > 0 {
+                    let elapsed = started.elapsed().as_secs();
+                    let remaining = self.config.max_wall_secs.saturating_sub(elapsed).max(1);
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(remaining),
+                        self.request_with_retry(&request, events),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(ProviderError::new(
+                            crate::providers::ProviderErrorKind::Network,
+                            "turn wall-clock budget exhausted during a request",
+                        )),
+                    }
+                } else {
+                    self.request_with_retry(&request, events).await
+                };
+                let assistant = match request_result {
                     Ok(message) => message,
                     Err(error) => {
                         send(
