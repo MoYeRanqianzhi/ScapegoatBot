@@ -5,6 +5,20 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.32] - 2026-11-04
+
+图片附件随 transcript 持久化，重启后仍可恢复。
+
+### 变更
+
+- `ToolResult` / `ToolResultMessage` 的 `images` 不再 `skip_serializing`；非空时
+  写进加密 transcript 与 turn buffer，`read_segment` 会还原 base64 image。
+- 图片大小仍受 `Read` 的 3.5 MB / MIME 限制，避免单条 transcript 无限膨胀。
+
+### 测试
+
+- `cargo test --all-targets`：345 项通过；`clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.31] - 2026-11-04
 
 - 同步 `Cargo.lock` 版本，修复 `cargo build --release --locked` 失败。
