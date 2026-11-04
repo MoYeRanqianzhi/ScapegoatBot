@@ -448,10 +448,7 @@ impl Database {
     }
 
     /// 最近的事件审计行。
-    pub fn recent_events(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<EventAuditRow>> {
+    pub fn recent_events(&self, limit: usize) -> Result<Vec<EventAuditRow>> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let mut statement = conn.prepare(
             "SELECT kind, chat, actor, payload_enc, created_at FROM event_audit
