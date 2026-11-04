@@ -5,6 +5,24 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.21] - 2026-11-04
+
+让 `Agent message` 真正进入运行中的子代理。
+
+### 新增
+
+- 子代理实例持有消息通道；`AgentHub::message` 在运行中把消息送进当前回合，
+  `AgentLoop` 在回合边界排空，不再只堆在实例历史里等下一次运行。
+- 子代理结束后把完整历史（含注入消息）写回实例，续聊不会丢上下文。
+- 运行结束后清理通道；发送失败时回退为入历史并返回 `queued`。
+
+### 测试
+
+- 新增：运行中的子代理在 50ms 内收到 `Agent message`，响应标记 `delivered`。
+- `cargo test --all-targets`：342 项通过（331 lib + 4 config + 1 live stub +
+  6 NapCat，2 项真实 API 测试默认忽略）；`cargo fmt --check`、
+  `clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.20] - 2026-11-04
 
 新增 WebFetch 的本地抓取模式，消除“先由后端取内容、再复核 URL”的窗口。

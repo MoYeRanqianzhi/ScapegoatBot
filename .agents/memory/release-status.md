@@ -8,7 +8,7 @@ metadata:
   last_verified: 2026-11-04
 ---
 
-当前版本：`0.2.0-alpha.20`（`main`）。数据库迁移到 v11；测试 341 项通过，
+当前版本：`0.2.0-alpha.21`（`main`）。数据库迁移到 v11；测试 342 项通过，
 `cargo fmt --check`、`clippy -D warnings` 通过；CI 已接入 GitHub Actions。
 
 alpha.13 修掉了 2026-11-03 审查的 P0/P1 主体；alpha.14 补齐了当时列为未实现的项；
@@ -45,7 +45,7 @@ alpha.15 做了第二轮审查，修掉新代码的边界问题（复盘基线�
 - 周期检查使用独立窗口；`auto` 门禁仍缺完整 `context_sources` 追踪。
 - WebFetch 已支持 `local = true` 的本地逐跳抓取；默认后端模式仍是后端抓取后复核。
 - `[hooks.events]` 的 rewrite 只在 BeforeSend；SessionEnd/Stop/ConfigChange 的 inject 无去处。
-- `Agent message` 发给运行中的子代理仍只入历史。
+- `Agent message` 已能注入运行中的子代理（回合边界排空），结束后历史写回实例。
 - 真实 API 未重跑；NapCat 协议用本地 WebSocket 模拟覆盖。
 
 **Evidence:** `CHANGELOG.md` 的 alpha.14 条目、`cargo test --all-targets` 输出、

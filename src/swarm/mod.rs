@@ -116,7 +116,6 @@ impl AgentType {
 }
 
 /// 子代理请求。
-#[derive(Debug, Clone)]
 pub struct SubagentRequest {
     /// 完整 system prompt（公共子代理提示 + 定义正文）。
     pub system: String,
@@ -134,6 +133,10 @@ pub struct SubagentRequest {
     pub read_only: bool,
     /// 继承自 spawn 调用方的回合证据；跨 chat 发送与 owner intent 检查依赖它。
     pub evidence: crate::agent::TurnEvidence,
+    /// 运行中注入的消息（`Agent message`）；在回合边界排空。
+    pub incoming: Option<tokio::sync::mpsc::UnboundedReceiver<AgentMessage>>,
+    /// 运行结束后把完整历史写回实例，供续聊使用。
+    pub shared_history: Option<Arc<tokio::sync::Mutex<Vec<AgentMessage>>>>,
 }
 
 /// 子代理执行器；由 runtime 实现。
@@ -270,7 +273,9 @@ pub struct AgentInstance {
     max_steps: u32,
     depth: u32,
     status: Mutex<InstanceStatus>,
-    history: Mutex<Vec<AgentMessage>>,
+    history: Arc<tokio::sync::Mutex<Vec<AgentMessage>>>,
+    /// 运行中的消息通道；结束后清空。
+    incoming: Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentMessage>>>,
     result: Mutex<Option<String>>,
 }
 
@@ -446,7 +451,8 @@ impl AgentHub {
             max_steps,
             depth,
             status: Mutex::new(InstanceStatus::Running),
-            history: Mutex::new(vec![AgentMessage::user(&task)]),
+            history: Arc::new(Mutex::new(vec![AgentMessage::user(&task)])),
+            incoming: Mutex::new(None),
             result: Mutex::new(None),
         });
         self.instances
@@ -454,6 +460,8 @@ impl AgentHub {
             .await
             .insert(id.clone(), Arc::clone(&instance));
 
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+        *instance.incoming.lock().await = Some(incoming_tx);
         let request = SubagentRequest {
             system,
             task,
@@ -464,6 +472,8 @@ impl AgentHub {
             max_depth: self.config.max_depth,
             read_only,
             evidence,
+            incoming: Some(incoming_rx),
+            shared_history: Some(Arc::clone(&instance.history)),
         };
         let runner = Arc::clone(&self.runner);
         tokio::spawn(async move {
@@ -491,6 +501,12 @@ impl AgentHub {
             .ok_or_else(|| anyhow::anyhow!("unknown subagent {id:?}"))?;
         let status = instance.status.lock().await.clone();
         if status == InstanceStatus::Running {
+            let sender = instance.incoming.lock().await.clone();
+            if let Some(sender) = sender
+                && sender.send(AgentMessage::user(&text)).is_ok()
+            {
+                return Ok(serde_json::json!({"id": id, "delivered": true}));
+            }
             instance
                 .history
                 .lock()
@@ -511,6 +527,8 @@ impl AgentHub {
             "{}\n\n# Your role\nContinue the previous task. Keep the same boundaries.",
             instance.system
         );
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+        *instance.incoming.lock().await = Some(incoming_tx);
         let request = SubagentRequest {
             system,
             task: text,
@@ -521,6 +539,8 @@ impl AgentHub {
             max_depth: self.config.max_depth,
             read_only: instance.read_only,
             evidence: instance.evidence.clone(),
+            incoming: Some(incoming_rx),
+            shared_history: Some(Arc::clone(&instance.history)),
         };
         let runner = Arc::clone(&self.runner);
         tokio::spawn(async move {
@@ -639,7 +659,8 @@ async fn run_instance(
     request: SubagentRequest,
 ) {
     let task = request.task.clone();
-    let outcome = runner.run_subagent(request.clone()).await;
+    let outcome = runner.run_subagent(request).await;
+    *instance.incoming.lock().await = None;
     let mut history = instance.history.lock().await;
     match outcome {
         Ok(result) => {
@@ -841,5 +862,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("concurrency"));
+    }
+
+    struct InterruptRunner {
+        seen: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SubagentRunner for InterruptRunner {
+        async fn run_subagent(&self, request: SubagentRequest) -> Result<String> {
+            let mut incoming = request.incoming;
+            if let Some(receiver) = &mut incoming
+                && let Ok(Some(message)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv()).await
+                && let AgentMessage::User { text } = message
+            {
+                self.seen.lock().await.push(text);
+            }
+            Ok("done".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn running_subagent_receives_agent_messages() {
+        let runner = Arc::new(InterruptRunner {
+            seen: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let hub = hub(Arc::clone(&runner) as Arc<dyn SubagentRunner>);
+        let started = hub
+            .spawn(None, None, "start".to_owned(), 0, Default::default())
+            .await
+            .unwrap();
+        let id = started["id"].as_str().unwrap().to_owned();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let response = hub.message(&id, "interrupt now".to_owned()).await.unwrap();
+        assert_eq!(response["delivered"], true);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(runner.seen.lock().await.as_slice(), ["interrupt now"]);
     }
 }
