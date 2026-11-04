@@ -1162,8 +1162,13 @@ impl Runner {
             }
         };
         let mut prompts = Vec::new();
+        let mut image_count = 0usize;
         for message in messages {
             for segment in &message.segments {
+                if image_count >= 4 {
+                    warn!("more than 4 images in one batch; extra images were not attached");
+                    break;
+                }
                 let crate::qq::event::Segment::Image { url, file, path } = segment else {
                     continue;
                 };
@@ -1180,6 +1185,7 @@ impl Runner {
                         && bytes.len() <= 3_500_000
                     {
                         let mime = mime_for_bytes(&bytes);
+                        image_count += 1;
                         prompts.push(AgentMessage::user_with_images(
                             format!("[image from {}]", message.chat),
                             vec![crate::agent::message::ImageAttachment {
@@ -1232,6 +1238,7 @@ impl Runner {
                     )
                 {
                     let mime = mime_for_bytes(&value);
+                    image_count += 1;
                     prompts.push(AgentMessage::user_with_images(
                         format!("[image from {}]", message.chat),
                         vec![crate::agent::message::ImageAttachment {

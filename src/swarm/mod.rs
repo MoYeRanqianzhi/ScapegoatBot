@@ -277,6 +277,8 @@ pub struct AgentInstance {
     /// 运行中的消息通道；结束后清空。
     incoming: Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentMessage>>>,
     result: Mutex<Option<String>>,
+    /// 重启代数；旧 runner 完成后不得覆盖新实例状态。
+    generation: std::sync::atomic::AtomicU64,
     /// 串行化 message/restart，避免两个调用同时把实例重启。
     dispatch_lock: tokio::sync::Mutex<()>,
 }
@@ -456,6 +458,7 @@ impl AgentHub {
             history: Arc::new(Mutex::new(vec![AgentMessage::user(&task)])),
             incoming: Mutex::new(None),
             result: Mutex::new(None),
+            generation: std::sync::atomic::AtomicU64::new(0),
             dispatch_lock: tokio::sync::Mutex::new(()),
         });
         self.instances
@@ -479,8 +482,11 @@ impl AgentHub {
             shared_history: Some(Arc::clone(&instance.history)),
         };
         let runner = Arc::clone(&self.runner);
+        let generation = instance
+            .generation
+            .load(std::sync::atomic::Ordering::SeqCst);
         tokio::spawn(async move {
-            run_instance(instance, runner, request).await;
+            run_instance(instance, runner, request, generation).await;
         });
 
         Ok(serde_json::json!({
@@ -511,12 +517,9 @@ impl AgentHub {
             {
                 return Ok(serde_json::json!({"id": id, "delivered": true}));
             }
-            instance
-                .history
-                .lock()
-                .await
-                .push(AgentMessage::user(&text));
-            return Ok(serde_json::json!({"id": id, "queued": true}));
+            // receiver 已关闭但 status 还是 Running：交给下面重启，旧 runner
+            // 的 completion 会被 generation 检查丢弃。
+            *instance.status.lock().await = InstanceStatus::Done;
         }
 
         // 已结束：锁已持有，重新检查状态。
@@ -529,6 +532,9 @@ impl AgentHub {
                 return Ok(serde_json::json!({"id": id, "delivered": true}));
             }
         }
+        instance
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let history = {
             let mut history = instance.history.lock().await;
             history.push(AgentMessage::user(&text));
@@ -557,8 +563,11 @@ impl AgentHub {
         };
         drop(_dispatch);
         let runner = Arc::clone(&self.runner);
+        let generation = instance
+            .generation
+            .load(std::sync::atomic::Ordering::SeqCst);
         tokio::spawn(async move {
-            run_instance(instance, runner, request).await;
+            run_instance(instance, runner, request, generation).await;
         });
         Ok(serde_json::json!({"id": id, "restarted": true}))
     }
@@ -671,10 +680,18 @@ async fn run_instance(
     instance: Arc<AgentInstance>,
     runner: Arc<dyn SubagentRunner>,
     request: SubagentRequest,
+    generation: u64,
 ) {
     let task = request.task.clone();
     let outcome = runner.run_subagent(request).await;
     let _dispatch = instance.dispatch_lock.lock().await;
+    if instance
+        .generation
+        .load(std::sync::atomic::Ordering::SeqCst)
+        != generation
+    {
+        return;
+    }
     *instance.incoming.lock().await = None;
     let mut history = instance.history.lock().await;
     match outcome {
