@@ -69,5 +69,7 @@
 
 - 真实 API / NapCat 测试默认 `#[ignore]`，需要环境变量显式启用
   （见 [live-testing.md](../development/live-testing.md)）。
+- NapCat 协议由本地 WebSocket 模拟：覆盖登录/版本、全部 `napcat.*` ActionSpec 的
+  请求动作与参数形状、发送/查询/失败响应、事件推送与 nonce 往返。
 - CI（GitHub Actions）运行 `cargo fmt --check`、`clippy -D warnings` 与
   `cargo test --all-targets`；真实端点测试不在 CI 里。

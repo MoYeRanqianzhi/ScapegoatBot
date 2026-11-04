@@ -86,7 +86,7 @@ async fn spawn_mock_napcat(records: Records, push_event: bool) -> String {
                                 "sender": {"user_id": 20000, "nickname": "Alice"}
                             }]
                         }),
-                        "get_group_info" => {
+                        "get_group_info" if params.get("group_id") == Some(&json!(404)) => {
                             let response = json!({
                                 "status": "failed",
                                 "retcode": 100,
@@ -250,7 +250,7 @@ async fn api_tool_matches_napcat_request_and_error_shapes() {
         &context,
         json!({
             "action": "napcat.get_group_info",
-            "params": {"group_id": 123}
+            "params": {"group_id": 404}
         }),
     )
     .await;
@@ -362,4 +362,102 @@ async fn approve_mode_nonce_round_trip_over_napcat() {
             .iter()
             .any(|(action, _)| action == "send_group_msg")
     );
+}
+
+/// 依据 action 注册表的 JSON Schema 生成最小参数。
+fn params_for(spec: &scapegoat_bot::tools::actions::ActionSpec) -> Value {
+    let mut params = serde_json::Map::new();
+    if let Some(properties) = spec.params.as_object() {
+        for (key, field) in properties {
+            let value = match field.get("type").and_then(Value::as_str) {
+                Some("integer") | Some("number") => json!(1),
+                Some("boolean") => json!(false),
+                Some("array") => json!([]),
+                Some("object") => json!({}),
+                _ => match key.as_str() {
+                    "message_type" => json!("group"),
+                    "message" | "text" => json!("hi"),
+                    _ => json!("x"),
+                },
+            };
+            params.insert(key.clone(), value);
+        }
+    }
+    if let Some(field) = spec.scope_field {
+        params.entry(field).or_insert(json!(1));
+    }
+    Value::Object(params)
+}
+
+#[tokio::test]
+async fn every_napcat_action_round_trips_over_the_mock() {
+    use scapegoat_bot::tools::actions::specs;
+
+    let records: Records = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_mock_napcat(Arc::clone(&records), false).await;
+    let client = connect(&url).await;
+    let gate = Arc::new(scapegoat_bot::security::action_gate::ActionGate::new(
+        &scapegoat_bot::config::GateConfig {
+            mode: scapegoat_bot::config::GateMode::Auto,
+            max_per_minute: 200,
+            llm_review: false,
+        },
+        scapegoat_bot::security::action_gate::ApprovalQueue::new(),
+    ));
+    let tool = ApiTool::new(
+        Some(Arc::clone(&client) as Arc<dyn NapcatGateway>),
+        None,
+        10000,
+        10000,
+        None,
+        vec!["*".to_owned()],
+        None,
+    )
+    .with_action_gate(gate);
+    let (mut context, _dir) = tool_context();
+    context.evidence = scapegoat_bot::agent::TurnEvidence::owner("control");
+
+    let napcat_specs: Vec<_> = specs()
+        .iter()
+        .filter(|spec| spec.namespace() == "napcat")
+        .collect();
+    assert!(napcat_specs.len() >= 30, "unexpectedly few actions");
+    let mut failures = Vec::new();
+    for spec in &napcat_specs {
+        let params = params_for(spec);
+        let result = Tool::execute(
+            &tool,
+            &context,
+            json!({"action": spec.action, "params": params}),
+        )
+        .await;
+        if result.is_error {
+            failures.push(format!("{}: {}", spec.action, result.content));
+        }
+        assert!(
+            spec.params.is_object(),
+            "{} params schema is not an object",
+            spec.action
+        );
+    }
+    assert!(
+        failures.is_empty(),
+        "actions failed:\n{}",
+        failures.join("\n")
+    );
+
+    let recorded: Vec<String> = records
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(action, _)| action.clone())
+        .collect();
+    for spec in &napcat_specs {
+        let wire = spec.action.strip_prefix("napcat.").unwrap();
+        assert!(
+            recorded.iter().any(|action| action == wire),
+            "{} never reached NapCat",
+            spec.action
+        );
+    }
 }
