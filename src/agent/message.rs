@@ -44,6 +44,14 @@ impl ToolResult {
         }
     }
 
+    pub fn error_with_images(content: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+            images,
+        }
+    }
+
     pub fn with_images(content: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
         Self {
             content: content.into(),

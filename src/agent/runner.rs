@@ -220,8 +220,8 @@ pub struct Runner {
     review_failures: std::sync::atomic::AtomicU32,
     /// 周期检查互斥。
     review_lock: Mutex<()>,
-    /// 主 agent 回合互斥：shared transcript 下同一时刻只允许一个回合。
-    turn_lock: tokio::sync::Mutex<()>,
+    /// 每个 transcript scope 一个回合锁；shared 模式天然只有一个锁。
+    turn_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 控制通道排队上限，避免一次灌入无限任务。
     control_slots: tokio::sync::Semaphore,
 }
@@ -378,7 +378,7 @@ impl Runner {
             unchecked_tokens: std::sync::atomic::AtomicU64::new(0),
             review_failures: std::sync::atomic::AtomicU32::new(0),
             review_lock: Mutex::new(()),
-            turn_lock: tokio::sync::Mutex::new(()),
+            turn_locks: Mutex::new(HashMap::new()),
             control_slots: tokio::sync::Semaphore::new(4),
         });
         let _ = runner
@@ -407,6 +407,16 @@ impl Runner {
         } else {
             "shared".to_owned()
         }
+    }
+
+    async fn turn_lock_for(&self, chat: ChatId) -> Arc<tokio::sync::Mutex<()>> {
+        let scope = self.scope_name(chat);
+        let mut locks = self.turn_locks.lock().await;
+        Arc::clone(
+            locks
+                .entry(scope)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
     }
 
     /// 取该 chat 的分段存储；shared 模式返回全局存储。
@@ -994,7 +1004,9 @@ impl Runner {
                 turns: 0,
             });
         }
-        let _turn_guard = self.turn_lock.lock().await;
+        let chat = ChatId::Private(self.config.owner_qq);
+        let turn_lock = self.turn_lock_for(chat).await;
+        let _turn_guard = turn_lock.lock().await;
         if let Some(budget) = &self.config.budget
             && let Some(reason) = budget.check_daily().await
         {
@@ -1005,7 +1017,6 @@ impl Runner {
                 turns: 0,
             });
         }
-        let chat = ChatId::Private(self.config.owner_qq);
         let sessions = self.session_for(chat).await;
         let history = self.history_for(chat).await;
         {
@@ -1305,8 +1316,9 @@ impl Runner {
             debug!(chat = %input.chat, "agent is paused by the security review; skipping this turn");
             return Ok(());
         }
-        let _turn_guard = self.turn_lock.lock().await;
         let chat = input.chat;
+        let turn_lock = self.turn_lock_for(chat).await;
+        let _turn_guard = turn_lock.lock().await;
         let inbound_messages = input.messages.clone();
         let sessions = self.session_for(chat).await;
         let history = self.history_for(chat).await;
@@ -1496,6 +1508,11 @@ impl Runner {
 {text}"
                 ),
             });
+        }
+
+        // 回合结束窗口内到达的消息也写入 history，避免随 channel 关闭丢失。
+        while let Ok(message) = steering_rx.try_recv() {
+            working.push(message);
         }
 
         // 5) 提交新块：buffer -> transcript -> 共享历史。
