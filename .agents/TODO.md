@@ -43,7 +43,7 @@
 
 - [ ] `ChatQueue` 已不在 live ingress；`idle_only`、`max_concurrent`、去抖配置实际失效。要么删除 queue 配置/文档，要么把 monitor 唤醒接回队列。
 - [ ] `run_injected` 的 steering 尾部消息仍可能丢弃（当前 inbox 模式影响较小）。
-- [ ] 图片附件仍不落 session：重启后文本还在、图片不在；需要持久化 VFS 引用或明确标注 turn-local。
+- [x] 图片附件随 transcript 持久化（alpha.32）。
 - [ ] MCP image blocks 仍被转成 `[image content omitted]`。
 - [ ] P2：重试无 jitter、无逐 chunk idle timeout、截断 tool args 以 `{}` 执行、`retention_days`/`monitor` 小竞态。
 - [ ] 旧版本留下的 transcript 行号损坏无法自动修复；清空数据或迁移后才能消除 `skipping unreadable transcript line`。
