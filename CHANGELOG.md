@@ -5,6 +5,11 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.31] - 2026-11-04
+
+- 同步 `Cargo.lock` 版本，修复 `cargo build --release --locked` 失败。
+- 合并 alpha.30 的回合串行化、transcript 行号、Chat 流截断与图片链路修复。
+
 ## [0.2.0-alpha.30] - 2026-11-04
 
 按 pi / Claude Code 对照审计修复回合与图片链路。
