@@ -33,3 +33,8 @@
 - [ ] 控制回合出现 `elapsed=657` 与 `elapsed=1287` 两层预算告警，确认是否重复计时/嵌套重试。
 - [ ] 运行时 `owner-private-wakeup` monitor 会对同一条私聊注入重复事件（transcript 出现两次 `嗯哼？`）；确认 preset 去重与 `batch_window` 语义。
 - [ ] 会话压缩后旧行按新行号解密失败（AAD `session:<file_id>:<line_no>` 错位）；确认压缩是否重写/重排 transcript。
+
+- [ ] 对照 NapCat/OneBot 事件目录做一次完整审计：notice 子类型（poke、recall、group_admin、group_upload、essence、ban、card、reaction 等）、request、meta lifecycle、未知事件；明确哪些进 inbox、哪些只审计。
+- [ ] 决定 meta lifecycle / heartbeat 的落库策略；heartbeat 不能刷 inbox，但 connect/disable 等低频事件可能需要审计表。
+- [ ] 未知事件没有 group_id/user_id 时目前丢弃；评估是否建 system/audit 表保留 raw。
+- [ ] `/messages` 渲染目前只显示 plain_text；确认事件细节（raw/摘要）是否需要单独视图，避免上下文被 JSON 撑爆。

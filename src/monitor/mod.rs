@@ -86,7 +86,10 @@ impl MonitorEvent {
                 kind: format!("notice:{}", notice.kind),
                 chat: notice.chat.map(|chat| chat.to_string()).unwrap_or_default(),
                 sender: notice.actor,
-                text: String::new(),
+                text: notice
+                    .to_inbox_message()
+                    .map(|message| message.plain_text())
+                    .unwrap_or_default(),
                 mentions_self: false,
             }),
             QqEvent::Request(request) => Some(Self {

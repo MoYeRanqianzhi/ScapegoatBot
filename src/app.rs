@@ -1616,16 +1616,33 @@ async fn handle_qq_event(
             Err(error) => warn!(%error, "cannot store an inbound message"),
         },
         QqEvent::Notice(notice) => {
+            if let Some(message) = notice.to_inbox_message()
+                && let Err(error) = messages.append(&message)
+            {
+                warn!(%error, kind = %notice.kind, "cannot store a QQ notice");
+            }
             debug!(kind = %notice.kind, "QQ notice");
         }
         QqEvent::Request(request) => {
+            if let Some(message) = request.to_inbox_message()
+                && let Err(error) = messages.append(&message)
+            {
+                warn!(%error, kind = %request.kind, "cannot store a QQ request");
+            }
             debug!(kind = %request.kind, actor = ?request.actor, "QQ request");
         }
         QqEvent::Meta { kind } => debug!(kind, "meta event"),
         QqEvent::Connection { connected, reason } => {
             debug!(connected, %reason, "connection state");
         }
-        QqEvent::Unknown { name, .. } => debug!(name, "unknown QQ event"),
+        QqEvent::Unknown { name, data } => {
+            if let Some(message) = crate::qq::event::unknown_to_inbox_message(&name, &data)
+                && let Err(error) = messages.append(&message)
+            {
+                warn!(%error, %name, "cannot store an unknown QQ event");
+            }
+            debug!(name, "unknown QQ event");
+        }
     }
 }
 
