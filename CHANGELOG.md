@@ -5,6 +5,22 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.22] - 2026-11-04
+
+把 NapCat 模拟测试扩到全部 `napcat.*` action。
+
+### 测试
+
+- 新增 `every_napcat_action_round_trips_over_the_mock`：按 action 注册表的参数
+  schema 生成最小请求，逐个经 `API` 工具发到本地 OneBot 11 模拟服务，断言：
+  - action 名去掉 `napcat.` 后原样出现在 WebSocket 请求里；
+  - 参数 schema 是对象；
+  - 所有 action 都能完成一次请求/响应（含发送、查询、管理、文件、请求处理）。
+- 模拟服务只在 `get_group_info` 且 `group_id = 404` 时返回失败，正常 action 全部成功。
+- `cargo test --all-targets`：343 项通过（331 lib + 4 config + 1 live stub +
+  7 NapCat，2 项真实 API 测试默认忽略）；`cargo fmt --check`、
+  `clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.21] - 2026-11-04
 
 让 `Agent message` 真正进入运行中的子代理。
