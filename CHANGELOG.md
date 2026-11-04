@@ -17,6 +17,12 @@
 - 控制通道最多 4 个排队回合，超出直接拒绝。
 - `cap_batches` 死分支移除。
 - QQ 入站图片自动下载并作为 image prompt 注入（仅 QQ CDN，≤3.5 MB）。
+- `Read` 超过 3.5 MB 时自动缩到 2000px 并转 JPEG。
+- 请求级 wall-clock 超时，单次 provider 请求不能跑满整个回合预算。
+
+### 测试
+
+- `cargo test --all-targets`：348 项通过；`clippy -D warnings` 通过。
 
 ## [0.2.0-alpha.34] - 2026-11-04
 

@@ -18,6 +18,16 @@ use serde_json::{Value, json};
 use crate::agent::{ExecutionMode, ToolResult};
 use crate::vfs::{FileContent, NodeKind, Vfs, VfsError, VfsPath};
 use base64::Engine as _;
+/// 超过视觉上限时缩到 2000px 内并转 JPEG；返回新 mime 与字节。
+fn shrink_image(bytes: &[u8]) -> Option<(String, Vec<u8>)> {
+    let image = image::load_from_memory(bytes).ok()?;
+    let shrunk = image.thumbnail(2000, 2000).to_rgb8();
+    let mut encoded = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 85);
+    encoder.encode_image(&shrunk).ok()?;
+    Some(("image/jpeg".to_owned(), encoded))
+}
+
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use super::{
@@ -110,15 +120,34 @@ impl Tool for ReadTool {
                     bytes.len()
                 ));
             }
-            if bytes.len() > 3_500_000 {
-                return ToolResult::ok(format!(
-                    "Image {} ({} bytes, {mime}); too large for vision (limit 3.5 MB). Resize it with media.image_resize first.",
+            let (mime, bytes) = if bytes.len() > 3_500_000 {
+                match shrink_image(&bytes) {
+                    Some((mime, shrunk)) => (mime, shrunk),
+                    None => {
+                        return ToolResult::ok(format!(
+                            "Image {} ({} bytes, {mime}); too large for vision and could not be resized.",
+                            target.path,
+                            bytes.len()
+                        ));
+                    }
+                }
+            } else {
+                (mime, bytes)
+            };
+            let note = if bytes.len() > 3_500_000 {
+                format!(
+                    "Image {} ({} bytes, {mime}); still too large for vision.",
                     target.path,
                     bytes.len()
-                ));
+                )
+            } else {
+                format!("Image {} ({} bytes, {mime})", target.path, bytes.len())
+            };
+            if bytes.len() > 3_500_000 {
+                return ToolResult::ok(note);
             }
             return ToolResult::with_images(
-                format!("Image {} ({} bytes, {mime})", target.path, bytes.len()),
+                note,
                 vec![crate::agent::message::ImageAttachment {
                     mime,
                     data_base64: BASE64.encode(bytes),
@@ -1302,5 +1331,19 @@ mod tests {
         assert_eq!(result.images.len(), 1);
         assert_eq!(result.images[0].mime, "image/png");
         assert_eq!(result.images[0].data_base64, BASE64.encode(bytes));
+    }
+
+    #[test]
+    fn large_images_are_shrunk_for_vision() {
+        let image = image::DynamicImage::new_rgb8(2500, 2500);
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let (mime, bytes) = shrink_image(&encoded.into_inner()).expect("shrink");
+        assert_eq!(mime, "image/jpeg");
+        let decoded = image::load_from_memory(&bytes).unwrap();
+        assert!(decoded.width() <= 2000);
+        assert!(decoded.height() <= 2000);
     }
 }
