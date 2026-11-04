@@ -942,11 +942,17 @@ impl Runner {
         let message = AgentMessage::user(format!(
             "<owner_context source=\"control:{control_id}\">\n{text}\n</owner_context>"
         ));
-        self.run_injected("control", message).await
+        self.run_injected("control", message, true).await
     }
 
     /// monitor 投递：以 `[monitor: name | source | time]` 信封进入上下文。
-    pub async fn run_event(&self, name: &str, source: &str, text: &str) -> Result<LoopOutcome> {
+    pub async fn run_event(
+        &self,
+        name: &str,
+        source: &str,
+        text: &str,
+        owner_intent: bool,
+    ) -> Result<LoopOutcome> {
         if !self.ai_enabled.load(std::sync::atomic::Ordering::Relaxed) {
             anyhow::bail!("AI calls are stopped; run `sbot ai start` first");
         }
@@ -960,11 +966,16 @@ impl Runner {
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
             text
         ));
-        self.run_injected("monitor", message).await
+        self.run_injected("monitor", message, owner_intent).await
     }
 
     /// 注入一条上下文消息并跑一个回合（控制通道与 monitor 共用）。
-    async fn run_injected(&self, origin: &str, message: AgentMessage) -> Result<LoopOutcome> {
+    async fn run_injected(
+        &self,
+        origin: &str,
+        message: AgentMessage,
+        owner_intent: bool,
+    ) -> Result<LoopOutcome> {
         if origin != "control" && self.gate.agent_paused() {
             debug!(%origin, "agent is paused by the security review; skipping this event");
             return Ok(LoopOutcome {
@@ -994,7 +1005,7 @@ impl Runner {
         let prompts = vec![AgentMessage::user(runtime.render())];
         let prompt_tokens = crate::session::compaction::estimate_messages(&prompts);
 
-        let evidence = if origin == "control" {
+        let evidence = if owner_intent {
             TurnEvidence::owner(origin)
         } else {
             TurnEvidence::monitor()
