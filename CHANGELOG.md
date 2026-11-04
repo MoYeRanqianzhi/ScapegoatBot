@@ -5,6 +5,27 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.27] - 2026-11-04
+
+修复 Windows checkout 的 CRLF 导致 companion 提示词丢失。
+
+### 修复
+
+- `static_prefix` 在首次渲染时把模板的 `
+` 归一化为 `
+`；此前 Windows
+  CI 上 `render_static(Companion)` 找不到 `
+
+`，会把身份之后的全部提示词截掉。
+- 新增 `.gitattributes`，源码/文本文件统一 `eol=lf`，避免 Windows checkout
+  再引入 CRLF。
+- alpha.26 的 Windows 产物受该问题影响；alpha.27 为修复版本。
+
+### 测试
+
+- `cargo test --all-targets`：347 项通过；`cargo fmt --check`、
+  `clippy -D warnings` 通过；CI 的 Windows job 是本次修复的回归验证。
+
 ## [0.2.0-alpha.26] - 2026-11-04
 
 发布构建与流水线。
