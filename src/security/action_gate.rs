@@ -40,6 +40,14 @@ const MASS_WINDOW: Duration = Duration::from_secs(120);
 const DUPLICATE_WINDOW: Duration = Duration::from_secs(30);
 /// 触发跨群判定的最少不同 chat 数。
 const MASS_TARGETS: usize = 3;
+/// 跨 chat 内容重叠的字符 n-gram 大小。
+const NGRAM_SIZE: usize = 5;
+/// 跨 chat 内容重叠的时间窗口。
+const NGRAM_WINDOW: Duration = Duration::from_secs(600);
+/// 只有足够长的内容才做 n-gram 比对，避免短句误伤。
+const NGRAM_MIN_CHARS: usize = 24;
+/// 共享 n-gram 数达到该值即视为搬运。
+const NGRAM_SHARED: usize = 5;
 
 /// 一次门禁结论。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,6 +479,50 @@ fn truncate(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// 发送参数里的媒体引用（图片/文件/语音/视频）。
+fn outgoing_media(params: &Value) -> Vec<String> {
+    let Some(segments) = params.get("message").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    segments
+        .iter()
+        .filter_map(|segment| {
+            let kind = segment.get("type")?.as_str()?;
+            if !matches!(kind, "image" | "file" | "record" | "video") {
+                return None;
+            }
+            let data = segment.get("data")?;
+            let origin = data
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    data.get("file")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                })?;
+            Some(origin.to_owned())
+        })
+        .collect()
+}
+
+/// 归一化字符 n-gram（小写、空白折叠），用于跨 chat 内容重叠检测。
+fn ngrams(text: &str) -> std::collections::HashSet<String> {
+    let normalized: String = text
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let chars: Vec<char> = normalized.chars().collect();
+    if chars.len() < NGRAM_SIZE {
+        return std::collections::HashSet::new();
+    }
+    chars
+        .windows(NGRAM_SIZE)
+        .map(|window| window.iter().collect())
+        .collect()
+}
+
 struct SendRecord {
     at: Instant,
     chat: String,
@@ -577,6 +629,7 @@ impl ActionGate {
         if contains_at_all(params) && !evidence.owner_intent {
             return Err("message mentions @all; owner intent is required".to_owned());
         }
+        self.media_rule(params, evidence, chat)?;
         let content = message_content(params);
         if content.trim().is_empty() {
             return Ok(());
@@ -631,6 +684,49 @@ impl ActionGate {
                  mass sending requires owner intent",
                 targets.len()
             ));
+        }
+        // 不是逐字相同但高度重叠（搬运/转发）时也要求 owner intent。
+        if !evidence.owner_intent && content.chars().count() >= NGRAM_MIN_CHARS {
+            let current = ngrams(&content);
+            let overlapping = sends.iter().any(|record| {
+                record.chat != chat
+                    // 逐字相同交给 mass 规则（阈值 3 个 chat）；这里只抓“改写后搬运”。
+                    && record.content != content
+                    && now.duration_since(record.at) <= NGRAM_WINDOW
+                    && record.content.chars().count() >= NGRAM_MIN_CHARS
+                    && current.intersection(&ngrams(&record.content)).count() >= NGRAM_SHARED
+            });
+            if overlapping {
+                return Err(
+                    "content overlaps a message sent to another chat within 10 minutes;                      forwarding requires owner intent"
+                        .to_owned(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// 媒体来源校验：第一次出现在别的 chat 的图片/文件不能无证据转发。
+    fn media_rule(
+        &self,
+        params: &Value,
+        evidence: &TurnEvidence,
+        chat: &str,
+    ) -> Result<(), String> {
+        if evidence.owner_intent {
+            return Ok(());
+        }
+        let Some(db) = &self.db else {
+            return Ok(());
+        };
+        for origin in outgoing_media(params) {
+            if let Ok(Some(source)) = db.media_origin(&origin)
+                && source != chat
+            {
+                return Err(format!(
+                    "media was first seen in {source}; forwarding it to {chat} requires                      owner intent"
+                ));
+            }
         }
         Ok(())
     }
@@ -1057,5 +1153,78 @@ mod tests {
                 .await,
             ActionDecision::Block(reason) if reason.contains("reviewer blocked")
         ));
+    }
+
+    #[tokio::test]
+    async fn overlapping_content_across_chats_requires_owner_intent() {
+        let gate = auto_gate();
+        let original = "今天下午三点在会议室讨论一下新版本的上线计划和回滚方案，记得带上文档";
+        let params = json!({"group_id": 1, "message": original});
+        assert!(
+            gate.check(
+                spec("napcat.send_group_msg"),
+                &params,
+                &TurnEvidence::default()
+            )
+            .await
+            .is_allowed()
+        );
+        gate.note_send(&params, "group:1");
+
+        // 共享多个 5-gram、但不是逐字相同。
+        let forwarded = "今天下午三点在会议室讨论一下新版本的上线计划，以及回滚方案，记得带上文档";
+        let params = json!({"group_id": 2, "message": forwarded});
+        assert!(matches!(
+            gate.check(spec("napcat.send_group_msg"), &params, &TurnEvidence::default())
+                .await,
+            ActionDecision::Block(reason) if reason.contains("overlaps")
+        ));
+
+        let owner = TurnEvidence::owner("control");
+        assert!(
+            gate.check(spec("napcat.send_group_msg"), &params, &owner)
+                .await
+                .is_allowed()
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_media_from_another_chat_requires_owner_intent() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        db.record_media_origin("https://example.invalid/a.png", "group:1")
+            .unwrap();
+        let gate = auto_gate().with_db(db);
+        let params = json!({
+            "group_id": 2,
+            "message": [{"type": "image", "data": {"url": "https://example.invalid/a.png"}}]
+        });
+        assert!(matches!(
+            gate.check(spec("napcat.send_group_msg"), &params, &TurnEvidence::default())
+                .await,
+            ActionDecision::Block(reason) if reason.contains("first seen")
+        ));
+        assert!(
+            gate.check(
+                spec("napcat.send_group_msg"),
+                &params,
+                &TurnEvidence::owner("control")
+            )
+            .await
+            .is_allowed()
+        );
+        // 发回来源 chat 不需要额外证据。
+        let same = json!({
+            "group_id": 1,
+            "message": [{"type": "image", "data": {"url": "https://example.invalid/a.png"}}]
+        });
+        assert!(
+            gate.check(
+                spec("napcat.send_group_msg"),
+                &same,
+                &TurnEvidence::default()
+            )
+            .await
+            .is_allowed()
+        );
     }
 }

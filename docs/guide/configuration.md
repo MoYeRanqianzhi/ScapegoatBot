@@ -234,7 +234,8 @@ key 放 `auth.json`：
 - `[gate]`：每次 `napcat.*` 调用都过门禁。
   - `trusted`：直接放行，只统计速率。
   - `auto`（默认）：每分钟调用上限 `max_per_minute`；发送规则拦截 30 秒内同 chat 重复、
-    2 分钟内同内容发到 3 个以上 chat、无 owner intent 的 @全体；
+    2 分钟内同内容发到 3 个以上 chat、10 分钟内跨 chat 的 5-gram 重叠、跨 chat 转发媒体、
+    无 owner intent 的 @全体；
     `llm_review = true` 时对变更类动作追加一次 LLM 审查，失败按拒绝。
   - `approve`：变更类动作返回 `approval_required` 与请求 id，并私聊 master 一个
     6 位 nonce；主人回复 nonce 或用 `sbot gate approve <id>` 批准，120 秒内重试一次

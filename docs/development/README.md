@@ -27,7 +27,7 @@
 | `paths.rs` | `~/.sbot` 布局、逻辑根解析 | `SbotPaths` |
 | `config/mod.rs` | 根结构、加载、环境变量覆盖、校验分派 | `SbotConfig::load` |
 | `config/sections.rs` | 分节 schema（agent/queue/security/monitor/hooks…） | 各 `Config` 结构 |
-| `storage/` | 迁移 v1–v10、主密钥、消息归档 | `Database`、`MessageStore` |
+| `storage/` | 迁移 v1–v11、主密钥、消息归档 | `Database`、`MessageStore` |
 | `vfs/` | VFS 路径、SQLite 后端、配额 | `VfsStore`、`VfsPath` |
 | `providers/` | 三种协议、SSE、回退 | `build_provider`、`AgentLoop::new_with_fallbacks` |
 | `agent/` | 循环、消息/事件、队列、runner | `AgentLoop`、`Runner` |

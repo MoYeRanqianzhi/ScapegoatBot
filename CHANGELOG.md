@@ -5,6 +5,25 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.19] - 2026-11-04
+
+补齐 `auto` 门禁的内容级规则；数据库迁移到 v11。
+
+### 新增
+
+- **跨 chat 5-gram 重叠**：长文本（≥24 字）在 10 分钟内与发往其他 chat 的内容共享
+  3 个以上 5-gram 时，视为搬运/转发，要求 owner intent；短句与正常短回复不受影响。
+- **媒体来源**：新表 `media_origins` 记录图片/文件/语音/视频第一次出现的 chat；
+  转发到其他 chat 需要 owner intent，发回来源 chat 不需要。
+- 规则顺序：@all → 媒体来源 → 重复/跨群同文 → 5-gram 重叠，全部在成功发送前。
+
+### 测试
+
+- 新增：5-gram 拦截与 owner 放行、媒体跨 chat 拦截、来源 chat 放行。
+- `cargo test --all-targets`：339 项通过（328 lib + 4 config + 1 live stub +
+  6 NapCat，2 项真实 API 测试默认忽略）；`cargo fmt --check`、
+  `clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.18] - 2026-11-04
 
 补齐 `approve` 的第二个确认通道与持久化；数据库迁移到 v10。

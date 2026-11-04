@@ -142,6 +142,8 @@ owner intent 由 runtime 核实，不接受模型自报或聊天里的“主人�
 - 每分钟 `max_per_minute` 次 `napcat.*`，超出拒绝；
 - 30 秒内同 chat 重复同一内容 → 拒绝；
 - 2 分钟内同一内容发往 3 个以上不同 chat → 拒绝（除非有 owner intent）；
+- 10 分钟内与发往其他 chat 的长文本（≥24 字）共享 5 个以上 5-gram → 拒绝；
+- 图片/文件/语音/视频第一次出现在别的 chat，转发到新 chat → 拒绝；
 - 无 owner intent 的 @全体 → 拒绝；
 - `llm_review = true`：对变更类动作追加一次审查，审查失败/超时按拒绝处理。
 
@@ -202,7 +204,7 @@ sbot gate reject <id>
 | 项 | 现状 |
 |----|------|
 | `approve` 的确认通道 | 只有本地 IPC；没有向 master QQ 发 nonce 的流程；队列在内存里，重启丢失 |
-| `auto` 的发送规则 | 基于频率/重复/跨群同文/@all 的启发式，没有跨 chat n-gram 内容比对 |
+| `auto` 的发送规则 | 频率/重复/跨群同文/@all/5-gram/媒体来源是启发式；没有完整 `context_sources` 追踪 |
 | 周期检查的缓存复用 | 检查请求是独立窗口，不与主请求逐字节共享前缀 |
 | 群级破坏动作 | 没有用户目标，靠 owner intent 而不是硬保护 |
 | WebFetch | 后端已经抓取后才复核 `final_url` |

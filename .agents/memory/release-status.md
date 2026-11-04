@@ -8,7 +8,7 @@ metadata:
   last_verified: 2026-11-04
 ---
 
-当前版本：`0.2.0-alpha.18`（`main`）。数据库迁移到 v10；测试 337 项通过，
+当前版本：`0.2.0-alpha.19`（`main`）。数据库迁移到 v11；测试 339 项通过，
 `cargo fmt --check`、`clippy -D warnings` 通过；CI 已接入 GitHub Actions。
 
 alpha.13 修掉了 2026-11-03 审查的 P0/P1 主体；alpha.14 补齐了当时列为未实现的项；
@@ -41,7 +41,8 @@ alpha.15 做了第二轮审查，修掉新代码的边界问题（复盘基线�
 - 群级破坏动作（全员禁言/退群/解散）没有用户目标，不做 owner 保护。
 - WebFetch 的抓取由后端完成，内容在 final_url 复核前已被取走。
 - `approve` 已有 master 私聊 nonce 与数据库持久化（只存参数哈希）。
-- 周期检查使用独立窗口；`auto` 门禁仍是启发式；WebFetch 由后端抓取。
+- `auto` 已有跨 chat 5-gram 与媒体来源（`media_origins`）拦截。
+- 周期检查使用独立窗口；`auto` 门禁仍缺完整 `context_sources` 追踪；WebFetch 由后端抓取。
 - `[hooks.events]` 的 rewrite 只在 BeforeSend；SessionEnd/Stop/ConfigChange 的 inject 无去处。
 - `Agent message` 发给运行中的子代理仍只入历史。
 - 真实 API 未重跑；NapCat 协议用本地 WebSocket 模拟覆盖。
