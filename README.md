@@ -21,7 +21,7 @@ QQ 消息，用可配置的 LLM 生成回复，并把所有状态集中在本机
 - **安全闸**：输入/输出两层规则 + 分类器（Jev 或主模型）；`shadow` 只记录，
   `enforce` 命中即永久 `hold`，直到用真实上下文复核通过。
 - **动作门禁 `[gate]`**：每次 `napcat.*` 调用都过速率、重复/跨群/@all 规则，
-  可选 LLM 审查；`approve` 模式下变更动作需主人在 CLI 确认。
+  可选 LLM 审查；`approve` 模式下变更动作需主人在 CLI 或私聊 nonce 确认。
 - **owner intent**：跨 chat 发送、加好友、改资料等扩张动作必须由 runtime 证据支持；
   同 chat 回复不需要。
 - **周期安全检查**：每 `check_every_tokens` 用独立模型检查注入/社工与是否已照做；

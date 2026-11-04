@@ -79,7 +79,7 @@ sbot gate reject g3        # 拒绝
 3. 普通消息只留在 inbox，不逐条唤醒；内置 `wake-on-mention` / `wake-on-owner`
    命中时投递一次唤醒；
 4. 回合开始：入站消息进 transcript，压缩超限时先压缩，然后请求模型；
-5. 回合结束提交 transcript，标会话已读；`[queue]` 去抖在当前 inbox 模式下不参与。
+5. 回合结束提交 transcript，标会话已读；唤醒预设走 `[queue]` 的去抖/并发控制。
 
 ## 让它主动做事
 
