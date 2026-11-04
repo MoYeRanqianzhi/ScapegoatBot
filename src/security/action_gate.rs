@@ -59,22 +59,26 @@ impl ActionDecision {
     }
 }
 
-/// 主人在控制通道里对一次请求的确认记录。
+/// 主人在控制通道或主人私聊里对一次请求的确认记录。
 #[derive(Debug, Clone)]
 struct Approval {
     id: String,
     action: String,
     summary: String,
+    /// 仅进程内保留，用于展示；不写数据库。
     params: String,
-    created: Instant,
-    approved_until: Option<Instant>,
+    params_hash: String,
+    nonce: String,
+    created_at: i64,
+    approved_until: Option<i64>,
 }
 
-/// 待确认队列（进程内）。
+/// 待确认队列；可选数据库持久化（只存参数哈希与 nonce）。
 #[derive(Default)]
 pub struct ApprovalQueue {
     items: Mutex<HashMap<String, Approval>>,
     counter: AtomicU64,
+    db: Option<Arc<Database>>,
 }
 
 impl ApprovalQueue {
@@ -82,50 +86,189 @@ impl ApprovalQueue {
         Arc::new(Self::default())
     }
 
-    fn prune(&self, items: &mut HashMap<String, Approval>) {
-        let now = Instant::now();
-        items.retain(|_, approval| {
-            if let Some(until) = approval.approved_until {
-                until > now
-            } else {
-                now.duration_since(approval.created) <= APPROVAL_TTL
-            }
+    /// 带持久化：重启后未过期的 pending/approved 记录仍然可用。
+    pub fn with_db(db: Arc<Database>) -> Arc<Self> {
+        let queue = Arc::new(Self {
+            db: Some(Arc::clone(&db)),
+            ..Self::default()
         });
+        queue.load_from_db();
+        queue
+    }
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    fn load_from_db(&self) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        let rows = match db.gate_approvals() {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, "cannot load gate approvals");
+                return;
+            }
+        };
+        let now = Self::now();
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        for row in rows {
+            let approved =
+                row.status == "approved" && row.approved_until.is_some_and(|until| until > now);
+            let pending =
+                row.status == "pending" && now - row.created_at <= APPROVAL_TTL.as_secs() as i64;
+            if approved || pending {
+                items.insert(
+                    row.id.clone(),
+                    Approval {
+                        id: row.id,
+                        action: row.action,
+                        summary: row.summary,
+                        params: String::new(),
+                        params_hash: row.params_hash,
+                        nonce: row.nonce,
+                        created_at: row.created_at,
+                        approved_until: if approved { row.approved_until } else { None },
+                    },
+                );
+            } else {
+                let _ = db.delete_gate_approval(&row.id);
+            }
+        }
+    }
+
+    fn prune(&self, items: &mut HashMap<String, Approval>) {
+        let now = Self::now();
+        let ttl = APPROVAL_TTL.as_secs() as i64;
+        let mut expired = Vec::new();
+        items.retain(|id, approval| {
+            let keep = match approval.approved_until {
+                Some(until) => until > now,
+                None => now - approval.created_at <= ttl,
+            };
+            if !keep {
+                expired.push(id.clone());
+            }
+            keep
+        });
+        if let Some(db) = &self.db {
+            for id in expired {
+                let _ = db.delete_gate_approval(&id);
+            }
+        }
     }
 
     fn request(&self, action: &str, summary: &str, params: &Value) -> String {
-        let id = format!("g{}", self.counter.fetch_add(1, Ordering::Relaxed) + 1);
+        // 进程计数器重启会归零；带上毫秒时间戳，避免覆盖数据库里仍有效的旧请求。
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.subsec_nanos())
+            .unwrap_or(0);
+        let id = format!(
+            "g{}-{nanos}-{}",
+            chrono::Utc::now().timestamp_millis(),
+            self.counter.fetch_add(1, Ordering::Relaxed) + 1
+        );
+        let nonce = new_nonce(&id);
+        let params_text = params.to_string();
+        let params_hash = params_hash(&params_text);
+        let created_at = Self::now();
         let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         self.prune(&mut items);
-        items.insert(
-            id.clone(),
-            Approval {
+        let approval = Approval {
+            id: id.clone(),
+            action: action.to_owned(),
+            summary: summary.to_owned(),
+            params: params_text,
+            params_hash: params_hash.clone(),
+            nonce: nonce.clone(),
+            created_at,
+            approved_until: None,
+        };
+        if let Some(db) = &self.db {
+            let row = crate::storage::GateApprovalRow {
                 id: id.clone(),
                 action: action.to_owned(),
                 summary: summary.to_owned(),
-                params: params.to_string(),
-                created: Instant::now(),
+                params_hash,
+                nonce,
+                status: "pending".to_owned(),
+                created_at,
                 approved_until: None,
-            },
-        );
+            };
+            if let Err(error) = db.save_gate_approval(&row) {
+                tracing::warn!(%error, "cannot persist a gate approval request");
+            }
+        }
+        items.insert(id.clone(), approval);
         id
     }
 
     fn consume(&self, action: &str, params: &Value) -> bool {
-        let canonical = params.to_string();
+        let hash = params_hash(&params.to_string());
         let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         self.prune(&mut items);
-        let now = Instant::now();
+        let now = Self::now();
         let found = items.values().find(|approval| {
             approval.action == action
-                && approval.params == canonical
+                && approval.params_hash == hash
                 && approval.approved_until.is_some_and(|until| until > now)
         });
         let Some(found) = found.map(|approval| approval.id.clone()) else {
             return false;
         };
         items.remove(&found);
+        if let Some(db) = &self.db {
+            let _ = db.delete_gate_approval(&found);
+        }
         true
+    }
+
+    /// 某个待确认请求的 nonce（API 用它通知主人）。
+    pub fn nonce_for(&self, id: &str) -> Option<String> {
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        self.prune(&mut items);
+        items
+            .get(id)
+            .filter(|approval| approval.approved_until.is_none())
+            .map(|approval| approval.nonce.clone())
+    }
+
+    /// 主人私聊回复 nonce：批准对应请求并返回 id/action。
+    pub fn approve_by_nonce(&self, text: &str) -> Option<Value> {
+        let nonce = text.trim();
+        if nonce.is_empty() {
+            return None;
+        }
+        let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
+        self.prune(&mut items);
+        let id = items
+            .values()
+            .find(|approval| approval.approved_until.is_none() && approval.nonce == nonce)
+            .map(|approval| approval.id.clone())?;
+        let approval = items.get_mut(&id)?;
+        let until = Self::now() + APPROVED_WINDOW.as_secs() as i64;
+        approval.approved_until = Some(until);
+        if let Some(db) = &self.db
+            && let Err(error) = db.save_gate_approval(&crate::storage::GateApprovalRow {
+                id: approval.id.clone(),
+                action: approval.action.clone(),
+                summary: approval.summary.clone(),
+                params_hash: approval.params_hash.clone(),
+                nonce: approval.nonce.clone(),
+                status: "approved".to_owned(),
+                created_at: approval.created_at,
+                approved_until: Some(until),
+            })
+        {
+            tracing::warn!(%error, "cannot persist an approved gate request");
+        }
+        Some(json!({
+            "approved": id,
+            "action": approval.action,
+            "window_secs": APPROVED_WINDOW.as_secs(),
+        }))
     }
 
     /// 待确认列表（CLI / `/system/gate` 用）。
@@ -141,7 +284,8 @@ impl ApprovalQueue {
                     "action": approval.action,
                     "summary": approval.summary,
                     "params": approval.params,
-                    "wait_secs": approval.created.elapsed().as_secs(),
+                    "nonce": approval.nonce,
+                    "wait_secs": (Self::now() - approval.created_at).max(0),
                 })
             })
             .collect();
@@ -156,10 +300,27 @@ impl ApprovalQueue {
         let Some(approval) = items.get_mut(id) else {
             return Err(format!("unknown or expired approval request {id:?}"));
         };
-        approval.approved_until = Some(Instant::now() + APPROVED_WINDOW);
-        Ok(
-            json!({"approved": id, "action": approval.action, "window_secs": APPROVED_WINDOW.as_secs()}),
-        )
+        let until = Self::now() + APPROVED_WINDOW.as_secs() as i64;
+        approval.approved_until = Some(until);
+        if let Some(db) = &self.db
+            && let Err(error) = db.save_gate_approval(&crate::storage::GateApprovalRow {
+                id: approval.id.clone(),
+                action: approval.action.clone(),
+                summary: approval.summary.clone(),
+                params_hash: approval.params_hash.clone(),
+                nonce: approval.nonce.clone(),
+                status: "approved".to_owned(),
+                created_at: approval.created_at,
+                approved_until: Some(until),
+            })
+        {
+            tracing::warn!(%error, "cannot persist an approved gate request");
+        }
+        Ok(json!({
+            "approved": id,
+            "action": approval.action,
+            "window_secs": APPROVED_WINDOW.as_secs()
+        }))
     }
 
     /// 拒绝一个请求。
@@ -169,6 +330,9 @@ impl ApprovalQueue {
         if items.remove(id).is_none() {
             return Err(format!("unknown or expired approval request {id:?}"));
         }
+        if let Some(db) = &self.db {
+            let _ = db.delete_gate_approval(id);
+        }
         Ok(json!({"rejected": id}))
     }
 
@@ -176,6 +340,26 @@ impl ApprovalQueue {
     pub fn pending_count(&self) -> usize {
         self.pending().len()
     }
+}
+
+/// 参数哈希：只用于重启后匹配同一次调用，不落原文。
+fn params_hash(params: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(params.as_bytes());
+    hex::encode(digest)
+}
+
+/// 6 位 nonce；主人只在私聊里回复它。不是密码学令牌，但需要不可预测到
+/// 足以防止同群成员猜中；输入包含时间与进程信息。
+fn new_nonce(id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let digest = Sha256::digest(format!("{id}:{nanos}:{}", std::process::id()).as_bytes());
+    let value = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) % 1_000_000;
+    format!("{value:06}")
 }
 
 /// LLM 审查接口；由 runtime 注入（主 provider）。
@@ -323,6 +507,11 @@ impl ActionGate {
     }
 
     /// 设置每 chat 每小时发送上限（`[budget].chat_sends_per_hour`）。
+    /// 某个待确认请求的 nonce；API 用它通知主人。
+    pub fn nonce_for(&self, id: &str) -> Option<String> {
+        self.approvals.nonce_for(id)
+    }
+
     pub fn with_chat_send_limit(mut self, limit: u32) -> Self {
         self.chat_send_limit = limit;
         self
@@ -719,6 +908,58 @@ mod tests {
             .await
             .is_allowed()
         );
+    }
+
+    #[tokio::test]
+    async fn approvals_persist_and_match_by_nonce() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let config = GateConfig {
+            mode: GateMode::Approve,
+            max_per_minute: 60,
+            llm_review: false,
+        };
+        let first = ApprovalQueue::with_db(Arc::clone(&db));
+        let gate = ActionGate::new(&config, Arc::clone(&first));
+        let params = json!({"group_id": 1, "message": "hello"});
+        let decision = gate
+            .check(
+                spec("napcat.send_group_msg"),
+                &params,
+                &TurnEvidence::default(),
+            )
+            .await;
+        let ActionDecision::Pending { id, .. } = decision else {
+            panic!("expected pending");
+        };
+        let nonce = first.pending()[0]["nonce"].as_str().unwrap().to_owned();
+        assert!(first.approve_by_nonce(&nonce).is_some());
+
+        // 重启：只有参数哈希与 nonce 落库，已批准记录仍可消费一次。
+        drop(gate);
+        drop(first);
+        let reloaded = ApprovalQueue::with_db(Arc::clone(&db));
+        let gate = ActionGate::new(&config, Arc::clone(&reloaded));
+        assert!(matches!(
+            gate.check(
+                spec("napcat.send_group_msg"),
+                &params,
+                &TurnEvidence::default()
+            )
+            .await,
+            ActionDecision::Allow
+        ));
+        // 第二次消费失败，重新回到 pending。
+        assert!(matches!(
+            gate.check(
+                spec("napcat.send_group_msg"),
+                &params,
+                &TurnEvidence::default()
+            )
+            .await,
+            ActionDecision::Pending { .. }
+        ));
+        assert_eq!(reloaded.pending().len(), 1);
+        assert_ne!(reloaded.pending()[0]["id"], id);
     }
 
     #[tokio::test]

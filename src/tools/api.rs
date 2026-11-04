@@ -402,8 +402,27 @@ impl Tool for ApiTool {
                             return ToolResult::error(format!("blocked_by_gate: {reason}"));
                         }
                         crate::security::action_gate::ActionDecision::Pending { id, action } => {
+                            let nonce = action_gate
+                                .nonce_for(&id)
+                                .unwrap_or_else(|| "??????".to_owned());
+                            if self.master_qq > 0
+                                && let Some(gateway) = &self.gateway
+                            {
+                                let notice = format!(
+                                    "gate approval {id} for {action}. Reply with code {nonce}                                      in this private chat within 60s."
+                                );
+                                if let Err(error) = gateway
+                                    .call(
+                                        "send_private_msg",
+                                        json!({"user_id": self.master_qq, "message": notice}),
+                                    )
+                                    .await
+                                {
+                                    warn!(%error, "cannot send a gate approval nonce");
+                                }
+                            }
                             return ToolResult::error(format!(
-                                "approval_required: {action} is pending as {id}. The owner must run                                  `sbot gate approve {id}` (or reject it), then retry the action."
+                                "approval_required: {action} is pending as {id}. The owner can                                  reply with the code sent to their private chat, or run                                  `sbot gate approve {id}`, then retry the action."
                             ));
                         }
                     }
@@ -994,6 +1013,41 @@ mod tests {
             .await;
         assert!(!result.is_error, "{}", result.content);
         assert_eq!(gateway.calls.lock().unwrap()[0].0, "send_group_msg");
+    }
+
+    #[tokio::test]
+    async fn approve_mode_sends_a_nonce_to_master() {
+        let gateway = Arc::new(FakeGateway::default());
+        let approvals = crate::security::action_gate::ApprovalQueue::new();
+        let gate = Arc::new(crate::security::action_gate::ActionGate::new(
+            &crate::config::GateConfig {
+                mode: crate::config::GateMode::Approve,
+                max_per_minute: 60,
+                llm_review: false,
+            },
+            Arc::clone(&approvals),
+        ));
+        let tool = tool(Some(gateway.clone()), None).with_action_gate(Arc::clone(&gate));
+        let mut context = intent_ctx("control");
+        context.evidence = crate::agent::TurnEvidence::owner("control");
+        let result = tool
+            .execute(
+                &context,
+                json!({"action": "napcat.send_group_msg",
+                       "params": {"group_id": 1, "message": "hello"}}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("approval_required"));
+        let id = approvals.pending()[0]["id"].as_str().unwrap().to_owned();
+        let nonce = approvals.nonce_for(&id).unwrap();
+        let calls = gateway.calls.lock().unwrap();
+        let notice = calls
+            .iter()
+            .find(|(action, _)| action == "send_private_msg")
+            .expect("nonce notification");
+        assert_eq!(notice.1["user_id"], 10000);
+        assert!(notice.1["message"].as_str().unwrap().contains(&nonce));
     }
 
     #[tokio::test]

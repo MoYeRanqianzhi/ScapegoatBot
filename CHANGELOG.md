@@ -5,6 +5,29 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.18] - 2026-11-04
+
+补齐 `approve` 的第二个确认通道与持久化；数据库迁移到 v10。
+
+### 新增
+
+- **master 私聊 nonce**：`approve` 模式登记请求后，API 通过 NapCat 私聊 `master_qq`
+  发送 6 位 nonce；主人在该私聊回复 nonce 即批准。只接受 owner/master 的私聊、
+  非 self、非补消息；不进入 agent 回合。
+- **审批持久化**：新表 `gate_approvals` 保存 action、摘要、参数哈希、nonce、状态与
+  时间戳，不保存消息原文；重启后未过期的 pending/approved 记录仍可消费一次。
+  批准窗口 120 秒、pending 60 秒不变。
+- **请求 id 防重启碰撞**：改为 `g<毫秒>-<纳秒>-<计数器>`，避免进程计数器归零后覆盖
+  数据库中仍有效的旧请求。
+
+### 测试
+
+- 新增：nonce 批准与一次性消费、重启后按参数哈希恢复、API 私聊通知、以及
+  NapCat 本地 WebSocket 上的完整 nonce 往返（通知 → 批准 → 成功发送）。
+- `cargo test --all-targets`：337 项通过（326 lib + 4 config + 1 live stub +
+  6 NapCat，2 项真实 API 测试默认忽略）；`cargo fmt --check`、
+  `clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.17] - 2026-11-04
 
 补完剩余事件 hook 与配置字段，并新增本地 NapCat 协议模拟测试。

@@ -145,15 +145,18 @@ owner intent 由 runtime 核实，不接受模型自报或聊天里的“主人�
 - 无 owner intent 的 @全体 → 拒绝；
 - `llm_review = true`：对变更类动作追加一次审查，审查失败/超时按拒绝处理。
 
-`approve`：变更类动作返回 `approval_required` 和请求 id（60 秒内有效）。主人执行：
+`approve`：变更类动作返回 `approval_required` 和请求 id（60 秒内有效）。机器人同时
+用 NapCat 私聊 master 发送 6 位 nonce；主人在该私聊里直接回复 nonce 即批准，也可用
+控制通道：
 
 ```bash
 sbot gate pending
-sbot gate approve g1     # 批准后 120 秒内重试一次
-sbot gate reject g1
+sbot gate approve <id>   # 批准后 120 秒内重试一次
+sbot gate reject <id>
 ```
 
-批准是一次性的；确认只走控制通道，普通聊天回复不构成确认。
+批准是一次性的；普通群聊/他人回复不构成确认。队列持久化到 `gate_approvals`（只存
+参数哈希），重启后未过期的批准仍可消费一次。
 
 ## 主人保护
 
