@@ -55,8 +55,6 @@
 - `[session].scope = shared` 时跨 chat 上下文互相可见，这是替身场景的默认设计；
   需要隔离用 `per_chat`。
 - 子代理嵌套受 `max_depth`（默认 8）限制；`monitor` 绑定随子代理结束删除。
-- `Agent message` 发给正在运行的子代理会排入其历史，但当前回合不会中途读取，
-  要等下一次运行。
 - 压缩失败连续达到 `[compaction].max_failures` 后，自动压缩停止尝试，直到重启或
   一次手动 `agent.compact` 成功。
 - `[compaction].post_compact_recall` 注入的是 `/MEMORY.md` 索引，不是按语义检索

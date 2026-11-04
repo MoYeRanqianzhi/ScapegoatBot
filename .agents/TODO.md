@@ -16,7 +16,6 @@
 
 ## 运行与数据
 
-- [ ] `Agent message` 发给运行中的子代理只入历史、当前回合不读取：明确语义或实现中断。
 - [ ] 长跑/压测：alpha.14 的周期检查与压缩预算需要真实流量验证；记录到
       `docs/development/live-testing.md`。
 

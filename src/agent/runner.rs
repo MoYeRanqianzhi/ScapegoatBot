@@ -1308,6 +1308,8 @@ impl crate::swarm::SubagentRunner for Runner {
     /// - 有自己的历史，不写 transcript / turn buffer；
     /// - 不注入 owner context / USER / memory / skills。
     async fn run_subagent(&self, request: crate::swarm::SubagentRequest) -> Result<String> {
+        let mut incoming = request.incoming;
+        let shared_history = request.shared_history.clone();
         let slot = self.provider_snapshot();
         let mut tools = self.tools.filtered(&request.tools);
         if request.read_only {
@@ -1370,8 +1372,23 @@ impl crate::swarm::SubagentRunner for Runner {
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let mut steering = SteeringQueue::default();
         let outcome = loop_
-            .run(&mut history, Vec::new(), &mut steering, &tx)
+            .run_with_steering(
+                &mut history,
+                Vec::new(),
+                &mut steering,
+                incoming.as_mut(),
+                &tx,
+            )
             .await;
+        // 收尾：最后一轮之后到达的消息仍进入历史，避免下一轮丢失。
+        if let Some(receiver) = &mut incoming {
+            while let Ok(message) = receiver.try_recv() {
+                history.push(message);
+            }
+        }
+        if let Some(shared) = shared_history {
+            *shared.lock().await = history.clone();
+        }
         drop(tx);
         let _ = drain.await;
 
