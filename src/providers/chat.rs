@@ -573,4 +573,26 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn user_image_becomes_image_url_content() {
+        let messages = provider_messages(&[crate::providers::ProviderMessage {
+            role: crate::providers::Role::User,
+            content: vec![
+                crate::providers::ContentBlock::Text {
+                    text: "look".to_owned(),
+                },
+                crate::providers::ContentBlock::Image {
+                    mime_type: "image/png".to_owned(),
+                    data_base64: "aGVsbG8=".to_owned(),
+                },
+            ],
+        }]);
+        assert_eq!(messages[0]["content"][1]["type"], "image_url");
+        assert!(
+            messages[0]["content"][1]["image_url"]["url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("data:image/png;base64,"))
+        );
+    }
 }
