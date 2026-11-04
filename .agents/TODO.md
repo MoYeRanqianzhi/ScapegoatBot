@@ -23,9 +23,9 @@
 
 ## 待合并 / 待发布
 
-- [ ] 合并 `feat/i18n-logs`（`d90cec9`）：vendored `napcat-link` + 52 条英文日志 + `tools/check_log_i18n.py`。
+- [x] 合并 `feat/i18n-logs`（`d90cec9`）：vendored `napcat-link` + 52 条英文日志 + `tools/check_log_i18n.py`。
 - [ ] 处理 vendored `napcat-link` 剩余 17 条中文错误文本（`#[error]`、连接状态错误、配置校验），同步更新 `tests/error_test.rs` 断言。
-- [ ] 发布并部署 alpha.29/alpha.30：inbox-only + 可删除 `wake-on-mention` / `wake-on-owner` 预设，替换 hw1 上的 alpha.27。
+- [ ] 发布并部署 alpha.29：inbox-only + 可删除唤醒预设 + notice/request 入库 + 图片 tool result/media.*，替换 hw1 上的 alpha.27。
 
 ## Agent 运行时问题
 
