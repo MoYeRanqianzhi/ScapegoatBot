@@ -774,7 +774,7 @@ mod tests {
         let group_messages = group.read_segment(&group_current.file).unwrap();
         assert_eq!(group_messages.len(), 1);
         assert!(
-            matches!(&group_messages[0], AgentMessage::User { text } if text.contains("group message"))
+            matches!(&group_messages[0], AgentMessage::User { text, .. } if text.contains("group message"))
         );
     }
 }

@@ -52,9 +52,16 @@
 
 ## 仍未完成（下一轮）
 
-- [ ] meta lifecycle / heartbeat 审计落库；heartbeat 不入 inbox，connect/disable 需要审计表。
-- [ ] 无 chat 字段的 unknown 事件仍只写日志。
-- [ ] `/system/events` 或 `/messages` 的 raw 事件详情视图。
-- [ ] media.image_watermark 未实现；rotate/thumbnail/compress 已加。
+- [x] meta lifecycle / heartbeat 审计落库；heartbeat 跳过，`/system/events` 可读。
+- [x] 无 chat 字段的 unknown 事件进入 event_audit。
+- [x] `/system/events` 原始事件视图。
+- [x] media.image_watermark / rotate / thumbnail / compress。
 - [ ] runtime context 每回合持久化、prune 修改 in-flight working copy、cap_batches 不可达、swarm/monitor 小竞态。
 - [ ] alpha.34 尚未发布/部署；服务器 sbot 已按要求停止。
+
+## 仍剩余（P2）
+
+- [ ] `prune_tool_results` 修改 in-flight working copy，与已提交 transcript 可能不一致。
+- [ ] `Monitor fire` 被 min_interval 限速时仍返回成功。
+- [ ] swarm 重启竞态；控制回合无显式并发上限（turn_lock 串行但未限制排队数量）。
+- [ ] 图片自动下载的 QQ 域名白名单需要随 NapCat 实际 CDN 复核。

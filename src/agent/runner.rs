@@ -1017,6 +1017,7 @@ impl Runner {
             ..self.runtime_context(chat, &sessions)
         };
         let prompts = vec![AgentMessage::user(runtime.render())];
+        let runtime_blocks = prompts.len();
         let prompt_tokens = crate::session::compaction::estimate_messages(&prompts);
 
         let evidence = if owner_intent {
@@ -1080,7 +1081,7 @@ impl Runner {
                 .await;
         }
 
-        let new_blocks: Vec<AgentMessage> = working[base..].to_vec();
+        let new_blocks: Vec<AgentMessage> = working[base + runtime_blocks..].to_vec();
         if !new_blocks.is_empty() {
             let turn_id = new_turn_id();
             let scope = self.scope_name(chat);
@@ -1096,6 +1097,88 @@ impl Runner {
         );
         self.maybe_security_review(&history).await;
         Ok(outcome)
+    }
+
+    /// 把本批入站消息里的 QQ 图片下载成 image prompt；只接受 QQ 图片域名。
+    async fn inbound_image_prompts(
+        &self,
+        messages: &[crate::qq::event::QqMessage],
+    ) -> Vec<AgentMessage> {
+        use base64::Engine as _;
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+        {
+            Ok(client) => client,
+            Err(error) => {
+                warn!(%error, "cannot build the image download client");
+                return Vec::new();
+            }
+        };
+        let mut prompts = Vec::new();
+        for message in messages {
+            for segment in &message.segments {
+                let crate::qq::event::Segment::Image { url, .. } = segment else {
+                    continue;
+                };
+                let Ok(parsed) = reqwest::Url::parse(url) else {
+                    continue;
+                };
+                if parsed.scheme() != "https" {
+                    continue;
+                }
+                let Some(host) = parsed.host_str() else {
+                    continue;
+                };
+                if !(host.ends_with(".qq.com.cn")
+                    || host.ends_with(".qpic.cn")
+                    || host.ends_with(".qq.com"))
+                {
+                    continue;
+                }
+                let response = match client.get(parsed).send().await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        warn!(%error, "cannot download a QQ image");
+                        continue;
+                    }
+                };
+                let mime = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("image/jpeg")
+                    .split(';')
+                    .next()
+                    .unwrap_or("image/jpeg")
+                    .to_owned();
+                if !matches!(
+                    mime.as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                ) {
+                    continue;
+                }
+                let bytes = match response.bytes().await {
+                    Ok(bytes) if bytes.len() <= 3_500_000 => bytes,
+                    Ok(_) => {
+                        warn!("QQ image exceeds the 3.5 MB vision limit");
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(%error, "cannot read a QQ image");
+                        continue;
+                    }
+                };
+                prompts.push(AgentMessage::user_with_images(
+                    format!("[image from {}]", message.chat),
+                    vec![crate::agent::message::ImageAttachment {
+                        mime,
+                        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    }],
+                ));
+            }
+        }
+        prompts
     }
 
     /// “上次回复以来的群消息”：提供上下文，但不触发回合。
@@ -1247,7 +1330,10 @@ impl Runner {
             )));
         }
 
+        prompts.extend(self.inbound_image_prompts(&inbound_messages).await);
+
         // 4) 运行循环。工具执行器带上本回合证据。
+        let runtime_blocks = prompts.len();
         let prompt_tokens = crate::session::compaction::estimate_messages(&prompts);
         let slot = self.provider_snapshot();
         let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {
@@ -1335,7 +1421,7 @@ impl Runner {
         }
 
         // 5) 提交新块：buffer -> transcript -> 共享历史。
-        let new_blocks: Vec<AgentMessage> = working[base..].to_vec();
+        let new_blocks: Vec<AgentMessage> = working[base + runtime_blocks..].to_vec();
         if !new_blocks.is_empty() {
             let scope = self.scope_name(chat);
             for (seq, message) in new_blocks.iter().enumerate() {
@@ -2425,13 +2511,13 @@ mod tests {
         let group = histories.get("group-1").unwrap().lock().await.clone();
         let private = histories.get("private-2").unwrap().lock().await.clone();
         assert!(group.iter().any(
-            |message| matches!(message, AgentMessage::User { text } if text.contains("group one"))
+            |message| matches!(message, AgentMessage::User { text, .. } if text.contains("group one"))
         ));
         assert!(!group.iter().any(
-            |message| matches!(message, AgentMessage::User { text } if text.contains("private two"))
+            |message| matches!(message, AgentMessage::User { text, .. } if text.contains("private two"))
         ));
         assert!(private.iter().any(
-            |message| matches!(message, AgentMessage::User { text } if text.contains("private two"))
+            |message| matches!(message, AgentMessage::User { text, .. } if text.contains("private two"))
         ));
     }
 

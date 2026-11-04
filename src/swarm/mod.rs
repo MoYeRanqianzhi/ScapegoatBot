@@ -875,7 +875,7 @@ mod tests {
             if let Some(receiver) = &mut incoming
                 && let Ok(Some(message)) =
                     tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv()).await
-                && let AgentMessage::User { text } = message
+                && let AgentMessage::User { text, .. } = message
             {
                 self.seen.lock().await.push(text);
             }

@@ -1,6 +1,6 @@
 [package]
 name = "scapegoat-bot"
-version = "0.2.0-alpha.33"
+version = "0.2.0-alpha.34"
 edition = "2024"
 description = "ScapegoatBot - 一个 QQ Agent，代替用户像真人一样回复消息"
 license = "MIT"
@@ -57,6 +57,7 @@ dirs = "6"
 # 过滤器正则（sbot.toml 的 [filter].ignore_patterns）。
 regex = "1"
 # Base64：加密后的 JSONL 行。
+font8x8 = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 base64 = "0.22"
 # 十六进制编码：主密钥文件与哈希摘要。

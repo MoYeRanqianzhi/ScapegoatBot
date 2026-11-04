@@ -139,14 +139,28 @@ pub struct ToolResultMessage {
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum AgentMessage {
     System { text: String },
-    User { text: String },
+    User {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageAttachment>,
+    },
     Assistant(AssistantMessage),
     Tool(ToolResultMessage),
 }
 
 impl AgentMessage {
     pub fn user(text: impl Into<String>) -> Self {
-        Self::User { text: text.into() }
+        Self::User {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn user_with_images(text: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        Self::User {
+            text: text.into(),
+            images,
+        }
     }
 
     pub fn system(text: impl Into<String>) -> Self {

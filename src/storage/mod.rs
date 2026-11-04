@@ -25,6 +25,8 @@ const CANARY_PLAINTEXT: &[u8] = b"scapegoat-bot/canary/v1";
 /// canary 在 `meta` 表中的键名。
 const CANARY_KEY: &str = "encryption.canary";
 
+pub type EventAuditRow = (String, Option<String>, Option<u64>, Vec<u8>, String);
+
 /// 迁移列表：`(版本号, 说明, SQL)`。只追加，不修改已发布条目。
 const MIGRATIONS: &[(u32, &str, &str)] = &[
     (
@@ -300,6 +302,21 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     );
     "#,
     ),
+    (
+        12,
+        "event audit",
+        r#"
+    CREATE TABLE event_audit (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind        TEXT NOT NULL,
+        chat        TEXT,
+        actor       INTEGER,
+        payload_enc BLOB NOT NULL,
+        created_at  TEXT NOT NULL
+    );
+    CREATE INDEX event_audit_created ON event_audit(created_at);
+    "#,
+    ),
 ];
 
 /// 一条 gate 审批记录；参数只保存哈希。
@@ -411,6 +428,45 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    /// 记录一条原始 QQ 事件（payload 已加密）。
+    pub fn record_event(
+        &self,
+        kind: &str,
+        chat: Option<&str>,
+        actor: Option<u64>,
+        payload: &[u8],
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "INSERT INTO event_audit (kind, chat, actor, payload_enc, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![kind, chat, actor.map(|a| a as i64), payload, now_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// 最近的事件审计行。
+    pub fn recent_events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<EventAuditRow>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT kind, chat, actor, payload_enc, created_at FROM event_audit
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit as u32], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get::<_, Option<i64>>(2)?.map(|value| value as u64),
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// 写入元数据（覆盖）。
@@ -668,5 +724,18 @@ mod tests {
         let first = db.insert_control_input(b"x", "cli").unwrap();
         let second = db.insert_control_input(b"y", "cli").unwrap();
         assert_eq!(second, first + 1);
+    }
+
+    #[test]
+    fn event_audit_roundtrips() {
+        let db = Database::open_in_memory().unwrap();
+        db.record_event("notice:poke", Some("group:1"), Some(42), b"sealed")
+            .unwrap();
+        let rows = db.recent_events(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "notice:poke");
+        assert_eq!(rows[0].1.as_deref(), Some("group:1"));
+        assert_eq!(rows[0].2, Some(42));
+        assert_eq!(rows[0].3, b"sealed");
     }
 }

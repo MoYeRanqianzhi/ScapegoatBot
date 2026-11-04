@@ -5,6 +5,28 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.34] - 2026-11-04
+
+补齐事件审计、图片自动注入与剩余审计项。
+
+### 新增
+
+- `/system/events`：最近 100 条 notice/request/meta/unknown 原始事件（加密落库）。
+- 入站 QQ 图片在唤醒回合内自动下载为 image prompt（仅 QQ 图片域名，≤3.5 MB）。
+- `media.image_watermark`。
+- `media.image_rotate` / `image_thumbnail` / `image_compress`。
+- MCP image block 进入 `ToolResult.images`。
+
+### 修复
+
+- 唤醒预设重新走 `ChatQueue`，恢复去抖/并发/`idle_only`。
+- 30 秒逐 chunk 流空闲超时。
+- 旧 transcript 行号偏移自动尝试恢复。
+- runtime context 不再写入 transcript。
+- 截断 tool args 不再以 `{}` 执行；重试 jitter；`Retry-After` 不截断。
+- session 创建改为 `create_new` 原子占位。
+- monitor batch flush 竞态；移除不可达的 `cap_batches` 分支。
+
 ## [0.2.0-alpha.33] - 2026-11-04
 
 用真实 API usage 估算上下文，避免图片把上下文撑爆。

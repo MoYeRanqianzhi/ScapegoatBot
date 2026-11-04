@@ -28,6 +28,7 @@ use crate::qq::{ChatId, QqClient, format};
 use crate::security::Gate;
 use crate::storage::messages::MessageStore;
 use crate::vfs::Vfs;
+use font8x8::UnicodeFonts;
 
 use super::actions::{ActionSpec, Category, specs};
 use super::{Permission, Tool, ToolContext, arg_str, object_schema};
@@ -720,6 +721,37 @@ impl ApiTool {
                     })
                     .to_string(),
                 );
+            }
+            "media.image_watermark" => {
+                let text = params.get("text").and_then(Value::as_str).unwrap_or("sbot");
+                let mut rgba = image.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let scale = 2u32;
+                let text_w = text.chars().count() as u32 * 8 * scale;
+                let x0 = w.saturating_sub(text_w + 8);
+                let y0 = h.saturating_sub(8 * scale + 8);
+                for (i, ch) in text.chars().enumerate() {
+                    let Some(glyph) = font8x8::BASIC_FONTS.get(ch) else {
+                        continue;
+                    };
+                    for (row, bits) in glyph.iter().enumerate() {
+                        for col in 0..8 {
+                            if bits & (1 << col) == 0 {
+                                continue;
+                            }
+                            for dy in 0..scale {
+                                for dx in 0..scale {
+                                    let x = x0 + i as u32 * 8 * scale + col as u32 * scale + dx;
+                                    let y = y0 + row as u32 * scale + dy;
+                                    if x < w && y < h {
+                                        rgba.put_pixel(x, y, image::Rgba([255, 255, 255, 180]));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                image::DynamicImage::ImageRgba8(rgba)
             }
             "media.image_convert" => image,
             other => return ToolResult::error(format!("unsupported media action {other:?}")),
@@ -1572,5 +1604,20 @@ mod tests {
         assert!(!result.is_error, "{}", result.content);
         let out = crate::vfs::path::VfsPath::parse("/tmp/b.png").unwrap();
         assert!(vfs.stat(&out).is_ok());
+
+        let result = tool
+            .execute(
+                &ctx,
+                json!({
+                    "action": "media.image_watermark",
+                    "params": {"path": "/tmp/a.png", "out": "/tmp/wm.png", "text": "sbot"}
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            vfs.stat(&crate::vfs::path::VfsPath::parse("/tmp/wm.png").unwrap())
+                .is_ok()
+        );
     }
 }

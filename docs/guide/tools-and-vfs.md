@@ -91,7 +91,8 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 
 - `napcat.*`：QQ 操作。hold 期间全部拒绝。
 - `agent.*`：`status`、`resume`、`quarantine`、`compact`、`clear_context`。
-- `media.*`：本地图片处理：`image_info`、`image_resize`、`image_crop`、`image_convert`；
+- `media.*`：本地图片处理：`image_info`、`image_resize`、`image_crop`、`image_convert`、
+  `image_rotate`、`image_thumbnail`、`image_compress`、`image_watermark`；
   处理结果写回 VFS，随后可直接 `Read`。
 - `api.*`：`list`（过滤/分页）、`help`（单个 action 的 schema）。
 
@@ -115,7 +116,8 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 | transcript | 2 GiB | 超限关闭最旧分段 |
 | 磁盘余量 | ≥1 GiB | 低于阈值拒绝写入 |
 
-回收站按比例清理；墓碑与用量可在 `/system` 查看。
+回收站按比例清理；墓碑与用量可在 `/system` 查看；`/system/events` 列出最近 100 条 notice/request/meta/unknown
+原始事件（正文已解密）。
 
 ## 子代理
 

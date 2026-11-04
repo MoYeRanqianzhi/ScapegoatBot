@@ -461,10 +461,17 @@ impl AgentLoop {
                     text: text.clone(),
                     cache: false,
                 }),
-                AgentMessage::User { text } => messages.push(ProviderMessage {
-                    role: Role::User,
-                    content: vec![ContentBlock::Text { text: text.clone() }],
-                }),
+                AgentMessage::User { text, images } => {
+                    let mut content = vec![ContentBlock::Text { text: text.clone() }];
+                    content.extend(images.iter().map(|image| ContentBlock::Image {
+                        mime_type: image.mime.clone(),
+                        data_base64: image.data_base64.clone(),
+                    }));
+                    messages.push(ProviderMessage {
+                        role: Role::User,
+                        content,
+                    });
+                }
                 AgentMessage::Assistant(assistant) => {
                     let content = assistant
                         .content
@@ -900,7 +907,7 @@ fn push_thinking(blocks: &mut Vec<BlockAccumulator>, delta: &str) {
 pub(crate) fn render_message(message: &AgentMessage) -> String {
     match message {
         AgentMessage::System { text } => format!("system: {text}\n"),
-        AgentMessage::User { text } => format!("user: {text}\n"),
+        AgentMessage::User { text, .. } => format!("user: {text}\n"),
         AgentMessage::Assistant(assistant) => render_assistant(assistant),
         AgentMessage::Tool(tool) => format!(
             "tool {} ({}): {}\n",

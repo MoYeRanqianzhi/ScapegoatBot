@@ -81,6 +81,7 @@ pub struct ViewContext {
     pub estop_file: Option<PathBuf>,
     pub started_at: Option<DateTime<Utc>>,
     pub db: Option<Arc<Database>>,
+    pub key: Option<Arc<crate::storage::crypto::MasterKey>>,
     /// 允许读取的 chat；`["*"]` = 全部，空 = 拒绝一切。
     pub receive_scopes: Vec<String>,
 }
@@ -95,6 +96,7 @@ impl Default for ViewContext {
             estop_file: None,
             started_at: None,
             db: None,
+            key: None,
             receive_scopes: vec!["*".to_owned()],
         }
     }
@@ -503,7 +505,7 @@ fn storage(error: anyhow::Error) -> VfsError {
 fn render_agent_message(message: &AgentMessage) -> String {
     match message {
         AgentMessage::System { text } => format!("[system]\n{text}"),
-        AgentMessage::User { text } => format!("[user]\n{text}"),
+        AgentMessage::User { text, .. } => format!("[user]\n{text}"),
         AgentMessage::Assistant(assistant) => {
             let mut out = String::from("[assistant]");
             for block in &assistant.content {
