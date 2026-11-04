@@ -469,4 +469,15 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn idle_covers_pending_debounce_batches() {
+        let handler = Arc::new(RecordingHandler::default());
+        let queue = ChatQueue::new(config(), handler);
+        assert!(queue.is_idle().await);
+        queue.ingest(msg(ChatId::Group(1), 1)).await;
+        assert!(!queue.is_idle().await);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(queue.is_idle().await);
+    }
 }
