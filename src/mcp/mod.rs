@@ -466,6 +466,9 @@ impl Tool for McpTool {
         let tool = args.get("tool").and_then(Value::as_str);
         let arguments = args.get("args").cloned().unwrap_or_else(|| json!({}));
         match self.manager.call(server, tool, arguments).await {
+            Ok((text, true, images)) if !images.is_empty() => {
+                ToolResult::error_with_images(text, images)
+            }
             Ok((text, true, _)) => ToolResult::error(text),
             Ok((text, false, images)) if !images.is_empty() => {
                 ToolResult::with_images(text, images)

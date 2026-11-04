@@ -61,6 +61,8 @@ pub struct SessionStore {
     retention_days: u32,
     /// 同一分段的 append/read 串行化，避免行号竞争。
     append_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    /// 当前分段解析/创建串行化，避免两个首次写入建出两个 open segment。
+    current_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl SessionStore {
@@ -83,6 +85,7 @@ impl SessionStore {
             scope: None,
             retention_days: 0,
             append_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            current_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -97,6 +100,7 @@ impl SessionStore {
             scope: Some(scope.to_owned()),
             retention_days: self.retention_days,
             append_lock: std::sync::Arc::clone(&self.append_lock),
+            current_lock: std::sync::Arc::clone(&self.current_lock),
         }
     }
 
@@ -123,6 +127,10 @@ impl SessionStore {
 
     /// 当前（未关闭）分段；不存在时创建一个。
     pub fn current(&self) -> Result<SessionFile> {
+        let _guard = self
+            .current_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let existing: Option<String> = {
             let conn = self.db.lock();
             conn.query_row(
@@ -566,7 +574,7 @@ impl SessionStore {
                 sealed.extend_from_slice(&nonce);
                 sealed.extend_from_slice(&ct);
                 let mut plain = None;
-                for candidate in std::iter::once(line_no).chain(1..=4096) {
+                for candidate in std::iter::once(line_no).chain(1..=65536) {
                     let aad = format!("session:{file_id}:{candidate}");
                     if let Ok(value) = self.key.open("session", aad.as_bytes(), &sealed) {
                         plain = Some(value);

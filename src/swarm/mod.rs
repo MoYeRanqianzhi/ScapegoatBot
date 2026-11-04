@@ -502,6 +502,7 @@ impl AgentHub {
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown subagent {id:?}"))?;
+        let _dispatch = instance.dispatch_lock.lock().await;
         let status = instance.status.lock().await.clone();
         if status == InstanceStatus::Running {
             let sender = instance.incoming.lock().await.clone();
@@ -518,8 +519,7 @@ impl AgentHub {
             return Ok(serde_json::json!({"id": id, "queued": true}));
         }
 
-        // 已结束：串行化重启；拿到锁后重新检查状态。
-        let _dispatch = instance.dispatch_lock.lock().await;
+        // 已结束：锁已持有，重新检查状态。
         let status = instance.status.lock().await.clone();
         if status == InstanceStatus::Running {
             let sender = instance.incoming.lock().await.clone();
@@ -674,6 +674,7 @@ async fn run_instance(
 ) {
     let task = request.task.clone();
     let outcome = runner.run_subagent(request).await;
+    let _dispatch = instance.dispatch_lock.lock().await;
     *instance.incoming.lock().await = None;
     let mut history = instance.history.lock().await;
     match outcome {

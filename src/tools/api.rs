@@ -656,6 +656,14 @@ impl ApiTool {
         {
             return ToolResult::error("media.image_compress requires a .jpg/.jpeg output path");
         }
+        if spec.action == "media.image_convert"
+            && !(out.ends_with(".png")
+                || out.ends_with(".jpg")
+                || out.ends_with(".jpeg")
+                || out.ends_with(".webp"))
+        {
+            return ToolResult::error("media.image_convert requires .png/.jpg/.jpeg/.webp output");
+        }
         let output = match spec.action {
             "media.image_resize" => {
                 let w = params.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -736,6 +744,9 @@ impl ApiTool {
             }
             "media.image_watermark" => {
                 let text = params.get("text").and_then(Value::as_str).unwrap_or("sbot");
+                if !text.is_ascii() {
+                    return ToolResult::error("media.image_watermark only supports ASCII text");
+                }
                 let mut rgba = image.to_rgba8();
                 let (w, h) = rgba.dimensions();
                 let scale = 2u32;

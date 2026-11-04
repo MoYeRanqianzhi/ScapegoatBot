@@ -258,6 +258,13 @@ impl ChatQueue {
             .filter(|state| state.active.is_some())
             .count()
     }
+
+    /// 没有运行中的回合、没有待派发批次、没有排队消息。
+    pub async fn is_idle(&self) -> bool {
+        self.states.lock().await.values().all(|state| {
+            state.active.is_none() && state.pending.is_empty() && state.pending_batches == 0
+        })
+    }
 }
 
 #[cfg(test)]
