@@ -166,7 +166,7 @@ fn truncate(text: &str, max_chars: usize) -> String {
 fn render_message(message: &AgentMessage) -> String {
     match message {
         AgentMessage::System { text } => format!("[system] {text}"),
-        AgentMessage::User { text } => format!("[user] {text}"),
+        AgentMessage::User { text, .. } => format!("[user] {text}"),
         AgentMessage::Assistant(assistant) => {
             let mut out = String::from("[assistant]");
             for block in &assistant.content {

@@ -390,7 +390,7 @@ mod tests {
         let messages = one.read_segment(&current.file).unwrap();
         assert_eq!(messages.len(), 1);
         match &messages[0] {
-            AgentMessage::User { text } => assert!(text.contains("group one")),
+            AgentMessage::User { text, .. } => assert!(text.contains("group one")),
             other => panic!("unexpected {other:?}"),
         }
 

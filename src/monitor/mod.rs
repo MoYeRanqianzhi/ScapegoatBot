@@ -485,8 +485,8 @@ impl MonitorManager {
         monitor.pending_deliveries.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
             tokio::time::sleep(monitor.batch_window).await;
-            let texts = std::mem::take(&mut *monitor.batch.lock().expect("monitor lock"));
             monitor.flush_queued.store(false, Ordering::SeqCst);
+            let texts = std::mem::take(&mut *monitor.batch.lock().expect("monitor lock"));
             if texts.is_empty() {
                 monitor.pending_deliveries.fetch_sub(1, Ordering::SeqCst);
                 return;

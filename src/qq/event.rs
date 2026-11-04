@@ -245,6 +245,7 @@ pub enum QqEvent {
     Request(QqRequest),
     Meta {
         kind: String,
+        data: Value,
     },
     Unknown {
         name: String,
@@ -278,6 +279,7 @@ pub fn normalize(name: &str, data: &Value) -> QqEvent {
     if post_type == "meta_event" || name.starts_with("meta_event.") {
         return QqEvent::Meta {
             kind: name.to_owned(),
+            data: data.clone(),
         };
     }
     QqEvent::Unknown {

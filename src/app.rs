@@ -68,6 +68,28 @@ struct AgentRuntime {
     approvals: Arc<crate::security::action_gate::ApprovalQueue>,
     owner_qq: u64,
     master_qq: u64,
+    audit: EventAudit,
+}
+
+#[derive(Clone)]
+struct EventAudit {
+    db: Arc<Database>,
+    key: Arc<crate::storage::crypto::MasterKey>,
+}
+
+impl EventAudit {
+    fn record(&self, kind: &str, chat: Option<&str>, actor: Option<u64>, raw: &serde_json::Value) {
+        let Ok(plain) = serde_json::to_vec(raw) else {
+            return;
+        };
+        let Ok(sealed) = self.key.seal("event-audit", b"", &plain) else {
+            warn!(%kind, "cannot encrypt an event audit record");
+            return;
+        };
+        if let Err(error) = self.db.record_event(kind, chat, actor, &sealed) {
+            warn!(%error, %kind, "cannot store an event audit record");
+        }
+    }
 }
 
 /// monitor 的投递端：把事件变成一次注入回合。
@@ -365,6 +387,7 @@ impl Runtime {
             &models,
             &auth,
             Arc::clone(&db),
+            Arc::clone(&key),
             Arc::clone(&vfs),
             Arc::clone(&messages),
             Arc::clone(&sessions),
@@ -1093,6 +1116,7 @@ async fn build_agent(
     models: &ModelsFile,
     auth: &AuthFile,
     db: Arc<Database>,
+    key: Arc<crate::storage::crypto::MasterKey>,
     vfs: Arc<VfsStore>,
     messages: Arc<MessageStore>,
     sessions: Arc<SessionStore>,
@@ -1200,6 +1224,7 @@ async fn build_agent(
             estop_file: Some(estop_file.clone()),
             started_at: Some(chrono::Utc::now()),
             db: Some(Arc::clone(&db)),
+            key: Some(Arc::clone(&key)),
             receive_scopes: config.agent.receive_scopes.clone(),
         }),
     );
@@ -1397,6 +1422,10 @@ async fn build_agent(
         approvals,
         owner_qq,
         master_qq,
+        audit: EventAudit {
+            db: Arc::clone(&db),
+            key: Arc::clone(&key),
+        },
     });
 
     // `/config/filter` 写入后立即替换准入过滤器（弱引用避免循环）。
@@ -1628,6 +1657,12 @@ async fn handle_qq_event(
             Err(error) => warn!(%error, "cannot store an inbound message"),
         },
         QqEvent::Notice(notice) => {
+            agent.audit.record(
+                &format!("notice:{}", notice.kind),
+                notice.chat.as_ref().map(|chat| chat.to_string()).as_deref(),
+                notice.actor,
+                &notice.raw,
+            );
             if let Some(message) = notice.to_inbox_message()
                 && let Err(error) = messages.append(&message)
             {
@@ -1636,6 +1671,15 @@ async fn handle_qq_event(
             debug!(kind = %notice.kind, "QQ notice");
         }
         QqEvent::Request(request) => {
+            agent.audit.record(
+                &format!("request:{}", request.kind),
+                request
+                    .group
+                    .map(|group| format!("group:{group}"))
+                    .as_deref(),
+                request.actor,
+                &request.raw,
+            );
             if let Some(message) = request.to_inbox_message()
                 && let Err(error) = messages.append(&message)
             {
@@ -1643,11 +1687,21 @@ async fn handle_qq_event(
             }
             debug!(kind = %request.kind, actor = ?request.actor, "QQ request");
         }
-        QqEvent::Meta { kind } => debug!(kind, "meta event"),
+        QqEvent::Meta { kind, data } => {
+            let heartbeat = data
+                .get("meta_event_type")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind == "heartbeat");
+            if !heartbeat {
+                agent.audit.record(&kind, None, None, &data);
+            }
+            debug!(kind, "meta event");
+        }
         QqEvent::Connection { connected, reason } => {
             debug!(connected, %reason, "connection state");
         }
         QqEvent::Unknown { name, data } => {
+            agent.audit.record(&name, None, None, &data);
             if let Some(message) = crate::qq::event::unknown_to_inbox_message(&name, &data)
                 && let Err(error) = messages.append(&message)
             {

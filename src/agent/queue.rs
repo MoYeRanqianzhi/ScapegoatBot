@@ -160,7 +160,6 @@ impl ChatQueue {
 
     /// 去抖窗口结束：取出一批并启动回合。
     async fn fire(self: &Arc<Self>, chat: ChatId, token: u64) {
-        let config = self.config();
         let (batch, steering_tx, steering_rx) = {
             let mut states = self.states.lock().await;
             let Some(state) = states.get_mut(&chat) else {
@@ -173,12 +172,6 @@ impl ChatQueue {
             if state.pending.is_empty() {
                 state.pending_batches = state.pending_batches.saturating_sub(1);
                 return;
-            }
-            if state.pending_batches > config.cap_batches {
-                // 批次上限：当前实现每个 chat 同时只有一个排队批次，超出说明
-                // 计数异常；丢掉最旧的消息并记账，避免继续堆积。
-                state.pending.pop_front();
-                state.dropped += 1;
             }
 
             let messages: Vec<QqMessage> = state.pending.drain(..).collect();
@@ -459,7 +452,7 @@ mod tests {
         let steer = handler.steer.lock().unwrap();
         assert_eq!(steer.len(), 1);
         match &steer[0] {
-            AgentMessage::User { text } => assert!(text.contains("m2")),
+            AgentMessage::User { text, .. } => assert!(text.contains("m2")),
             other => panic!("unexpected {other:?}"),
         }
     }

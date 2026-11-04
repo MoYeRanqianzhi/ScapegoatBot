@@ -6,10 +6,12 @@ use super::*;
 
 impl Views {
     pub(super) fn list_system(&self) -> Vec<ViewEntry> {
-        ["status", "storage", "security", "gate", "hooks", "context"]
-            .into_iter()
-            .map(|name| text_entry(&format!("/system/{name}")))
-            .collect()
+        [
+            "status", "storage", "security", "gate", "hooks", "context", "events",
+        ]
+        .into_iter()
+        .map(|name| text_entry(&format!("/system/{name}")))
+        .collect()
     }
 
     pub(super) fn read_system(&self, section: &str) -> Result<ViewRead, VfsError> {
@@ -43,6 +45,40 @@ impl Views {
                     out.push_str(&format!(
                         "uptime_secs: {}\n",
                         (Utc::now() - started).num_seconds().max(0)
+                    ));
+                }
+                out
+            }
+            "events" => {
+                let mut out = String::from(
+                    "# Event audit (newest first)
+",
+                );
+                let Some(db) = &self.context.db else {
+                    return Err(VfsError::Offline("/system/events".to_owned()));
+                };
+                let Some(key) = &self.context.key else {
+                    return Err(VfsError::Offline("/system/events".to_owned()));
+                };
+                for (kind, chat, actor, sealed, created_at) in db
+                    .recent_events(100)
+                    .map_err(|error| VfsError::Storage(error.to_string()))?
+                {
+                    let raw = key
+                        .open("event-audit", b"", &sealed)
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .unwrap_or_else(|_| "<cannot decrypt>".to_owned());
+                    out.push_str(&format!(
+                        "## {kind} {created_at}
+chat: {}
+actor: {}
+{raw}
+
+",
+                        chat.as_deref().unwrap_or("-"),
+                        actor
+                            .map(|a| a.to_string())
+                            .unwrap_or_else(|| "-".to_owned())
                     ));
                 }
                 out

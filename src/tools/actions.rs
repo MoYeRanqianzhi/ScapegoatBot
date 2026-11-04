@@ -550,6 +550,12 @@ pub fn specs() -> &'static [ActionSpec] {
                 r#"{"path":"/tmp/a.jpg","out":"/tmp/face.jpg","x":100,"y":50,"width":512,"height":512}"#,
             ),
             (
+                "media.image_watermark",
+                "Draw an ASCII text watermark near the bottom-right corner.",
+                json!({"path": {"type": "string"}, "out": {"type": "string"}, "text": {"type": "string"}}),
+                r#"{"path":"/tmp/a.jpg","out":"/tmp/wm.jpg","text":"sbot"}"#,
+            ),
+            (
                 "media.image_rotate",
                 "Rotate an image clockwise by 90/180/270 degrees.",
                 json!({"path": {"type": "string"}, "out": {"type": "string"}, "degrees": {"type": "number"}}),
