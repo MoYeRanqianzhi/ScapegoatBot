@@ -220,6 +220,8 @@ pub struct Runner {
     review_failures: std::sync::atomic::AtomicU32,
     /// 周期检查互斥。
     review_lock: Mutex<()>,
+    /// 主 agent 回合互斥：shared transcript 下同一时刻只允许一个回合。
+    turn_lock: tokio::sync::Mutex<()>,
 }
 
 /// 把回合证据注入每次工具调用。
@@ -374,6 +376,7 @@ impl Runner {
             unchecked_tokens: std::sync::atomic::AtomicU64::new(0),
             review_failures: std::sync::atomic::AtomicU32::new(0),
             review_lock: Mutex::new(()),
+            turn_lock: tokio::sync::Mutex::new(()),
         });
         let _ = runner
             .fire_hooks(crate::config::HookEvent::SessionStart, None, None)
@@ -984,6 +987,17 @@ impl Runner {
                 turns: 0,
             });
         }
+        let _turn_guard = self.turn_lock.lock().await;
+        if let Some(budget) = &self.config.budget
+            && let Some(reason) = budget.check_daily().await
+        {
+            warn!(%reason, "skipping this injected turn");
+            return Ok(LoopOutcome {
+                stop_reason: crate::agent::StopReason::Aborted,
+                usage: Default::default(),
+                turns: 0,
+            });
+        }
         let chat = ChatId::Private(self.config.owner_qq);
         let sessions = self.session_for(chat).await;
         let history = self.history_for(chat).await;
@@ -1060,6 +1074,11 @@ impl Runner {
             .await;
         drop(tx);
         let _ = logger.await;
+        if let Some(budget) = &self.config.budget {
+            budget
+                .record_usage(outcome.usage.input_tokens, outcome.usage.output_tokens)
+                .await;
+        }
 
         let new_blocks: Vec<AgentMessage> = working[base..].to_vec();
         if !new_blocks.is_empty() {
@@ -1126,6 +1145,7 @@ impl Runner {
             debug!(chat = %input.chat, "agent is paused by the security review; skipping this turn");
             return Ok(());
         }
+        let _turn_guard = self.turn_lock.lock().await;
         let chat = input.chat;
         let inbound_messages = input.messages.clone();
         let sessions = self.session_for(chat).await;

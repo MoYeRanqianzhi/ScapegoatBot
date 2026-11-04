@@ -98,7 +98,7 @@ impl Tool for MonitorTool {
                     Ok(name) => name,
                     Err(error) => return error,
                 };
-                match self.manager.fire(name).await {
+                match self.manager.fire_async(name).await {
                     Ok(()) => ToolResult::ok(json!({"fired": name}).to_string()),
                     Err(error) => ToolResult::error(error.to_string()),
                 }
@@ -333,6 +333,7 @@ mod tests {
         // 常量条件在 fire 时以“手动触发”文本投递。
         let result = run(&tool, json!({"op": "fire", "name": "at-me"})).await;
         assert!(!result.is_error, "{}", result.content);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert_eq!(sink.deliveries.lock().unwrap().len(), 1);
 
         let result = run(&tool, json!({"op": "remove", "name": "at-me"})).await;

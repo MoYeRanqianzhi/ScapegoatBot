@@ -5,6 +5,28 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.30] - 2026-11-04
+
+按 pi / Claude Code 对照审计修复回合与图片链路。
+
+### 修复
+
+- 主 agent 回合加全局互斥：shared transcript 下控制、monitor、普通回合不再并发交错；
+  `Monitor fire` 改为后台投递，避免在工具栈里重入回合锁。
+- transcript append/read 按分段串行化，行号写入加密信封；修复并发 append 导致的
+  AAD 行号错位和“skipping unreadable transcript line”。
+- Chat 协议流没有 `finish_reason` 时不再伪造 `EndTurn`，改为 Network 错误，避免
+  半截响应被当成成功提交。
+- `run_injected` 计入 daily budget，monitor/control 回合不再绕过预算。
+- 图片：Chat 协议真正发送 `image_url`；`Read` 限制 3.5 MB 与 png/jpeg/gif/webp；
+  `media.image_resize`/`crop` 限制 8192 并做 checked 边界；图片计入 token 估算，
+  旧工具结果裁剪时清理图片附件。
+- `API` 返回值中的 base64/image 自动转成图片附件；描述补齐 `media.*` 第四个命名空间。
+
+### 测试
+
+- `cargo test --all-targets`：344 项通过；`clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.29] - 2026-11-04
 
 消息不再逐条唤醒 agent，改为 inbox + 可删除唤醒预设。

@@ -100,6 +100,23 @@ impl Tool for ReadTool {
                 Err(error) => return vfs_error(error),
             };
             let mime = meta.mime.unwrap_or_else(|| "image/jpeg".to_owned());
+            if !matches!(
+                mime.as_str(),
+                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+            ) {
+                return ToolResult::ok(format!(
+                    "Image {} ({} bytes, {mime}); unsupported for vision. Convert it with media.image_convert first.",
+                    target.path,
+                    bytes.len()
+                ));
+            }
+            if bytes.len() > 3_500_000 {
+                return ToolResult::ok(format!(
+                    "Image {} ({} bytes, {mime}); too large for vision (limit 3.5 MB). Resize it with media.image_resize first.",
+                    target.path,
+                    bytes.len()
+                ));
+            }
             return ToolResult::with_images(
                 format!("Image {} ({} bytes, {mime})", target.path, bytes.len()),
                 vec![crate::agent::message::ImageAttachment {
