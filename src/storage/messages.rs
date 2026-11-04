@@ -233,6 +233,14 @@ impl MessageStore {
                 now
             ],
         )?;
+        let seen_at = Utc::now().timestamp();
+        for origin in message.media_origins() {
+            tx.execute(
+                "INSERT INTO media_origins (origin, chat, seen_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(origin) DO NOTHING",
+                params![origin, message.chat.to_string(), seen_at],
+            )?;
+        }
         tx.commit()?;
         Ok(true)
     }

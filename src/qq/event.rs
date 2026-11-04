@@ -182,6 +182,30 @@ impl QqMessage {
         out
     }
 
+    /// 消息里的媒体引用（URL 优先，其次文件名）；用于记录来源。
+    pub fn media_origins(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for segment in &self.segments {
+            let origin = match segment {
+                Segment::Image { url, file } => {
+                    if url.is_empty() {
+                        file
+                    } else {
+                        url
+                    }
+                }
+                Segment::File { url, .. }
+                | Segment::Record { url, .. }
+                | Segment::Video { url } => url,
+                _ => continue,
+            };
+            if !origin.is_empty() {
+                out.push(origin.clone());
+            }
+        }
+        out
+    }
+
     /// 是否 @ 了本账号。
     pub fn mentions_self(&self, self_id: u64) -> bool {
         self.segments.iter().any(|segment| match segment {

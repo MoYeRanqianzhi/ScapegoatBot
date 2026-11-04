@@ -288,6 +288,18 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     CREATE INDEX gate_approvals_nonce ON gate_approvals(nonce, status);
     "#,
     ),
+    (
+        11,
+        "media origins",
+        // 记录媒体第一次出现的 chat，用于阻止跨聊天搬运图片/文件。
+        r#"
+    CREATE TABLE media_origins (
+        origin   TEXT PRIMARY KEY,
+        chat     TEXT NOT NULL,
+        seen_at  INTEGER NOT NULL
+    );
+    "#,
+    ),
 ];
 
 /// 一条 gate 审批记录；参数只保存哈希。
@@ -464,6 +476,29 @@ impl Database {
         let conn = self.conn.lock().expect("database mutex poisoned");
         conn.execute("DELETE FROM gate_approvals WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    /// 记录一次媒体来源（已有记录不覆盖）。
+    pub fn record_media_origin(&self, origin: &str, chat: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "INSERT INTO media_origins (origin, chat, seen_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(origin) DO NOTHING",
+            params![origin, chat, chrono::Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// 媒体第一次出现的 chat；没有记录返回 `None`。
+    pub fn media_origin(&self, origin: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT chat FROM media_origins WHERE origin = ?1",
+                params![origin],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// 校验密钥与数据库匹配；首次打开时写入 canary。
