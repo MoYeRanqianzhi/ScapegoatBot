@@ -479,6 +479,29 @@ impl Tool for McpTool {
     }
 }
 
+fn compress_mcp_image(data: &str, mime: &str) -> (String, String) {
+    use base64::Engine as _;
+    if data.len() <= 1_000_000 {
+        return (mime.to_owned(), data.to_owned());
+    }
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
+        return (mime.to_owned(), data.to_owned());
+    };
+    let Ok(image) = image::load_from_memory(&bytes) else {
+        return (mime.to_owned(), data.to_owned());
+    };
+    let rgb = image.thumbnail(2000, 2000).to_rgb8();
+    let mut encoded = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 85);
+    if encoder.encode_image(&rgb).is_err() {
+        return (mime.to_owned(), data.to_owned());
+    }
+    (
+        "image/jpeg".to_owned(),
+        base64::engine::general_purpose::STANDARD.encode(encoded),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
