@@ -147,7 +147,8 @@ impl MonitorSink for RunnerSink {
             }
             return;
         }
-        if let Some(message) = delivery.message.clone()
+        if delivery.name.starts_with("wake-on-")
+            && let Some(message) = delivery.message.clone()
             && let Some(queue) = self.queue.get()
         {
             queue.ingest(message).await;
