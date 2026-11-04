@@ -47,3 +47,5 @@
 - [ ] MCP image blocks 仍被转成 `[image content omitted]`。
 - [ ] P2：重试无 jitter、无逐 chunk idle timeout、截断 tool args 以 `{}` 执行、`retention_days`/`monitor` 小竞态。
 - [ ] 旧版本留下的 transcript 行号损坏无法自动修复；清空数据或迁移后才能消除 `skipping unreadable transcript line`。
+
+- [x] 上下文估算改用最近 assistant 的真实 usage；图片按 2000 tokens/张计入尾部（alpha.33）。
