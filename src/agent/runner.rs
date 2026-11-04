@@ -1106,7 +1106,10 @@ impl Runner {
         Ok(outcome)
     }
 
-    /// 把本批入站消息里的 QQ 图片下载成 image prompt；只接受 QQ 图片域名。
+    /// 把本批入站消息里的 QQ 图片转成 image prompt。
+    ///
+    /// NapCat 的 image segment 有 `url`、`file`（文件路径/URL/base64）和 `path`。
+    /// `url` 为空时先用 `file` 直接判断；容器内路径再调用 `get_image` 解析成 URL。
     async fn inbound_image_prompts(
         &self,
         messages: &[crate::qq::event::QqMessage],
@@ -1125,10 +1128,55 @@ impl Runner {
         let mut prompts = Vec::new();
         for message in messages {
             for segment in &message.segments {
-                let crate::qq::event::Segment::Image { url, .. } = segment else {
+                let crate::qq::event::Segment::Image { url, file } = segment else {
                     continue;
                 };
-                let Ok(parsed) = reqwest::Url::parse(url) else {
+                let mut reference = if !url.is_empty() {
+                    url.clone()
+                } else {
+                    file.clone()
+                };
+                if reference.starts_with("base64://") {
+                    let payload = reference.trim_start_matches("base64://");
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload)
+                        && bytes.len() <= 3_500_000
+                    {
+                        let mime = mime_for_bytes(&bytes);
+                        prompts.push(AgentMessage::user_with_images(
+                            format!("[image from {}]", message.chat),
+                            vec![crate::agent::message::ImageAttachment {
+                                mime,
+                                data_base64: payload.to_owned(),
+                            }],
+                        ));
+                    }
+                    continue;
+                }
+                if !reference.starts_with("http") {
+                    let Some(qq) = &self.qq else {
+                        continue;
+                    };
+                    match qq
+                        .call("get_image", serde_json::json!({"file": file}))
+                        .await
+                    {
+                        Ok(value) => {
+                            reference = value
+                                .get("url")
+                                .or_else(|| value.pointer("/data/url"))
+                                .or_else(|| value.get("file"))
+                                .or_else(|| value.pointer("/data/file"))
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned();
+                        }
+                        Err(error) => {
+                            warn!(%error, "cannot resolve a QQ image reference");
+                            continue;
+                        }
+                    }
+                }
+                let Ok(parsed) = reqwest::Url::parse(&reference) else {
                     continue;
                 };
                 if parsed.scheme() != "https" {
@@ -1762,6 +1810,14 @@ pub fn inbox_summary(messages: &MessageStore) -> String {
             }
         })
         .unwrap_or_else(|_| "unknown".to_owned())
+}
+
+
+/// 从图片字节猜 MIME；只用于 QQ 图片附件。
+fn mime_for_bytes(bytes: &[u8]) -> String {
+    image::guess_format(bytes)
+        .map(|format| format.to_mime_type().to_owned())
+        .unwrap_or_else(|_| "image/jpeg".to_owned())
 }
 
 #[cfg(test)]
