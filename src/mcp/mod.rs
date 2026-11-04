@@ -576,4 +576,20 @@ mod tests {
         assert!(!is_error);
         assert_eq!(text, "echoed");
     }
+
+    #[test]
+    fn large_mcp_images_are_compressed() {
+        use base64::Engine as _;
+        let mut raw = image::RgbImage::new(1200, 1200);
+        for (x, y, pixel) in raw.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8]);
+        }
+        let image = image::DynamicImage::ImageRgb8(raw);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+        let (mime, data) = compress_mcp_image(&encoded, "image/png");
+        assert_eq!(mime, "image/jpeg");
+        assert!(data.len() < encoded.len());
+    }
 }
