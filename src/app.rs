@@ -172,9 +172,11 @@ impl MonitorSink for RunnerSink {
     }
 
     async fn is_idle(&self) -> bool {
+        if self.runner.get().is_some_and(|runner| runner.is_busy()) {
+            return false;
+        }
         match self.queue.get() {
             Some(queue) => queue.is_idle().await,
-            // 队列尚未装配时按空闲处理，避免启动阶段的 monitor 永久等待。
             None => true,
         }
     }

@@ -31,10 +31,12 @@
 - 回合 early-return 前排空 local SteeringQueue；关闭 receiver 让晚到消息回填 ChatQueue。
 - API base64/image 响应重新接入图片附件；User 图片计入 token 估算与裁剪。
 - 自动入站图片按模型 `input`/`vision` 门控。
+- 解析 NapCat image segment 的 `path` 字段；`get_image` 可用 path 作为 fallback。
+- `rotate()` 持 current 锁；`idle_only` 也检查运行中的 injected 回合。
 
 ### 测试
 
-- `cargo test --all-targets`：361 项通过（349 lib + 12 integration），2 ignored；`clippy -D warnings` 通过。
+- `cargo test --all-targets`：362 项通过（350 lib + 12 integration），2 ignored；`clippy -D warnings` 通过。
 
 ## [0.2.0-alpha.34] - 2026-11-04
 

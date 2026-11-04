@@ -113,7 +113,7 @@ pub fn segment_to_napcat(segment: &Segment) -> Option<MessageSegment> {
             result_id: None,
             chain_count: None,
         },
-        Segment::Image { url, file } => MessageSegment::Image {
+        Segment::Image { url, file, path } => MessageSegment::Image {
             file: if url.is_empty() {
                 file.clone()
             } else {
@@ -123,7 +123,11 @@ pub fn segment_to_napcat(segment: &Segment) -> Option<MessageSegment> {
             sub_type: None,
             url: None,
             name: None,
-            path: None,
+            path: if path.is_empty() {
+                None
+            } else {
+                Some(path.clone())
+            },
             thumb: None,
         },
         // 其余段类型差异大，统一交给 `API` 工具按原始 JSON 透传。
