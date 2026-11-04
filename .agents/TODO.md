@@ -1,64 +1,48 @@
 # TODO
 
-按优先级排列；完成后同步 `CHANGELOG.md` 与 `docs/guide/limits.md`。
-已完成项直接删除（git 有记录）。
+剩余问题按优先级排列。已完成项已从本文件删除（git 有记录）。
 
-## 安全与设计对齐
+## P1 运行时
 
+- [ ] `ChatQueue` 的 `max_concurrent` 只限制 handler 派发；`Runner` 的全局 `turn_lock` 仍让主 agent 实际串行。
+      需要决定：shared transcript 下明确“主回合串行”，还是改成 per-scope 锁并让 `max_concurrent` 真正生效。
+- [ ] `idle_only` 只看 `active_turns`，不看 debounce 中尚未派发的批次；空闲判断可能过早。
+- [ ] steering 尾部 drain 只覆盖“没有工具调用”的正常结束路径。
+      Error / Refusal / Aborted / MaxTokens / wall-clock / token-budget 等提前返回仍可能丢消息；
+      handler 返回后的收尾窗口也仍有 send 失败风险（已加回填 pending，但未覆盖所有路径）。
+- [ ] swarm 完成路径在 `run_instance` 里清空 `incoming` 并写 status，不在 `dispatch_lock` 内；
+      消息与完成并发时可能返回 `queued` 但不会自动启动。重启路径已加锁，完成路径仍需同样处理。
 
+## P1 transcript / storage
 
-## 配置与能力边界
+- [ ] AAD 行号恢复只尝试 `1..=4096`；更大的旧偏移仍不可读。
+- [ ] 尝试任意候选行号削弱了 AAD 对行位置的绑定；需要在“恢复旧数据”和“完整性”之间定策略。
+- [ ] `current()` 没有 `append_lock`，`transcript_files` 也没有“每个 scope 只有一个 open 分段”的唯一约束；
+      并发首次创建仍可能产生两个 active segment（turn_lock 下概率低）。
+- [ ] 缺少 transcript 偏移恢复、并发 append、rotate 的回归测试。
 
+## P1 图片 / 视觉
 
-## 运行与数据
+- [ ] `input: ["image"]` / `capabilities: ["vision"]` 仍未用于过滤附件；文本模型会收到 image_url。
+      要么做 capability gate，要么把“无条件附加”写进配置文档并接受 400 风险。
+- [ ] `get_image` 真实返回契约未实测：代码兼容 `url` / `file` / `base64`，但本机没有跑过真实 NapCat；
+      `http` URL、重定向目标、`content-type` 为 `image/jpg`/octet-stream、`file` 只是容器本地路径等情况仍未覆盖。
+- [ ] 自动图片只处理触发本回合的入站消息；后续回合/重启依赖已持久化的 image prompt。
+      转发消息、回复引用图片、control/monitor 注入回合仍不会自动注入图片。
+- [ ] MCP 错误结果仍丢弃 images；MCP 图片大小/MIME 只做了基础过滤，未做压缩。
+- [ ] `media.image_watermark` 只支持 ASCII；中文会静默跳过并返回成功。
+- [ ] `media.image_compress` 强制 JPEG 输出；`image_convert` 的未知扩展名/MIME 匹配仍需测试。
+- [ ] 缺少 inbound resolver、domain/size 过滤、provider image 顺序、MCP 图片、crop/rotate/convert/thumbnail/compress 的测试。
 
+## P2 其他
 
-## 工程
+- [ ] `cap_batches` 作为 deprecated 字段仍被接受；旧配置可解析，但不再参与调度，文档已移除该行。
+- [ ] 历史重写后其他 clone 必须重新 clone 或 `git fetch --all --prune --tags --force && git reset --hard origin/main`；
+      旧 commit SHA 已失效。GitHub 不可达旧对象只能等服务端 GC。
+- [ ] 无 alpha.35 tag；按用户要求暂缓发布/部署。服务器 `sbot.service` 保持停止。
 
+## 验证缺口
 
-## 文档
-
-
-## 待合并 / 待发布
-
-- [x] 合并 `feat/i18n-logs`（`d90cec9`）：vendored `napcat-link` + 52 条英文日志 + `tools/check_log_i18n.py`。
-- [x] vendored `napcat-link` 17 条中文错误文本已英文化（13b534b）。
-- [x] 发布并部署 alpha.31：inbox-only + 唤醒预设 + notice/request 入库 + 图片 tool result/media.* + 回合互斥/transcript 行号。
-
-## Agent 运行时问题
-
-- [x] provider 流式响应加 30s 逐 chunk 空闲超时；解码失败走 Network 重试。
-- [x] transcript append/read 串行化 + 行号信封；读取时尝试偏移行号恢复旧数据（alpha.34 待发）。
-
-
-## pi/Claude Code 对照审计剩余项（alpha.31 之后）
-
-- [x] monitor 唤醒携带原 QqMessage 重新走 ChatQueue；idle_only/并发/去抖恢复。
-- [x] 图片附件随 transcript 持久化（alpha.32）。
-- [x] MCP image blocks 进入 ToolResult.images。
-- [x] 重试 jitter、逐 chunk idle timeout、截断 tool args 拒绝执行；其余小竞态仍在。
-
-- [x] 上下文估算改用最近 assistant 的真实 usage；图片按 2000 tokens/张计入尾部（alpha.33）。
-
-## 仍未完成（下一轮）
-
-- [x] meta lifecycle / heartbeat 审计落库；heartbeat 跳过，`/system/events` 可读。
-- [x] 无 chat 字段的 unknown 事件进入 event_audit。
-- [x] `/system/events` 原始事件视图。
-- [x] media.image_watermark / rotate / thumbnail / compress。
-
-## 仍剩余（P2）
-
-- [x] `prune_tool_results` 只裁剪请求副本，不改写已提交历史。
-- [x] `Monitor fire` 限速时返回错误。
-
-## 本轮收尾（alpha.35）
-
-- [x] ChatQueue 唤醒接回、流式 idle timeout、旧 transcript 偏移恢复。
-- [x] QQ 图片自动注入、Read 大图自动压缩、MCP 图片、media watermark/rotate/thumbnail/compress。
-- [x] event_audit + `/system/events`，meta/unknown 落库，heartbeat 跳过。
-- [x] i18n vendor 错误文本。
-- [x] jitter/Retry-After、请求级 wall-clock、截断参数拒绝、runtime context 不落库、prune 请求副本、原子 create、monitor batch/fire、swarm 续聊、控制回合上限。
-- [x] steering 尾部 drain。
-- [ ] 暂缓：alpha.35 发布/部署（按要求先不部署，服务器 sbot 保持停止）。
-
+- [ ] `event_audit` 只有存储 roundtrip 测试；`/system/events`、notice/request/meta/unknown 落库没有端到端测试。
+- [ ] wake→ChatQueue、30s idle timeout、request wall-clock、控制回合上限、swarm 并发续聊没有专门测试。
+- [ ] 真实 NapCat / provider 回归测试需要在部署后做；当前服务器 sbot 已停止。
