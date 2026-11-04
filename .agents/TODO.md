@@ -10,7 +10,7 @@
 - [ ] 控制/monitor 回合现在计入 `Runner::is_busy`，但控制 semaphore 与 `queue.max_concurrent` 是两套上限，
       总主 agent 并发仍可超过配置值；`agent.compact` 在 per_chat 固定压 owner private 链。
 - [ ] per-scope 统计仍是全局：`compaction_failures` / `unchecked_tokens` / `review_failures` 跨 chat 互相影响。
-- [ ] `append_lock`/`current_lock` 被所有 scope 共享；`read_segment` 在全局锁内读完整段，慢分段会阻塞其他 chat。
+- [x] per_chat 的 append/current 锁已按 scope 独立；shared 仍共用。
 
 ## transcript
 
@@ -19,8 +19,8 @@
 
 ## 图片
 
-- [ ] 真实 `get_image` 契约仍未实测；重定向最终 host、流式大小上限仍未严格限制（单批已限 4 张）。
-- [ ] daily/chat budget 早退时图片不会落库，之后只能手动 Download/Read；转发/回复引用图片、control/monitor 注入回合不自动注入。
+- [ ] 真实 `get_image` 契约仍未实测；重定向 host 与流式大小已校验，但 http/get_image 实际返回仍需实测。
+- [x] daily/chat budget 早退时图片会持久化；转发/回复引用图片、control/monitor 注入回合仍不自动注入。
 - [ ] MCP 图片只做 MIME/大小过滤，不压缩。
 - [ ] `media.image_watermark` 只支持 ASCII；`image_compress` 强制 JPEG。
 - [ ] 缺 inbound resolver、provider image body、User image estimate/prune、MCP 图片、media 各动作测试。

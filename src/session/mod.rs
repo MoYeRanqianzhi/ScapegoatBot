@@ -99,8 +99,9 @@ impl SessionStore {
             encryption: self.encryption,
             scope: Some(scope.to_owned()),
             retention_days: self.retention_days,
-            append_lock: std::sync::Arc::clone(&self.append_lock),
-            current_lock: std::sync::Arc::clone(&self.current_lock),
+            // per_chat 的每个 scope 写自己的文件，独立锁；shared 仍共用。
+            append_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            current_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         }
     }
 

@@ -36,6 +36,7 @@ use crate::storage::messages::MessageStore;
 use crate::tools::ToolRegistry;
 use crate::vfs::Vfs;
 use crate::vfs::sqlite::VfsStore;
+use futures_util::StreamExt;
 
 /// 运行配置。
 #[derive(Clone)]
@@ -1153,6 +1154,13 @@ impl Runner {
         use base64::Engine as _;
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if is_qq_image_url(attempt.url()) {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
             .build()
         {
             Ok(client) => client,
@@ -1279,12 +1287,8 @@ impl Runner {
                     .next()
                     .unwrap_or("")
                     .to_owned();
-                let bytes = match response.bytes().await {
-                    Ok(bytes) if bytes.len() <= 3_500_000 => bytes,
-                    Ok(_) => {
-                        warn!("QQ image exceeds the 3.5 MB vision limit");
-                        continue;
-                    }
+                let bytes = match read_capped(response, 3_500_000).await {
+                    Ok(bytes) => bytes,
                     Err(error) => {
                         warn!(%error, "cannot read a QQ image");
                         continue;
@@ -1422,11 +1426,17 @@ impl Runner {
         // 压缩会改写 `working`，基点在压缩之后取：否则 `working[base..]` 既会越界，
         // 也会把保留的旧块重复提交。
         let base = working.len();
+        let image_prompts = self.inbound_image_prompts(&accepted_messages).await;
 
         // 2.6) 预算：消息已经入库，只跳过模型回合；下一个窗口/日期自动恢复。
+        // 图片也持久化，避免预算恢复后丢失视觉上下文。
         if let Some(budget) = &self.config.budget {
             if let Some(reason) = budget.check_daily().await {
                 warn!(chat = %chat, %reason, "skipping this turn");
+                if !image_prompts.is_empty() {
+                    sessions.append(&image_prompts)?;
+                    history.lock().await.extend(image_prompts.clone());
+                }
                 return Ok(());
             }
             let limit = budget.chat_turns_per_hour();
@@ -1445,6 +1455,10 @@ impl Runner {
                         limit,
                         "chat turn budget exhausted; skipping this turn"
                     );
+                    if !image_prompts.is_empty() {
+                        sessions.append(&image_prompts)?;
+                        history.lock().await.extend(image_prompts.clone());
+                    }
                     return Ok(());
                 }
                 queue.push_back(Instant::now());
@@ -1470,7 +1484,7 @@ impl Runner {
 
         // runtime/pending prompt 不落 transcript；入站图片属于真实消息内容，需要落库。
         let runtime_blocks = prompts.len();
-        prompts.extend(self.inbound_image_prompts(&accepted_messages).await);
+        prompts.extend(image_prompts);
 
         // 4) 运行循环。工具执行器带上本回合证据。
         let prompt_tokens = crate::session::compaction::estimate_messages(&prompts);
@@ -1904,6 +1918,26 @@ pub fn inbox_summary(messages: &MessageStore) -> String {
             }
         })
         .unwrap_or_else(|_| "unknown".to_owned())
+}
+
+fn is_qq_image_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str().is_some_and(|host| {
+            host.ends_with(".qq.com.cn") || host.ends_with(".qpic.cn") || host.ends_with(".qq.com")
+        })
+}
+
+async fn read_capped(response: reqwest::Response, limit: usize) -> anyhow::Result<Vec<u8>> {
+    let mut stream = response.bytes_stream();
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if out.len() + chunk.len() > limit {
+            anyhow::bail!("response exceeds the image size limit");
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
 }
 
 /// 从图片字节猜 MIME；只用于 QQ 图片附件。
