@@ -244,6 +244,7 @@ pub fn fill_missing_tool_results(messages: Vec<AgentMessage>) -> Vec<AgentMessag
                         content: "interrupted; the action may or may not have taken effect"
                             .to_owned(),
                         is_error: true,
+                        images: Vec::new(),
                     });
                 }
             }
@@ -265,6 +266,7 @@ pub fn tool_message(call_id: &str, name: &str, result: ToolResult) -> AgentMessa
         tool_name: name.to_owned(),
         content: result.content,
         is_error: result.is_error,
+        images: result.images,
     })
 }
 

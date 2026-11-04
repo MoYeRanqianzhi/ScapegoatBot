@@ -394,6 +394,7 @@ impl AgentLoop {
                                       max_tokens; its arguments may be truncated."
                                 .to_owned(),
                             is_error: true,
+                            images: Vec::new(),
                         };
                         input_delta.push_str(&render_message(&AgentMessage::Tool(result.clone())));
                         history.push(AgentMessage::Tool(result));
@@ -504,14 +505,31 @@ impl AgentLoop {
                         content,
                     });
                 }
-                AgentMessage::Tool(result) => messages.push(ProviderMessage {
-                    role: Role::User,
-                    content: vec![ContentBlock::ToolResult {
-                        tool_use_id: result.tool_call_id.clone(),
-                        content: result.content.clone(),
-                        is_error: result.is_error,
-                    }],
-                }),
+                AgentMessage::Tool(result) => {
+                    messages.push(ProviderMessage {
+                        role: Role::User,
+                        content: vec![ContentBlock::ToolResult {
+                            tool_use_id: result.tool_call_id.clone(),
+                            content: result.content.clone(),
+                            is_error: result.is_error,
+                        }],
+                    });
+                    // 工具返回的图片作为紧随其后的 user 图片消息；tool role 本身
+                    // 在 OpenAI 兼容协议里不保证支持多模态内容。
+                    if !result.images.is_empty() {
+                        let mut content = vec![ContentBlock::Text {
+                            text: format!("Image returned by tool {}.", result.tool_name),
+                        }];
+                        content.extend(result.images.iter().map(|image| ContentBlock::Image {
+                            mime_type: image.mime.clone(),
+                            data_base64: image.data_base64.clone(),
+                        }));
+                        messages.push(ProviderMessage {
+                            role: Role::User,
+                            content,
+                        });
+                    }
+                }
             }
         }
 
@@ -790,6 +808,7 @@ impl AgentLoop {
             tool_name: call.name.clone(),
             content: result.content,
             is_error: result.is_error,
+            images: result.images,
         }
     }
 }
@@ -994,6 +1013,7 @@ fn append_interrupted(history: &mut Vec<AgentMessage>, calls: &[ToolCall], reaso
             tool_name: call.name.clone(),
             content: format!("Tool call was not executed: {reason}."),
             is_error: true,
+            images: Vec::new(),
         }));
     }
 }
@@ -1609,6 +1629,7 @@ mod tests {
                 tool_name: "Read".to_owned(),
                 content: long.clone(),
                 is_error: false,
+                images: Vec::new(),
             }),
             AgentMessage::user("turn 2"),
             AgentMessage::Tool(ToolResultMessage {
@@ -1616,6 +1637,7 @@ mod tests {
                 tool_name: "Read".to_owned(),
                 content: long.clone(),
                 is_error: false,
+                images: Vec::new(),
             }),
         ];
 

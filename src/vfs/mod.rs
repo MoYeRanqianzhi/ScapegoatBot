@@ -201,6 +201,13 @@ pub trait Vfs: Send + Sync {
         limit: Option<u64>,
     ) -> Result<FileContent, VfsError>;
 
+    /// 读取二进制内容（图片等）；默认实现不支持。
+    fn read_bytes(&self, _path: &VfsPath) -> Result<Vec<u8>, VfsError> {
+        Err(VfsError::Storage(
+            "this VFS backend does not expose binary reads".to_owned(),
+        ))
+    }
+
     /// 写入文本；已存在的节点要求先全文读取。
     fn write_text(
         &self,

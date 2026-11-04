@@ -19,6 +19,10 @@
   删除会写入 `monitor.removed.<name>`，重启不再恢复；手动 `Monitor add` 同名可恢复。
 - Monitor 谓词新增 `event.sender != 'qq'`，用于避免主人 @ 时两个预设重复唤醒。
 - `MonitorEvent` 的 `mentions_self` 现在按登录账号判断，不再把任意 @ 当成 @ 自己。
+- `Read` 读取 VFS 图片时返回 image attachment；工具结果新增图片通道，Chat 协议
+  转成 `image_url`，Anthropic/OpenAI 走各自的 image block。
+- `API` 新增 `media.*`：`image_info`、`image_resize`、`image_crop`、`image_convert`；
+  NapCat/扩展 action 响应中的 `base64`/`image` 也会自动转成图片附件。
 - 主人消息触发 monitor 时，投递带 `owner_intent`，回合拥有 owner 证据，不会被
   `send_private_msg` 的 owner-intent 闸拦下；这是之前“图片消息不回复”的直接原因。
 - QQ notice（拍一拍、撤回等）、好友/群请求、带 chat 字段的未知事件都转成

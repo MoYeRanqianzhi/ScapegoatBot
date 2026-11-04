@@ -18,6 +18,7 @@ pub enum Category {
     File,
     Profile,
     Agent,
+    Media,
     Meta,
 }
 
@@ -31,6 +32,7 @@ impl Category {
             Self::File => "file",
             Self::Profile => "profile",
             Self::Agent => "agent",
+            Self::Media => "media",
             Self::Meta => "meta",
         }
     }
@@ -44,6 +46,7 @@ impl Category {
             "file" => Self::File,
             "profile" => Self::Profile,
             "agent" => Self::Agent,
+            "media" => Self::Media,
             "meta" => Self::Meta,
             _ => return None,
         })
@@ -523,6 +526,47 @@ pub fn specs() -> &'static [ActionSpec] {
                 target_field: None,
                 destructive: false,
                 examples: &[],
+            });
+        }
+
+        // ---- media (local, no NapCat) ----
+        for (action, summary, params, example) in [
+            (
+                "media.image_info",
+                "Inspect an image in the VFS (dimensions, format, bytes).",
+                json!({"path": {"type": "string"}}),
+                r#"{"path":"/tmp/a.png"}"#,
+            ),
+            (
+                "media.image_resize",
+                "Resize an image into the VFS, preserving aspect ratio.",
+                json!({"path": {"type": "string"}, "out": {"type": "string"}, "width": {"type": "number"}, "height": {"type": "number"}}),
+                r#"{"path":"/tmp/a.jpg","out":"/tmp/a-small.jpg","width":640,"height":640}"#,
+            ),
+            (
+                "media.image_crop",
+                "Crop an image into the VFS.",
+                json!({"path": {"type": "string"}, "out": {"type": "string"}, "x": {"type": "number"}, "y": {"type": "number"}, "width": {"type": "number"}, "height": {"type": "number"}}),
+                r#"{"path":"/tmp/a.jpg","out":"/tmp/face.jpg","x":100,"y":50,"width":512,"height":512}"#,
+            ),
+            (
+                "media.image_convert",
+                "Convert an image (png/jpeg/webp) into the VFS.",
+                json!({"path": {"type": "string"}, "out": {"type": "string"}}),
+                r#"{"path":"/tmp/a.webp","out":"/tmp/a.png"}"#,
+            ),
+        ] {
+            list.push(ActionSpec {
+                action,
+                category: Category::Media,
+                summary,
+                params,
+                returns: "JSON with the source/output path and image metadata.",
+                requires_owner_intent: false,
+                scope_field: None,
+                target_field: None,
+                destructive: false,
+                examples: Box::leak(Box::new([example])),
             });
         }
 

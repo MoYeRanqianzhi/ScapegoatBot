@@ -684,6 +684,19 @@ fn hash_bytes(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 impl Vfs for VfsStore {
+    fn read_bytes(&self, path: &VfsPath) -> Result<Vec<u8>, VfsError> {
+        let meta = self.stat(path)?;
+        if !meta.kind.is_file() {
+            return Err(VfsError::IsADirectory(path.to_string()));
+        }
+        let chunks = meta.size.div_ceil(1024 * 1024);
+        let mut out = Vec::with_capacity(meta.size as usize);
+        for index in 0..chunks {
+            out.extend(self.read_blob_chunk(path, index)?);
+        }
+        Ok(out)
+    }
+
     fn stat(&self, path: &VfsPath) -> Result<NodeMeta, VfsError> {
         let conn = self.db.lock();
         let row = self

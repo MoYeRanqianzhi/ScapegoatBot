@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 
 use crate::agent::{ExecutionMode, ToolResult};
 use crate::vfs::{FileContent, NodeKind, Vfs, VfsError, VfsPath};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 
 use super::{
     Permission, Tool, ToolContext, arg_opt_bool, arg_opt_str, arg_opt_u64, arg_str, object_schema,
@@ -90,6 +92,22 @@ impl Tool for ReadTool {
             };
         }
 
+        if let Ok(meta) = ctx.vfs.stat(&target.path)
+            && meta.kind == crate::vfs::NodeKind::Image
+        {
+            let bytes = match ctx.vfs.read_bytes(&target.path) {
+                Ok(bytes) => bytes,
+                Err(error) => return vfs_error(error),
+            };
+            let mime = meta.mime.unwrap_or_else(|| "image/jpeg".to_owned());
+            return ToolResult::with_images(
+                format!("Image {} ({} bytes, {mime})", target.path, bytes.len()),
+                vec![crate::agent::message::ImageAttachment {
+                    mime,
+                    data_base64: BASE64.encode(bytes),
+                }],
+            );
+        }
         match ctx.vfs.read_lines(&target.path, offset, limit) {
             Ok(content) => ToolResult::ok(render_content(&target.path, content)),
             Err(error) => vfs_error(error),
@@ -1251,5 +1269,21 @@ mod tests {
         assert!(result.content.contains("recursive"));
         let result = run(&registry, "RM", json!({"path": "/d", "recursive": true})).await;
         assert!(!result.is_error, "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn read_image_returns_an_image_attachment() {
+        let (registry, vfs, _dir) = setup();
+        let path = crate::vfs::path::VfsPath::parse("/img/a.png").unwrap();
+        let bytes = b"fake-image";
+        vfs.write_binary(&path, bytes, crate::vfs::NodeKind::Image)
+            .unwrap();
+
+        let result = run(&registry, "Read", json!({"path": "/img/a.png"})).await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(result.content.contains("image/png"));
+        assert_eq!(result.images.len(), 1);
+        assert_eq!(result.images[0].mime, "image/png");
+        assert_eq!(result.images[0].data_base64, BASE64.encode(bytes));
     }
 }
