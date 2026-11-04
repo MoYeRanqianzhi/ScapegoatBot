@@ -206,7 +206,7 @@ sbot gate reject <id>
 
 | 项 | 现状 |
 |----|------|
-| `approve` 的确认通道 | 只有本地 IPC；没有向 master QQ 发 nonce 的流程；队列在内存里，重启丢失 |
+| `approve` 的确认通道 | 本地 IPC，或向 master QQ 发 nonce；待审批队列持久化在 `gate_approvals`，重启不丢 |
 | `auto` 的发送规则 | 频率/重复/跨群同文/@all/5-gram/context_sources/媒体来源是启发式；Grep 不按来源拆分 |
 | 周期检查的缓存复用 | 检查请求是独立窗口，不与主请求逐字节共享前缀 |
 | 群级破坏动作 | 没有用户目标，靠 owner intent 而不是硬保护 |

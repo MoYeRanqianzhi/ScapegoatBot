@@ -39,7 +39,7 @@ SBOT__NAPCAT__URL=ws://127.0.0.1:3002
 | `available_models` | 见默认 | 白名单；不在其中的模型不可用 |
 | `fallback_models` | `[]` | 主模型失败后的回退链 |
 | `thinking_level` | `high` | 与模型声明的 `thinking_levels` 校验 |
-| `compaction_model` | 空 | 摘要模型；空 = 主模型（当前版本未使用） |
+| `compaction_model` | 空 | 摘要模型；空 = 主模型 |
 | `max_output_tokens` | 8192 | 单次回复上限 |
 | `max_steps` | 48 | 单回合工具循环上限 |
 | `master` | `self` | owner 通知目标：`self` 或 QQ 号 |
@@ -78,7 +78,7 @@ access token 在 `auth.json`，不在这里。
 `shared` 让 A 群与 B 私聊的上下文互相可见，是替身场景的默认选择；需要强隔离时用
 `per_chat`（文件名带 `group-<id>-` / `private-<id>-` 前缀）。
 
-### `[queue]`（当前 inbox 模式下未参与调度）
+### `[queue]`（普通消息只进 inbox；唤醒预设走队列）
 
 | 键 | 默认 | 说明 |
 |----|------|------|
@@ -296,7 +296,7 @@ key 放 `auth.json`：
 
 - `api` 三选一：`anthropic`、`openai`（Responses）、`chat`（Chat Completions）。
 - 模型引用是 `provider/id`；`id` 同时作为发给 API 的 model 字段。
-- `capabilities` 决定是否启用服务端工具/图片输入。
+- `capabilities` 决定是否启用服务端工具；图片输入目前由工具链直接附加（不按 `input` 字段过滤）。
 - `base_url` 留空时由各 provider 用自己的默认地址（Anthropic 官方；OpenAI 兼容
   端点通常必须显式配置）。
 - `models.json` 不存在时只使用内置清单（`assets/models.default.json`）；存在时按
