@@ -5,6 +5,45 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.24] - 2026-11-04
+
+补齐最后两个非真实 API 项：审查前缀缓存与剩余 hook 注入。
+
+### 新增
+
+- **周期检查复用主 system 前缀**：`SecurityReviewer` 接收 Runner 当前的 system
+  块，审查请求以相同前缀开头，provider 可命中 prompt cache；消息窗口仍独立。
+- **剩余 `inject_context` 落点**：
+  - Stop → 作为 System 消息进入本轮提交（下一轮可见）；
+  - SessionEnd → 清空后写入新 history/session；
+  - ConfigChange → 写入内存 history（下一次压缩落盘）。
+
+### 测试
+
+- 新增：审查请求的 system[0] 与主前缀一致且 `cache = true`。
+- `cargo test --all-targets`：346 项通过（334 lib + 4 config + 1 live stub +
+  7 NapCat，2 项真实 API 测试默认忽略）；`cargo fmt --check`、
+  `clippy -D warnings` 通过。
+
+## [0.2.0-alpha.23] - 2026-11-04
+
+补齐 `context_sources`：按内容来源而不是目标 chat 判断跨 chat 泄露。
+
+### 新增
+
+- `TurnEvidence` 携带本轮上下文片段及来源 chat：触发批次、pending history、
+  `Read /messages|/inbox`、`API get_*_msg_history` 都会记录（最多 32 条、每条 8k 字符）。
+- `auto` 门禁发送前把外发内容与来源 chat 不同的片段做 5-gram 比对；共享 5 个以上
+  即拒绝，owner intent 或发回来源 chat 放行。
+- 工具执行器在执行后根据 `Read` 路径 / `API` 参数自动登记来源，不需要模型自报。
+
+### 测试
+
+- 新增：上下文来源拦截与 owner/来源 chat 放行、Read/API 来源解析。
+- `cargo test --all-targets`：345 项通过（333 lib + 4 config + 1 live stub +
+  7 NapCat，2 项真实 API 测试默认忽略）；`cargo fmt --check`、
+  `clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.22] - 2026-11-04
 
 把 NapCat 模拟测试扩到全部 `napcat.*` action。

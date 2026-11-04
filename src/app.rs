@@ -1338,6 +1338,25 @@ async fn build_agent(
                 MessageFilter::from_config(&config.filter);
             agent.queue.reload_config(config.queue.clone());
             info!("filter and queue settings reloaded from /config");
+            let injected = crate::agent::hooks::injected(
+                &config.hooks.events,
+                crate::config::HookEvent::ConfigChange,
+            );
+            if !injected.is_empty() {
+                let runner = Arc::clone(&agent.runner);
+                tokio::spawn(async move {
+                    let history_handle = runner.history();
+                    let mut history = history_handle.lock().await;
+                    for text in injected {
+                        history.push(crate::agent::AgentMessage::System {
+                            text: format!(
+                                "[hook context | ConfigChange]
+{text}"
+                            ),
+                        });
+                    }
+                });
+            }
         }
         let outcome = crate::agent::hooks::fire(
             &config.hooks.events,

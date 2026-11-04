@@ -703,6 +703,23 @@ impl ActionGate {
                 );
             }
         }
+        // 本回合上下文里来自别的 chat 的内容被复述时，同样要求 owner intent。
+        if !evidence.owner_intent && content.chars().count() >= NGRAM_MIN_CHARS {
+            let current = ngrams(&content);
+            let sources = evidence
+                .context_sources
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(source) = sources.iter().find(|source| {
+                source.chat != chat
+                    && current.intersection(&ngrams(&source.text)).count() >= NGRAM_SHARED
+            }) {
+                return Err(format!(
+                    "outbound content overlaps context from {}; cross-chat forwarding                      requires owner intent",
+                    source.chat
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1225,6 +1242,36 @@ mod tests {
             )
             .await
             .is_allowed()
+        );
+    }
+
+    #[tokio::test]
+    async fn context_from_another_chat_requires_owner_intent() {
+        let gate = auto_gate();
+        let text = "这是另一个私聊里提到的上线时间和回滚方案，请原样转告给群里的同事";
+        let evidence = TurnEvidence::chat("group:2");
+        evidence.record_source("private:9", text);
+        let params = json!({"group_id": 2, "message": text});
+        assert!(matches!(
+            gate.check(spec("napcat.send_group_msg"), &params, &evidence)
+                .await,
+            ActionDecision::Block(reason) if reason.contains("context from private:9")
+        ));
+        assert!(
+            gate.check(
+                spec("napcat.send_group_msg"),
+                &params,
+                &TurnEvidence::owner("control")
+            )
+            .await
+            .is_allowed()
+        );
+        // 发回来源 chat 不需要额外证据。
+        let same = json!({"user_id": 9, "message": text});
+        assert!(
+            gate.check(spec("napcat.send_private_msg"), &same, &evidence)
+                .await
+                .is_allowed()
         );
     }
 }
