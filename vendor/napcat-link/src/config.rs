@@ -479,7 +479,7 @@ impl NapLinkConfigBuilder {
         if self.url.trim().is_empty() {
             return Err(NapLinkError::InvalidConfig {
                 field: "url".to_string(),
-                reason: "WebSocket URL 不能为空".to_string(),
+                reason: "WebSocket URL must not be empty".to_string(),
             });
         }
 

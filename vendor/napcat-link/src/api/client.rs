@@ -255,7 +255,7 @@ impl ApiClient {
             // oneshot sender 被 drop（不应在正常流程中发生）
             Ok(Err(_)) => {
                 // channel 异常关闭，可能是 ApiClient 被 destroy 了
-                Err(NapLinkError::Connection("响应 channel 异常关闭".into()))
+                Err(NapLinkError::Connection("response channel closed unexpectedly".into()))
             }
             // 超时未收到响应
             Err(_) => {

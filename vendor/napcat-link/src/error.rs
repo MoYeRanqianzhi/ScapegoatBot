@@ -23,14 +23,14 @@ pub enum NapLinkError {
     ///
     /// 当无法建立 WebSocket 连接时产生，携带错误描述字符串。
     /// 例如：连接被拒绝、DNS 解析失败、TLS 握手失败等。
-    #[error("连接错误: {0}")]
+    #[error("Connection error: {0}")]
     Connection(String),
 
     /// API 调用超时
     ///
     /// 当 API 请求在指定时间内未收到响应时产生。
     /// 携带 API 方法名和超时时间，便于排查慢请求。
-    #[error("API 调用 {method} 超时 ({timeout_ms}ms)")]
+    #[error("API call {method} timed out after {timeout_ms}ms")]
     ApiTimeout {
         /// API 方法名（例如 "send_msg"、"get_group_list" 等）
         method: String,
@@ -58,7 +58,7 @@ pub enum NapLinkError {
     ///
     /// 当自动重连机制耗尽所有重试机会后产生。
     /// 表示连接已不可恢复，需要用户介入。
-    #[error("达到最大重连次数 ({attempts})")]
+    #[error("Maximum reconnect attempts reached ({attempts})")]
     MaxReconnectAttempts {
         /// 已尝试的重连次数
         attempts: u32,
@@ -68,7 +68,7 @@ pub enum NapLinkError {
     ///
     /// 当 WebSocket 连接被远端关闭时产生。
     /// 携带 WebSocket 关闭码和关闭原因字符串。
-    #[error("连接已关闭: {reason} (code: {code})")]
+    #[error("Connection closed: {reason} (code: {code})")]
     ConnectionClosed {
         /// WebSocket 关闭码（例如 1000 表示正常关闭，1006 表示异常关闭）
         code: u16,
@@ -80,7 +80,7 @@ pub enum NapLinkError {
     ///
     /// 当用户提供的配置参数不合法时产生。
     /// 携带具体的字段名和错误原因，便于定位配置问题。
-    #[error("无效的配置: {field} - {reason}")]
+    #[error("Invalid config: {field} - {reason}")]
     InvalidConfig {
         /// 配置字段名（例如 "url"、"token"、"timeout_ms" 等）
         field: String,
@@ -93,21 +93,21 @@ pub enum NapLinkError {
     /// 对底层 `tokio_tungstenite` WebSocket 错误的透明包装。
     /// 使用 `Box` 包装以减小枚举整体大小（tungstenite::Error 体积较大）。
     /// 使用 `#[from]` 实现从 tungstenite Error 到 NapLinkError 的自动转换。
-    #[error("WebSocket 错误: {0}")]
+    #[error("WebSocket error: {0}")]
     WebSocket(#[from] Box<tokio_tungstenite::tungstenite::Error>),
 
     /// JSON 序列化/反序列化错误
     ///
     /// 对 `serde_json::Error` 的透明包装。
     /// 当消息 JSON 解析失败或序列化失败时产生。
-    #[error("JSON 错误: {0}")]
+    #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
     /// URL 解析错误
     ///
     /// 对 `url::ParseError` 的透明包装。
     /// 当 WebSocket 连接地址格式不正确时产生。
-    #[error("URL 解析错误: {0}")]
+    #[error("URL parse error: {0}")]
     UrlParse(#[from] url::ParseError),
 }
 

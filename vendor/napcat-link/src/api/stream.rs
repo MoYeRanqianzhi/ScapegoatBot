@@ -24,7 +24,7 @@ use crate::api::client::ApiClient;
 use crate::error::Result;
 
 /// 默认上传分块大小：256KB（与 TS 版 upload 一致）
-#[expect(dead_code, reason = "预留给后续上传功能使用")]
+#[expect(dead_code, reason = "reserved for future upload functionality")]
 const DEFAULT_UPLOAD_CHUNK_SIZE: u64 = 256 * 1024;
 
 /// 默认下载分块大小：64KB（与 TS 版 download 一致）
