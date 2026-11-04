@@ -226,6 +226,8 @@ pub struct Runner {
     turn_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 控制通道排队上限，避免一次灌入无限任务。
     control_slots: tokio::sync::Semaphore,
+    /// 当前正在跑的主/injected 回合数；idle_only 用。
+    active_turns: std::sync::atomic::AtomicUsize,
 }
 
 /// 把回合证据注入每次工具调用。
@@ -251,6 +253,13 @@ impl crate::agent::ToolExecutor for TurnExecutor {
         self.registry
             .execute_with_evidence(call, self.evidence.clone())
             .await
+    }
+}
+
+struct ActiveTurnGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for ActiveTurnGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -382,6 +391,7 @@ impl Runner {
             review_lock: Mutex::new(()),
             turn_locks: Mutex::new(HashMap::new()),
             control_slots: tokio::sync::Semaphore::new(4),
+            active_turns: std::sync::atomic::AtomicUsize::new(0),
         });
         let _ = runner
             .fire_hooks(crate::config::HookEvent::SessionStart, None, None)
@@ -409,6 +419,10 @@ impl Runner {
         } else {
             "shared".to_owned()
         }
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.active_turns.load(std::sync::atomic::Ordering::Relaxed) > 0
     }
 
     async fn turn_lock_for(&self, chat: ChatId) -> Arc<tokio::sync::Mutex<()>> {
@@ -1009,6 +1023,9 @@ impl Runner {
         let chat = ChatId::Private(self.config.owner_qq);
         let turn_lock = self.turn_lock_for(chat).await;
         let _turn_guard = turn_lock.lock().await;
+        self.active_turns
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _active = ActiveTurnGuard(&self.active_turns);
         if let Some(budget) = &self.config.budget
             && let Some(reason) = budget.check_daily().await
         {
@@ -1147,13 +1164,15 @@ impl Runner {
         let mut prompts = Vec::new();
         for message in messages {
             for segment in &message.segments {
-                let crate::qq::event::Segment::Image { url, file } = segment else {
+                let crate::qq::event::Segment::Image { url, file, path } = segment else {
                     continue;
                 };
                 let mut reference = if !url.is_empty() {
                     url.clone()
-                } else {
+                } else if !file.is_empty() {
                     file.clone()
+                } else {
+                    path.clone()
                 };
                 if reference.starts_with("base64://") {
                     let payload = reference.trim_start_matches("base64://");

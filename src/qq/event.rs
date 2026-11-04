@@ -105,6 +105,8 @@ pub enum Segment {
         url: String,
         #[serde(default, skip_serializing_if = "String::is_empty")]
         file: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        path: String,
     },
     Face {
         id: String,
@@ -168,8 +170,14 @@ impl QqMessage {
                 Segment::Text { text } => out.push_str(text),
                 Segment::At { qq } => out.push_str(&format!("@{qq}")),
                 Segment::Reply { id } => out.push_str(&format!("[reply:{id}]")),
-                Segment::Image { url, file } => {
-                    let reference = if !url.is_empty() { url } else { file };
+                Segment::Image { url, file, path } => {
+                    let reference = if !url.is_empty() {
+                        url
+                    } else if !file.is_empty() {
+                        file
+                    } else {
+                        path
+                    };
                     out.push_str(&format!("[image: {reference}]"));
                 }
                 Segment::Face { id } => out.push_str(&format!("[face:{id}]")),
@@ -187,11 +195,13 @@ impl QqMessage {
         let mut out = Vec::new();
         for segment in &self.segments {
             let origin = match segment {
-                Segment::Image { url, file } => {
-                    if url.is_empty() {
+                Segment::Image { url, file, path } => {
+                    if !url.is_empty() {
+                        url
+                    } else if !file.is_empty() {
                         file
                     } else {
-                        url
+                        path
                     }
                 }
                 Segment::File { url, .. }
@@ -387,6 +397,7 @@ fn parse_segment(value: &Value) -> Segment {
         "image" => Segment::Image {
             url: text("url"),
             file: text("file"),
+            path: text("path"),
         },
         "face" => Segment::Face { id: text("id") },
         "file" => Segment::File {
@@ -792,5 +803,23 @@ mod tests {
         assert_eq!(unknown.chat, ChatId::Group(123));
         assert!(unknown.plain_text().contains("custom.event"));
         assert!(unknown.plain_text().contains("\"nested\":true"));
+    }
+
+    #[test]
+    fn image_path_is_preserved_when_url_and_file_are_empty() {
+        let data = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": 1,
+            "user_id": 2,
+            "message_id": 3,
+            "time": 1793304000,
+            "sender": {"nickname": "n"},
+            "message": [{"type": "image", "data": {"path": "/tmp/a.png"}}]
+        });
+        let QqEvent::Message(message) = normalize("message.private.normal", &data) else {
+            panic!("expected message");
+        };
+        assert_eq!(message.plain_text(), "[image: /tmp/a.png]");
     }
 }

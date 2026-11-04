@@ -131,6 +131,10 @@ impl SessionStore {
             .current_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.current_unlocked()
+    }
+
+    fn current_unlocked(&self) -> Result<SessionFile> {
         let existing: Option<String> = {
             let conn = self.db.lock();
             conn.query_row(
@@ -167,7 +171,7 @@ impl SessionStore {
             .append_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let current = self.current()?;
+        let current = self.current_unlocked()?;
         let path = self.root.join("sessions").join(&current.file);
         let mut count = current.message_count;
         let mut added_bytes = 0u64;
@@ -267,7 +271,11 @@ impl SessionStore {
             .append_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let current = self.current()?;
+        let _current_guard = self
+            .current_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = self.current_unlocked()?;
         {
             let conn = self.db.lock();
             conn.execute(

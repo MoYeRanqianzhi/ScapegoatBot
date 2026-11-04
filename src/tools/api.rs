@@ -915,6 +915,11 @@ fn self_message_from_params(chat: ChatId, params: &Value) -> QqMessage {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_owned(),
+                        path: data
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
                     },
                     other => Segment::Other {
                         kind: other.to_owned(),
