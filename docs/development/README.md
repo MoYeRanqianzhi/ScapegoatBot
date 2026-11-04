@@ -57,3 +57,7 @@
 - `config.example.toml` 由 `tests/config_example.rs` 校验：改配置 schema 时同步改样例。
 - 提交前至少运行 `cargo fmt --check`、`cargo test --all-targets`、
   `cargo clippy --all-targets -- -D warnings`；CI 会跑同样三项。
+- 发布：推送 `v*` 标签会触发 `.github/workflows/release.yml`，在 Linux/Windows
+  原生 runner 上用 `cargo build --release --locked` 构建，上传二进制与 sha256，
+  并创建 GitHub Release。`[profile.release]` 使用 fat LTO、单 codegen unit、
+  `panic = "abort"` 与符号剥离，优先运行时性能、其次体积。

@@ -74,3 +74,11 @@ tempfile = "3"
 # 暂停时钟：队列去抖与定时器测试。
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.26"
+
+# 发布构建：运行时性能优先，其次体积；构建时间不重要（CI 上跑）。
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
