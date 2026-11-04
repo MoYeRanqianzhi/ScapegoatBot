@@ -5,6 +5,26 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.29] - 2026-11-04
+
+消息不再逐条唤醒 agent，改为 inbox + 可删除唤醒预设。
+
+### 变更
+
+- 所有非 self、非 backfill 的 QQ 消息只写入 `/inbox` 与 transcript，不再进入
+  队列逐条触发回合，避免消息洪峰把 agent 拖进无休止的回复。
+- 启动时安装两个可删除的 Monitor 预设：
+  - `wake-on-mention`：非主人的 @ 消息；
+  - `wake-on-owner`：`owner_qq` 的消息。
+  删除会写入 `monitor.removed.<name>`，重启不再恢复；手动 `Monitor add` 同名可恢复。
+- Monitor 谓词新增 `event.sender != 'qq'`，用于避免主人 @ 时两个预设重复唤醒。
+- `MonitorEvent` 的 `mentions_self` 现在按登录账号判断，不再把任意 @ 当成 @ 自己。
+
+### 测试
+
+- `cargo test --all-targets`：350 项通过；`cargo fmt --check`、
+  `clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.28] - 2026-11-04
 
 修正 Chat 协议的 reasoning effort 映射。
