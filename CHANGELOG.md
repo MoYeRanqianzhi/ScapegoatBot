@@ -28,10 +28,13 @@
 - 补 GIF/BMP 解码；MCP image-only 结果不再把 base64 复制进正文。
 - `get_image` 支持返回 base64；API 响应中的 base64/image 自动转图片附件。
 - `media.image_compress` 要求 .jpg/.jpeg 输出，避免 JPEG 字节标成 PNG。
+- 回合 early-return 前排空 local SteeringQueue；关闭 receiver 让晚到消息回填 ChatQueue。
+- API base64/image 响应重新接入图片附件；User 图片计入 token 估算与裁剪。
+- 自动入站图片按模型 `input`/`vision` 门控。
 
 ### 测试
 
-- `cargo test --all-targets`：360 项通过（348 lib + 12 integration），2 ignored；`clippy -D warnings` 通过。
+- `cargo test --all-targets`：361 项通过（349 lib + 12 integration），2 ignored；`clippy -D warnings` 通过。
 
 ## [0.2.0-alpha.34] - 2026-11-04
 
