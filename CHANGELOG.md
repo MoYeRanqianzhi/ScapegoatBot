@@ -5,6 +5,19 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.26] - 2026-11-04
+
+发布构建与流水线。
+
+### 构建
+
+- `[profile.release]` 改为性能优先：`opt-level = 3`、fat LTO、单 codegen unit、
+  `panic = "abort"`、`strip = "symbols"`。本机 Windows 上体积从 17.17 MiB
+  降到 10.19 MiB。
+- 新增 `.github/workflows/release.yml`：推送 `v*` 标签时在 Linux/Windows 原生
+  runner 上 `cargo build --release --locked`，上传二进制与 sha256，并创建
+  GitHub Release；也可手动 `workflow_dispatch`。
+
 ## [0.2.0-alpha.25] - 2026-11-04
 
 用模拟流量补长跑覆盖，关闭剩余 TODO。
