@@ -18,6 +18,8 @@ clap = { version = "4", features = ["derive"] }
 # 异步运行时：守护进程、IPC、WebSocket、数据库都跑在 tokio 上。
 tokio = { version = "1", features = ["full"] }
 # NapCatLink SDK：QQ 机器人 WebSocket 客户端（项目自有代码，固定 alpha.2）。
+# 上游运行时日志是中文，vendored 到 ./vendor/napcat-link 以翻译成英文；
+# 版本 pin 不变，[patch.crates-io] 让本地副本参与构建。
 napcat-link = "=0.1.0-alpha.2"
 # HTTP 客户端：provider 与 Jev 判定器。
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
@@ -67,6 +69,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
 ] }
+
+# 用本地 vendored 副本替换 registry 里的 napcat-link（只翻译了日志文本）。
+[patch.crates-io]
+napcat-link = { path = "vendor/napcat-link" }
 
 [dev-dependencies]
 # 临时目录：配置、存储、IPC 的单元测试。
