@@ -1245,6 +1245,7 @@ async fn build_agent(
                 attempts: config.agent.retry_attempts,
                 base_ms: config.agent.retry_base_ms,
                 max_ms: config.agent.retry_max_ms,
+                mode: config.agent.retry_mode,
             },
             chat_history_limit: 20,
             hooks: config.hooks.context.clone(),

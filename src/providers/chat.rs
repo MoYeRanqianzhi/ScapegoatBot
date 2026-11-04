@@ -99,21 +99,24 @@ fn system_text(blocks: &[super::SystemBlock]) -> String {
         .join("\n\n")
 }
 
-/// Chat 协议只有 `reasoning_effort`（low/medium/high），高等级向下取整。
+/// Chat 协议的 `reasoning_effort` 直接使用模型声明的级别。
+///
+/// 各家的取值不同：OpenAI 是 `low/medium/high`，DeepSeek 是 `low/high/max`。
+/// 之前把 `max` 一律压成 `high` 是错的；这里不再猜供应商，由 `models.json`
+/// 的 `thinking_levels` 决定可配置值，原样传给 API。
 fn apply_reasoning(body: &mut Value, thinking: &ThinkingOptions) {
+    if !thinking.enabled {
+        return;
+    }
     let Some(effort) = &thinking.effort else {
         return;
     };
-    if !thinking.enabled && effort.is_empty() {
+    if effort.is_empty() {
         return;
     }
-    let mapped = match effort.as_str() {
-        "low" => "low",
-        "medium" => "medium",
-        "high" | "xhigh" | "max" => "high",
-        _ => return,
-    };
-    body["reasoning_effort"] = json!(mapped);
+    if matches!(effort.as_str(), "low" | "medium" | "high" | "max") {
+        body["reasoning_effort"] = json!(effort);
+    }
 }
 
 fn provider_messages(messages: &[super::ProviderMessage]) -> Vec<Value> {
@@ -459,8 +462,8 @@ mod tests {
         assert_eq!(body["messages"][3]["role"], "tool");
         assert_eq!(body["messages"][3]["tool_call_id"], "t1");
         assert_eq!(body["tools"][0]["type"], "function");
-        // `max` 向下映射到 `high`。
-        assert_eq!(body["reasoning_effort"], "high");
+        // DeepSeek 的 `max` 原样传递，不再压成 `high`。
+        assert_eq!(body["reasoning_effort"], "max");
     }
 
     #[test]

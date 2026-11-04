@@ -61,6 +61,17 @@ pub enum AgentMode {
     Companion,
 }
 
+/// Provider 请求失败后的重试间隔策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryMode {
+    /// 阶梯退避：base、2×base、4×base……直到 max。
+    #[default]
+    Stepped,
+    /// 固定间隔：每次都用 base。
+    Fixed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
@@ -78,6 +89,8 @@ pub struct AgentConfig {
     pub retry_attempts: u32,
     pub retry_base_ms: u64,
     pub retry_max_ms: u64,
+    /// `stepped`（默认，阶梯退避）或 `fixed`（固定间隔）。
+    pub retry_mode: RetryMode,
     /// owner 通知目标：`self` 或 QQ 号。
     pub master: String,
     pub receive_scopes: Vec<String>,
@@ -106,6 +119,7 @@ impl Default for AgentConfig {
             retry_attempts: 3,
             retry_base_ms: 400,
             retry_max_ms: 30_000,
+            retry_mode: RetryMode::Stepped,
             master: "self".to_owned(),
             receive_scopes: vec!["*".to_owned()],
             send_scopes: vec!["*".to_owned()],
