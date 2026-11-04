@@ -972,15 +972,22 @@ pub(crate) fn prune_tool_results(
         return;
     }
     for message in history.iter_mut().take(boundary) {
-        if let AgentMessage::Tool(result) = message
-            && result.content.chars().count() > soft_limit
-        {
-            let mut trimmed: String = result.content.chars().take(soft_limit).collect();
-            trimmed.push_str(
-                "
+        if let AgentMessage::Tool(result) = message {
+            if !result.images.is_empty() {
+                result.images.clear();
+                result.content.push_str(
+                    "
+[image detached]",
+                );
+            }
+            if result.content.chars().count() > soft_limit {
+                let mut trimmed: String = result.content.chars().take(soft_limit).collect();
+                trimmed.push_str(
+                    "
 [tool result trimmed]",
-            );
-            result.content = trimmed;
+                );
+                result.content = trimmed;
+            }
         }
     }
 }

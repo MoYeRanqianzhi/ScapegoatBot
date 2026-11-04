@@ -59,6 +59,8 @@ pub struct SessionStore {
     scope: Option<String>,
     /// 按年龄清理已关闭的分段；0 = 只按配额。
     retention_days: u32,
+    /// 同一分段的 append/read 串行化，避免行号竞争。
+    append_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl SessionStore {
@@ -80,6 +82,7 @@ impl SessionStore {
             encryption,
             scope: None,
             retention_days: 0,
+            append_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -93,6 +96,7 @@ impl SessionStore {
             encryption: self.encryption,
             scope: Some(scope.to_owned()),
             retention_days: self.retention_days,
+            append_lock: std::sync::Arc::clone(&self.append_lock),
         }
     }
 
@@ -151,6 +155,10 @@ impl SessionStore {
         if messages.is_empty() {
             return Ok(());
         }
+        let _guard = self
+            .append_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.current()?;
         let path = self.root.join("sessions").join(&current.file);
         let mut count = current.message_count;
@@ -182,6 +190,10 @@ impl SessionStore {
 
     /// 读取整个分段。
     pub fn read_segment(&self, file: &str) -> Result<Vec<AgentMessage>> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let file_name = file;
         let path = self.root.join("sessions").join(file);
         let handle = std::fs::File::open(&path)
@@ -522,6 +534,11 @@ impl SessionStore {
         let value: Value = serde_json::from_str(line)?;
         let ct = base64::engine::general_purpose::STANDARD
             .decode(value.get("ct").and_then(Value::as_str).unwrap_or_default())?;
+        let line_no = value
+            .get("line")
+            .and_then(Value::as_u64)
+            .map(|line| line as usize)
+            .unwrap_or(line_no);
         let plain = match self.encryption {
             EncryptionMode::XChaCha20Poly1305 => {
                 let nonce = base64::engine::general_purpose::STANDARD.decode(

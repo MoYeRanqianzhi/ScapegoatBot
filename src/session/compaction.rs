@@ -75,7 +75,14 @@ pub fn estimate_messages(messages: &[AgentMessage]) -> usize {
     messages
         .iter()
         .map(|message| estimate_tokens(&render_message(message)))
-        .sum()
+        .sum::<usize>()
+        + messages
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::Tool(result) => Some(result.images.len() * 2000),
+                _ => None,
+            })
+            .sum::<usize>()
 }
 
 /// 切分：返回 `(要摘要的旧消息, 要保留的最近消息)`。

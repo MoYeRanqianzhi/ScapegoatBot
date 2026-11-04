@@ -357,6 +357,22 @@ impl MonitorManager {
         Ok(())
     }
 
+    /// 工具调用用：后台投递，避免在工具栈里同步跑回合、重入 turn_lock。
+    pub async fn fire_async(&self, name: &str) -> Result<()> {
+        let monitor = {
+            let monitors = self.monitors.read().await;
+            monitors.get(name).cloned()
+        };
+        let Some(monitor) = monitor else {
+            anyhow::bail!("monitor {name:?} does not exist");
+        };
+        let sink = Arc::clone(&self.sink);
+        tokio::spawn(async move {
+            deliver_once(&monitor, &*sink, None, 0).await;
+        });
+        Ok(())
+    }
+
     /// 以一条合成事件投递一次；用于 `backlog = "inbox"` 的首次补投。
     pub async fn deliver_text(&self, name: &str, text: String) -> Result<()> {
         let monitor = {

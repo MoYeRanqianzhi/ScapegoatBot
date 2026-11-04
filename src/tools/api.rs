@@ -654,8 +654,8 @@ impl ApiTool {
             "media.image_resize" => {
                 let w = params.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
                 let h = params.get("height").and_then(Value::as_u64).unwrap_or(0) as u32;
-                if w == 0 || h == 0 {
-                    return ToolResult::error("width and height must be greater than zero");
+                if w == 0 || h == 0 || w > 8192 || h > 8192 {
+                    return ToolResult::error("width and height must be between 1 and 8192");
                 }
                 image.resize(w, h, image::imageops::FilterType::Lanczos3)
             }

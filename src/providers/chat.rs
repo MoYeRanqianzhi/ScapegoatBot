@@ -158,8 +158,22 @@ fn provider_messages(messages: &[super::ProviderMessage]) -> Vec<Value> {
                         _ => {}
                     }
                 }
-                if !text_parts.is_empty() {
-                    out.push(json!({ "role": "user", "content": text_parts.join("\n\n") }));
+                if !image_parts.is_empty() {
+                    let mut content = Vec::new();
+                    if !text_parts.is_empty() {
+                        content.push(json!({
+                            "type": "text",
+                            "text": text_parts.join("
+
+")
+                        }));
+                    }
+                    content.extend(image_parts);
+                    out.push(json!({ "role": "user", "content": content }));
+                } else if !text_parts.is_empty() {
+                    out.push(json!({ "role": "user", "content": text_parts.join("
+
+") }));
                 }
             }
             Role::Assistant => {
@@ -397,10 +411,19 @@ async fn pump(response: reqwest::Response, tx: mpsc::Sender<ProviderEvent>) {
         }
     }
     if !state.stop_sent {
-        let mut tail = Vec::new();
-        state.emit_stop(&mut tail);
-        for outgoing in tail {
-            let _ = sender.send(outgoing).await;
+        if state.stop_reason.is_some() {
+            let mut tail = Vec::new();
+            state.emit_stop(&mut tail);
+            for outgoing in tail {
+                let _ = sender.send(outgoing).await;
+            }
+        } else {
+            let _ = sender
+                .send(ProviderEvent::Error(ProviderError::new(
+                    ProviderErrorKind::Network,
+                    "stream ended without finish_reason",
+                )))
+                .await;
         }
     }
 }
