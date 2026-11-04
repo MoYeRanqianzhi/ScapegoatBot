@@ -136,7 +136,6 @@ curator_min_new_skills = 2
 enabled = true
 profile_path = "/STYLE.md"
 max_chars = 2000
-sample_retention_days = 30
 
 [swarm]
 enabled = true
@@ -174,7 +173,6 @@ base_url = ""
 threshold = 0.9
 timeout_ms = 800
 max_state_tokens = 8000
-delta_every_tokens = 200
 
 [budget]
 daily_tokens = 2000000
@@ -211,4 +209,12 @@ prune_keep_turns = 3
 # when = ["SessionStart", "PostCompact"]
 # inject = "system"
 # max_bytes = 32768
+# enabled = true
+
+# [[hooks.events]]
+# event = "before_send"
+# action = "rewrite"
+# pattern = "secret"
+# replacement = "[redacted]"
+# scope = "all"
 # enabled = true

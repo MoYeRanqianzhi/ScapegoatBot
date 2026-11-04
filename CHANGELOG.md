@@ -5,6 +5,33 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.17] - 2026-11-04
+
+补完剩余事件 hook 与配置字段，并新增本地 NapCat 协议模拟测试。
+
+### 新增
+
+- **全部 `[hooks.events]` 事件触发**：SessionStart/End、Pre/PostCompact、
+  MessageReceived、BeforeSend、Stop、ConfigChange。`log`/`block`/`inject_context`/
+  `notify` 生效；`inject_context` 落到 SessionStart（system）、MessageReceived（回合提示）、
+  Pre/PostCompact（摘要输入/新分段）；`notify` 支持 owner/master 私聊。
+- **`guard.max_state_tokens`**：用于截断闸看到的 state（不再固定 32k 字符）。
+- **`models.json.default_thinking_level`**：`[agent].thinking_level` 为空时作为默认 effort。
+- **NapCat 协议集成测试**：本地 WebSocket 模拟 OneBot 11/NapCat 的
+  `{action, params, echo}` 与 `{status, retcode, data, echo}`，覆盖登录、版本、群/私聊发送、
+  API 工具请求形状、失败响应与事件推送；测试按 napcat-link 源码的请求/响应结构实现。
+
+### 变更
+
+- 删除无效字段 `security.guard.delta_every_tokens` 与 `style.sample_retention_days`
+  （严格 schema，旧配置含这两个键会报未知字段）。
+- `QqClient::call` 的错误信息现在包含 NapCat 返回的 message，而不是只留方法名。
+
+### 测试
+
+- `cargo test --all-targets`：334 项通过（324 lib + 4 config + 1 live stub + 5 NapCat，
+  2 项真实 API 测试默认忽略）；`cargo fmt --check`、`clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.16] - 2026-11-04
 
 把上一轮列出的“配置写了但不生效”补齐。数据库无新迁移。

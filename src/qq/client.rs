@@ -61,7 +61,7 @@ impl QqClient {
         self.link
             .call_api(action, params)
             .await
-            .with_context(|| format!("NapCat action {action} failed"))
+            .map_err(|error| anyhow::anyhow!("NapCat action {action} failed: {error}"))
     }
 
     /// 查询登录账号。

@@ -241,8 +241,10 @@ key 放 `auth.json`：
     `sbot gate pending` 查看队列，`sbot gate reject <id>` 拒绝。
 - `[hooks.context]`：`name`、`path`、`kind`、`when`、`inject`、`max_bytes`；
   自定义注入到 system prompt 的上下文文件。
-- `[hooks.events]`：目前只接线 `BeforeSend`（`log` / `block` / `rewrite`），
-  `scope` 支持 `model`（默认）与 `all`；其他事件尚未触发。
+- `[hooks.events]`：所有事件都会触发 `log` / `block` / `inject_context` / `notify`；
+  `rewrite` 只在 `BeforeSend` 生效，`scope` 支持 `model`（默认）与 `all`。
+  `inject_context` 的落点：SessionStart → system，MessageReceived → 回合内提示，
+  Pre/PostCompact → 摘要输入/新分段；`notify` 只支持 `owner`/`master`。
 
 ## models.json
 
