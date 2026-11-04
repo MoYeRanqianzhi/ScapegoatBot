@@ -174,6 +174,11 @@ lifecycle = { idle_only = false, max_events = 1000 }
 | `wake-on-mention` | 非主人的 `@` 消息 | 唤醒主代理处理 |
 | `wake-on-owner` | `owner_qq` 的消息 | 唤醒主代理处理 |
 
+拍一拍、撤回等 QQ notice，以及好友/群请求、带 `group_id`/`user_id` 的未知事件，
+都会以 `[poke]` / `[recall]` / `[request]` / `[unknown]` 伪消息写入 inbox；
+正文带一行摘要和压缩原始 JSON（截断到 1200 字符），原始字段同时保留在消息的 `raw`。
+它们不会自动唤醒 agent，除非另建 monitor 订阅对应事件。
+
 用 `Monitor` 工具的 `remove` 删除后，会在数据库记录一条禁用标记；重启不会自动恢复。
 需要恢复时用 `Monitor add` 同名重新添加即可；其他消息仍留在 `/inbox`，可主动读取。
 

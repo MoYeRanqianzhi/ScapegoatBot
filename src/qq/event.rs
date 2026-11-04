@@ -407,12 +407,9 @@ fn parse_notice(name: &str, data: &Value) -> QqNotice {
     let group = data.get("group_id").and_then(Value::as_u64);
     let actor = data.get("user_id").and_then(Value::as_u64);
     let target = data.get("target_id").and_then(Value::as_u64);
-    let chat = group.map(ChatId::Group).or_else(|| {
-        data.get("message_type")
-            .and_then(Value::as_str)
-            .filter(|kind| *kind == "private")
-            .and_then(|_| actor.map(ChatId::Private))
-    });
+    let chat = group
+        .map(ChatId::Group)
+        .or_else(|| actor.map(ChatId::Private));
     QqNotice {
         kind: name.strip_prefix("notice.").unwrap_or(name).to_owned(),
         chat,
@@ -420,6 +417,148 @@ fn parse_notice(name: &str, data: &Value) -> QqNotice {
         target,
         raw: data.clone(),
     }
+}
+
+impl QqNotice {
+    /// 把通知转成一条可进 inbox 的伪消息。
+    ///
+    /// QQ 的拍一拍、撤回等是 notice 而不是 message；不转换的话它们既不会
+    /// 出现在 `/inbox`，也不会被 agent 看到。原文保留在 `raw`，正文只放
+    /// 一个稳定的占位符，避免把原始 JSON 塞进上下文。
+    pub fn to_inbox_message(&self) -> Option<QqMessage> {
+        let chat = self.chat?;
+        let subtype = self
+            .raw
+            .get("sub_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let message_id = self
+            .raw
+            .get("message_id")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let label = if self.kind.contains("notify") && subtype == "poke" {
+            "poke".to_owned()
+        } else if self.kind.contains("recall") {
+            "recall".to_owned()
+        } else {
+            self.kind.clone()
+        };
+        let summary = match label.as_str() {
+            "poke" => format!(
+                "[poke] {} -> {}",
+                self.actor.unwrap_or_default(),
+                self.target.unwrap_or_default()
+            ),
+            "recall" if message_id != 0 => format!("[recall] message_id={message_id}"),
+            "recall" => "[recall]".to_owned(),
+            other => format!("[{other}]"),
+        };
+        let text = with_event_details(summary, &self.raw);
+        let time = self
+            .raw
+            .get("time")
+            .and_then(Value::as_i64)
+            .and_then(|seconds| Utc.timestamp_opt(seconds, 0).single())
+            .unwrap_or_else(Utc::now);
+        Some(QqMessage {
+            message_id: synthetic_event_id(),
+            chat,
+            sender: Sender {
+                qq: self.actor,
+                nickname: String::new(),
+                card: String::new(),
+                role: String::new(),
+            },
+            time,
+            segments: vec![Segment::Text { text }],
+            reply_to: None,
+            is_self: false,
+            backfilled: false,
+            raw: self.raw.clone(),
+        })
+    }
+}
+
+/// 事件正文 = 一行摘要 + 压缩后的原始 JSON；inbox/上下文需要细节。
+fn with_event_details(summary: String, raw: &Value) -> String {
+    let details = serde_json::to_string(raw).unwrap_or_default();
+    let details: String = details.chars().take(1200).collect();
+    if details.is_empty() {
+        summary
+    } else {
+        format!("{summary} {details}")
+    }
+}
+
+impl QqRequest {
+    /// 好友/群请求也进 inbox；`comment` 与原始字段都保留。
+    pub fn to_inbox_message(&self) -> Option<QqMessage> {
+        let chat = self
+            .group
+            .map(ChatId::Group)
+            .or_else(|| self.actor.map(ChatId::Private))?;
+        let summary = format!(
+            "[request] {} from {}: {}",
+            self.kind,
+            self.actor.unwrap_or_default(),
+            self.comment
+        );
+        Some(QqMessage {
+            message_id: synthetic_event_id(),
+            chat,
+            sender: Sender {
+                qq: self.actor,
+                nickname: String::new(),
+                card: String::new(),
+                role: String::new(),
+            },
+            time: Utc::now(),
+            segments: vec![Segment::Text {
+                text: with_event_details(summary, &self.raw),
+            }],
+            reply_to: None,
+            is_self: false,
+            backfilled: false,
+            raw: self.raw.clone(),
+        })
+    }
+}
+
+/// 未知事件只要带 group_id / user_id 也入库，避免丢细节。
+pub fn unknown_to_inbox_message(name: &str, data: &Value) -> Option<QqMessage> {
+    let chat = data
+        .get("group_id")
+        .and_then(Value::as_u64)
+        .map(ChatId::Group)
+        .or_else(|| {
+            data.get("user_id")
+                .and_then(Value::as_u64)
+                .map(ChatId::Private)
+        })?;
+    let summary = format!("[unknown] {name}");
+    Some(QqMessage {
+        message_id: synthetic_event_id(),
+        chat,
+        sender: Sender {
+            qq: data.get("user_id").and_then(Value::as_u64),
+            nickname: String::new(),
+            card: String::new(),
+            role: String::new(),
+        },
+        time: Utc::now(),
+        segments: vec![Segment::Text {
+            text: with_event_details(summary, data),
+        }],
+        reply_to: None,
+        is_self: false,
+        backfilled: false,
+        raw: data.clone(),
+    })
+}
+
+fn synthetic_event_id() -> i64 {
+    -(Utc::now().timestamp_micros().unsigned_abs() as i64).max(1)
 }
 
 fn parse_request(name: &str, data: &Value) -> QqRequest {
@@ -576,5 +715,80 @@ mod tests {
             panic!("expected message");
         };
         assert_eq!(message.plain_text(), "plain text");
+    }
+
+    #[test]
+    fn poke_notice_becomes_an_inbox_message() {
+        let data = json!({
+            "post_type": "notice",
+            "notice_type": "notify",
+            "sub_type": "poke",
+            "self_id": 10000,
+            "group_id": 123,
+            "user_id": 456,
+            "target_id": 10000,
+            "time": 1793304000
+        });
+        let QqEvent::Notice(notice) = normalize("notice.notify.poke", &data) else {
+            panic!("expected notice");
+        };
+        let message = notice
+            .to_inbox_message()
+            .expect("notice should map to inbox");
+        assert_eq!(message.chat, ChatId::Group(123));
+        assert_eq!(message.sender.qq, Some(456));
+        assert!(message.plain_text().starts_with("[poke] 456 -> 10000"));
+        assert!(message.plain_text().contains("\"sub_type\":\"poke\""));
+        assert!(!message.is_self);
+    }
+
+    #[test]
+    fn recall_notice_becomes_an_inbox_message() {
+        let data = json!({
+            "post_type": "notice",
+            "notice_type": "friend_recall",
+            "self_id": 10000,
+            "user_id": 456,
+            "message_id": 789,
+            "time": 1793304000
+        });
+        let QqEvent::Notice(notice) = normalize("notice.friend_recall", &data) else {
+            panic!("expected notice");
+        };
+        let message = notice
+            .to_inbox_message()
+            .expect("notice should map to inbox");
+        assert_eq!(message.chat, ChatId::Private(456));
+        assert!(message.plain_text().starts_with("[recall] message_id=789"));
+    }
+
+    #[test]
+    fn request_and_unknown_events_enter_inbox_with_details() {
+        let request = parse_request(
+            "request.group.add",
+            &json!({
+                "group_id": 123,
+                "user_id": 456,
+                "comment": "hello",
+                "flag": "f1"
+            }),
+        );
+        let message = request.to_inbox_message().expect("request should map");
+        assert_eq!(message.chat, ChatId::Group(123));
+        assert!(
+            message
+                .plain_text()
+                .starts_with("[request] group.add from 456: hello")
+        );
+        assert!(message.plain_text().contains("\"flag\":\"f1\""));
+
+        let unknown = unknown_to_inbox_message(
+            "custom.event",
+            &json!({"group_id": 123, "x": {"nested": true}}),
+        )
+        .expect("unknown with chat should map");
+        assert_eq!(unknown.chat, ChatId::Group(123));
+        assert!(unknown.plain_text().contains("custom.event"));
+        assert!(unknown.plain_text().contains("\"nested\":true"));
     }
 }
