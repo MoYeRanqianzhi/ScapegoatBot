@@ -54,7 +54,7 @@ pub trait AgentOps: Send + Sync {
     async fn status(&self) -> Result<Value, String>;
     async fn resume(&self) -> Result<Value, String>;
     async fn quarantine(&self, params: &Value) -> Result<Value, String>;
-    async fn compact(&self) -> Result<Value, String>;
+    async fn compact(&self, chat: Option<crate::qq::event::ChatId>) -> Result<Value, String>;
     async fn clear_context(&self) -> Result<Value, String>;
 }
 
@@ -332,7 +332,7 @@ impl Tool for ApiTool {
         }
 
         match spec.namespace() {
-            "agent" => self.run_agent(spec, &params).await,
+            "agent" => self.run_agent(spec, &params, ctx).await,
             "media" => self.run_media(spec, &params, ctx).await,
             "napcat" => {
                 // hold 期间一律拒绝，包括拉黑/禁言/踢人。
@@ -810,7 +810,7 @@ impl ApiTool {
         )
     }
 
-    async fn run_agent(&self, spec: &ActionSpec, params: &Value) -> ToolResult {
+    async fn run_agent(&self, spec: &ActionSpec, params: &Value, ctx: &ToolContext) -> ToolResult {
         let Some(ops) = &self.agent_ops else {
             return ToolResult::error("Agent operations are not available in this runtime.");
         };
@@ -818,7 +818,14 @@ impl ApiTool {
             "agent.status" => ops.status().await,
             "agent.resume" => ops.resume().await,
             "agent.quarantine" => ops.quarantine(params).await,
-            "agent.compact" => ops.compact().await,
+            "agent.compact" => {
+                let chat = ctx
+                    .evidence
+                    .origin_chat
+                    .as_deref()
+                    .and_then(crate::qq::event::ChatId::parse);
+                ops.compact(chat).await
+            }
             "agent.clear_context" => ops.clear_context().await,
             other => Err(format!("{other} is not implemented by this runtime")),
         };
@@ -1021,7 +1028,7 @@ mod tests {
         async fn quarantine(&self, params: &Value) -> Result<Value, String> {
             Ok(json!({"quarantined": params}))
         }
-        async fn compact(&self) -> Result<Value, String> {
+        async fn compact(&self, _chat: Option<crate::qq::event::ChatId>) -> Result<Value, String> {
             Ok(json!({"compacted": true}))
         }
         async fn clear_context(&self) -> Result<Value, String> {
