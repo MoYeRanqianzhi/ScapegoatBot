@@ -45,7 +45,8 @@ SBOT__NAPCAT__URL=ws://127.0.0.1:3002
 | `master` | `self` | owner 通知目标：`self` 或 QQ 号 |
 | `receive_scopes` | `["*"]` | 允许读的 chat 列表 |
 | `send_scopes` | `["*"]` | 允许发的 chat 列表；空 = 禁止一切发送 |
-| `retry_attempts` / `retry_base_ms` / `retry_max_ms` | 3 / 400 / 8000 | provider 重试 |
+| `retry_attempts` / `retry_base_ms` / `retry_max_ms` | 3 / 400 / 8000 | provider 重试次数、基础间隔、上限 |
+| `retry_mode` | `stepped` | `stepped` 阶梯退避（base、2×base…封顶 max）；`fixed` 固定 base |
 
 `mode` 启动时固定，修改需重启。
 

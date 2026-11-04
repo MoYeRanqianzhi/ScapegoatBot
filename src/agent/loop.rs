@@ -42,6 +42,29 @@ pub struct RetryPolicy {
     pub attempts: u32,
     pub base_ms: u64,
     pub max_ms: u64,
+    pub mode: crate::config::RetryMode,
+}
+
+impl RetryPolicy {
+    /// 第 `attempt` 次重试前的等待毫秒数（`attempt` 从 1 开始）。
+    ///
+    /// - `fixed`：始终 `base_ms`；
+    /// - `stepped`：`base_ms * 2^(attempt-1)`，封顶 `max_ms`；
+    /// - provider 返回 `Retry-After` 时优先，但仍受 `max_ms` 限制。
+    pub fn delay_ms(&self, attempt: u32, retry_after_ms: Option<u64>) -> u64 {
+        if let Some(delay) = retry_after_ms {
+            return delay.min(self.max_ms);
+        }
+        match self.mode {
+            crate::config::RetryMode::Fixed => self.base_ms.min(self.max_ms),
+            crate::config::RetryMode::Stepped => {
+                let exponent = attempt.saturating_sub(1).min(6);
+                self.base_ms
+                    .saturating_mul(1u64 << exponent)
+                    .min(self.max_ms)
+            }
+        }
+    }
 }
 
 impl Default for RetryPolicy {
@@ -50,6 +73,7 @@ impl Default for RetryPolicy {
             attempts: 3,
             base_ms: 400,
             max_ms: 30_000,
+            mode: crate::config::RetryMode::Stepped,
         }
     }
 }
@@ -547,16 +571,7 @@ impl AgentLoop {
                             break;
                         }
                         attempt += 1;
-                        let exponential = self
-                            .config
-                            .retry
-                            .base_ms
-                            .saturating_mul(1u64 << attempt.min(6))
-                            .min(self.config.retry.max_ms);
-                        let backoff = error
-                            .retry_after_ms
-                            .unwrap_or(exponential)
-                            .min(self.config.retry.max_ms);
+                        let backoff = self.config.retry.delay_ms(attempt, error.retry_after_ms);
                         debug!(attempt, backoff, %error, "retrying provider request");
                         tokio::time::sleep(Duration::from_millis(backoff)).await;
                     }
@@ -1618,5 +1633,28 @@ mod tests {
             AgentMessage::Tool(result) => assert_eq!(result.content, long),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn retry_delay_supports_fixed_and_stepped() {
+        let stepped = RetryPolicy {
+            attempts: 4,
+            base_ms: 400,
+            max_ms: 2_000,
+            mode: crate::config::RetryMode::Stepped,
+        };
+        assert_eq!(stepped.delay_ms(1, None), 400);
+        assert_eq!(stepped.delay_ms(2, None), 800);
+        assert_eq!(stepped.delay_ms(3, None), 1_600);
+        assert_eq!(stepped.delay_ms(4, None), 2_000);
+        // Retry-After 优先，但受 max 截断。
+        assert_eq!(stepped.delay_ms(1, Some(5_000)), 2_000);
+
+        let fixed = RetryPolicy {
+            mode: crate::config::RetryMode::Fixed,
+            ..stepped
+        };
+        assert_eq!(fixed.delay_ms(1, None), 400);
+        assert_eq!(fixed.delay_ms(4, None), 400);
     }
 }

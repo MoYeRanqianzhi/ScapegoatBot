@@ -5,6 +5,26 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.28] - 2026-11-04
+
+修正 Chat 协议的 reasoning effort 映射。
+
+### 修复
+
+- 之前把 `max`/`xhigh` 一律向下映射成 `high`，注释还写成“Chat 只有
+  low/medium/high”。实际取值由供应商决定：OpenAI 是 `low/medium/high`，
+  DeepSeek 是 `low/high/max`。
+- `apply_reasoning` 现在直接透传模型声明的 `low/medium/high/max`，不再猜供应商；
+  `thinking.enabled = false` 时也不发送。
+- 测试改为断言 DeepSeek 的 `max` 原样到达请求体。
+- 新增 `[agent].retry_mode`：`stepped`（默认，base、2×base…封顶 `retry_max_ms`）
+  或 `fixed`（每次固定 `retry_base_ms`）；`Retry-After` 仍优先但受上限约束。
+
+### 测试
+
+- `cargo test --all-targets`：347 项通过；`cargo fmt --check`、
+  `clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.27] - 2026-11-04
 
 修复 Windows checkout 的 CRLF 导致 companion 提示词丢失。
@@ -12,6 +32,7 @@
 ### 修复
 
 - `static_prefix` 在首次渲染时把模板的 `
+
 ` 归一化为 `
 `；此前 Windows
   CI 上 `render_static(Companion)` 找不到 `

@@ -40,6 +40,8 @@ send_scopes = ["*"]
 retry_attempts = 3
 retry_base_ms = 400
 retry_max_ms = 8000
+# stepped：400/800/1600…（默认）；fixed：每次固定 retry_base_ms。
+retry_mode = "stepped"
 # 摘要模型；当前版本未使用（摘要走主模型）。
 compaction_model = ""
 
