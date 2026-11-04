@@ -5,6 +5,19 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.33] - 2026-11-04
+
+用真实 API usage 估算上下文，避免图片把上下文撑爆。
+
+### 修复
+
+- `estimate_messages` 优先使用最近一次 assistant 响应的
+  `input/output/cache_read/cache_write` 作为前缀基准，只估算尾部消息；
+  无 usage 时才退回逐条估算。
+- 图片仍按 Claude Code 的保守 2000 tokens/张计入尾部；实际计费以 provider
+  返回的 usage 为准。
+- 避免“图片 base64 很大但估算为 0”导致自动压缩触发过晚。
+
 ## [0.2.0-alpha.32] - 2026-11-04
 
 图片附件随 transcript 持久化，重启后仍可恢复。
