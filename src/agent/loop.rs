@@ -433,7 +433,8 @@ impl AgentLoop {
                 }
 
                 if calls.is_empty() {
-                    // 没有工具调用：看看是否有 follow-up；有就开新轮。
+                    // 最后一轮流式期间到达的消息也要进入下一轮，不能随通道关闭丢失。
+                    drain_incoming(steering, &mut incoming);
                     let followups = steering.drain();
                     if followups.is_empty() {
                         break 'outer;
