@@ -78,7 +78,7 @@ access token 在 `auth.json`，不在这里。
 `shared` 让 A 群与 B 私聊的上下文互相可见，是替身场景的默认选择；需要强隔离时用
 `per_chat`（文件名带 `group-<id>-` / `private-<id>-` 前缀）。
 
-### `[queue]`
+### `[queue]`（当前 inbox 模式下未参与调度）
 
 | 键 | 默认 | 说明 |
 |----|------|------|
