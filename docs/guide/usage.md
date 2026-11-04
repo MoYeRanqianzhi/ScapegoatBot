@@ -76,10 +76,10 @@ sbot gate reject g3        # 拒绝
 
 1. NapCat 事件到达，`[filter]` 先做准入判断（拒收即丢弃）；
 2. 消息写入加密 JSONL，索引进 SQLite，收件箱默认未读；
-3. `[queue]` 按 chat 去抖合并；
+3. 普通消息只留在 inbox，不逐条唤醒；内置 `wake-on-mention` / `wake-on-owner`
+   命中时投递一次唤醒；
 4. 回合开始：入站消息进 transcript，压缩超限时先压缩，然后请求模型；
-5. 输出闸通过后执行工具、发送消息；发送成功记为 `self`；
-6. 回合结束提交 transcript，标会话已读。
+5. 回合结束提交 transcript，标会话已读；`[queue]` 去抖在当前 inbox 模式下不参与。
 
 ## 让它主动做事
 
@@ -103,7 +103,7 @@ sbot effort set high
 
 通过 `/config` 写入（agent 自己改）或直接编辑文件后重启：
 
-- 立即生效：`[filter]`、`[queue]`（`max_concurrent` 除外）。
+- 立即生效：`[filter]`。
 - 下次启动生效：`[compaction]` 的预算、`[skills]`、`[style]`、`[agent]` 白名单键等。
 - 只读：凭据、安全策略、存储路径等。
 

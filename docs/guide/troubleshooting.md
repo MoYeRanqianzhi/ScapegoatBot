@@ -90,7 +90,7 @@ sbot resume          # 删除 ESTOP
 - 单回合步数上限 `[agent].max_steps`；
 - provider 重试与回退链会拉长耗时：看日志里的重试与 fallback；
 - 上下文过大触发压缩：压缩本身要一次模型请求；
-- 并发打满 `[queue].max_concurrent` 时新回合排队（默认 4）。
+- 主 agent 回合是串行的：前一个回合未结束时，新的唤醒会等待它完成。
 
 ## 磁盘与配额
 
