@@ -670,6 +670,57 @@ impl ApiTool {
                 }
                 image.crop_imm(x, y, w, h)
             }
+            "media.image_rotate" => {
+                let degrees = params.get("degrees").and_then(Value::as_u64).unwrap_or(0);
+                match degrees {
+                    90 => image::DynamicImage::ImageRgba8(image::imageops::rotate90(&image)),
+                    180 => image::DynamicImage::ImageRgba8(image::imageops::rotate180(&image)),
+                    270 => image::DynamicImage::ImageRgba8(image::imageops::rotate270(&image)),
+                    _ => return ToolResult::error("degrees must be 90, 180 or 270"),
+                }
+            }
+            "media.image_thumbnail" => {
+                let w = params.get("max_width").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let h = params
+                    .get("max_height")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as u32;
+                if w == 0 || h == 0 || w > 8192 || h > 8192 {
+                    return ToolResult::error("max_width/max_height must be 1..8192");
+                }
+                image.thumbnail(w, h)
+            }
+            "media.image_compress" => {
+                let quality = params
+                    .get("quality")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(80)
+                    .clamp(1, 100) as u8;
+                let mut encoded = Vec::new();
+                let rgb = image.to_rgb8();
+                let mut encoder =
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, quality);
+                if let Err(error) = encoder.encode_image(&rgb) {
+                    return ToolResult::error(format!("cannot encode JPEG: {error}"));
+                }
+                if let Err(error) =
+                    ctx.vfs
+                        .write_binary(&out_path, &encoded, crate::vfs::NodeKind::Image)
+                {
+                    return ToolResult::error(format!("cannot write {out}: {error}"));
+                }
+                return ToolResult::ok(
+                    json!({
+                        "path": out,
+                        "source": input,
+                        "width": rgb.width(),
+                        "height": rgb.height(),
+                        "bytes": encoded.len(),
+                        "quality": quality,
+                    })
+                    .to_string(),
+                );
+            }
             "media.image_convert" => image,
             other => return ToolResult::error(format!("unsupported media action {other:?}")),
         };

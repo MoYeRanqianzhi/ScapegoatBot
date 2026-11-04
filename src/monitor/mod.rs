@@ -51,6 +51,9 @@ pub struct MonitorDelivery {
     pub owner_intent: bool,
     /// 目标不存在时的处理方式。
     pub on_missing: crate::config::OnMissing,
+    /// QQ 消息唤醒时携带原消息，交给 ChatQueue 走统一去抖/并发。
+    #[serde(default)]
+    pub message: Option<crate::qq::event::QqMessage>,
 }
 
 /// 投递端；由 runtime 提供。
@@ -74,6 +77,8 @@ pub struct MonitorEvent {
     pub mentions_self: bool,
     /// 该事件是主人发的消息；monitor 回合可据此获得 owner 证据。
     pub owner_intent: bool,
+    /// 原始 QQ 消息；用于把唤醒重新交给 ChatQueue。
+    pub message: Option<crate::qq::event::QqMessage>,
 }
 
 impl MonitorEvent {
@@ -87,6 +92,7 @@ impl MonitorEvent {
                 text: message.plain_text(),
                 mentions_self: message.mentions_self(self_id),
                 owner_intent: false,
+                message: Some(message.clone()),
             }),
             QqEvent::Notice(notice) => Some(Self {
                 kind: format!("notice:{}", notice.kind),
@@ -98,6 +104,7 @@ impl MonitorEvent {
                     .unwrap_or_default(),
                 mentions_self: false,
                 owner_intent: false,
+                message: None,
             }),
             QqEvent::Request(request) => Some(Self {
                 kind: format!("request:{}", request.kind),
@@ -109,6 +116,7 @@ impl MonitorEvent {
                 text: request.comment.clone(),
                 mentions_self: false,
                 owner_intent: false,
+                message: None,
             }),
             _ => None,
         }
@@ -425,6 +433,7 @@ impl MonitorManager {
                             ),
                             system: true,
                             owner_intent: false,
+                            message: None,
                             on_missing: monitor.on_missing,
                         })
                         .await;
@@ -516,6 +525,7 @@ async fn deliver_once(
             ),
             system: true,
             owner_intent: false,
+            message: None,
             on_missing: monitor.on_missing,
         })
         .await;
@@ -578,6 +588,7 @@ async fn deliver_once(
                 ),
                 system: true,
                 owner_intent: false,
+                message: None,
                 on_missing: monitor.on_missing,
             })
             .await;
@@ -593,6 +604,7 @@ async fn deliver_once(
         text: text.clone(),
         system: false,
         owner_intent: event.as_ref().is_some_and(|event| event.owner_intent),
+        message: event.as_ref().and_then(|event| event.message.clone()),
         on_missing: monitor.on_missing,
     })
     .await;
@@ -606,6 +618,7 @@ async fn deliver_once(
             text: format!("[cc {}] {text}", monitor.name),
             system: false,
             owner_intent: false,
+            message: None,
             on_missing: crate::config::OnMissing::Queue,
         })
         .await;
@@ -662,6 +675,7 @@ fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, timer: TimerSp
                                 ),
                                 system: true,
                                 owner_intent: false,
+                                message: None,
                                 on_missing: monitor.on_missing,
                             })
                             .await;
@@ -958,6 +972,7 @@ pub async fn load_config_monitors(
                         .iter()
                         .any(|segment| matches!(segment, crate::qq::event::Segment::At { .. })),
                     owner_intent: false,
+                    message: None,
                 };
                 if !matches(monitor.when.as_deref(), &event).unwrap_or(false) {
                     continue;
@@ -1021,6 +1036,7 @@ mod tests {
             text: text.to_owned(),
             mentions_self: mentions,
             owner_intent: false,
+            message: None,
         }
     }
 
@@ -1323,6 +1339,7 @@ mod tests {
             text: "hi".to_owned(),
             mentions_self: true,
             owner_intent: false,
+            message: None,
         };
         assert!(
             matches(
