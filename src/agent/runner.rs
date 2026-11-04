@@ -673,7 +673,11 @@ impl Runner {
     ///
     /// 设计 §8.1：摘要块固定包含 `previous_session`，当前分段的路径由 runtime 注入。
     pub async fn compact_now(&self, reason: &str) -> Result<serde_json::Value> {
-        let chat = ChatId::Private(self.config.owner_qq);
+        self.compact_chat(reason, ChatId::Private(self.config.owner_qq))
+            .await
+    }
+
+    pub async fn compact_chat(&self, reason: &str, chat: ChatId) -> Result<serde_json::Value> {
         let history = self.history_for(chat).await;
         let sessions = self.session_for(chat).await;
         self.compact_scope(reason, history, sessions).await
@@ -1878,13 +1882,14 @@ impl crate::tools::api::AgentOps for RuntimeOps {
         Ok(serde_json::json!({"quarantined": path.to_string()}))
     }
 
-    async fn compact(&self) -> Result<serde_json::Value, String> {
+    async fn compact(&self, chat: Option<ChatId>) -> Result<serde_json::Value, String> {
         let runner = self
             .runner
             .get()
             .ok_or_else(|| "the runner is not ready yet".to_owned())?;
+        let chat = chat.unwrap_or(ChatId::Private(self.owner_qq));
         runner
-            .compact_now("manual")
+            .compact_chat("manual", chat)
             .await
             .map_err(|error| error.to_string())
     }
@@ -2031,7 +2036,7 @@ mod tests {
         ) -> Result<serde_json::Value, String> {
             Ok(json!({}))
         }
-        async fn compact(&self) -> Result<serde_json::Value, String> {
+        async fn compact(&self, _chat: Option<ChatId>) -> Result<serde_json::Value, String> {
             Ok(json!({}))
         }
         async fn clear_context(&self) -> Result<serde_json::Value, String> {
