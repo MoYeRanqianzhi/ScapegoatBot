@@ -87,11 +87,17 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 | `Agent` | 生成/续聊/查询/等待子代理 |
 | `MCP` | 调用已连接的 MCP 服务器工具（可选） |
 
-`API` 分三个命名空间：
+`API` 分四个命名空间：
 
 - `napcat.*`：QQ 操作。hold 期间全部拒绝。
 - `agent.*`：`status`、`resume`、`quarantine`、`compact`、`clear_context`。
+- `media.*`：本地图片处理：`image_info`、`image_resize`、`image_crop`、`image_convert`；
+  处理结果写回 VFS，随后可直接 `Read`。
 - `api.*`：`list`（过滤/分页）、`help`（单个 action 的 schema）。
+
+`Read` 读取 VFS 图片时会把图片作为 tool result 的 image attachment 交给 provider；
+图片处理工具的输出同样适用。`API` 的响应若包含 `base64` / `image` 字段，也会自动
+转成图片附件，而不是只把 JSON 塞进文本。
 
 发送、请求处理、管理动作都在表里标注了作用域与是否 destructive；目标为 owner/master
 的踢人/禁言等动作无条件拒绝。

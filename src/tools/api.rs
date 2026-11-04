@@ -27,6 +27,7 @@ use crate::qq::event::{QqMessage, Segment, Sender};
 use crate::qq::{ChatId, QqClient, format};
 use crate::security::Gate;
 use crate::storage::messages::MessageStore;
+use crate::vfs::Vfs;
 
 use super::actions::{ActionSpec, Category, specs};
 use super::{Permission, Tool, ToolContext, arg_str, object_schema};
@@ -331,6 +332,7 @@ impl Tool for ApiTool {
 
         match spec.namespace() {
             "agent" => self.run_agent(spec, &params).await,
+            "media" => self.run_media(spec, &params, ctx).await,
             "napcat" => {
                 // hold 期间一律拒绝，包括拉黑/禁言/踢人。
                 if self.gate.as_ref().is_some_and(|gate| gate.hold_active()) {
@@ -610,6 +612,91 @@ impl ApiTool {
         )
     }
 
+    async fn run_media(&self, spec: &ActionSpec, params: &Value, ctx: &ToolContext) -> ToolResult {
+        let input = match arg_str(params, "path") {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
+        let input_path = match crate::vfs::path::VfsPath::parse(input) {
+            Ok(path) => path,
+            Err(error) => return ToolResult::error(format!("invalid VFS path: {error}")),
+        };
+        let bytes = match ctx.vfs.read_bytes(&input_path) {
+            Ok(bytes) => bytes,
+            Err(error) => return ToolResult::error(error.to_string()),
+        };
+        let image = match image::load_from_memory(&bytes) {
+            Ok(image) => image,
+            Err(error) => return ToolResult::error(format!("cannot decode image: {error}")),
+        };
+        let (width, height) = (image.width(), image.height());
+        if spec.action == "media.image_info" {
+            return ToolResult::ok(
+                json!({
+                    "path": input,
+                    "width": width,
+                    "height": height,
+                    "bytes": bytes.len(),
+                    "format": image::guess_format(&bytes).ok().map(|f| format!("{f:?}")),
+                })
+                .to_string(),
+            );
+        }
+        let out = match arg_str(params, "out") {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
+        let out_path = match crate::vfs::path::VfsPath::parse(out) {
+            Ok(path) => path,
+            Err(error) => return ToolResult::error(format!("invalid output path: {error}")),
+        };
+        let output = match spec.action {
+            "media.image_resize" => {
+                let w = params.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let h = params.get("height").and_then(Value::as_u64).unwrap_or(0) as u32;
+                if w == 0 || h == 0 {
+                    return ToolResult::error("width and height must be greater than zero");
+                }
+                image.resize(w, h, image::imageops::FilterType::Lanczos3)
+            }
+            "media.image_crop" => {
+                let x = params.get("x").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let y = params.get("y").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let w = params.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let h = params.get("height").and_then(Value::as_u64).unwrap_or(0) as u32;
+                if w == 0 || h == 0 || x >= width || y >= height || x + w > width || y + h > height
+                {
+                    return ToolResult::error("crop rectangle is outside the image");
+                }
+                image.crop_imm(x, y, w, h)
+            }
+            "media.image_convert" => image,
+            other => return ToolResult::error(format!("unsupported media action {other:?}")),
+        };
+        let format = image::ImageFormat::from_path(out).unwrap_or(image::ImageFormat::Png);
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        if let Err(error) = output.write_to(&mut encoded, format) {
+            return ToolResult::error(format!("cannot encode image: {error}"));
+        }
+        let encoded = encoded.into_inner();
+        if let Err(error) = ctx
+            .vfs
+            .write_binary(&out_path, &encoded, crate::vfs::NodeKind::Image)
+        {
+            return ToolResult::error(format!("cannot write {out}: {error}"));
+        }
+        ToolResult::ok(
+            json!({
+                "path": out,
+                "source": input,
+                "width": output.width(),
+                "height": output.height(),
+                "bytes": encoded.len(),
+            })
+            .to_string(),
+        )
+    }
+
     async fn run_agent(&self, spec: &ActionSpec, params: &Value) -> ToolResult {
         let Some(ops) = &self.agent_ops else {
             return ToolResult::error("Agent operations are not available in this runtime.");
@@ -742,6 +829,38 @@ fn self_message_from_params(chat: ChatId, params: &Value) -> QqMessage {
         backfilled: false,
         raw: Value::Null,
     }
+}
+
+/// NapCat/扩展动作若直接返回 base64 图片，把它作为 tool result 的图片附件；
+/// 调用方（provider）会转成 image block，和 Playwright 截图的行为一致。
+fn images_from_response(response: &Value) -> Vec<crate::agent::message::ImageAttachment> {
+    let data = response.get("data").unwrap_or(response);
+    let mut out = Vec::new();
+    for (key, mime) in [
+        ("base64", "image/png"),
+        ("image_base64", "image/png"),
+        ("image", "image/png"),
+    ] {
+        let Some(raw) = data.get(key).and_then(Value::as_str) else {
+            continue;
+        };
+        let (mime, payload) = raw
+            .strip_prefix("data:")
+            .and_then(|rest| rest.split_once(','))
+            .map(|(header, payload)| {
+                (
+                    header.split(';').next().unwrap_or(mime).to_owned(),
+                    payload.to_owned(),
+                )
+            })
+            .unwrap_or_else(|| (mime.to_owned(), raw.to_owned()));
+        out.push(crate::agent::message::ImageAttachment {
+            mime,
+            data_base64: payload,
+        });
+        break;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1357,5 +1476,50 @@ mod tests {
         assert!(result.is_error);
         assert!(result.content.contains("unknown_action"));
         assert!(result.content.contains("set_group_ban"));
+    }
+
+    #[tokio::test]
+    async fn media_image_info_and_resize_work() {
+        let vfs = Arc::new(
+            crate::vfs::sqlite::VfsStore::open(
+                Arc::new(crate::storage::Database::open_in_memory().unwrap()),
+                Arc::new(crate::storage::crypto::MasterKey::from_bytes([3u8; 32])),
+                tempfile::tempdir().unwrap().keep(),
+                crate::vfs::quota::Limits::default(),
+            )
+            .unwrap(),
+        );
+        let image = image::DynamicImage::new_rgb8(4, 2);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let input = crate::vfs::path::VfsPath::parse("/tmp/a.png").unwrap();
+        vfs.write_binary(&input, &png.into_inner(), crate::vfs::NodeKind::Image)
+            .unwrap();
+
+        let tool = tool(None, None);
+        let ctx = ToolContext::new(Arc::clone(&vfs), None);
+        let result = tool
+            .execute(
+                &ctx,
+                json!({"action": "media.image_info", "params": {"path": "/tmp/a.png"}}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let info: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(info["width"], 4);
+        assert_eq!(info["height"], 2);
+
+        let result = tool
+            .execute(
+                &ctx,
+                json!({
+                    "action": "media.image_resize",
+                    "params": {"path": "/tmp/a.png", "out": "/tmp/b.png", "width": 2, "height": 1}
+                }),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let out = crate::vfs::path::VfsPath::parse("/tmp/b.png").unwrap();
+        assert!(vfs.stat(&out).is_ok());
     }
 }

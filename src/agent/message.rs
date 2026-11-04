@@ -21,9 +21,18 @@ pub struct ToolCall {
 /// 工具执行结果。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
-    /// 进入上下文的文本；二进制内容不进来（设计 §6.4）。
+    /// 进入上下文的文本。
     pub content: String,
     pub is_error: bool,
+    /// 工具附带的图片；不落 session，只在当前回合转成 provider image block。
+    #[serde(default, skip_serializing)]
+    pub images: Vec<ImageAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    pub mime: String,
+    pub data_base64: String,
 }
 
 impl ToolResult {
@@ -31,6 +40,15 @@ impl ToolResult {
         Self {
             content: content.into(),
             is_error: false,
+            images: Vec::new(),
+        }
+    }
+
+    pub fn with_images(content: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            images,
         }
     }
 
@@ -38,6 +56,7 @@ impl ToolResult {
         Self {
             content: content.into(),
             is_error: true,
+            images: Vec::new(),
         }
     }
 }
@@ -111,6 +130,8 @@ pub struct ToolResultMessage {
     pub tool_name: String,
     pub content: String,
     pub is_error: bool,
+    #[serde(default, skip_serializing)]
+    pub images: Vec<ImageAttachment>,
 }
 
 /// 内部消息。

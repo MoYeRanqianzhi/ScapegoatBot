@@ -126,16 +126,19 @@ fn provider_messages(messages: &[super::ProviderMessage]) -> Vec<Value> {
             Role::User => {
                 // Chat 协议没有独立的 tool 内容块：连续的 tool_result 要拆成多条 `role: tool`。
                 let mut text_parts: Vec<String> = Vec::new();
+                let mut image_parts: Vec<Value> = Vec::new();
                 for block in &message.content {
                     match block {
                         ContentBlock::Text { text } => text_parts.push(text.clone()),
-                        ContentBlock::Image { .. } => {
-                            // Chat 的图片格式在不同兼容服务间差异很大，当前不转换图片。
-                            text_parts.push(
-                                "[image omitted: this protocol does not accept inline images]"
-                                    .to_owned(),
-                            );
-                        }
+                        ContentBlock::Image {
+                            mime_type,
+                            data_base64,
+                        } => image_parts.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{mime_type};base64,{data_base64}")
+                            }
+                        })),
                         ContentBlock::ToolResult {
                             tool_use_id,
                             content,
