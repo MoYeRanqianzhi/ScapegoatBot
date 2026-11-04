@@ -255,6 +255,10 @@ impl SessionStore {
 
     /// 轮转：关闭当前分段并创建新分段（压缩成功后调用）。
     pub fn rotate(&self) -> Result<SessionFile> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.current()?;
         {
             let conn = self.db.lock();

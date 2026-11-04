@@ -104,7 +104,13 @@ impl ChatQueue {
         if let Some(steering) = &state.active
             && config.mode == QueueMode::Steer
         {
-            let _ = steering.send(AgentMessage::user(render_inbound(&message)));
+            if steering
+                .send(AgentMessage::user(render_inbound(&message)))
+                .is_err()
+            {
+                // handler 已收尾但 active 尚未清空：放回 pending，finish 会补开一轮。
+                self.push_with_caps(state, message);
+            }
             return;
         }
 

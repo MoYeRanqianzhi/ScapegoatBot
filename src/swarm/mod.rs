@@ -502,7 +502,6 @@ impl AgentHub {
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown subagent {id:?}"))?;
-        let _dispatch = instance.dispatch_lock.lock().await;
         let status = instance.status.lock().await.clone();
         if status == InstanceStatus::Running {
             let sender = instance.incoming.lock().await.clone();
@@ -519,7 +518,17 @@ impl AgentHub {
             return Ok(serde_json::json!({"id": id, "queued": true}));
         }
 
-        // 已结束：把新消息并入历史，启动新一轮。
+        // 已结束：串行化重启；拿到锁后重新检查状态。
+        let _dispatch = instance.dispatch_lock.lock().await;
+        let status = instance.status.lock().await.clone();
+        if status == InstanceStatus::Running {
+            let sender = instance.incoming.lock().await.clone();
+            if let Some(sender) = sender
+                && sender.send(AgentMessage::user(&text)).is_ok()
+            {
+                return Ok(serde_json::json!({"id": id, "delivered": true}));
+            }
+        }
         let history = {
             let mut history = instance.history.lock().await;
             history.push(AgentMessage::user(&text));

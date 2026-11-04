@@ -477,7 +477,9 @@ impl AgentLoop {
         let mut system = self.config.system.clone();
         let mut messages = Vec::new();
 
-        for message in history {
+        let mut index = 0;
+        while index < history.len() {
+            let message = &history[index];
             match message {
                 AgentMessage::System { text } => system.push(SystemBlock {
                     text: text.clone(),
@@ -534,32 +536,32 @@ impl AgentLoop {
                         content,
                     });
                 }
-                AgentMessage::Tool(result) => {
-                    messages.push(ProviderMessage {
-                        role: Role::User,
-                        content: vec![ContentBlock::ToolResult {
+                AgentMessage::Tool(_) => {
+                    // 连续的 tool 结果合并为同一个 user 消息；图片只能放在所有
+                    // tool_result 之后，否则严格协议会拒绝。
+                    let mut content = Vec::new();
+                    let mut images = Vec::new();
+                    while let Some(AgentMessage::Tool(result)) = history.get(index) {
+                        content.push(ContentBlock::ToolResult {
                             tool_use_id: result.tool_call_id.clone(),
                             content: result.content.clone(),
                             is_error: result.is_error,
-                        }],
-                    });
-                    // 工具返回的图片作为紧随其后的 user 图片消息；tool role 本身
-                    // 在 OpenAI 兼容协议里不保证支持多模态内容。
-                    if !result.images.is_empty() {
-                        let mut content = vec![ContentBlock::Text {
-                            text: format!("Image returned by tool {}.", result.tool_name),
-                        }];
-                        content.extend(result.images.iter().map(|image| ContentBlock::Image {
+                        });
+                        images.extend(result.images.iter().map(|image| ContentBlock::Image {
                             mime_type: image.mime.clone(),
                             data_base64: image.data_base64.clone(),
                         }));
-                        messages.push(ProviderMessage {
-                            role: Role::User,
-                            content,
-                        });
+                        index += 1;
                     }
+                    content.extend(images);
+                    messages.push(ProviderMessage {
+                        role: Role::User,
+                        content,
+                    });
+                    continue;
                 }
             }
+            index += 1;
         }
 
         LlmRequest {

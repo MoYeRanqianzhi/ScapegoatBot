@@ -651,6 +651,11 @@ impl ApiTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(format!("invalid output path: {error}")),
         };
+        if spec.action == "media.image_compress"
+            && !(out.ends_with(".jpg") || out.ends_with(".jpeg"))
+        {
+            return ToolResult::error("media.image_compress requires a .jpg/.jpeg output path");
+        }
         let output = match spec.action {
             "media.image_resize" => {
                 let w = params.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -665,9 +670,16 @@ impl ApiTool {
                 let y = params.get("y").and_then(Value::as_u64).unwrap_or(0) as u32;
                 let w = params.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
                 let h = params.get("height").and_then(Value::as_u64).unwrap_or(0) as u32;
-                if w == 0 || h == 0 || x >= width || y >= height || x + w > width || y + h > height
+                if w == 0
+                    || h == 0
+                    || w > 8192
+                    || h > 8192
+                    || x >= width
+                    || y >= height
+                    || x.checked_add(w).is_none_or(|end| end > width)
+                    || y.checked_add(h).is_none_or(|end| end > height)
                 {
-                    return ToolResult::error("crop rectangle is outside the image");
+                    return ToolResult::error("crop rectangle is outside the image or too large");
                 }
                 image.crop_imm(x, y, w, h)
             }

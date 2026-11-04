@@ -83,7 +83,7 @@ access token 在 `auth.json`，不在这里。
 | 键 | 默认 | 说明 |
 |----|------|------|
 | `mode` | `steer` | 回合中到达的消息：`steer` 立即注入 / `followup` 下一回合 / `collect` 合并 |
-| `max_concurrent` | 4 | 全局并发回合数；修改需重启 |
+| `max_concurrent` | 4 | 队列同时派发的 handler 数；shared transcript 下主回合仍由 turn_lock 串行 |
 | `cap_messages` | 200 | 每 chat 待处理消息上限 |
 | `drop` | `summarize` | 溢出策略：`summarize` / `old` / `new` |
 | `debounce_ms` | 3000 | 连发合并窗口 |

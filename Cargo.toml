@@ -58,7 +58,7 @@ dirs = "6"
 regex = "1"
 # Base64：加密后的 JSONL 行。
 font8x8 = "0.3"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 base64 = "0.22"
 # 十六进制编码：主密钥文件与哈希摘要。
 hex = "0.4"
