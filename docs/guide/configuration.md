@@ -295,7 +295,7 @@ key 放 `auth.json`：
 
 - `api` 三选一：`anthropic`、`openai`（Responses）、`chat`（Chat Completions）。
 - 模型引用是 `provider/id`；`id` 同时作为发给 API 的 model 字段。
-- `capabilities` 决定是否启用服务端工具；图片输入目前由工具链直接附加（不按 `input` 字段过滤）。
+- `capabilities` 决定是否启用服务端工具；入站 QQ 图片按 `input`/`vision` 门控，`Read`/MCP 工具图片仍直接附加。
 - `base_url` 留空时由各 provider 用自己的默认地址（Anthropic 官方；OpenAI 兼容
   端点通常必须显式配置）。
 - `models.json` 不存在时只使用内置清单（`assets/models.default.json`）；存在时按

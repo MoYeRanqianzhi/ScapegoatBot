@@ -1332,6 +1332,12 @@ async fn build_agent(
             send_scopes: config.agent.send_scopes.clone(),
             gate_mode: config.gate.mode,
             max_tokens: config.agent.max_output_tokens,
+            supports_images: model_ref.model.input.iter().any(|input| input == "image")
+                || model_ref
+                    .model
+                    .capabilities
+                    .iter()
+                    .any(|cap| cap == "vision"),
             thinking,
             max_steps: config.agent.max_steps,
             retry: crate::agent::agent_loop::RetryPolicy {

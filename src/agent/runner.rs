@@ -51,6 +51,8 @@ pub struct RunnerConfig {
     pub send_scopes: Vec<String>,
     pub gate_mode: GateMode,
     pub max_tokens: u32,
+    /// 模型是否声明接受图片输入；只影响入站图片自动注入。
+    pub supports_images: bool,
     pub thinking: ThinkingOptions,
     pub max_steps: u32,
     pub retry: crate::agent::agent_loop::RetryPolicy,
@@ -1125,6 +1127,9 @@ impl Runner {
         &self,
         messages: &[crate::qq::event::QqMessage],
     ) -> Vec<AgentMessage> {
+        if !self.config.supports_images {
+            return Vec::new();
+        }
         use base64::Engine as _;
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
@@ -2092,6 +2097,7 @@ mod tests {
                 send_scopes: vec!["*".to_owned()],
                 gate_mode: GateMode::Auto,
                 max_tokens: 256,
+                supports_images: true,
                 thinking: ThinkingOptions::default(),
                 max_steps: 8,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
@@ -2258,6 +2264,7 @@ mod tests {
                 send_scopes: vec!["*".to_owned()],
                 gate_mode: GateMode::Auto,
                 max_tokens: 256,
+                supports_images: true,
                 thinking: ThinkingOptions::default(),
                 max_steps: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
@@ -2402,6 +2409,7 @@ mod tests {
                 send_scopes: vec!["*".to_owned()],
                 gate_mode: GateMode::Auto,
                 max_tokens: 256,
+                supports_images: true,
                 thinking: ThinkingOptions::default(),
                 max_steps: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
@@ -2553,6 +2561,7 @@ mod tests {
                 send_scopes: vec!["*".to_owned()],
                 gate_mode: GateMode::Auto,
                 max_tokens: 256,
+                supports_images: true,
                 thinking: ThinkingOptions::default(),
                 max_steps: 2,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
@@ -2725,6 +2734,7 @@ mod tests {
                 send_scopes: vec!["*".to_owned()],
                 gate_mode: GateMode::Auto,
                 max_tokens: 256,
+                supports_images: true,
                 thinking: ThinkingOptions::default(),
                 max_steps: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
@@ -2905,6 +2915,7 @@ mod tests {
                 send_scopes: vec!["*".to_owned()],
                 gate_mode: GateMode::Auto,
                 max_tokens: 256,
+                supports_images: true,
                 thinking: ThinkingOptions::default(),
                 max_steps: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
