@@ -20,3 +20,16 @@
 
 - [ ] 真实 API / NapCat 实测记录更新到 alpha.14（当前 live-testing 停在 alpha.12）。
 - [ ] 若实现上述任一项，先改 `docs/guide` 对应页，再删 `limits.md` 对应行。
+
+## 待合并 / 待发布
+
+- [ ] 合并 `feat/i18n-logs`（`d90cec9`）：vendored `napcat-link` + 52 条英文日志 + `tools/check_log_i18n.py`。
+- [ ] 处理 vendored `napcat-link` 剩余 17 条中文错误文本（`#[error]`、连接状态错误、配置校验），同步更新 `tests/error_test.rs` 断言。
+- [ ] 发布并部署 alpha.29/alpha.30：inbox-only + 可删除 `wake-on-mention` / `wake-on-owner` 预设，替换 hw1 上的 alpha.27。
+
+## Agent 运行时问题
+
+- [ ] provider 流式响应 `Network: error decoding response body` 反复出现；给流式读取加空闲超时，并让解码失败进入重试/回退，而不是拖到 wall-clock 600s。
+- [ ] 控制回合出现 `elapsed=657` 与 `elapsed=1287` 两层预算告警，确认是否重复计时/嵌套重试。
+- [ ] 运行时 `owner-private-wakeup` monitor 会对同一条私聊注入重复事件（transcript 出现两次 `嗯哼？`）；确认 preset 去重与 `batch_window` 语义。
+- [ ] 会话压缩后旧行按新行号解密失败（AAD `session:<file_id>:<line_no>` 错位）；确认压缩是否重写/重排 transcript。
