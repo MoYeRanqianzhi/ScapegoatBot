@@ -21,7 +21,7 @@
 
 - [ ] 真实 `get_image` 契约仍未实测；重定向 host 与流式大小已校验，但 http/get_image 实际返回仍需实测。
 - [x] daily/chat budget 早退时图片会持久化；转发/回复引用图片、control/monitor 注入回合仍不自动注入。
-- [ ] MCP 图片只做 MIME/大小过滤，不压缩。
+- [x] MCP 图片 >1 MB 时缩到 2000px JPEG。
 - [ ] `media.image_watermark` 只支持 ASCII；`image_compress` 强制 JPEG。
 - [ ] 缺 inbound resolver、provider image body、User image estimate/prune、MCP 图片、media 各动作测试。
 
