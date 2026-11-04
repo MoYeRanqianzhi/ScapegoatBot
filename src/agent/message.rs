@@ -138,7 +138,9 @@ pub struct ToolResultMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "snake_case")]
 pub enum AgentMessage {
-    System { text: String },
+    System {
+        text: String,
+    },
     User {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

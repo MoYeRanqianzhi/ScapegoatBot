@@ -374,6 +374,11 @@ impl MonitorManager {
         let Some(monitor) = monitor else {
             anyhow::bail!("monitor {name:?} does not exist");
         };
+        if let Some(previous) = *monitor.last_delivery.lock().expect("monitor lock")
+            && previous.elapsed() < monitor.min_interval
+        {
+            anyhow::bail!("monitor {name:?} is rate limited");
+        }
         let sink = Arc::clone(&self.sink);
         tokio::spawn(async move {
             deliver_once(&monitor, &*sink, None, 0).await;

@@ -277,6 +277,8 @@ pub struct AgentInstance {
     /// 运行中的消息通道；结束后清空。
     incoming: Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentMessage>>>,
     result: Mutex<Option<String>>,
+    /// 串行化 message/restart，避免两个调用同时把实例重启。
+    dispatch_lock: tokio::sync::Mutex<()>,
 }
 
 /// 子代理管理器。
@@ -454,6 +456,7 @@ impl AgentHub {
             history: Arc::new(Mutex::new(vec![AgentMessage::user(&task)])),
             incoming: Mutex::new(None),
             result: Mutex::new(None),
+            dispatch_lock: tokio::sync::Mutex::new(()),
         });
         self.instances
             .write()
@@ -499,6 +502,7 @@ impl AgentHub {
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown subagent {id:?}"))?;
+        let _dispatch = instance.dispatch_lock.lock().await;
         let status = instance.status.lock().await.clone();
         if status == InstanceStatus::Running {
             let sender = instance.incoming.lock().await.clone();
@@ -542,6 +546,7 @@ impl AgentHub {
             incoming: Some(incoming_rx),
             shared_history: Some(Arc::clone(&instance.history)),
         };
+        drop(_dispatch);
         let runner = Arc::clone(&self.runner);
         tokio::spawn(async move {
             run_instance(instance, runner, request).await;

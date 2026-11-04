@@ -5,6 +5,19 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.35] - 2026-11-04
+
+收尾审计 P2。
+
+### 修复
+
+- `prune_tool_results` 只裁剪发给 provider 的副本，不再改写已提交历史。
+- `Monitor fire` 在 `min_interval` 内返回错误，而不是假报成功。
+- 子代理续聊加 dispatch 锁，避免并发重启覆盖历史。
+- 控制通道最多 4 个排队回合，超出直接拒绝。
+- `cap_batches` 死分支移除。
+- QQ 入站图片自动下载并作为 image prompt 注入（仅 QQ CDN，≤3.5 MB）。
+
 ## [0.2.0-alpha.34] - 2026-11-04
 
 补齐事件审计、图片自动注入与剩余审计项。

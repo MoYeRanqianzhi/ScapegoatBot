@@ -252,13 +252,6 @@ impl AgentLoop {
 
             loop {
                 drain_incoming(steering, &mut incoming);
-                if self.config.prune {
-                    prune_tool_results(
-                        history,
-                        self.config.prune_keep_turns as usize,
-                        self.config.prune_soft_limit,
-                    );
-                }
                 if self.config.max_wall_secs > 0
                     && started.elapsed().as_secs() >= self.config.max_wall_secs
                 {
@@ -317,7 +310,17 @@ impl AgentLoop {
                     }
                 }
 
-                let request = self.build_request(history);
+                let request = if self.config.prune {
+                    let mut pruned = history.clone();
+                    prune_tool_results(
+                        &mut pruned,
+                        self.config.prune_keep_turns as usize,
+                        self.config.prune_soft_limit,
+                    );
+                    self.build_request(&pruned)
+                } else {
+                    self.build_request(history)
+                };
                 send(events, AgentEvent::MessageStart).await;
 
                 let assistant = match self.request_with_retry(&request, events).await {

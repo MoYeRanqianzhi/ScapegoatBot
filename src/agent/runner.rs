@@ -222,6 +222,8 @@ pub struct Runner {
     review_lock: Mutex<()>,
     /// 主 agent 回合互斥：shared transcript 下同一时刻只允许一个回合。
     turn_lock: tokio::sync::Mutex<()>,
+    /// 控制通道排队上限，避免一次灌入无限任务。
+    control_slots: tokio::sync::Semaphore,
 }
 
 /// 把回合证据注入每次工具调用。
@@ -377,6 +379,7 @@ impl Runner {
             review_failures: std::sync::atomic::AtomicU32::new(0),
             review_lock: Mutex::new(()),
             turn_lock: tokio::sync::Mutex::new(()),
+            control_slots: tokio::sync::Semaphore::new(4),
         });
         let _ = runner
             .fire_hooks(crate::config::HookEvent::SessionStart, None, None)
@@ -939,6 +942,10 @@ impl Runner {
     }
 
     pub async fn run_control(&self, text: &str, control_id: i64) -> Result<LoopOutcome> {
+        let _permit = self
+            .control_slots
+            .try_acquire()
+            .map_err(|_| anyhow::anyhow!("too many queued control turns"))?;
         if !self.ai_enabled.load(std::sync::atomic::Ordering::Relaxed) {
             anyhow::bail!("AI calls are stopped; run `sbot ai start` first");
         }
