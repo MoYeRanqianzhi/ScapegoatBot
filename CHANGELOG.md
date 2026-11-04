@@ -19,7 +19,15 @@
 - QQ 入站图片按 NapCat segment 的 `url` / `file`（URL、`base64://`、容器路径）解析；
   容器路径通过 `get_image` 换取 URL，再下载为 image prompt（仅 QQ CDN，≤3.5 MB）。
 - `Read` 超过 3.5 MB 时自动缩到 2000px 并转 JPEG。
-- 请求级 wall-clock 超时，单次 provider 请求不能跑满整个回合预算。
+- 请求级 wall-clock 超时：请求最多使用回合剩余预算，不能越过总预算。
+
+### 图片与协议补充
+
+- 入站图片 prompt 现在随 transcript 持久化，不再只在到达回合可见。
+- 连续 tool 结果合并为一个 user 消息，图片排在全部 tool_result 之后。
+- 补 GIF/BMP 解码；MCP image-only 结果不再把 base64 复制进正文。
+- `get_image` 支持返回 base64；API 响应中的 base64/image 自动转图片附件。
+- `media.image_compress` 要求 .jpg/.jpeg 输出，避免 JPEG 字节标成 PNG。
 
 ### 测试
 

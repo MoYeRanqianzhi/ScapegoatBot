@@ -260,10 +260,16 @@ impl McpClient {
                                 .get("mimeType")
                                 .and_then(Value::as_str)
                                 .unwrap_or("image/png");
-                            images.push(crate::agent::message::ImageAttachment {
-                                mime: mime.to_owned(),
-                                data_base64: data.to_owned(),
-                            });
+                            if matches!(
+                                mime,
+                                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                            ) && data.len() <= 4_700_000
+                            {
+                                images.push(crate::agent::message::ImageAttachment {
+                                    mime: mime.to_owned(),
+                                    data_base64: data.to_owned(),
+                                });
+                            }
                         }
                     }
                     Some(kind) => {
@@ -277,7 +283,11 @@ impl McpClient {
             }
         }
         if out.is_empty() {
-            out = serde_json::to_string(&result).unwrap_or_default();
+            out = if images.is_empty() {
+                serde_json::to_string(&result).unwrap_or_default()
+            } else {
+                format!("[{} image(s)]", images.len())
+            };
         }
         if out.len() > MAX_RESULT_BYTES {
             // 按字符边界截断，避免写出半个 UTF-8 字符。

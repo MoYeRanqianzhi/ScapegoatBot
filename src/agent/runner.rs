@@ -1161,20 +1161,42 @@ impl Runner {
                         .await
                     {
                         Ok(value) => {
-                            reference = value
-                                .get("url")
-                                .or_else(|| value.pointer("/data/url"))
-                                .or_else(|| value.get("file"))
-                                .or_else(|| value.pointer("/data/file"))
+                            if let Some(data) = value
+                                .get("base64")
+                                .or_else(|| value.pointer("/data/base64"))
                                 .and_then(serde_json::Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned();
+                            {
+                                reference = format!("base64://{data}");
+                            } else {
+                                reference = value
+                                    .get("url")
+                                    .or_else(|| value.pointer("/data/url"))
+                                    .or_else(|| value.get("file"))
+                                    .or_else(|| value.pointer("/data/file"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned();
+                            }
                         }
                         Err(error) => {
                             warn!(%error, "cannot resolve a QQ image reference");
                             continue;
                         }
                     }
+                }
+                if let Ok(value) = base64::engine::general_purpose::STANDARD
+                    .decode(reference.trim_start_matches("base64://"))
+                    && value.len() <= 3_500_000
+                {
+                    let mime = mime_for_bytes(&value);
+                    prompts.push(AgentMessage::user_with_images(
+                        format!("[image from {}]", message.chat),
+                        vec![crate::agent::message::ImageAttachment {
+                            mime,
+                            data_base64: base64::engine::general_purpose::STANDARD.encode(&value),
+                        }],
+                    ));
+                    continue;
                 }
                 let Ok(parsed) = reqwest::Url::parse(&reference) else {
                     continue;
@@ -1385,10 +1407,11 @@ impl Runner {
             )));
         }
 
+        // runtime/pending prompt 不落 transcript；入站图片属于真实消息内容，需要落库。
+        let runtime_blocks = prompts.len();
         prompts.extend(self.inbound_image_prompts(&inbound_messages).await);
 
         // 4) 运行循环。工具执行器带上本回合证据。
-        let runtime_blocks = prompts.len();
         let prompt_tokens = crate::session::compaction::estimate_messages(&prompts);
         let slot = self.provider_snapshot();
         let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {

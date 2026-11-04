@@ -361,7 +361,16 @@ impl MonitorManager {
         let Some(monitor) = monitor else {
             anyhow::bail!("monitor {name:?} does not exist");
         };
-        deliver_once(&monitor, &*self.sink, None, 0).await;
+        {
+            let mut last = monitor.last_delivery.lock().expect("monitor lock");
+            if let Some(previous) = *last
+                && previous.elapsed() < monitor.min_interval
+            {
+                anyhow::bail!("monitor {name:?} is rate limited");
+            }
+            *last = Some(std::time::Instant::now());
+        }
+        deliver_once(&monitor, &*self.sink, None, 0, true).await;
         Ok(())
     }
 
@@ -374,14 +383,18 @@ impl MonitorManager {
         let Some(monitor) = monitor else {
             anyhow::bail!("monitor {name:?} does not exist");
         };
-        if let Some(previous) = *monitor.last_delivery.lock().expect("monitor lock")
-            && previous.elapsed() < monitor.min_interval
         {
-            anyhow::bail!("monitor {name:?} is rate limited");
+            let mut last = monitor.last_delivery.lock().expect("monitor lock");
+            if let Some(previous) = *last
+                && previous.elapsed() < monitor.min_interval
+            {
+                anyhow::bail!("monitor {name:?} is rate limited");
+            }
+            *last = Some(std::time::Instant::now());
         }
         let sink = Arc::clone(&self.sink);
         tokio::spawn(async move {
-            deliver_once(&monitor, &*sink, None, 0).await;
+            deliver_once(&monitor, &*sink, None, 0, true).await;
         });
         Ok(())
     }
@@ -399,7 +412,7 @@ impl MonitorManager {
             text,
             ..MonitorEvent::default()
         };
-        deliver_once(&monitor, &*self.sink, Some(&event), 1).await;
+        deliver_once(&monitor, &*self.sink, Some(&event), 1, false).await;
         Ok(())
     }
 
@@ -462,7 +475,7 @@ impl MonitorManager {
             // 无批处理且无需等空闲时直接投递，保持调用方看到同步结果。
             if !monitor.idle_only {
                 monitor.pending_deliveries.fetch_add(1, Ordering::SeqCst);
-                deliver_once(monitor, &*self.sink, Some(event), 1).await;
+                deliver_once(monitor, &*self.sink, Some(event), 1, false).await;
                 monitor.pending_deliveries.fetch_sub(1, Ordering::SeqCst);
                 return;
             }
@@ -471,7 +484,7 @@ impl MonitorManager {
             let event = event.clone();
             monitor.pending_deliveries.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
-                deliver_once(&monitor, &*sink, Some(&event), 1).await;
+                deliver_once(&monitor, &*sink, Some(&event), 1, false).await;
                 monitor.pending_deliveries.fetch_sub(1, Ordering::SeqCst);
             });
             return;
@@ -500,7 +513,7 @@ impl MonitorManager {
                 text: texts.join("\n"),
                 ..MonitorEvent::default()
             };
-            deliver_once(&monitor, &*sink, Some(&event), texts.len() as u64).await;
+            deliver_once(&monitor, &*sink, Some(&event), texts.len() as u64, false).await;
             monitor.pending_deliveries.fetch_sub(1, Ordering::SeqCst);
         });
     }
@@ -510,6 +523,7 @@ async fn deliver_once(
     sink: &dyn MonitorSink,
     event: Option<&MonitorEvent>,
     count: u64,
+    force: bool,
 ) {
     if monitor.cancelled.load(Ordering::SeqCst) {
         return;
@@ -552,7 +566,9 @@ async fn deliver_once(
         }
     }
 
-    {
+    if force {
+        *monitor.last_delivery.lock().expect("monitor lock") = Some(std::time::Instant::now());
+    } else {
         let mut last = monitor.last_delivery.lock().expect("monitor lock");
         if let Some(previous) = *last
             && previous.elapsed() < monitor.min_interval
@@ -648,7 +664,7 @@ fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, timer: TimerSp
                     text: format!("[timer catch-up] {missed} missed occurrence(s)"),
                     ..MonitorEvent::default()
                 };
-                deliver_once(&monitor, &*sink, Some(&event), missed).await;
+                deliver_once(&monitor, &*sink, Some(&event), missed, false).await;
             }
         }
         write_last_fire(monitor.db.as_ref(), &monitor.name, now);
@@ -694,7 +710,7 @@ fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, timer: TimerSp
                 break;
             }
             write_last_fire(monitor.db.as_ref(), &monitor.name, Local::now());
-            deliver_once(&monitor, &*sink, None, 1).await;
+            deliver_once(&monitor, &*sink, None, 1, false).await;
             if monitor.one_shot
                 || monitor.cancelled.load(Ordering::SeqCst)
                 || matches!(timer, TimerSpec::At { .. })

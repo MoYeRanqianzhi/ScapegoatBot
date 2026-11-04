@@ -55,7 +55,7 @@ impl Tool for MonitorTool {
          Silence is not success. Before adding one, ask: if the thing I am watching failed right \
          now, would this monitor deliver anything? If not, widen when. A monitor delivers \
          messages; it never executes anything on its own. list shows name, source, remaining \
-         quota and expiry; fire triggers one immediately."
+         quota and expiry; fire triggers one delivery (idle_only may wait)."
     }
 
     fn parameters(&self) -> Value {
