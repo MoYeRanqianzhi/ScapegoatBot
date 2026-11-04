@@ -24,15 +24,15 @@
 ## 待合并 / 待发布
 
 - [x] 合并 `feat/i18n-logs`（`d90cec9`）：vendored `napcat-link` + 52 条英文日志 + `tools/check_log_i18n.py`。
-- [ ] 处理 vendored `napcat-link` 剩余 17 条中文错误文本（`#[error]`、连接状态错误、配置校验），同步更新 `tests/error_test.rs` 断言。
+- [x] vendored `napcat-link` 17 条中文错误文本已英文化（13b534b）。
 - [x] 发布并部署 alpha.31：inbox-only + 唤醒预设 + notice/request 入库 + 图片 tool result/media.* + 回合互斥/transcript 行号。
 
 ## Agent 运行时问题
 
-- [ ] provider 流式响应 `Network: error decoding response body` 反复出现；给流式读取加空闲超时，并让解码失败进入重试/回退，而不是拖到 wall-clock 600s。
+- [x] provider 流式响应加 30s 逐 chunk 空闲超时；解码失败走 Network 重试。
 - [ ] 控制回合出现 `elapsed=657` 与 `elapsed=1287` 两层预算告警，确认是否重复计时/嵌套重试。
 - [ ] 运行时 `owner-private-wakeup` monitor 会对同一条私聊注入重复事件（transcript 出现两次 `嗯哼？`）；确认 preset 去重与 `batch_window` 语义。
-- [ ] 会话压缩后旧行按新行号解密失败（AAD `session:<file_id>:<line_no>` 错位）；确认压缩是否重写/重排 transcript。
+- [x] transcript append/read 串行化 + 行号信封；读取时尝试偏移行号恢复旧数据（alpha.34 待发）。
 
 - [ ] 对照 NapCat/OneBot 事件目录做一次完整审计：notice 子类型（poke、recall、group_admin、group_upload、essence、ban、card、reaction 等）、request、meta lifecycle、未知事件；明确哪些进 inbox、哪些只审计。
 - [ ] 决定 meta lifecycle / heartbeat 的落库策略；heartbeat 不能刷 inbox，但 connect/disable 等低频事件可能需要审计表。
@@ -41,11 +41,20 @@
 
 ## pi/Claude Code 对照审计剩余项（alpha.31 之后）
 
-- [ ] `ChatQueue` 已不在 live ingress；`idle_only`、`max_concurrent`、去抖配置实际失效。要么删除 queue 配置/文档，要么把 monitor 唤醒接回队列。
+- [x] monitor 唤醒携带原 QqMessage 重新走 ChatQueue；idle_only/并发/去抖恢复。
 - [ ] `run_injected` 的 steering 尾部消息仍可能丢弃（当前 inbox 模式影响较小）。
 - [x] 图片附件随 transcript 持久化（alpha.32）。
-- [ ] MCP image blocks 仍被转成 `[image content omitted]`。
-- [ ] P2：重试无 jitter、无逐 chunk idle timeout、截断 tool args 以 `{}` 执行、`retention_days`/`monitor` 小竞态。
+- [x] MCP image blocks 进入 ToolResult.images。
+- [x] 重试 jitter、逐 chunk idle timeout、截断 tool args 拒绝执行；其余小竞态仍在。
 - [ ] 旧版本留下的 transcript 行号损坏无法自动修复；清空数据或迁移后才能消除 `skipping unreadable transcript line`。
 
 - [x] 上下文估算改用最近 assistant 的真实 usage；图片按 2000 tokens/张计入尾部（alpha.33）。
+
+## 仍未完成（下一轮）
+
+- [ ] meta lifecycle / heartbeat 审计落库；heartbeat 不入 inbox，connect/disable 需要审计表。
+- [ ] 无 chat 字段的 unknown 事件仍只写日志。
+- [ ] `/system/events` 或 `/messages` 的 raw 事件详情视图。
+- [ ] media.image_watermark 未实现；rotate/thumbnail/compress 已加。
+- [ ] runtime context 每回合持久化、prune 修改 in-flight working copy、cap_batches 不可达、swarm/monitor 小竞态。
+- [ ] alpha.34 尚未发布/部署；服务器 sbot 已按要求停止。
