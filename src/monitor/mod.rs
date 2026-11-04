@@ -73,17 +73,14 @@ pub struct MonitorEvent {
 
 impl MonitorEvent {
     /// 从 QQ 事件构造；非消息/通知/请求返回 `None`。
-    pub fn from_qq(event: &QqEvent) -> Option<Self> {
+    pub fn from_qq(event: &QqEvent, self_id: u64) -> Option<Self> {
         match event {
             QqEvent::Message(message) => Some(Self {
                 kind: "message".to_owned(),
                 chat: message.chat.to_string(),
                 sender: message.sender.qq,
                 text: message.plain_text(),
-                mentions_self: message
-                    .segments
-                    .iter()
-                    .any(|segment| matches!(segment, crate::qq::event::Segment::At { .. })),
+                mentions_self: message.mentions_self(self_id),
             }),
             QqEvent::Notice(notice) => Some(Self {
                 kind: format!("notice:{}", notice.kind),
@@ -136,6 +133,9 @@ fn match_term(term: &str, event: &MonitorEvent) -> Result<bool, String> {
     }
     if let Some(value) = term.strip_prefix("event.sender == ") {
         return Ok(event.sender.map(|sender| sender.to_string()).as_deref() == Some(unquote(value)));
+    }
+    if let Some(value) = term.strip_prefix("event.sender != ") {
+        return Ok(event.sender.map(|sender| sender.to_string()).as_deref() != Some(unquote(value)));
     }
     if let Some(rest) = term.strip_prefix("event.text contains ") {
         return Ok(event.text.contains(unquote(rest)));
@@ -197,6 +197,7 @@ pub struct MonitorManager {
     monitors: RwLock<HashMap<String, Arc<Monitor>>>,
     sink: Arc<dyn MonitorSink>,
     db: std::sync::RwLock<Option<Arc<Database>>>,
+    self_id: AtomicU64,
 }
 
 impl MonitorManager {
@@ -205,7 +206,13 @@ impl MonitorManager {
             monitors: RwLock::new(HashMap::new()),
             sink,
             db: std::sync::RwLock::new(None),
+            self_id: AtomicU64::new(0),
         })
+    }
+
+    /// 登录账号；用于 `@` 判定。
+    pub fn set_self_id(&self, self_id: u64) {
+        self.self_id.store(self_id, Ordering::Relaxed);
     }
 
     /// 接入数据库：定时源把上次触发时间写进 `meta`，重启后可补投。
@@ -234,6 +241,9 @@ impl MonitorManager {
         cc: bool,
         on_missing: crate::config::OnMissing,
     ) -> Result<()> {
+        if let Some(db) = self.db.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = db.meta_set(&format!("monitor.removed.{name}"), b"0");
+        }
         {
             let mut monitors = self.monitors.write().await;
             if monitors.contains_key(&name) {
@@ -283,6 +293,11 @@ impl MonitorManager {
         let removed = self.monitors.write().await.remove(name);
         if let Some(monitor) = removed {
             monitor.cancelled.store(true, Ordering::SeqCst);
+            if name.starts_with("wake-on-")
+                && let Some(db) = self.db.read().unwrap_or_else(|e| e.into_inner()).as_ref()
+            {
+                let _ = db.meta_set(&format!("monitor.removed.{name}"), b"1");
+            }
             true
         } else {
             false
@@ -343,7 +358,7 @@ impl MonitorManager {
 
     /// 喂入 QQ 事件；匹配的 monitor 各投递一次。
     pub async fn on_qq_event(&self, event: &QqEvent) {
-        let Some(view) = MonitorEvent::from_qq(event) else {
+        let Some(view) = MonitorEvent::from_qq(event, self.self_id.load(Ordering::Relaxed)) else {
             return;
         };
         let monitors: Vec<Arc<Monitor>> = {
@@ -1028,6 +1043,7 @@ mod tests {
     async fn qq_monitor_delivers_matching_events_only() {
         let sink = Arc::new(RecordingSink::default());
         let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+        manager.set_self_id(1);
         manager
             .add(
                 "at-me".to_owned(),
@@ -1250,5 +1266,66 @@ mod tests {
         sink.idle.store(true, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(sink.deliveries.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sender_not_equal_predicate() {
+        let event = MonitorEvent {
+            kind: "message".to_owned(),
+            chat: "group:1".to_owned(),
+            sender: Some(42),
+            text: "hi".to_owned(),
+            mentions_self: true,
+        };
+        assert!(
+            matches(
+                Some("event.type == 'message' and event.mentions_self and event.sender != '7'"),
+                &event
+            )
+            .unwrap()
+        );
+        assert!(
+            !matches(
+                Some("event.type == 'message' and event.sender != '42'"),
+                &event
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_wake_preset_is_remembered() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let sink = Arc::new(RecordingSink::default());
+        let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+        manager.set_db(Arc::clone(&db));
+        manager
+            .add(
+                "wake-on-owner".to_owned(),
+                "qq".to_owned(),
+                None,
+                Some("event.type == 'message'".to_owned()),
+                None,
+                false,
+                10,
+                None,
+                false,
+                Duration::ZERO,
+                false,
+                Duration::ZERO,
+                None,
+                CatchUp::Coalesce,
+                false,
+                crate::config::OnMissing::Queue,
+            )
+            .await
+            .unwrap();
+        assert!(manager.remove("wake-on-owner").await);
+        assert_eq!(
+            db.meta_get("monitor.removed.wake-on-owner")
+                .unwrap()
+                .as_deref(),
+            Some(&b"1"[..])
+        );
     }
 }

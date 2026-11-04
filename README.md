@@ -26,8 +26,9 @@ QQ 消息，用可配置的 LLM 生成回复，并把所有状态集中在本机
   同 chat 回复不需要。
 - **周期安全检查**：每 `check_every_tokens` 用独立模型检查注入/社工与是否已照做；
   `high + complied` 暂停外发，`critical` 暂停新回合。
-- **准入过滤**：`[filter]` 是拒收门；被拒消息不写 JSONL、不进 inbox、不进
-  transcript，monitor 也看不到。
+- **事件驱动**：默认所有 QQ 消息只进 `/inbox`，不逐条唤醒；内置可删除的
+  `wake-on-mention`（非主人 @）与 `wake-on-owner`（主人消息）预设，
+  其余消息由 agent 主动读取。
 - **存储加密**：XChaCha20-Poly1305，密钥在 `~/.sbot/key`；SQLite 索引明文，
   内容加密；blob 按 1 MiB 分块。
 - **守护进程**：`sbot start` 前台运行；其余命令通过 Windows 命名管道 / Unix UDS 控制。

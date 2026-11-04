@@ -1021,6 +1021,60 @@ async fn assemble_tools(
     (tools, server_tools, hub_handle, approvals)
 }
 
+/// 内置唤醒预设：只对 @ 与主人消息唤醒；删除后会记录到 meta，重启不再恢复。
+async fn install_wake_presets(monitors: &Arc<MonitorManager>, db: &Arc<Database>, owner_qq: u64) {
+    let presets = [
+        (
+            "wake-on-mention",
+            format!(
+                "event.type == 'message' and event.mentions_self and event.sender != '{owner_qq}'"
+            ),
+            "You were mentioned in {{event.chat}}. Message: {{event.text}}
+             Read /inbox if you need the surrounding conversation. Reply only if appropriate;              otherwise end the turn."
+                .to_owned(),
+        ),
+        (
+            "wake-on-owner",
+            format!("event.type == 'message' and event.sender == '{owner_qq}'"),
+            "The owner wrote in {{event.chat}}: {{event.text}}
+             Read /inbox if needed, then respond."
+                .to_owned(),
+        ),
+    ];
+    for (name, when, prompt) in presets {
+        if name == "wake-on-owner" && owner_qq == 0 {
+            continue;
+        }
+        let key = format!("monitor.removed.{name}");
+        if db.meta_get(&key).ok().flatten().as_deref() == Some(b"1") {
+            continue;
+        }
+        if let Err(error) = monitors
+            .add(
+                name.to_owned(),
+                "qq".to_owned(),
+                None,
+                Some(when),
+                Some(prompt),
+                true,
+                1_000_000,
+                None,
+                false,
+                std::time::Duration::ZERO,
+                false,
+                std::time::Duration::from_millis(300),
+                None,
+                crate::config::CatchUp::Coalesce,
+                false,
+                crate::config::OnMissing::Queue,
+            )
+            .await
+        {
+            warn!(%error, preset = name, "cannot install a wake preset");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_agent(
     loaded: &LoadedConfig,
@@ -1141,6 +1195,7 @@ async fn build_agent(
     let sink = Arc::new(RunnerSink::default());
     let monitors = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
     monitors.set_db(Arc::clone(&db));
+    monitors.set_self_id(self_id);
 
     let guard_cost = match config.security.guard.backend {
         crate::config::GuardBackend::Off => 0.0,
@@ -1296,6 +1351,7 @@ async fn build_agent(
         }
     }
     crate::monitor::load_config_monitors(&monitors, &config.monitor, Some(&messages)).await?;
+    install_wake_presets(&monitors, &db, owner_qq).await;
 
     let filter = MessageFilter::from_config(&config.filter);
     let queue = ChatQueue::new(
@@ -1546,12 +1602,14 @@ async fn handle_qq_event(
         debug!(chat = %message.chat, "message rejected by the admission filter");
         return;
     }
-    agent.monitors.on_qq_event(&event).await;
+    if !matches!(&event, QqEvent::Message(_)) {
+        agent.monitors.on_qq_event(&event).await;
+    }
     match event {
         QqEvent::Message(message) => match messages.append(&message) {
             Ok(true) => {
                 if !message.is_self && !message.backfilled {
-                    agent.queue.ingest(message).await;
+                    agent.monitors.on_qq_event(&QqEvent::Message(message)).await;
                 }
             }
             Ok(false) => {}

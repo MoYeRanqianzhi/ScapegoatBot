@@ -166,6 +166,17 @@ lifecycle = { idle_only = false, max_events = 1000 }
 `source` 四选一：`qq` / `timer` / `stream` / `internal`。`timer` 支持 `every`、`at`、
 `cron`（5 字段）。运行时也能通过 `Monitor` 工具增删，但重启即消失；配置文件里的才是常驻。
 
+默认所有 QQ 消息只写入 `/inbox` / transcript，**不逐条唤醒 agent**。内置两个可删除的
+唤醒预设：
+
+| 名称 | 条件 | 行为 |
+|------|------|------|
+| `wake-on-mention` | 非主人的 `@` 消息 | 唤醒主代理处理 |
+| `wake-on-owner` | `owner_qq` 的消息 | 唤醒主代理处理 |
+
+用 `Monitor` 工具的 `remove` 删除后，会在数据库记录一条禁用标记；重启不会自动恢复。
+需要恢复时用 `Monitor add` 同名重新添加即可；其他消息仍留在 `/inbox`，可主动读取。
+
 `deliver.cc = true` 会在投递给子代理时把同一内容抄送主代理。绑定目标不存在时，
 `on_missing` 决定 `drop`（丢弃并告警）、`queue`（最多等 60 秒）或 `spawn`
 （新建 general 子代理处理）。
