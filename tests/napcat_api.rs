@@ -306,3 +306,60 @@ async fn direct_websocket_handshake_is_accepted() {
     assert_eq!(value["retcode"], 0);
     assert_eq!(value["data"]["user_id"], 10000);
 }
+
+#[tokio::test]
+async fn approve_mode_nonce_round_trip_over_napcat() {
+    let records: Records = Arc::new(Mutex::new(Vec::new()));
+    let url = spawn_mock_napcat(Arc::clone(&records), false).await;
+    let client = connect(&url).await;
+    let approvals = scapegoat_bot::security::action_gate::ApprovalQueue::new();
+    let gate = Arc::new(scapegoat_bot::security::action_gate::ActionGate::new(
+        &scapegoat_bot::config::GateConfig {
+            mode: scapegoat_bot::config::GateMode::Approve,
+            max_per_minute: 60,
+            llm_review: false,
+        },
+        Arc::clone(&approvals),
+    ));
+    let tool = ApiTool::new(
+        Some(Arc::clone(&client) as Arc<dyn NapcatGateway>),
+        None,
+        10000,
+        10000,
+        None,
+        vec!["*".to_owned()],
+        None,
+    )
+    .with_action_gate(Arc::clone(&gate));
+    let (mut context, _dir) = tool_context();
+    context.evidence = scapegoat_bot::agent::TurnEvidence::owner("control");
+
+    let params = json!({"action": "napcat.send_group_msg",
+                        "params": {"group_id": 123, "message": "hello"}});
+    let pending = Tool::execute(&tool, &context, params.clone()).await;
+    assert!(pending.is_error);
+    assert!(pending.content.contains("approval_required"));
+
+    let id = approvals.pending()[0]["id"].as_str().unwrap().to_owned();
+    let nonce = approvals.nonce_for(&id).unwrap();
+    {
+        let records = records.lock().unwrap();
+        let notice = records
+            .iter()
+            .find(|(action, _)| action == "send_private_msg")
+            .expect("send_private_msg notification");
+        assert_eq!(notice.1["user_id"], 10000);
+        assert!(notice.1["message"].as_str().unwrap().contains(&nonce));
+    }
+
+    assert!(approvals.approve_by_nonce(&nonce).is_some());
+    let allowed = Tool::execute(&tool, &context, params).await;
+    assert!(!allowed.is_error, "{}", allowed.content);
+    assert!(
+        records
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(action, _)| action == "send_group_msg")
+    );
+}

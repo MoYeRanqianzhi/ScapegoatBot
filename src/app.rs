@@ -64,8 +64,10 @@ struct AgentRuntime {
     /// 准入过滤器；`/config/filter` 写入后原地替换。
     filter: Arc<RwLock<MessageFilter>>,
     filtered: AtomicU64,
-    /// `[gate]` 的待确认队列；IPC 用它批准/拒绝。
+    /// `[gate]` 的待确认队列；IPC 与主人私聊 nonce 都能批准/拒绝。
     approvals: Arc<crate::security::action_gate::ApprovalQueue>,
+    owner_qq: u64,
+    master_qq: u64,
 }
 
 /// monitor 的投递端：把事件变成一次注入回合。
@@ -955,7 +957,7 @@ async fn assemble_tools(
         .map(|client| Arc::clone(client) as Arc<dyn NapcatGateway>);
 
     // `[gate]`：所有 napcat.* 调用都过这里；llm_review 用主 provider。
-    let approvals = crate::security::action_gate::ApprovalQueue::new();
+    let approvals = crate::security::action_gate::ApprovalQueue::with_db(Arc::clone(&db));
     let mut action_gate =
         crate::security::action_gate::ActionGate::new(&config.gate, Arc::clone(&approvals))
             .with_db(Arc::clone(&db))
@@ -1309,6 +1311,8 @@ async fn build_agent(
         filter: Arc::new(RwLock::new(filter)),
         filtered: AtomicU64::new(0),
         approvals,
+        owner_qq,
+        master_qq,
     });
 
     // `/config/filter` 写入后立即替换准入过滤器（弱引用避免循环）。
@@ -1444,6 +1448,7 @@ fn spawn_qq_pipeline(
                         Some(data) => {
                             handle_qq_event(
                                 &agent,
+                                &client,
                                 &messages,
                                 &data.name,
                                 &data.data,
@@ -1464,12 +1469,40 @@ fn spawn_qq_pipeline(
 
 async fn handle_qq_event(
     agent: &AgentRuntime,
+    client: &QqClient,
     messages: &MessageStore,
     name: &str,
     data: &serde_json::Value,
     _self_id: u64,
 ) {
     let event = crate::qq::event::normalize(name, data);
+
+    // 主人/通知账号在私聊里回复 nonce：批准对应 gate 请求，不进入 agent 回合。
+    if let QqEvent::Message(message) = &event
+        && !message.is_self
+        && !message.backfilled
+        && message.chat == crate::qq::event::ChatId::Private(agent.self_id)
+        && message
+            .sender
+            .qq
+            .is_some_and(|qq| qq == agent.owner_qq || qq == agent.master_qq)
+        && let Some(approved) = agent.approvals.approve_by_nonce(&message.plain_text())
+    {
+        let id = approved["approved"].as_str().unwrap_or_default();
+        let action = approved["action"].as_str().unwrap_or_default();
+        let ack = format!("gate approval {id} for {action} accepted; retry the action within 120s");
+        if let Some(qq) = message.sender.qq
+            && let Err(error) = client
+                .call(
+                    "send_private_msg",
+                    serde_json::json!({"user_id": qq, "message": ack}),
+                )
+                .await
+        {
+            warn!(%error, "cannot acknowledge a gate nonce");
+        }
+        return;
+    }
     // 准入过滤必须在 monitor 之前：被拒消息既不应入库，也不应通过 monitor
     // 进入上下文（否则过滤只剩“不写 JSONL”，挡不住注入）。
     if let QqEvent::Message(message) = &event

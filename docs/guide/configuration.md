@@ -236,9 +236,9 @@ key 放 `auth.json`：
   - `auto`（默认）：每分钟调用上限 `max_per_minute`；发送规则拦截 30 秒内同 chat 重复、
     2 分钟内同内容发到 3 个以上 chat、无 owner intent 的 @全体；
     `llm_review = true` 时对变更类动作追加一次 LLM 审查，失败按拒绝。
-  - `approve`：变更类动作返回 `approval_required` 与请求 id；主人在 CLI 执行
-    `sbot gate approve <id>` 后 120 秒内重试一次即可，60 秒未确认自动失效。
-    `sbot gate pending` 查看队列，`sbot gate reject <id>` 拒绝。
+  - `approve`：变更类动作返回 `approval_required` 与请求 id，并私聊 master 一个
+    6 位 nonce；主人回复 nonce 或用 `sbot gate approve <id>` 批准，120 秒内重试一次
+    即可，60 秒未确认自动失效。队列持久化到数据库（只存参数哈希）。
 - `[hooks.context]`：`name`、`path`、`kind`、`when`、`inject`、`max_bytes`；
   自定义注入到 system prompt 的上下文文件。
 - `[hooks.events]`：所有事件都会触发 `log` / `block` / `inject_context` / `notify`；

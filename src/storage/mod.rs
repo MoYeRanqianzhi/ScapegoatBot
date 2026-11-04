@@ -270,7 +270,38 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     CREATE INDEX turn_buffer_scope ON turn_buffer(scope, state);
     "#,
     ),
+    (
+        10,
+        "gate approvals",
+        // 只持久化参数哈希，不保存消息原文；重启后已批准的请求仍可消费一次。
+        r#"
+    CREATE TABLE gate_approvals (
+        id              TEXT PRIMARY KEY,
+        action          TEXT NOT NULL,
+        summary         TEXT NOT NULL,
+        params_hash     TEXT NOT NULL,
+        nonce           TEXT NOT NULL,
+        status          TEXT NOT NULL,
+        created_at      INTEGER NOT NULL,
+        approved_until  INTEGER
+    );
+    CREATE INDEX gate_approvals_nonce ON gate_approvals(nonce, status);
+    "#,
+    ),
 ];
+
+/// 一条 gate 审批记录；参数只保存哈希。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateApprovalRow {
+    pub id: String,
+    pub action: String,
+    pub summary: String,
+    pub params_hash: String,
+    pub nonce: String,
+    pub status: String,
+    pub created_at: i64,
+    pub approved_until: Option<i64>,
+}
 
 /// 数据库句柄。
 ///
@@ -378,6 +409,60 @@ impl Database {
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    /// 写入/覆盖一条 gate 审批记录（只存参数哈希，不存原文）。
+    pub fn save_gate_approval(&self, row: &GateApprovalRow) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "INSERT INTO gate_approvals
+             (id, action, summary, params_hash, nonce, status, created_at, approved_until)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+               status = excluded.status,
+               approved_until = excluded.approved_until",
+            params![
+                row.id,
+                row.action,
+                row.summary,
+                row.params_hash,
+                row.nonce,
+                row.status,
+                row.created_at,
+                row.approved_until
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 读取全部 gate 审批记录（启动恢复用）。
+    pub fn gate_approvals(&self) -> Result<Vec<GateApprovalRow>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let mut statement = conn.prepare(
+            "SELECT id, action, summary, params_hash, nonce, status, created_at, approved_until
+             FROM gate_approvals ORDER BY created_at ASC",
+        )?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(GateApprovalRow {
+                    id: row.get(0)?,
+                    action: row.get(1)?,
+                    summary: row.get(2)?,
+                    params_hash: row.get(3)?,
+                    nonce: row.get(4)?,
+                    status: row.get(5)?,
+                    created_at: row.get(6)?,
+                    approved_until: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// 删除一条 gate 审批记录。
+    pub fn delete_gate_approval(&self, id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute("DELETE FROM gate_approvals WHERE id = ?1", params![id])?;
         Ok(())
     }
 
