@@ -19,6 +19,8 @@
   删除会写入 `monitor.removed.<name>`，重启不再恢复；手动 `Monitor add` 同名可恢复。
 - Monitor 谓词新增 `event.sender != 'qq'`，用于避免主人 @ 时两个预设重复唤醒。
 - `MonitorEvent` 的 `mentions_self` 现在按登录账号判断，不再把任意 @ 当成 @ 自己。
+- 主人消息触发 monitor 时，投递带 `owner_intent`，回合拥有 owner 证据，不会被
+  `send_private_msg` 的 owner-intent 闸拦下；这是之前“图片消息不回复”的直接原因。
 - QQ notice（拍一拍、撤回等）、好友/群请求、带 chat 字段的未知事件都转成
   inbox 伪消息；正文含摘要与压缩原始 JSON，`raw` 完整保留。
   monitor 的 `event.text` 也能看到 `[poke]` / `[recall]` 文本。

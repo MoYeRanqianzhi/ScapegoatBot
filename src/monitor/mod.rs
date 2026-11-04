@@ -46,6 +46,9 @@ pub struct MonitorDelivery {
     pub text: String,
     /// 系统通知（到期、上限、谓词失败）——不来自任何用户。
     pub system: bool,
+    /// 事件来自主人消息；投递后回合拥有 owner 证据。
+    #[serde(default)]
+    pub owner_intent: bool,
     /// 目标不存在时的处理方式。
     pub on_missing: crate::config::OnMissing,
 }
@@ -69,6 +72,8 @@ pub struct MonitorEvent {
     pub sender: Option<u64>,
     pub text: String,
     pub mentions_self: bool,
+    /// 该事件是主人发的消息；monitor 回合可据此获得 owner 证据。
+    pub owner_intent: bool,
 }
 
 impl MonitorEvent {
@@ -81,6 +86,7 @@ impl MonitorEvent {
                 sender: message.sender.qq,
                 text: message.plain_text(),
                 mentions_self: message.mentions_self(self_id),
+                owner_intent: false,
             }),
             QqEvent::Notice(notice) => Some(Self {
                 kind: format!("notice:{}", notice.kind),
@@ -91,6 +97,7 @@ impl MonitorEvent {
                     .map(|message| message.plain_text())
                     .unwrap_or_default(),
                 mentions_self: false,
+                owner_intent: false,
             }),
             QqEvent::Request(request) => Some(Self {
                 kind: format!("request:{}", request.kind),
@@ -101,6 +108,7 @@ impl MonitorEvent {
                 sender: request.actor,
                 text: request.comment.clone(),
                 mentions_self: false,
+                owner_intent: false,
             }),
             _ => None,
         }
@@ -201,6 +209,7 @@ pub struct MonitorManager {
     sink: Arc<dyn MonitorSink>,
     db: std::sync::RwLock<Option<Arc<Database>>>,
     self_id: AtomicU64,
+    owner_qq: AtomicU64,
 }
 
 impl MonitorManager {
@@ -210,12 +219,18 @@ impl MonitorManager {
             sink,
             db: std::sync::RwLock::new(None),
             self_id: AtomicU64::new(0),
+            owner_qq: AtomicU64::new(0),
         })
     }
 
     /// 登录账号；用于 `@` 判定。
     pub fn set_self_id(&self, self_id: u64) {
         self.self_id.store(self_id, Ordering::Relaxed);
+    }
+
+    /// 主人 QQ；主人消息触发的 monitor 投递拥有 owner 证据。
+    pub fn set_owner_qq(&self, owner_qq: u64) {
+        self.owner_qq.store(owner_qq, Ordering::Relaxed);
     }
 
     /// 接入数据库：定时源把上次触发时间写进 `meta`，重启后可补投。
@@ -361,9 +376,13 @@ impl MonitorManager {
 
     /// 喂入 QQ 事件；匹配的 monitor 各投递一次。
     pub async fn on_qq_event(&self, event: &QqEvent) {
-        let Some(view) = MonitorEvent::from_qq(event, self.self_id.load(Ordering::Relaxed)) else {
+        let Some(mut view) = MonitorEvent::from_qq(event, self.self_id.load(Ordering::Relaxed))
+        else {
             return;
         };
+        let owner_qq = self.owner_qq.load(Ordering::Relaxed);
+        view.owner_intent =
+            view.kind == "message" && owner_qq != 0 && view.sender == Some(owner_qq);
         let monitors: Vec<Arc<Monitor>> = {
             let monitors = self.monitors.read().await;
             monitors
@@ -389,6 +408,7 @@ impl MonitorManager {
                                 monitor.name
                             ),
                             system: true,
+                            owner_intent: false,
                             on_missing: monitor.on_missing,
                         })
                         .await;
@@ -479,6 +499,7 @@ async fn deliver_once(
                 monitor.name
             ),
             system: true,
+            owner_intent: false,
             on_missing: monitor.on_missing,
         })
         .await;
@@ -540,6 +561,7 @@ async fn deliver_once(
                     monitor.name
                 ),
                 system: true,
+                owner_intent: false,
                 on_missing: monitor.on_missing,
             })
             .await;
@@ -554,6 +576,7 @@ async fn deliver_once(
         as_prompt: monitor.as_prompt,
         text: text.clone(),
         system: false,
+        owner_intent: event.as_ref().is_some_and(|event| event.owner_intent),
         on_missing: monitor.on_missing,
     })
     .await;
@@ -566,6 +589,7 @@ async fn deliver_once(
             as_prompt: monitor.as_prompt,
             text: format!("[cc {}] {text}", monitor.name),
             system: false,
+            owner_intent: false,
             on_missing: crate::config::OnMissing::Queue,
         })
         .await;
@@ -621,6 +645,7 @@ fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, timer: TimerSp
                                     monitor.name
                                 ),
                                 system: true,
+                                owner_intent: false,
                                 on_missing: monitor.on_missing,
                             })
                             .await;
@@ -916,6 +941,7 @@ pub async fn load_config_monitors(
                         .segments
                         .iter()
                         .any(|segment| matches!(segment, crate::qq::event::Segment::At { .. })),
+                    owner_intent: false,
                 };
                 if !matches(monitor.when.as_deref(), &event).unwrap_or(false) {
                     continue;
@@ -978,6 +1004,7 @@ mod tests {
             sender: Some(10001),
             text: text.to_owned(),
             mentions_self: mentions,
+            owner_intent: false,
         }
     }
 
@@ -1279,6 +1306,7 @@ mod tests {
             sender: Some(42),
             text: "hi".to_owned(),
             mentions_self: true,
+            owner_intent: false,
         };
         assert!(
             matches(
@@ -1330,5 +1358,48 @@ mod tests {
                 .as_deref(),
             Some(&b"1"[..])
         );
+    }
+
+    #[tokio::test]
+    async fn owner_message_delivery_carries_owner_intent() {
+        let sink = Arc::new(RecordingSink::default());
+        let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+        manager.set_owner_qq(322);
+        manager
+            .add(
+                "owner".to_owned(),
+                "qq".to_owned(),
+                None,
+                Some("event.sender == '322'".to_owned()),
+                None,
+                false,
+                10,
+                None,
+                false,
+                Duration::ZERO,
+                false,
+                Duration::ZERO,
+                None,
+                CatchUp::Coalesce,
+                false,
+                crate::config::OnMissing::Queue,
+            )
+            .await
+            .unwrap();
+        let raw = serde_json::json!({
+            "post_type": "message",
+            "message_type": "private",
+            "self_id": 1,
+            "user_id": 322,
+            "message_id": 9,
+            "time": 1793304000,
+            "sender": {"nickname": "owner"},
+            "message": "hello"
+        });
+        let event = crate::qq::event::normalize("message.private.normal", &raw);
+        manager.on_qq_event(&event).await;
+        let deliveries = sink.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].owner_intent);
     }
 }

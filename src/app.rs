@@ -130,7 +130,12 @@ impl MonitorSink for RunnerSink {
             return;
         };
         if let Err(error) = runner
-            .run_event(&delivery.name, &delivery.source, &delivery.text)
+            .run_event(
+                &delivery.name,
+                &delivery.source,
+                &delivery.text,
+                delivery.owner_intent,
+            )
             .await
         {
             warn!(%error, monitor = %delivery.name, "monitor delivery failed");
@@ -1196,6 +1201,7 @@ async fn build_agent(
     let monitors = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
     monitors.set_db(Arc::clone(&db));
     monitors.set_self_id(self_id);
+    monitors.set_owner_qq(owner_qq);
 
     let guard_cost = match config.security.guard.backend {
         crate::config::GuardBackend::Off => 0.0,
