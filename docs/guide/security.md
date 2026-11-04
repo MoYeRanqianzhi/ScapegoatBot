@@ -185,8 +185,9 @@ sbot gate reject <id>
 
 - `Download` / `WebFetch` 在请求前校验协议、域名与解析后的公网地址；
 - `Download` 的 DNS 解析在连接层过滤非公网地址（防 rebinding），重定向逐跳校验；
-- `WebFetch` 由你配置的后端执行抓取；返回前复核 `final_url`，不在允许范围内的结果
-  不会交给模型（但内容已经被后端取过，敏感目标不要交给不可信后端）。
+- `WebFetch` 默认由你配置的后端执行抓取，返回前复核 `final_url`；设置
+  `[tools.web_fetch].local = true` 后改为本地逐跳校验并直接抓取（HTML 转文本、
+  2 MiB/字符上限）。敏感目标优先用 local。
 
 ## 数据与密钥
 

@@ -5,6 +5,25 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.0-alpha.20] - 2026-11-04
+
+新增 WebFetch 的本地抓取模式，消除“先由后端取内容、再复核 URL”的窗口。
+
+### 新增
+
+- **`[tools.web_fetch].local = true`**：直接 GET，逐跳校验重定向（最多
+  `max_redirects`），每一跳都走 scheme/域名/公网地址检查与公共 DNS 解析器；
+  读取上限 2 MiB 或 `max_content_tokens × 4` 字符。
+- HTML 转文本：去掉 `script`/`style`/标签，解码常见实体并折叠空白。
+- 本地模式不要求 `base_url` 或 API key；默认仍为后端模式，行为不变。
+
+### 测试
+
+- 新增：HTML 转文本、302 跳转 + HTML 抓取（本地 TCP 服务器）、内容类型/最终 URL。
+- `cargo test --all-targets`：341 项通过（330 lib + 4 config + 1 live stub +
+  6 NapCat，2 项真实 API 测试默认忽略）；`cargo fmt --check`、
+  `clippy -D warnings` 通过。
+
 ## [0.2.0-alpha.19] - 2026-11-04
 
 补齐 `auto` 门禁的内容级规则；数据库迁移到 v11。

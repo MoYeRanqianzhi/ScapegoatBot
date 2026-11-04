@@ -109,7 +109,8 @@ access token 在 `auth.json`，不在这里。
 
 - `download`：`allowed_domains` / `blocked_domains` / `max_bytes`
 - `web_search` / `web_fetch`：`backend = "auto" | "server" | "tool"`、
-  `base_url`、`count` / `max_content_tokens`
+  `base_url`、`count` / `max_content_tokens`；`web_fetch.local = true` 时直接抓取
+  （逐跳校验重定向 + HTML 转文本），不需要后端与 key
 - `mcp`：见下
 
 Web 搜索/抓取不内置官方地址：要么由 provider 声明服务端工具（Anthropic/Responses），

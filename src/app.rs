@@ -933,7 +933,22 @@ async fn assemble_tools(
             Err(error) => warn!(%error, "cannot register WebSearch"),
         }
     }
-    if !fetch_server
+    if config.tools.web_fetch.local
+        && config.tools.web_fetch.backend != crate::config::WebBackend::Off
+    {
+        // 本地抓取不需要 base_url/key；dummy 后端只用于复用结构体。
+        match WebBackend::new("http://127.0.0.1:1", "") {
+            Ok(backend) => tools.register(Arc::new(
+                WebFetchTool::new(
+                    Arc::new(backend),
+                    config.tools.web_fetch.max_content_tokens,
+                    download_policy.clone(),
+                )
+                .with_local(true),
+            )),
+            Err(error) => warn!(%error, "cannot register local WebFetch"),
+        }
+    } else if !fetch_server
         && use_tool_backend(config.tools.web_fetch.backend)
         && let Some(key) = auth
             .tools

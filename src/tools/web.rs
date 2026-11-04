@@ -153,6 +153,8 @@ pub struct WebFetchTool {
     backend: Arc<WebBackend>,
     default_max_tokens: u32,
     policy: NetPolicy,
+    /// 直接抓取；开启后不再请求 `[tools.web_fetch].base_url`。
+    local: bool,
 }
 
 impl WebFetchTool {
@@ -161,7 +163,88 @@ impl WebFetchTool {
             backend,
             default_max_tokens,
             policy,
+            local: false,
         }
+    }
+
+    /// 本地抓取模式；重定向逐跳校验，不经过 HTTP 后端。
+    pub fn with_local(mut self, local: bool) -> Self {
+        self.local = local;
+        self
+    }
+
+    async fn local_fetch(
+        &self,
+        raw: &str,
+        tokens: u32,
+    ) -> Result<(String, String, String), String> {
+        let mut current = self.policy.check_url(raw)?;
+        self.policy.resolve_public(&current).await?;
+        let client = self.policy.client()?;
+        let max_bytes = u64::from(tokens)
+            .saturating_mul(4)
+            .clamp(1_024, 2 * 1024 * 1024)
+            .min(self.policy.max_bytes);
+        for _ in 0..=self.policy.max_redirects {
+            let mut response = client
+                .get(current.clone())
+                .header(reqwest::header::USER_AGENT, "scapegoat-bot/0.2")
+                .send()
+                .await
+                .map_err(|error| format!("fetch failed: {error}"))?;
+            let status = response.status();
+            if status.is_redirection() {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| "redirect without a Location header".to_owned())?;
+                let next = current
+                    .join(location)
+                    .map_err(|error| format!("invalid redirect: {error}"))?;
+                current = self.policy.check_url(next.as_str())?;
+                self.policy.resolve_public(&current).await?;
+                continue;
+            }
+            if !status.is_success() {
+                return Err(format!("HTTP {status}"));
+            }
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("text/plain")
+                .to_owned();
+            let mut body = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|error| format!("cannot read the response body: {error}"))?
+            {
+                let remaining = max_bytes.saturating_sub(body.len() as u64) as usize;
+                if remaining == 0 {
+                    break;
+                }
+                if chunk.len() > remaining {
+                    body.extend_from_slice(&chunk[..remaining]);
+                    break;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let text = String::from_utf8_lossy(&body);
+            let text = if content_type.contains("html") {
+                html_to_text(&text)
+            } else {
+                text.into_owned()
+            };
+            let limit = (tokens as usize).saturating_mul(4).max(256);
+            let mut text: String = text.chars().take(limit).collect();
+            if text.chars().count() >= limit {
+                text.push('…');
+            }
+            return Ok((text, current.to_string(), content_type));
+        }
+        Err("too many redirects".to_owned())
     }
 
     pub fn build_body(url: &str, max_content_tokens: u32) -> Value {
@@ -220,6 +303,20 @@ impl Tool for WebFetchTool {
         if let Err(error) = self.policy.resolve_public(&url).await {
             return ToolResult::error(error);
         }
+        if self.local {
+            return match self
+                .local_fetch(url.as_str(), tokens.min(u32::MAX as u64) as u32)
+                .await
+            {
+                Ok((content, final_url, content_type)) => ToolResult::ok(format!(
+                    "{content}
+
+[final_url] {final_url}
+[content_type] {content_type}"
+                )),
+                Err(error) => ToolResult::error(error),
+            };
+        }
 
         match self
             .backend
@@ -268,6 +365,24 @@ impl Tool for WebFetchTool {
     }
 }
 
+/// 极简 HTML → 文本：去掉 script/style 与标签，解码常见实体并折叠空白。
+fn html_to_text(html: &str) -> String {
+    static TAGS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let tags = TAGS.get_or_init(|| {
+        regex::Regex::new(r"(?is)<script.*?</script>|<style.*?</style>|<[^>]*>")
+            .expect("valid HTML regex")
+    });
+    let text = tags.replace_all(html, " ");
+    let text = text
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +397,64 @@ mod tests {
         let fetch = WebFetchTool::build_body("https://example.com", 1000);
         assert_eq!(fetch["url"], "https://example.com");
         assert_eq!(fetch["max_content_tokens"], 1000);
+    }
+
+    #[test]
+    fn html_is_reduced_to_readable_text() {
+        let text = html_to_text(
+            "<html><style>x{}</style><script>alert(1)</script><p>Hello&nbsp;world &amp; friends</p></html>",
+        );
+        assert_eq!(text, "Hello world & friends");
+    }
+
+    #[tokio::test]
+    async fn local_fetch_follows_redirects_and_strips_html() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let crlf = format!("{}{}", char::from(13), char::from(10));
+            for _ in 0..2 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buffer = [0u8; 2048];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let response = if request.starts_with("GET /start ") {
+                    format!(
+                        "HTTP/1.1 302 Found{crlf}Location: /page{crlf}Content-Length: 0{crlf}{crlf}"
+                    )
+                } else {
+                    let body = "<html><script>x</script><p>Hello&nbsp;world</p></html>";
+                    format!(
+                        "HTTP/1.1 200 OK{crlf}Content-Type: text/html{crlf}Content-Length: {}{crlf}{crlf}{body}",
+                        body.len()
+                    )
+                };
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let backend = Arc::new(WebBackend::new("http://127.0.0.1:1", "").unwrap());
+        let tool = WebFetchTool::new(
+            backend,
+            1000,
+            NetPolicy {
+                allow_private: true,
+                max_redirects: 2,
+                ..NetPolicy::default()
+            },
+        )
+        .with_local(true);
+        let (content, final_url, content_type) = tool
+            .local_fetch(&format!("http://{addr}/start"), 1000)
+            .await
+            .unwrap();
+        assert_eq!(content, "Hello world");
+        assert!(final_url.ends_with("/page"));
+        assert!(content_type.contains("text/html"));
     }
 
     #[test]
