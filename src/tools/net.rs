@@ -23,6 +23,8 @@ pub struct NetPolicy {
     pub max_bytes: u64,
     pub max_redirects: usize,
     pub timeout_secs: u64,
+    /// 仅测试用：允许 loopback/私网地址，并跳过公网 DNS 解析器。
+    pub allow_private: bool,
 }
 
 impl Default for NetPolicy {
@@ -33,6 +35,7 @@ impl Default for NetPolicy {
             max_bytes: 512 * 1024 * 1024,
             max_redirects: 3,
             timeout_secs: 60,
+            allow_private: false,
         }
     }
 }
@@ -64,12 +67,13 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
 impl NetPolicy {
     /// 构造 reqwest 客户端（重定向策略在 `check_hop` 之外由调用方逐跳检查）。
     pub fn client(&self) -> Result<reqwest::Client, String> {
-        reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs.max(1)))
-            .redirect(reqwest::redirect::Policy::none())
-            .dns_resolver(Arc::new(PublicOnlyResolver))
-            .build()
-            .map_err(|error| error.to_string())
+            .redirect(reqwest::redirect::Policy::none());
+        if !self.allow_private {
+            builder = builder.dns_resolver(Arc::new(PublicOnlyResolver));
+        }
+        builder.build().map_err(|error| error.to_string())
     }
 
     /// 校验 URL 的协议与域名；不解析 DNS。
@@ -101,6 +105,9 @@ impl NetPolicy {
 
     /// 解析并校验每个 IP；拒绝非公网地址。
     pub async fn resolve_public(&self, url: &Url) -> Result<(), String> {
+        if self.allow_private {
+            return Ok(());
+        }
         let host = url.host_str().ok_or_else(|| "URL has no host".to_owned())?;
         if let Ok(ip) = host.parse::<IpAddr>() {
             return if is_public_ip(ip) {

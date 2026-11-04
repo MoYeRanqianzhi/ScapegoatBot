@@ -568,6 +568,8 @@ pub struct WebFetchConfig {
     pub backend: WebBackend,
     pub base_url: String,
     pub max_content_tokens: u32,
+    /// 本地抓取：不经过 HTTP 后端，逐跳校验后直接 GET。
+    pub local: bool,
 }
 
 impl Default for WebFetchConfig {
@@ -576,6 +578,7 @@ impl Default for WebFetchConfig {
             backend: WebBackend::Auto,
             base_url: String::new(),
             max_content_tokens: 20_000,
+            local: false,
         }
     }
 }

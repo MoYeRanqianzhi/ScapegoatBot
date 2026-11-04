@@ -96,6 +96,8 @@ count = 5
 backend = "auto"
 base_url = ""
 max_content_tokens = 8000
+# true = 本地抓取（逐跳校验、HTML 转文本），不经过 base_url。
+local = false
 
 [tools.download]
 max_bytes = 536870912
