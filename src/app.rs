@@ -1096,7 +1096,7 @@ async fn install_wake_presets(monitors: &Arc<MonitorManager>, db: &Arc<Database>
                 false,
                 std::time::Duration::ZERO,
                 false,
-                std::time::Duration::from_millis(300),
+                std::time::Duration::ZERO,
                 None,
                 crate::config::CatchUp::Coalesce,
                 false,

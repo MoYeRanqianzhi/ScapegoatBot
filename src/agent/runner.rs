@@ -1812,7 +1812,6 @@ pub fn inbox_summary(messages: &MessageStore) -> String {
         .unwrap_or_else(|_| "unknown".to_owned())
 }
 
-
 /// 从图片字节猜 MIME；只用于 QQ 图片附件。
 fn mime_for_bytes(bytes: &[u8]) -> String {
     image::guess_format(bytes)
