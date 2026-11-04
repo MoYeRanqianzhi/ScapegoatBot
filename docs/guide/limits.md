@@ -15,10 +15,11 @@
   队列持久化只保存 action、摘要、参数哈希与 nonce，不保存消息原文。nonce 不是
   密码学令牌，靠“只有主人能私聊机器人”这一边界。
 - **`auto` 的发送规则**：频率、同 chat 重复、跨群同文、@全体、跨 chat 5-gram
-  重叠（≥24 字、共享 5 个 5-gram）与媒体来源都会拦；仍没有完整的
-  `context_sources` 追踪。规则是启发式，可能误报长文本的合理转述。
-- **周期检查的缓存复用**：检查请求使用独立窗口，不与主请求逐字节共享前缀；
-  token 计数是估算值。
+  重叠（≥24 字、共享 5 个 5-gram）、上下文来源与媒体来源都会拦。`context_sources`
+  覆盖本轮消息、pending history、`Read /messages|/inbox` 与 `API` 历史查询；
+  `Grep` 结果不按来源拆分。规则是启发式，可能误报长文本的合理转述。
+- **周期检查的缓存复用**：审查请求复用主请求的 system 前缀（provider 可命中
+  prompt cache），消息窗口仍是独立渲染；token 计数是估算值。
 - **WebFetch 后端模式**：初始 URL 与返回的 `final_url` 都会在本地校验，但抓取与
   重定向仍由你配置的后端执行；需要本地逐跳校验时设 `[tools.web_fetch].local = true`。
 - **加密边界**：防的是拿到 `data.db` / 文件但没有 `key`；不防同机管理员、
@@ -41,10 +42,11 @@
   估算值（Jev 固定单次成本，LLM 按约 3k 输入 + 100 输出估算），耗尽后分类器降级为
   规则层，规则仍生效。
 - **`[hooks.events]` 的边界**：所有事件都会触发 `log`/`block`/`inject_context`/`notify`，
-  但 `rewrite` 只在 BeforeSend 生效；`block` 只在 MessageReceived 能阻止内容进入上下文；
-  `inject_context` 只被 SessionStart（system）、MessageReceived（回合内提示）、
-  Pre/PostCompact（摘要输入/新分段）消费；SessionEnd/Stop/ConfigChange 的注入没有去处。
-  `notify` 只支持 `owner`/`master`，且需要 NapCat 已连接。
+  但 `rewrite` 只在 BeforeSend 生效；`block` 只在 MessageReceived 能阻止内容进入上下文。
+  `inject_context` 的落点：SessionStart（system）、MessageReceived（回合内提示）、
+  Pre/PostCompact（摘要输入/新分段）、Stop（下一轮历史）、SessionEnd（清空后的新历史）、
+  ConfigChange（内存历史，需下一次压缩才落盘）。`notify` 只支持 `owner`/`master`，
+  且需要 NapCat 已连接。
 - **`[tools].max_schema_tokens`**：超限时把过长描述压到 160 字符；若仅 schema 就超限，
   只告警、不删工具。
 - **monitor 的 `cc` / `on_missing`**：`cc` 在绑定子代理时抄送主代理；`on_missing`

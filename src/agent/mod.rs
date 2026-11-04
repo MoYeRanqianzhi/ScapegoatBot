@@ -41,10 +41,40 @@ pub enum ExecutionMode {
 /// - `owner_intent`：本回合由控制通道触发，或触发批次里有 owner_qq 的非 self 消息；
 /// - `origin_chat`：触发本回合的 chat（`group:<id>` / `private:<qq>` / `control` /
 ///   `monitor`）。同 chat 回复属于“有明确理由”，跨 chat 发送才需要 owner intent。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct TurnEvidence {
     pub owner_intent: bool,
     pub origin_chat: Option<String>,
+    /// 本回合进入上下文的内容片段及其来源 chat；跨 chat 泄露检查用。
+    pub context_sources: std::sync::Arc<std::sync::Mutex<Vec<ContextSource>>>,
+}
+
+/// 一条带来源 chat 的上下文片段。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextSource {
+    pub chat: String,
+    pub text: String,
+}
+
+impl TurnEvidence {
+    /// 记录一段上下文来源；只保留有限的条目与长度。
+    pub fn record_source(&self, chat: impl Into<String>, text: impl Into<String>) {
+        let text: String = text.into().chars().take(8_000).collect();
+        if text.trim().is_empty() {
+            return;
+        }
+        let mut sources = self
+            .context_sources
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if sources.len() >= 32 {
+            sources.remove(0);
+        }
+        sources.push(ContextSource {
+            chat: chat.into(),
+            text,
+        });
+    }
 }
 
 impl TurnEvidence {
@@ -52,6 +82,7 @@ impl TurnEvidence {
         Self {
             owner_intent: true,
             origin_chat: Some(origin.into()),
+            ..Self::default()
         }
     }
 
@@ -59,6 +90,7 @@ impl TurnEvidence {
         Self {
             owner_intent: false,
             origin_chat: Some(origin.into()),
+            ..Self::default()
         }
     }
 
@@ -66,6 +98,7 @@ impl TurnEvidence {
         Self {
             owner_intent: false,
             origin_chat: Some("monitor".to_owned()),
+            ..Self::default()
         }
     }
 }

@@ -5,14 +5,10 @@
 
 ## 安全与设计对齐
 
-- [ ] `auto` 门禁的 `context_sources` 追踪（设计 §5.8）：5-gram 与媒体来源已实现，
-      但还没有把“本回合上下文来自哪些 chat”作为证据。
-- [ ] 周期检查复用主请求的逐字节前缀缓存（设计 §5.9）：当前是独立窗口。
+
 
 ## 配置与能力边界
 
-- [ ] `[hooks.events]` 的 rewrite 只在 BeforeSend；SessionEnd/Stop/ConfigChange
-      的 inject_context 没有落点。
 
 ## 运行与数据
 

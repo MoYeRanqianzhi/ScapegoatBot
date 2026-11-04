@@ -583,10 +583,25 @@ impl Runner {
         let _ = self
             .fire_hooks(crate::config::HookEvent::SessionEnd, None, None)
             .await;
+        let session_end = crate::agent::hooks::injected(
+            &self.config.event_hooks,
+            crate::config::HookEvent::SessionEnd,
+        );
         if !self.scopes.per_chat {
             let current = self.sessions.current()?;
             let next = self.sessions.rotate()?;
-            self.history.lock().await.clear();
+            let mut history = self.history.lock().await;
+            history.clear();
+            for text in &session_end {
+                let message = AgentMessage::System {
+                    text: format!(
+                        "[hook context | SessionEnd]
+{text}"
+                    ),
+                };
+                self.sessions.append(std::slice::from_ref(&message))?;
+                history.push(message);
+            }
             return Ok(serde_json::json!({
                 "cleared": true,
                 "previous_session": current.file,
@@ -595,7 +610,7 @@ impl Runner {
         }
         let stores = self.scopes.all_sessions().await;
         let mut cleared = Vec::new();
-        for sessions in stores {
+        for sessions in &stores {
             let current = sessions.current()?;
             let next = sessions.rotate()?;
             cleared.push(serde_json::json!({
@@ -604,6 +619,20 @@ impl Runner {
             }));
         }
         self.scopes.clear_histories().await;
+        for text in &session_end {
+            let message = AgentMessage::System {
+                text: format!(
+                    "[hook context | SessionEnd]
+{text}"
+                ),
+            };
+            for sessions in &stores {
+                sessions.append(std::slice::from_ref(&message))?;
+            }
+            for history in self.scopes.histories.lock().await.values() {
+                history.lock().await.push(message.clone());
+            }
+        }
         Ok(serde_json::json!({"cleared": true, "chains": cleared}))
     }
 
@@ -799,6 +828,8 @@ impl Runner {
         let Some(checker) = &self.config.security_review else {
             return;
         };
+        // 主 system 前缀相同，provider 可以命中 prompt cache。
+        checker.set_system(self.system());
         let window = render_review_window(history, self.config.check_overlap_tokens);
         match checker.review(&window).await {
             Ok(outcome) => {
@@ -885,10 +916,15 @@ impl Runner {
             && messages
                 .iter()
                 .any(|message| !message.is_self && message.sender.qq == Some(owner));
-        TurnEvidence {
+        let evidence = TurnEvidence {
             owner_intent,
             origin_chat: Some(chat.to_string()),
+            ..TurnEvidence::default()
+        };
+        for message in messages {
+            evidence.record_source(chat.to_string(), format::render_inbound(message));
         }
+        evidence
     }
 
     /// 取一份 provider 快照；调用方在 await 前调用，避免跨 await 持有锁。
@@ -1164,10 +1200,12 @@ impl Runner {
         }
 
         // 3) 组装本回合的即时提示。
+        let evidence = self.evidence_for_batch(chat, &inbound_messages);
         let mut prompts = vec![AgentMessage::user(
             self.runtime_context(chat, &sessions).render(),
         )];
         if let Some(pending) = self.pending_history(chat, first_batch_id) {
+            evidence.record_source(chat.to_string(), &pending);
             prompts.push(AgentMessage::user(pending));
         }
         if input.dropped > 0 {
@@ -1181,7 +1219,6 @@ impl Runner {
         // 4) 运行循环。工具执行器带上本回合证据。
         let prompt_tokens = crate::session::compaction::estimate_messages(&prompts);
         let slot = self.provider_snapshot();
-        let evidence = self.evidence_for_batch(chat, &inbound_messages);
         let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {
             registry: Arc::clone(&self.tools),
             evidence,
@@ -1255,6 +1292,16 @@ impl Runner {
                 Some(&format!("turn finished: {:?}", outcome.stop_reason)),
             )
             .await;
+        for text in
+            crate::agent::hooks::injected(&self.config.event_hooks, crate::config::HookEvent::Stop)
+        {
+            working.push(AgentMessage::System {
+                text: format!(
+                    "[hook context | Stop]
+{text}"
+                ),
+            });
+        }
 
         // 5) 提交新块：buffer -> transcript -> 共享历史。
         let new_blocks: Vec<AgentMessage> = working[base..].to_vec();

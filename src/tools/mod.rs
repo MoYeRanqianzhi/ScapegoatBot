@@ -265,6 +265,10 @@ impl ToolRegistry {
         context.gate = self.gate.clone();
         context.evidence = evidence;
         let result = tool.execute(&context, call.arguments.clone()).await;
+        if let Some((chat, text)) = context_source_for(&call.name, &call.arguments, &result.content)
+        {
+            context.evidence.record_source(chat, text);
+        }
         truncate_result(result, self.max_result_bytes)
     }
 }
@@ -380,6 +384,39 @@ fn apply_schema_budget(mut specs: Vec<ToolSpec>, limit: usize) -> Vec<ToolSpec> 
     specs
 }
 
+/// 从工具调用中提取“这段内容来自哪个 chat”，供跨 chat 泄露检查。
+fn context_source_for(name: &str, args: &Value, content: &str) -> Option<(String, String)> {
+    if name == "Read" {
+        let path = args.get("path").and_then(Value::as_str)?;
+        let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        return match segments.as_slice() {
+            ["messages", "groups", peer, ..] => Some((format!("group:{peer}"), content.to_owned())),
+            ["messages", "private", peer, ..] => {
+                Some((format!("private:{peer}"), content.to_owned()))
+            }
+            ["inbox", chat, ..] => Some(((*chat).to_owned(), content.to_owned())),
+            _ => None,
+        };
+    }
+    if name == "API" {
+        let action = args.get("action").and_then(Value::as_str)?;
+        let params = args.get("params").cloned().unwrap_or(Value::Null);
+        let chat = match action {
+            "napcat.get_group_msg_history" | "napcat.get_group_member_list" => params
+                .get("group_id")
+                .and_then(Value::as_u64)
+                .map(|id| format!("group:{id}")),
+            "napcat.get_friend_msg_history" => params
+                .get("user_id")
+                .and_then(Value::as_u64)
+                .map(|id| format!("private:{id}")),
+            _ => None,
+        };
+        return chat.map(|chat| (chat, content.to_owned()));
+    }
+    None
+}
+
 /// 按字节上限截断工具结果；按字符边界切，避免破坏 UTF-8。
 fn truncate_result(mut result: ToolResult, limit: usize) -> ToolResult {
     if limit == 0 || result.content.len() <= limit {
@@ -420,6 +457,31 @@ mod tests {
         assert!(arg_opt_bool(&args, "flag").unwrap());
         assert!(!arg_opt_bool(&args, "missing").unwrap());
         assert!(arg_str(&args, "missing").is_err());
+    }
+
+    #[test]
+    fn read_and_api_results_record_their_source_chat() {
+        assert_eq!(
+            context_source_for(
+                "Read",
+                &json!({"path": "/messages/groups/123/2026-11/04.md"}),
+                "text"
+            ),
+            Some(("group:123".to_owned(), "text".to_owned()))
+        );
+        assert_eq!(
+            context_source_for("Read", &json!({"path": "/inbox/group:5/index.md"}), "text"),
+            Some(("group:5".to_owned(), "text".to_owned()))
+        );
+        assert_eq!(
+            context_source_for(
+                "API",
+                &json!({"action": "napcat.get_group_msg_history", "params": {"group_id": 7}}),
+                "text"
+            ),
+            Some(("group:7".to_owned(), "text".to_owned()))
+        );
+        assert!(context_source_for("Grep", &json!({"root": "/messages"}), "text").is_none());
     }
 
     #[test]
