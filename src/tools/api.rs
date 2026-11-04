@@ -509,11 +509,18 @@ impl Tool for ApiTool {
                                 }
                             }
                         }
-                        ToolResult::ok(format!(
-                            "{}\n{}",
+                        let images = images_from_response(&response);
+                        let text = format!(
+                            "{}
+{}",
                             spec.summary,
                             serde_json::to_string_pretty(&response).unwrap_or_default()
-                        ))
+                        );
+                        if images.is_empty() {
+                            ToolResult::ok(text)
+                        } else {
+                            ToolResult::with_images(text, images)
+                        }
                     }
                     Err(error) => {
                         if let (Some(id), Some(messages)) = (&ledger_id, &self.messages) {
@@ -651,18 +658,18 @@ impl ApiTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(format!("invalid output path: {error}")),
         };
+        let ext = out.to_ascii_lowercase();
+        if !(ext.ends_with(".png")
+            || ext.ends_with(".jpg")
+            || ext.ends_with(".jpeg")
+            || ext.ends_with(".webp"))
+        {
+            return ToolResult::error("media output must end with .png/.jpg/.jpeg/.webp");
+        }
         if spec.action == "media.image_compress"
-            && !(out.ends_with(".jpg") || out.ends_with(".jpeg"))
+            && !(ext.ends_with(".jpg") || ext.ends_with(".jpeg"))
         {
             return ToolResult::error("media.image_compress requires a .jpg/.jpeg output path");
-        }
-        if spec.action == "media.image_convert"
-            && !(out.ends_with(".png")
-                || out.ends_with(".jpg")
-                || out.ends_with(".jpeg")
-                || out.ends_with(".webp"))
-        {
-            return ToolResult::error("media.image_convert requires .png/.jpg/.jpeg/.webp output");
         }
         let output = match spec.action {
             "media.image_resize" => {
@@ -960,10 +967,16 @@ fn images_from_response(response: &Value) -> Vec<crate::agent::message::ImageAtt
                 )
             })
             .unwrap_or_else(|| (mime.to_owned(), raw.to_owned()));
-        out.push(crate::agent::message::ImageAttachment {
-            mime,
-            data_base64: payload,
-        });
+        if matches!(
+            mime.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) && payload.len() <= 4_700_000
+        {
+            out.push(crate::agent::message::ImageAttachment {
+                mime,
+                data_base64: payload,
+            });
+        }
         break;
     }
     out
@@ -1642,5 +1655,16 @@ mod tests {
             vfs.stat(&crate::vfs::path::VfsPath::parse("/tmp/wm.png").unwrap())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn api_base64_response_becomes_an_image_attachment() {
+        let images = images_from_response(&serde_json::json!({
+            "status": "ok",
+            "data": {"base64": "data:image/png;base64,aGVsbG8="}
+        }));
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime, "image/png");
+        assert_eq!(images[0].data_base64, "aGVsbG8=");
     }
 }

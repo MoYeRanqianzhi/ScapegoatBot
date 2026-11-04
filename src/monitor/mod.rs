@@ -361,6 +361,13 @@ impl MonitorManager {
         let Some(monitor) = monitor else {
             anyhow::bail!("monitor {name:?} does not exist");
         };
+        if monitor.cancelled.load(Ordering::SeqCst)
+            || monitor
+                .expires_at
+                .is_some_and(|deadline| Local::now() > deadline)
+        {
+            anyhow::bail!("monitor {name:?} is no longer deliverable");
+        }
         {
             let mut last = monitor.last_delivery.lock().expect("monitor lock");
             if let Some(previous) = *last

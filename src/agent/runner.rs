@@ -1101,6 +1101,9 @@ impl Runner {
                 .await;
         }
 
+        for message in steering.drain() {
+            working.push(message);
+        }
         let new_blocks: Vec<AgentMessage> = working[base + runtime_blocks..].to_vec();
         if !new_blocks.is_empty() {
             let turn_id = new_turn_id();
@@ -1200,9 +1203,14 @@ impl Runner {
                         }
                     }
                 }
-                if let Ok(value) = base64::engine::general_purpose::STANDARD
-                    .decode(reference.trim_start_matches("base64://"))
+                if reference.starts_with("base64://")
+                    && let Ok(value) = base64::engine::general_purpose::STANDARD
+                        .decode(reference.trim_start_matches("base64://"))
                     && value.len() <= 3_500_000
+                    && matches!(
+                        mime_for_bytes(&value).as_str(),
+                        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                    )
                 {
                     let mime = mime_for_bytes(&value);
                     prompts.push(AgentMessage::user_with_images(
@@ -1217,7 +1225,7 @@ impl Runner {
                 let Ok(parsed) = reqwest::Url::parse(&reference) else {
                     continue;
                 };
-                if parsed.scheme() != "https" {
+                if !matches!(parsed.scheme(), "http" | "https") {
                     continue;
                 }
                 let Some(host) = parsed.host_str() else {
@@ -1236,21 +1244,15 @@ impl Runner {
                         continue;
                     }
                 };
-                let mime = response
+                let header_mime = response
                     .headers()
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok())
-                    .unwrap_or("image/jpeg")
+                    .unwrap_or("")
                     .split(';')
                     .next()
-                    .unwrap_or("image/jpeg")
+                    .unwrap_or("")
                     .to_owned();
-                if !matches!(
-                    mime.as_str(),
-                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-                ) {
-                    continue;
-                }
                 let bytes = match response.bytes().await {
                     Ok(bytes) if bytes.len() <= 3_500_000 => bytes,
                     Ok(_) => {
@@ -1262,6 +1264,20 @@ impl Runner {
                         continue;
                     }
                 };
+                let mime = if matches!(
+                    header_mime.as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                ) {
+                    header_mime
+                } else {
+                    mime_for_bytes(&bytes)
+                };
+                if !matches!(
+                    mime.as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                ) {
+                    continue;
+                }
                 prompts.push(AgentMessage::user_with_images(
                     format!("[image from {}]", message.chat),
                     vec![crate::agent::message::ImageAttachment {
@@ -1337,6 +1353,7 @@ impl Runner {
 
         // 1) 入站消息立即进入 transcript 与共享历史。
         let mut inbound = Vec::with_capacity(input.messages.len());
+        let mut accepted_messages = Vec::new();
         let mut hook_context = Vec::new();
         for message in &input.messages {
             let text = format::render_inbound(message);
@@ -1352,6 +1369,7 @@ impl Runner {
                 warn!(chat = %chat, %reason, "MessageReceived hook dropped this message");
                 continue;
             }
+            accepted_messages.push(message.clone());
             let agent_message = AgentMessage::user(text);
             inbound.push(agent_message.clone());
             sessions.append(&[agent_message])?;
@@ -1426,7 +1444,7 @@ impl Runner {
 
         // runtime/pending prompt 不落 transcript；入站图片属于真实消息内容，需要落库。
         let runtime_blocks = prompts.len();
-        prompts.extend(self.inbound_image_prompts(&inbound_messages).await);
+        prompts.extend(self.inbound_image_prompts(&accepted_messages).await);
 
         // 4) 运行循环。工具执行器带上本回合证据。
         let prompt_tokens = crate::session::compaction::estimate_messages(&prompts);
@@ -1515,10 +1533,15 @@ impl Runner {
             });
         }
 
-        // 回合结束窗口内到达的消息也写入 history，避免随 channel 关闭丢失。
+        // 先把 local SteeringQueue（early return 时已取出的消息）与 channel 都排空；
+        // 然后关闭 receiver，让之后到达的消息走 ChatQueue 的 send-failure 回填。
+        for message in steering.drain() {
+            working.push(message);
+        }
         while let Ok(message) = steering_rx.try_recv() {
             working.push(message);
         }
+        drop(steering_rx);
 
         // 5) 提交新块：buffer -> transcript -> 共享历史。
         let new_blocks: Vec<AgentMessage> = working[base + runtime_blocks..].to_vec();

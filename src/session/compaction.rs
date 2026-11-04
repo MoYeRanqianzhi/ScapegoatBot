@@ -98,6 +98,7 @@ pub fn estimate_messages(messages: &[AgentMessage]) -> usize {
             estimate_tokens(&render_message(message))
                 + match message {
                     AgentMessage::Tool(result) => result.images.len() * 2000,
+                    AgentMessage::User { images, .. } => images.len() * 2000,
                     _ => 0,
                 }
         })
