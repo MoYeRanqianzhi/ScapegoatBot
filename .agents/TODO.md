@@ -15,14 +15,13 @@
 - [ ] 评估 `[style].sample_retention_days` 与 `models.json.default_thinking_level`：
       实现或删除。
 
-## 未执行的配置（配置欺骗风险）
+## 配置与能力边界
 
-- [ ] `[budget]`：每日 token/USD、单回合 token、每 chat 每小时发送/回合数、
-      `round_trip_wall_secs`、`guard_usd_per_day` 全部只解析。实现前在文档中保持
-      “未执行”提示，或从 schema 删除。
-- [ ] `[hooks.events]`：BeforeSend 的 rewrite/block 未接线。
-- [ ] `[tools].max_schema_tokens`、`[monitor].deliver.cc` / `on_missing`。
-- [ ] `get_msg` 只有 message_id，无法按 `receive_scopes` 校验。
+- [ ] `[hooks.events]` 只接线了 BeforeSend；SessionStart/End、Pre/PostCompact、
+      Stop、MessageReceived、ConfigChange 仍未触发。
+- [ ] `[security.guard].max_state_tokens` / `delta_every_tokens`：实现窗口控制或删除。
+- [ ] `[style].sample_retention_days`、`models.json.default_thinking_level`：实现或删除。
+- [ ] `get_msg` 现在会反查 chat；跨本地不存在的消息仍只能保守拒绝（可接受）。
 
 ## 运行与数据
 

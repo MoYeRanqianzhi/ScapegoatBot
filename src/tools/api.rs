@@ -75,6 +75,8 @@ pub struct ApiTool {
     action_gate: Option<Arc<crate::security::action_gate::ActionGate>>,
     /// 允许读取的 chat；`None` = 不限制（测试/旧路径），`["*"]` = 全部。
     receive_scopes: Option<Vec<String>>,
+    /// `[hooks.events]` 的 BeforeSend hook。
+    event_hooks: Vec<crate::config::EventHookConfig>,
 }
 
 impl ApiTool {
@@ -99,6 +101,7 @@ impl ApiTool {
             read_only: false,
             action_gate: None,
             receive_scopes: None,
+            event_hooks: Vec::new(),
         }
     }
 
@@ -111,6 +114,18 @@ impl ApiTool {
     /// 限制 `napcat.*` 查询能读到哪些 chat；`["*"]` = 全部。
     pub fn with_receive_scopes(mut self, scopes: Vec<String>) -> Self {
         self.receive_scopes = Some(scopes);
+        self
+    }
+
+    /// 接入消息库：`get_msg` 的 chat 反查与发送记账用。
+    pub fn with_messages(mut self, messages: Arc<MessageStore>) -> Self {
+        self.messages = Some(messages);
+        self
+    }
+
+    /// 接入 `BeforeSend` 事件 hook。
+    pub fn with_event_hooks(mut self, hooks: Vec<crate::config::EventHookConfig>) -> Self {
+        self.event_hooks = hooks;
         self
     }
 
@@ -329,6 +344,28 @@ impl Tool for ApiTool {
                         "receive scope does not allow reading {chat}; adjust [agent].receive_scopes"
                     ));
                 }
+                // `get_msg` 只有 message_id：能反查到 chat 就按范围校验，查不到则
+                // 在限制读取时保守拒绝。
+                if spec.action == "napcat.get_msg"
+                    && self.receive_scopes.is_some()
+                    && self.messages.is_some()
+                {
+                    let id = params.get("message_id").and_then(|value| {
+                        value
+                            .as_i64()
+                            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                    });
+                    let chat = id.and_then(|id| {
+                        self.messages
+                            .as_ref()
+                            .and_then(|store| store.chat_for_message(id).ok().flatten())
+                    });
+                    if !chat.is_some_and(|chat| self.receive_allows(chat)) {
+                        return ToolResult::error(
+                            "receive scope does not allow reading this message",
+                        );
+                    }
+                }
                 let Some(gateway) = &self.gateway else {
                     return ToolResult::error("NapCat is not connected.");
                 };
@@ -393,7 +430,7 @@ impl Tool for ApiTool {
                     }
                 }
 
-                let params = if spec.category == Category::Message {
+                let mut params = if spec.category == Category::Message {
                     match Self::sanitize_send_params(params) {
                         Ok(params) => params,
                         Err(error) => return ToolResult::error(error),
@@ -401,6 +438,13 @@ impl Tool for ApiTool {
                 } else {
                     params
                 };
+                if spec.category == Category::Message
+                    && let Some(chat) = Self::chat_of(spec, &params)
+                    && let Err(error) =
+                        crate::agent::hooks::before_send(&self.event_hooks, chat, &mut params)
+                {
+                    return ToolResult::error(format!("BeforeSend hook blocked the send: {error}"));
+                }
 
                 // 发送前登记意图；成功后按 message_id 记为 self。
                 let ledger_id = if spec.category == Category::Message {
@@ -950,6 +994,85 @@ mod tests {
             .await;
         assert!(!result.is_error, "{}", result.content);
         assert_eq!(gateway.calls.lock().unwrap()[0].0, "send_group_msg");
+    }
+
+    #[tokio::test]
+    async fn before_send_hooks_can_block() {
+        let gateway = Arc::new(FakeGateway::default());
+        let hook = crate::config::EventHookConfig {
+            event: crate::config::HookEvent::BeforeSend,
+            action: crate::config::HookAction::Block,
+            reason: "no sends in this test".to_owned(),
+            ..crate::config::EventHookConfig::default()
+        };
+        let tool = tool(Some(gateway.clone()), None).with_event_hooks(vec![hook]);
+        let result = tool
+            .execute(
+                &intent_ctx("group:1"),
+                json!({"action": "napcat.send_group_msg",
+                       "params": {"group_id": 1, "message": "hello"}}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("BeforeSend"));
+        assert!(gateway.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_msg_uses_the_chat_lookup_for_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(crate::storage::Database::open_in_memory().unwrap());
+        let key = Arc::new(crate::storage::crypto::MasterKey::from_bytes([21u8; 32]));
+        let messages = Arc::new(
+            MessageStore::open(
+                db,
+                key,
+                dir.path().to_path_buf(),
+                0,
+                crate::config::EncryptionMode::None,
+            )
+            .unwrap(),
+        );
+        let message = crate::qq::event::QqMessage {
+            message_id: 77,
+            chat: crate::qq::event::ChatId::Group(2),
+            sender: crate::qq::event::Sender {
+                qq: Some(20000),
+                nickname: "Bob".to_owned(),
+                card: String::new(),
+                role: "member".to_owned(),
+            },
+            time: chrono::Utc::now(),
+            segments: vec![crate::qq::event::Segment::Text {
+                text: "hi".to_owned(),
+            }],
+            reply_to: None,
+            is_self: false,
+            backfilled: false,
+            raw: Value::Null,
+        };
+        messages.append(&message).unwrap();
+
+        let tool = tool(Some(Arc::new(FakeGateway::default())), None)
+            .with_receive_scopes(vec!["group:1".to_owned()])
+            .with_messages(Arc::clone(&messages));
+        let denied = tool
+            .execute(
+                &intent_ctx("group:1"),
+                json!({"action": "napcat.get_msg", "params": {"message_id": 77}}),
+            )
+            .await;
+        assert!(denied.is_error);
+        assert!(denied.content.contains("receive scope"));
+
+        // 反查不到的消息在限制读取时同样拒绝。
+        let unknown = tool
+            .execute(
+                &intent_ctx("group:1"),
+                json!({"action": "napcat.get_msg", "params": {"message_id": 999}}),
+            )
+            .await;
+        assert!(unknown.is_error);
     }
 
     #[tokio::test]

@@ -303,6 +303,8 @@ pub struct ActionGate {
     calls: Mutex<VecDeque<Instant>>,
     sends: Mutex<VecDeque<SendRecord>>,
     db: Option<Arc<Database>>,
+    /// 每 chat 每小时成功发送上限；0 = 不限制。
+    chat_send_limit: u32,
 }
 
 impl ActionGate {
@@ -316,7 +318,14 @@ impl ActionGate {
             calls: Mutex::new(VecDeque::new()),
             sends: Mutex::new(VecDeque::new()),
             db: None,
+            chat_send_limit: 0,
         }
+    }
+
+    /// 设置每 chat 每小时发送上限（`[budget].chat_sends_per_hour`）。
+    pub fn with_chat_send_limit(mut self, limit: u32) -> Self {
+        self.chat_send_limit = limit;
+        self
     }
 
     pub fn with_reviewer(mut self, reviewer: Arc<dyn ActionReviewer>) -> Self {
@@ -387,7 +396,22 @@ impl ActionGate {
         let content_short = content.chars().count() < 12;
         let mut sends = self.sends.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        sends.retain(|record| now.duration_since(record.at) <= MASS_WINDOW);
+        sends.retain(|record| now.duration_since(record.at) <= Duration::from_secs(3600));
+        if self.chat_send_limit > 0 {
+            let count = sends
+                .iter()
+                .filter(|record| {
+                    record.chat == chat
+                        && now.duration_since(record.at) <= Duration::from_secs(3600)
+                })
+                .count();
+            if count >= self.chat_send_limit as usize {
+                return Err(format!(
+                    "chat send limit of {} per hour reached for {chat}",
+                    self.chat_send_limit
+                ));
+            }
+        }
         if !content_short
             && sends.iter().any(|record| {
                 record.chat == chat
@@ -402,7 +426,11 @@ impl ActionGate {
         }
         let mut targets: Vec<&str> = sends
             .iter()
-            .filter(|record| record.content == content && record.chat != chat)
+            .filter(|record| {
+                record.content == content
+                    && record.chat != chat
+                    && now.duration_since(record.at) <= MASS_WINDOW
+            })
             .map(|record| record.chat.as_str())
             .collect();
         targets.push(chat);
@@ -691,6 +719,27 @@ mod tests {
             .await
             .is_allowed()
         );
+    }
+
+    #[tokio::test]
+    async fn per_chat_hourly_send_limit_blocks() {
+        let gate = auto_gate().with_chat_send_limit(2);
+        let evidence = TurnEvidence::default();
+        for text in ["first long message", "second long message"] {
+            let params = json!({"group_id": 1, "message": text});
+            assert!(
+                gate.check(spec("napcat.send_group_msg"), &params, &evidence)
+                    .await
+                    .is_allowed()
+            );
+            gate.note_send(&params, "group:1");
+        }
+        let params = json!({"group_id": 1, "message": "third long message"});
+        assert!(matches!(
+            gate.check(spec("napcat.send_group_msg"), &params, &evidence)
+                .await,
+            ActionDecision::Block(reason) if reason.contains("send limit")
+        ));
     }
 
     #[tokio::test]

@@ -65,7 +65,8 @@ timeout_ms = 800
 ```
 
 用主 provider 发一个短 JSON 判定请求；适合不想额外托管 Jev 的部署。代价是每次
-输入/输出判定都消耗一次主模型的 token。
+输入/输出判定都消耗一次主模型的 token。`[budget].guard_usd_per_day` 耗尽后分类器
+降级为规则层（规则仍然生效），并在日志里告警。
 
 ## 周期安全检查 `[security]`
 

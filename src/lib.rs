@@ -8,6 +8,8 @@
 #[allow(dead_code)]
 pub mod agent;
 pub mod app;
+// 运行预算：每日 token/USD、回合上限与 guard 花费。
+pub mod budget;
 pub mod cli;
 pub mod config;
 pub mod ipc;

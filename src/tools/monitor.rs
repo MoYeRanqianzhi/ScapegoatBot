@@ -218,6 +218,8 @@ impl MonitorTool {
                 batch_window,
                 target,
                 crate::config::CatchUp::Coalesce,
+                false,
+                crate::config::OnMissing::Queue,
             )
             .await
         {

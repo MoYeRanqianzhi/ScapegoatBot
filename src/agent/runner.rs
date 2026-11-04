@@ -10,8 +10,9 @@
 //! runtime context 每回合单独注入，不写进 transcript；它承载时间、origin_chat、
 //! `current_session`、收件箱摘要等易变字段。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::sync::{Mutex, mpsc};
@@ -89,6 +90,8 @@ pub struct RunnerConfig {
     pub compaction: Option<Arc<CompactionModel>>,
     /// 最近一次回合活动时间（unix 秒），供记忆复盘判断空闲。
     pub last_activity: Arc<std::sync::atomic::AtomicI64>,
+    /// 运行预算；`None` = 不限制（测试/旧路径）。
+    pub budget: Option<Arc<crate::budget::Budget>>,
 }
 
 /// 摘要用的独立 provider 与模型 id。
@@ -205,6 +208,8 @@ pub struct Runner {
     compaction_lock: Mutex<()>,
     /// 连续自动压缩失败次数；达到上限后不再自动尝试。
     compaction_failures: std::sync::atomic::AtomicU32,
+    /// 每 chat 最近允许的回合时间，用于 `chat_turns_per_hour`。
+    turn_times: Mutex<HashMap<String, VecDeque<Instant>>>,
     /// 自上次周期检查以来新增的 token 估算。
     unchecked_tokens: std::sync::atomic::AtomicU64,
     /// 周期检查连续失败次数。
@@ -361,6 +366,7 @@ impl Runner {
             system: std::sync::RwLock::new(system),
             compaction_lock: Mutex::new(()),
             compaction_failures: std::sync::atomic::AtomicU32::new(0),
+            turn_times: Mutex::new(HashMap::new()),
             unchecked_tokens: std::sync::atomic::AtomicU64::new(0),
             review_failures: std::sync::atomic::AtomicU32::new(0),
             review_lock: Mutex::new(()),
@@ -893,6 +899,18 @@ impl Runner {
                 prune: self.config.prune,
                 prune_soft_limit: self.config.prune_soft_limit as usize,
                 prune_keep_turns: self.config.prune_keep_turns,
+                max_turn_tokens: self
+                    .config
+                    .budget
+                    .as_ref()
+                    .map(|budget| budget.turn_tokens())
+                    .unwrap_or(0),
+                max_wall_secs: self
+                    .config
+                    .budget
+                    .as_ref()
+                    .map(|budget| budget.wall_secs())
+                    .unwrap_or(0),
             },
         );
         let (tx, mut rx) = mpsc::channel(256);
@@ -1018,6 +1036,34 @@ impl Runner {
         // 也会把保留的旧块重复提交。
         let base = working.len();
 
+        // 2.6) 预算：消息已经入库，只跳过模型回合；下一个窗口/日期自动恢复。
+        if let Some(budget) = &self.config.budget {
+            if let Some(reason) = budget.check_daily().await {
+                warn!(chat = %chat, %reason, "skipping this turn");
+                return Ok(());
+            }
+            let limit = budget.chat_turns_per_hour();
+            if limit > 0 {
+                let mut turns = self.turn_times.lock().await;
+                let queue = turns.entry(chat.to_string()).or_default();
+                while queue
+                    .front()
+                    .is_some_and(|at| at.elapsed() >= Duration::from_secs(3600))
+                {
+                    queue.pop_front();
+                }
+                if queue.len() >= limit as usize {
+                    warn!(
+                        chat = %chat,
+                        limit,
+                        "chat turn budget exhausted; skipping this turn"
+                    );
+                    return Ok(());
+                }
+                queue.push_back(Instant::now());
+            }
+        }
+
         // 3) 组装本回合的即时提示。
         let mut prompts = vec![AgentMessage::user(
             self.runtime_context(chat, &sessions).render(),
@@ -1058,6 +1104,18 @@ impl Runner {
                 prune: self.config.prune,
                 prune_soft_limit: self.config.prune_soft_limit as usize,
                 prune_keep_turns: self.config.prune_keep_turns,
+                max_turn_tokens: self
+                    .config
+                    .budget
+                    .as_ref()
+                    .map(|budget| budget.turn_tokens())
+                    .unwrap_or(0),
+                max_wall_secs: self
+                    .config
+                    .budget
+                    .as_ref()
+                    .map(|budget| budget.wall_secs())
+                    .unwrap_or(0),
             },
         );
         let (events_tx, mut events_rx) = mpsc::channel(256);
@@ -1086,6 +1144,11 @@ impl Runner {
             .await;
         drop(events_tx);
         let _ = logger.await;
+        if let Some(budget) = &self.config.budget {
+            budget
+                .record_usage(outcome.usage.input_tokens, outcome.usage.output_tokens)
+                .await;
+        }
 
         // 5) 提交新块：buffer -> transcript -> 共享历史。
         let new_blocks: Vec<AgentMessage> = working[base..].to_vec();
@@ -1181,6 +1244,18 @@ impl crate::swarm::SubagentRunner for Runner {
                 prune: self.config.prune,
                 prune_soft_limit: self.config.prune_soft_limit as usize,
                 prune_keep_turns: self.config.prune_keep_turns,
+                max_turn_tokens: self
+                    .config
+                    .budget
+                    .as_ref()
+                    .map(|budget| budget.turn_tokens())
+                    .unwrap_or(0),
+                max_wall_secs: self
+                    .config
+                    .budget
+                    .as_ref()
+                    .map(|budget| budget.wall_secs())
+                    .unwrap_or(0),
             },
         );
         let mut history = request.history;
@@ -1650,6 +1725,7 @@ mod tests {
                 post_compact_recall: false,
                 compaction: None,
                 last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+                budget: None,
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -1813,6 +1889,7 @@ mod tests {
                 post_compact_recall: false,
                 compaction: None,
                 last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+                budget: None,
             },
             Arc::new(Mutex::new(Vec::new())),
             Arc::new(AtomicBool::new(false)),
@@ -1954,6 +2031,7 @@ mod tests {
                 post_compact_recall: false,
                 compaction: None,
                 last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+                budget: None,
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -2102,6 +2180,7 @@ mod tests {
                 post_compact_recall: false,
                 compaction: None,
                 last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+                budget: None,
             },
             history,
             Arc::new(AtomicBool::new(true)),
@@ -2272,6 +2351,7 @@ mod tests {
                 post_compact_recall: false,
                 compaction: None,
                 last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+                budget: None,
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -2435,6 +2515,7 @@ mod tests {
                 post_compact_recall: false,
                 compaction: None,
                 last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+                budget: None,
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),

@@ -164,6 +164,10 @@ lifecycle = { idle_only = false, max_events = 1000 }
 `source` 四选一：`qq` / `timer` / `stream` / `internal`。`timer` 支持 `every`、`at`、
 `cron`（5 字段）。运行时也能通过 `Monitor` 工具增删，但重启即消失；配置文件里的才是常驻。
 
+`deliver.cc = true` 会在投递给子代理时把同一内容抄送主代理。绑定目标不存在时，
+`on_missing` 决定 `drop`（丢弃并告警）、`queue`（最多等 60 秒）或 `spawn`
+（新建 general 子代理处理）。
+
 `lifecycle.catch_up` 控制重启后如何处理错过的定时触发：`coalesce`（默认）补投一次并
 说明错过了多少次，`skip` 直接放弃。上次触发时间写在 `meta` 表，运行时创建的 monitor
 不参与补投。
@@ -223,7 +227,10 @@ key 放 `auth.json`：
 
 - `[budget]`：`daily_tokens`、`daily_usd`、`turn_tokens`、`chat_sends_per_hour`、
   `chat_turns_per_hour`、`round_trip_wall_secs`、`guard_usd_per_day`。
-  **当前只解析、不执行**；需要硬预算时请用 provider 侧限额。
+  - 每日 token/USD 在回合开始时检查，超限跳过新回合（消息仍然入库）；
+  - `turn_tokens` 与 `round_trip_wall_secs` 是硬停：循环到上限就以 error 结束；
+  - 每 chat 每小时只统计成功发送/已开始的回合；
+  - `guard_usd_per_day` 用估算成本，耗尽后分类器降级为规则层。
 - `[gate]`：每次 `napcat.*` 调用都过门禁。
   - `trusted`：直接放行，只统计速率。
   - `auto`（默认）：每分钟调用上限 `max_per_minute`；发送规则拦截 30 秒内同 chat 重复、
@@ -234,7 +241,8 @@ key 放 `auth.json`：
     `sbot gate pending` 查看队列，`sbot gate reject <id>` 拒绝。
 - `[hooks.context]`：`name`、`path`、`kind`、`when`、`inject`、`max_bytes`；
   自定义注入到 system prompt 的上下文文件。
-- `[hooks.events]`：**当前只解析、不执行**（BeforeSend 的 rewrite/block 尚未接线）。
+- `[hooks.events]`：目前只接线 `BeforeSend`（`log` / `block` / `rewrite`），
+  `scope` 支持 `model`（默认）与 `all`；其他事件尚未触发。
 
 ## models.json
 

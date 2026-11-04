@@ -46,6 +46,8 @@ pub struct MonitorDelivery {
     pub text: String,
     /// 系统通知（到期、上限、谓词失败）——不来自任何用户。
     pub system: bool,
+    /// 目标不存在时的处理方式。
+    pub on_missing: crate::config::OnMissing,
 }
 
 /// 投递端；由 runtime 提供。
@@ -184,6 +186,10 @@ struct Monitor {
     catch_up: CatchUp,
     /// 记录上次触发时间，供重启后补投。
     db: Option<Arc<Database>>,
+    /// 是否把投递抄送主代理。
+    cc: bool,
+    /// 目标不存在时：丢弃 / 排队 / 新建子代理。
+    on_missing: crate::config::OnMissing,
 }
 
 /// 管理器。
@@ -225,6 +231,8 @@ impl MonitorManager {
         batch_window: Duration,
         target: Option<String>,
         catch_up: CatchUp,
+        cc: bool,
+        on_missing: crate::config::OnMissing,
     ) -> Result<()> {
         {
             let mut monitors = self.monitors.write().await;
@@ -257,6 +265,8 @@ impl MonitorManager {
                 origin: "runtime",
                 catch_up,
                 db: self.db.read().unwrap_or_else(|e| e.into_inner()).clone(),
+                cc,
+                on_missing,
             });
             monitors.insert(name.clone(), Arc::clone(&monitor));
             drop(monitors);
@@ -361,6 +371,7 @@ impl MonitorManager {
                                 monitor.name
                             ),
                             system: true,
+                            on_missing: monitor.on_missing,
                         })
                         .await;
                 }
@@ -450,6 +461,7 @@ async fn deliver_once(
                 monitor.name
             ),
             system: true,
+            on_missing: monitor.on_missing,
         })
         .await;
         return;
@@ -510,6 +522,7 @@ async fn deliver_once(
                     monitor.name
                 ),
                 system: true,
+                on_missing: monitor.on_missing,
             })
             .await;
         }
@@ -521,10 +534,24 @@ async fn deliver_once(
         source: monitor.source.clone(),
         target: monitor.target.clone(),
         as_prompt: monitor.as_prompt,
-        text,
+        text: text.clone(),
         system: false,
+        on_missing: monitor.on_missing,
     })
     .await;
+
+    if monitor.cc && monitor.target.is_some() {
+        sink.deliver(MonitorDelivery {
+            name: monitor.name.clone(),
+            source: monitor.source.clone(),
+            target: None,
+            as_prompt: monitor.as_prompt,
+            text: format!("[cc {}] {text}", monitor.name),
+            system: false,
+            on_missing: crate::config::OnMissing::Queue,
+        })
+        .await;
+    }
 
     if monitor.one_shot {
         monitor.cancelled.store(true, Ordering::SeqCst);
@@ -576,6 +603,7 @@ fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, timer: TimerSp
                                     monitor.name
                                 ),
                                 system: true,
+                                on_missing: monitor.on_missing,
                             })
                             .await;
                             break;
@@ -846,6 +874,8 @@ pub async fn load_config_monitors(
                     Some(monitor.deliver.to.clone())
                 },
                 monitor.lifecycle.catch_up,
+                monitor.deliver.cc,
+                monitor.on_missing,
             )
             .await?;
 
@@ -1014,6 +1044,8 @@ mod tests {
                 Duration::ZERO,
                 None,
                 CatchUp::Coalesce,
+                false,
+                crate::config::OnMissing::Queue,
             )
             .await
             .unwrap();
@@ -1039,6 +1071,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cc_delivers_a_copy_to_the_main_agent() {
+        let sink = Arc::new(RecordingSink::default());
+        let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+        manager
+            .add(
+                "cced".to_owned(),
+                "qq".to_owned(),
+                None,
+                None,
+                None,
+                false,
+                10,
+                None,
+                false,
+                Duration::ZERO,
+                false,
+                Duration::ZERO,
+                Some("sa-1".to_owned()),
+                CatchUp::Coalesce,
+                true,
+                crate::config::OnMissing::Queue,
+            )
+            .await
+            .unwrap();
+        manager.fire("cced").await.unwrap();
+        let deliveries = sink.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(deliveries[0].target.as_deref(), Some("sa-1"));
+        assert!(deliveries[1].target.is_none());
+        assert!(deliveries[1].text.contains("[cc cced]"));
+    }
+
+    #[tokio::test]
     async fn max_events_disables_and_notifies() {
         let sink = Arc::new(RecordingSink::default());
         let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
@@ -1058,6 +1123,8 @@ mod tests {
                 Duration::ZERO,
                 None,
                 CatchUp::Coalesce,
+                false,
+                crate::config::OnMissing::Queue,
             )
             .await
             .unwrap();
@@ -1089,6 +1156,8 @@ mod tests {
                 Duration::ZERO,
                 None,
                 CatchUp::Coalesce,
+                false,
+                crate::config::OnMissing::Queue,
             )
             .await
             .unwrap();
@@ -1118,6 +1187,8 @@ mod tests {
                 Duration::from_millis(50),
                 None,
                 CatchUp::Coalesce,
+                false,
+                crate::config::OnMissing::Queue,
             )
             .await
             .unwrap();
@@ -1164,6 +1235,8 @@ mod tests {
                 Duration::ZERO,
                 None,
                 CatchUp::Coalesce,
+                false,
+                crate::config::OnMissing::Queue,
             )
             .await
             .unwrap();

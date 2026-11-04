@@ -74,6 +74,10 @@ pub struct LoopConfig {
     pub prune_soft_limit: usize,
     /// 最近多少个“回合起点”不裁剪。
     pub prune_keep_turns: u32,
+    /// 单回合 token 上限；0 = 不限制。
+    pub max_turn_tokens: u64,
+    /// 单回合墙钟上限（秒）；0 = 不限制。
+    pub max_wall_secs: u64,
 }
 
 impl Default for LoopConfig {
@@ -90,6 +94,8 @@ impl Default for LoopConfig {
             prune: false,
             prune_soft_limit: 4_000,
             prune_keep_turns: 3,
+            max_turn_tokens: 0,
+            max_wall_secs: 0,
         }
     }
 }
@@ -207,6 +213,7 @@ impl AgentLoop {
     ) -> LoopOutcome {
         let mut total_usage = Usage::default();
         let mut turns = 0u32;
+        let started = std::time::Instant::now();
         let mut pending = prompts;
         // 自上次输入闸以来新进入上下文的文本；输入闸只检查这段增量。
         let mut input_delta = String::new();
@@ -227,6 +234,29 @@ impl AgentLoop {
                         self.config.prune_keep_turns as usize,
                         self.config.prune_soft_limit,
                     );
+                }
+                if self.config.max_wall_secs > 0
+                    && started.elapsed().as_secs() >= self.config.max_wall_secs
+                {
+                    warn!(
+                        elapsed = started.elapsed().as_secs(),
+                        limit = self.config.max_wall_secs,
+                        "turn wall-clock budget exhausted"
+                    );
+                    return conclude(events, total_usage, turns, StopReason::Error).await;
+                }
+                if self.config.max_turn_tokens > 0
+                    && total_usage
+                        .input_tokens
+                        .saturating_add(total_usage.output_tokens)
+                        >= self.config.max_turn_tokens
+                {
+                    warn!(
+                        tokens = total_usage.input_tokens + total_usage.output_tokens,
+                        limit = self.config.max_turn_tokens,
+                        "turn token budget exhausted"
+                    );
+                    return conclude(events, total_usage, turns, StopReason::Error).await;
                 }
                 turns += 1;
                 if turns > self.config.max_steps {

@@ -12,6 +12,7 @@
 #[path = "loop.rs"]
 pub mod agent_loop;
 pub mod event;
+pub mod hooks;
 pub mod message;
 pub mod queue;
 pub mod runner;
