@@ -373,7 +373,7 @@ impl ConnectionActor {
         // 防止重复连接 — 如果已在连接中或已连接，直接返回错误
         if self.state == ConnectionState::Connecting || self.state == ConnectionState::Connected {
             let _ = reply.send(Err(NapLinkError::Connection(
-                "已在连接中或已连接，请勿重复调用 connect()".to_string()
+                "already connecting or connected; do not call connect() again".to_string()
             )));
             return None;
         }
@@ -400,7 +400,7 @@ impl ConnectionActor {
             // 连接超时
             Err(_elapsed) => {
                 let err_msg = format!(
-                    "连接超时: 在 {}ms 内未能建立连接",
+                    "connection timed out: failed to establish a connection within {}ms",
                     self.config.connection.timeout_ms
                 );
                 error!("{}", err_msg);
@@ -413,7 +413,7 @@ impl ConnectionActor {
             }
             // 连接失败
             Ok(Err(e)) => {
-                let err_msg = format!("WebSocket 连接失败: {}", e);
+                let err_msg = format!("WebSocket connection failed: {}", e);
                 error!("{}", err_msg);
                 // 更新状态为断开
                 self.set_state(ConnectionState::Disconnected).await;
@@ -909,12 +909,12 @@ impl ConnectionHandle {
         self.cmd_tx
             .send(ConnectionCommand::Connect { reply: reply_tx })
             .await
-            .map_err(|_| NapLinkError::Connection("Actor 已停止".to_string()))?;
+            .map_err(|_| NapLinkError::Connection("actor has stopped".to_string()))?;
 
         // 等待 Actor 回复连接结果
         reply_rx
             .await
-            .map_err(|_| NapLinkError::Connection("Actor 未响应".to_string()))?
+            .map_err(|_| NapLinkError::Connection("actor did not respond".to_string()))?
     }
 
     /// 断开 WebSocket 连接
@@ -942,6 +942,6 @@ impl ConnectionHandle {
         // 使用 try_send 非阻塞发送消息命令
         self.cmd_tx
             .try_send(ConnectionCommand::Send { payload })
-            .map_err(|_| NapLinkError::Connection("Actor 已停止或消息队列已满".to_string()))
+            .map_err(|_| NapLinkError::Connection("actor has stopped or the message queue is full".to_string()))
     }
 }

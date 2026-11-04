@@ -14,7 +14,7 @@ fn test_connection_error_display() {
     // 创建一个连接错误实例，携带描述信息
     let err = NapLinkError::Connection("连接被拒绝".to_string());
     // 验证 Display 输出包含 "连接错误" 前缀
-    assert_eq!(err.to_string(), "连接错误: 连接被拒绝");
+    assert_eq!(err.to_string(), "Connection error: 连接被拒绝");
 }
 
 /// 测试 API 超时错误的 Display 输出格式
@@ -31,7 +31,7 @@ fn test_api_timeout_error() {
         timeout_ms: 15000,
     };
     // 验证 Display 输出包含方法名和超时时间
-    assert_eq!(err.to_string(), "API 调用 send_msg 超时 (15000ms)");
+    assert_eq!(err.to_string(), "API call send_msg timed out after 15000ms");
 }
 
 /// 测试 API 错误在有 wording 时的 Display 输出
