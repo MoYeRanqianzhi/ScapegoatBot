@@ -8,7 +8,7 @@ metadata:
   last_verified: 2026-11-04
 ---
 
-当前版本：`0.2.0-alpha.24`（`main`）。数据库迁移到 v11；测试 346 项通过，
+当前版本：`0.2.0-alpha.25`（`main`）。数据库迁移到 v11；测试 347 项通过，
 `cargo fmt --check`、`clippy -D warnings` 通过；CI 已接入 GitHub Actions。
 
 alpha.13 修掉了 2026-11-03 审查的 P0/P1 主体；alpha.14 补齐了当时列为未实现的项；
@@ -49,6 +49,8 @@ alpha.15 做了第二轮审查，修掉新代码的边界问题（复盘基线�
 - `Agent message` 已能注入运行中的子代理（回合边界排空），结束后历史写回实例。
 - NapCat 模拟测试已覆盖全部 `napcat.*` ActionSpec 的 wire action 与参数形状。
 - 真实 API 未重跑；NapCat 协议用本地 WebSocket 模拟覆盖。
+- 长跑用 fake provider 模拟 300 回合 + 压缩；MSRV 为 Rust 1.85（edition 2024），
+  `napcat-link` 固定在 0.1.0-alpha.2。
 
 **Evidence:** `CHANGELOG.md` 的 alpha.14 条目、`cargo test --all-targets` 输出、
 `.github/workflows/ci.yml`、`docs/guide/limits.md`。

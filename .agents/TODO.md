@@ -12,12 +12,9 @@
 
 ## 运行与数据
 
-- [ ] 长跑/压测：alpha.14 的周期检查与压缩预算需要真实流量验证；记录到
-      `docs/development/live-testing.md`。
 
 ## 工程
 
-- [ ] 观察 `cargo clippy` 的 MSRV 与依赖升级；`napcat-link` 固定在 alpha.2。
 
 ## 文档
 
