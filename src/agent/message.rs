@@ -24,8 +24,8 @@ pub struct ToolResult {
     /// 进入上下文的文本。
     pub content: String,
     pub is_error: bool,
-    /// 工具附带的图片；不落 session，只在当前回合转成 provider image block。
-    #[serde(default, skip_serializing)]
+    /// 工具附带的图片；随 transcript 持久化，重启后仍能恢复。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageAttachment>,
 }
 
@@ -130,7 +130,7 @@ pub struct ToolResultMessage {
     pub tool_name: String,
     pub content: String,
     pub is_error: bool,
-    #[serde(default, skip_serializing)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageAttachment>,
 }
 
@@ -261,5 +261,27 @@ mod tests {
         let json = serde_json::to_value(AgentMessage::user("hi")).unwrap();
         assert_eq!(json["role"], "user");
         assert_eq!(json["text"], "hi");
+    }
+
+    #[test]
+    fn tool_result_images_survive_serialization() {
+        let message = AgentMessage::Tool(ToolResultMessage {
+            tool_call_id: "t1".to_owned(),
+            tool_name: "Read".to_owned(),
+            content: "image".to_owned(),
+            is_error: false,
+            images: vec![ImageAttachment {
+                mime: "image/png".to_owned(),
+                data_base64: "aGVsbG8=".to_owned(),
+            }],
+        });
+        let encoded = serde_json::to_string(&message).unwrap();
+        assert!(encoded.contains("aGVsbG8="));
+        let decoded: AgentMessage = serde_json::from_str(&encoded).unwrap();
+        let AgentMessage::Tool(tool) = decoded else {
+            panic!("expected tool message");
+        };
+        assert_eq!(tool.images.len(), 1);
+        assert_eq!(tool.images[0].mime, "image/png");
     }
 }

@@ -96,7 +96,8 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 - `api.*`：`list`（过滤/分页）、`help`（单个 action 的 schema）。
 
 `Read` 读取 VFS 图片时会把图片作为 tool result 的 image attachment 交给 provider；
-图片处理工具的输出同样适用。`API` 的响应若包含 `base64` / `image` 字段，也会自动
+图片处理工具的输出同样适用；图片附件会随 transcript 持久化，重启后仍可恢复
+（受 3.5 MB / MIME 限制）。`API` 的响应若包含 `base64` / `image` 字段，也会自动
 转成图片附件，而不是只把 JSON 塞进文本。
 
 发送、请求处理、管理动作都在表里标注了作用域与是否 destructive；目标为 owner/master
