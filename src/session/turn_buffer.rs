@@ -117,11 +117,15 @@ impl TurnBufferStore {
         Ok(())
     }
 
-    /// 列出某个作用域里未完成的回合。
+    /// 列出某个作用域里需要恢复的回合（`open` 或 `committing`）。
+    ///
+    /// `committing` 表示崩溃发生在“已标记提交、transcript 可能只写了一部分”的窗口，
+    /// 也必须重放；完全忽略它会留下永久孤儿行。
     pub fn open_turns(&self, scope: &str) -> Result<Vec<String>> {
         let conn = self.db.lock();
         let mut statement = conn.prepare(
-            "SELECT DISTINCT turn_id FROM turn_buffer WHERE state = 'open' AND scope = ?1",
+            "SELECT DISTINCT turn_id FROM turn_buffer
+             WHERE state IN ('open', 'committing') AND scope = ?1",
         )?;
         Ok(statement
             .query_map(params![scope], |row| row.get(0))?
@@ -132,7 +136,8 @@ impl TurnBufferStore {
     pub fn open_scopes(&self) -> Result<Vec<String>> {
         let conn = self.db.lock();
         let mut statement = conn.prepare(
-            "SELECT DISTINCT scope FROM turn_buffer WHERE state = 'open' ORDER BY scope ASC",
+            "SELECT DISTINCT scope FROM turn_buffer
+             WHERE state IN ('open', 'committing') ORDER BY scope ASC",
         )?;
         Ok(statement
             .query_map([], |row| row.get(0))?
@@ -167,7 +172,10 @@ impl TurnBufferStore {
         Ok(messages.len())
     }
 
-    /// 崩溃恢复：重放该作用域里的 open 回合，补合成结果并提交。
+    /// 崩溃恢复：重放该作用域里的 open/committing 回合，补合成结果并提交。
+    ///
+    /// 已写入 transcript 的前缀按内容后缀去重：`committing` 状态下 transcript 可能
+    /// 只写了一半，直接重放会重复整段，按后缀匹配只补剩余部分。
     pub async fn recover_open(&self, sessions: &SessionStore, scope: &str) -> Result<usize> {
         let mut recovered = 0usize;
         for turn_id in self.open_turns(scope)? {
@@ -178,7 +186,12 @@ impl TurnBufferStore {
                 .collect();
             messages = fill_missing_tool_results(messages);
             if !messages.is_empty() {
-                sessions.append(&messages)?;
+                let current = sessions.current()?;
+                let existing = sessions.read_segment(&current.file)?;
+                let overlap = appended_prefix(&existing, &messages);
+                if overlap < messages.len() {
+                    sessions.append(&messages[overlap..])?;
+                }
                 recovered += 1;
             }
             self.set_state(&turn_id, TurnState::Committed)?;
@@ -198,6 +211,26 @@ impl TurnBufferStore {
         };
         Ok(serde_json::from_slice(&plain)?)
     }
+}
+
+/// 已写入 transcript 的 pending 前缀长度。
+///
+/// transcript 尾部是本回合已追加的前缀（回合按 scope 串行提交），所以拿
+/// `existing` 的后缀去匹配 `pending` 的前缀；按序列化内容比较，避免给已加密的
+/// transcript 行加 turn_id 字段。
+fn appended_prefix(existing: &[AgentMessage], pending: &[AgentMessage]) -> usize {
+    let max = existing.len().min(pending.len());
+    for length in (1..=max).rev() {
+        let tail = &existing[existing.len() - length..];
+        let head = &pending[..length];
+        let matches = tail.iter().zip(head).all(|(left, right)| {
+            serde_json::to_vec(left).ok() == serde_json::to_vec(right).ok()
+        });
+        if matches {
+            return length;
+        }
+    }
+    0
 }
 
 /// 给没有结果的工具调用补合成错误结果，保证成对。
@@ -425,5 +458,51 @@ mod tests {
         ];
         let filled = fill_missing_tool_results(messages);
         assert_eq!(filled.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn committing_turn_is_recovered() {
+        let (buffer, sessions, _dir) = setup();
+        buffer
+            .append("t4", 0, "shared", &AgentMessage::user("one"))
+            .unwrap();
+        buffer
+            .append("t4", 1, "shared", &AgentMessage::user("two"))
+            .unwrap();
+        buffer.set_state("t4", TurnState::Committing).unwrap();
+        assert!(buffer.open_turns("shared").unwrap().contains(&"t4".to_owned()));
+
+        assert_eq!(buffer.recover_open(&sessions, "shared").await.unwrap(), 1);
+        let current = sessions.current().unwrap();
+        assert_eq!(sessions.read_segment(&current.file).unwrap().len(), 2);
+        assert!(buffer.load("t4").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn partially_appended_committing_turn_is_completed_without_duplicates() {
+        let (buffer, sessions, _dir) = setup();
+        buffer
+            .append("t5", 0, "shared", &AgentMessage::user("one"))
+            .unwrap();
+        buffer
+            .append("t5", 1, "shared", &AgentMessage::user("two"))
+            .unwrap();
+        buffer.set_state("t5", TurnState::Committing).unwrap();
+        // 模拟崩溃：只有第一个块写进了 transcript。
+        sessions
+            .append(&[AgentMessage::user("one")])
+            .unwrap();
+
+        assert_eq!(buffer.recover_open(&sessions, "shared").await.unwrap(), 1);
+        let current = sessions.current().unwrap();
+        let messages = sessions.read_segment(&current.file).unwrap();
+        assert_eq!(messages.len(), 2, "recovery must not duplicate the prefix: {messages:?}");
+        match (&messages[0], &messages[1]) {
+            (AgentMessage::User { text: first, .. }, AgentMessage::User { text: second, .. }) => {
+                assert!(first.contains("one"));
+                assert!(second.contains("two"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }
