@@ -25,7 +25,7 @@ pub enum Risk {
 }
 
 impl Risk {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
             Self::Medium => "medium",
@@ -83,7 +83,11 @@ pub struct SecurityReviewer {
 }
 
 impl SecurityReviewer {
-    pub fn new(provider: Arc<dyn Provider>, model: impl Into<String>, timeout: Duration) -> Self {
+    pub(crate) fn new(
+        provider: Arc<dyn Provider>,
+        model: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
         Self {
             provider,
             model: model.into(),
@@ -100,7 +104,7 @@ impl SecurityReviewer {
     }
 
     /// 检查一段已经渲染好的窗口；超时/失败返回错误，由调用方决定是否放行。
-    pub async fn review(&self, window: &str) -> Result<ReviewOutcome, String> {
+    pub(crate) async fn review(&self, window: &str) -> Result<ReviewOutcome, String> {
         let mut system = self
             .system
             .lock()

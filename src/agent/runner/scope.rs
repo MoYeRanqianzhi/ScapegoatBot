@@ -2,7 +2,7 @@ use super::*;
 
 impl Runner {
     /// 全局历史的句柄（供 runtime 注入与复盘）。
-    pub fn history(&self) -> Arc<Mutex<Vec<AgentMessage>>> {
+    pub(crate) fn history(&self) -> Arc<Mutex<Vec<AgentMessage>>> {
         Arc::clone(&self.history)
     }
 

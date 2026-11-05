@@ -2,7 +2,7 @@ use super::*;
 
 impl Runner {
     /// 控制通道回合；主代理不受并发配额限制，串行化由 turn_lock 负责。
-    pub async fn run_control(&self, text: &str, control_id: i64) -> Result<LoopOutcome> {
+    pub(crate) async fn run_control(&self, text: &str, control_id: i64) -> Result<LoopOutcome> {
         if !self
             .deps
             .ai_enabled
@@ -17,7 +17,7 @@ impl Runner {
     }
 
     /// monitor 投递：以 `[monitor: name | source | time]` 信封进入上下文。
-    pub async fn run_event(
+    pub(crate) async fn run_event(
         &self,
         name: &str,
         source: &str,

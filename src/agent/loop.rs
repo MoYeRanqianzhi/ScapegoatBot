@@ -51,7 +51,7 @@ impl RetryPolicy {
     /// - `fixed`：始终 `base_ms`；
     /// - `stepped`：`base_ms * 2^(attempt-1)`，封顶 `max_ms`；
     /// - provider 返回 `Retry-After` 时优先，不再被 `max_ms` 截断。
-    pub fn delay_ms(&self, attempt: u32, retry_after_ms: Option<u64>) -> u64 {
+    pub(crate) fn delay_ms(&self, attempt: u32, retry_after_ms: Option<u64>) -> u64 {
         if let Some(delay) = retry_after_ms {
             return delay;
         }
@@ -141,20 +141,12 @@ pub struct SteeringQueue {
 }
 
 impl SteeringQueue {
-    pub fn push(&mut self, message: AgentMessage) {
+    pub(crate) fn push(&mut self, message: AgentMessage) {
         self.queue.push_back(message);
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.queue.len()
-    }
-
     /// 取出全部待注入消息。
-    pub fn drain(&mut self) -> Vec<AgentMessage> {
+    pub(crate) fn drain(&mut self) -> Vec<AgentMessage> {
         self.queue.drain(..).collect()
     }
 }
@@ -182,7 +174,8 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         provider: Arc<dyn Provider>,
         tools: Arc<dyn ToolExecutor>,
         gate: Arc<Gate>,
@@ -192,7 +185,7 @@ impl AgentLoop {
     }
 
     /// 带回退链构造。
-    pub fn new_with_fallbacks(
+    pub(crate) fn new_with_fallbacks(
         provider: Arc<dyn Provider>,
         fallbacks: Vec<FallbackProvider>,
         tools: Arc<dyn ToolExecutor>,
@@ -212,7 +205,8 @@ impl AgentLoop {
     ///
     /// `history` 是可变的全量历史；`prompts` 是本次触发追加的消息；
     /// `steering` 在循环中被消费，剩余消息作为 follow-up 开新轮。
-    pub async fn run(
+    #[cfg(test)]
+    pub(crate) async fn run(
         &self,
         history: &mut Vec<AgentMessage>,
         prompts: Vec<AgentMessage>,
@@ -227,7 +221,7 @@ impl AgentLoop {
     ///
     /// 队列在回合运行期间把同 chat 的新消息送进来；每个请求边界都会被排空，
     /// 对应设计 §3.4 的 `steer` 语义。
-    pub async fn run_with_steering(
+    pub(crate) async fn run_with_steering(
         &self,
         history: &mut Vec<AgentMessage>,
         prompts: Vec<AgentMessage>,

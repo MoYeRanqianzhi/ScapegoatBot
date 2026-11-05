@@ -196,7 +196,8 @@ impl Drop for ActiveTurnGuard<'_> {
 impl Runner {
     /// 不带回退链构造。
     #[allow(clippy::too_many_arguments)]
-    pub async fn new(
+    #[cfg(test)]
+    pub(crate) async fn new(
         provider: Arc<dyn Provider>,
         tools: Arc<ToolRegistry>,
         gate: Arc<Gate>,
@@ -230,7 +231,7 @@ impl Runner {
 
     /// 带回退链构造。
     #[allow(clippy::too_many_arguments)]
-    pub async fn new_with_fallbacks(
+    pub(crate) async fn new_with_fallbacks(
         provider: Arc<dyn Provider>,
         fallbacks: Vec<FallbackProvider>,
         tools: Arc<ToolRegistry>,
@@ -318,12 +319,12 @@ impl Runner {
         Ok(runner)
     }
 
-    pub fn is_busy(&self) -> bool {
+    pub(crate) fn is_busy(&self) -> bool {
         self.active_turns.load(std::sync::atomic::Ordering::Relaxed) > 0
     }
 
     /// 当前 system 块快照。
-    pub fn system(&self) -> Vec<SystemBlock> {
+    pub(crate) fn system(&self) -> Vec<SystemBlock> {
         self.system
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -440,12 +441,12 @@ impl Runner {
     /// 作为 `<owner_context source="control:<id>">` 注入并立即跑一个回合；
     /// 不依赖任何 QQ chat，因此 `origin_chat` 标为 `control`。
     /// 共享槽位；runtime 用它实现模型/effort 热切换。
-    pub fn provider_slot(&self) -> SharedProviderSlot {
+    pub(crate) fn provider_slot(&self) -> SharedProviderSlot {
         Arc::clone(&self.slot)
     }
 
     /// 注入子代理 hub；之后嵌套 spawn 才能为子代理注册 `Agent` 工具。
-    pub fn set_hub(&self, hub: Arc<crate::swarm::AgentHub>) {
+    pub(crate) fn set_hub(&self, hub: Arc<crate::swarm::AgentHub>) {
         let _ = self.hub.set(hub);
     }
 

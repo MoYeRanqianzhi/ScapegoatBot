@@ -63,7 +63,8 @@ pub enum ActionDecision {
 }
 
 impl ActionDecision {
-    pub fn is_allowed(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_allowed(&self) -> bool {
         matches!(self, Self::Allow)
     }
 }
@@ -96,7 +97,7 @@ impl ApprovalQueue {
     }
 
     /// 带持久化：重启后未过期的 pending/approved 记录仍然可用。
-    pub fn with_db(db: Arc<Database>) -> Arc<Self> {
+    pub(crate) fn with_db(db: Arc<Database>) -> Arc<Self> {
         let queue = Arc::new(Self {
             db: Some(Arc::clone(&db)),
             ..Self::default()
@@ -303,7 +304,7 @@ impl ApprovalQueue {
     }
 
     /// 批准一个请求；返回可读结果。
-    pub fn approve(&self, id: &str) -> Result<Value, String> {
+    pub(crate) fn approve(&self, id: &str) -> Result<Value, String> {
         let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         self.prune(&mut items);
         let Some(approval) = items.get_mut(id) else {
@@ -333,7 +334,7 @@ impl ApprovalQueue {
     }
 
     /// 拒绝一个请求。
-    pub fn reject(&self, id: &str) -> Result<Value, String> {
+    pub(crate) fn reject(&self, id: &str) -> Result<Value, String> {
         let mut items = self.items.lock().unwrap_or_else(|e| e.into_inner());
         self.prune(&mut items);
         if items.remove(id).is_none() {
@@ -346,7 +347,7 @@ impl ApprovalQueue {
     }
 
     /// 当前待确认数量（`status` 用）。
-    pub fn pending_count(&self) -> usize {
+    pub(crate) fn pending_count(&self) -> usize {
         self.pending().len()
     }
 }
@@ -538,32 +539,19 @@ impl ActionGate {
         self.approvals.nonce_for(id)
     }
 
-    pub fn with_chat_send_limit(mut self, limit: u32) -> Self {
+    pub(crate) fn with_chat_send_limit(mut self, limit: u32) -> Self {
         self.chat_send_limit = limit;
         self
     }
 
-    pub fn with_reviewer(mut self, reviewer: Arc<dyn ActionReviewer>) -> Self {
+    pub(crate) fn with_reviewer(mut self, reviewer: Arc<dyn ActionReviewer>) -> Self {
         self.reviewer = Some(reviewer);
         self
     }
 
-    pub fn with_db(mut self, db: Arc<Database>) -> Self {
+    pub(crate) fn with_db(mut self, db: Arc<Database>) -> Self {
         self.db = Some(db);
         self
-    }
-
-    pub fn approvals(&self) -> &Arc<ApprovalQueue> {
-        &self.approvals
-    }
-
-    /// 当前模式（`/system/gate` 用）。
-    pub fn mode(&self) -> GateMode {
-        self.mode
-    }
-
-    pub fn llm_review(&self) -> bool {
-        self.llm_review
     }
 
     fn record_audit(&self, action: &str, allowed: bool, reason: &str) {
@@ -724,7 +712,7 @@ impl ActionGate {
 
     /// 记录一次**成功**的发送；失败/超时不应触发重复与跨群规则，
     /// 否则一次临时错误会让重试被自己的记录挡住。
-    pub fn note_send(&self, params: &Value, chat: &str) {
+    pub(crate) fn note_send(&self, params: &Value, chat: &str) {
         let content = message_content(params);
         if content.trim().is_empty() {
             return;
@@ -740,7 +728,7 @@ impl ActionGate {
     }
 
     /// 执行一次门禁判定。
-    pub async fn check(
+    pub(crate) async fn check(
         &self,
         spec: &ActionSpec,
         params: &Value,

@@ -69,7 +69,7 @@ pub struct ChatQueue {
 }
 
 impl ChatQueue {
-    pub fn new(config: QueueConfig, handler: Arc<dyn TurnHandler>) -> Arc<Self> {
+    pub(crate) fn new(config: QueueConfig, handler: Arc<dyn TurnHandler>) -> Arc<Self> {
         let max = config.max_concurrent.max(1);
         Arc::new(Self {
             config: std::sync::RwLock::new(config),
@@ -81,7 +81,7 @@ impl ChatQueue {
     }
 
     /// 热更新队列参数；`max_concurrent` 的信号量不会缩小，需重启生效。
-    pub fn reload_config(&self, config: QueueConfig) {
+    pub(crate) fn reload_config(&self, config: QueueConfig) {
         *self.config.write().expect("queue config lock poisoned") = config;
     }
 
@@ -94,7 +94,7 @@ impl ChatQueue {
     }
 
     /// 注入一条已通过过滤器的消息。
-    pub async fn ingest(self: &Arc<Self>, message: QqMessage) {
+    pub(crate) async fn ingest(self: &Arc<Self>, message: QqMessage) {
         let chat = message.chat;
         let config = self.config();
         let mut states = self.states.lock().await;
@@ -240,7 +240,8 @@ impl ChatQueue {
     }
 
     /// 当前待处理消息数（测试与 status 使用）。
-    pub async fn pending(&self, chat: ChatId) -> usize {
+    #[cfg(test)]
+    pub(crate) async fn pending(&self, chat: ChatId) -> usize {
         self.states
             .lock()
             .await
@@ -250,7 +251,7 @@ impl ChatQueue {
     }
 
     /// 正在运行的回合数。
-    pub async fn active_turns(&self) -> usize {
+    pub(crate) async fn active_turns(&self) -> usize {
         self.states
             .lock()
             .await
@@ -260,7 +261,7 @@ impl ChatQueue {
     }
 
     /// 没有运行中的回合、没有待派发批次、没有排队消息。
-    pub async fn is_idle(&self) -> bool {
+    pub(crate) async fn is_idle(&self) -> bool {
         self.states.lock().await.values().all(|state| {
             state.active.is_none() && state.pending.is_empty() && state.pending_batches == 0
         })

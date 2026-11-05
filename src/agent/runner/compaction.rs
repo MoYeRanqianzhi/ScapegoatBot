@@ -44,7 +44,7 @@ impl Runner {
     }
 
     /// 清空上下文：轮转唯一 transcript，并清空内存历史。
-    pub async fn clear_all_context(&self) -> Result<serde_json::Value> {
+    pub(crate) async fn clear_all_context(&self) -> Result<serde_json::Value> {
         let _ = self
             .fire_hooks(crate::config::HookEvent::SessionEnd, None, None)
             .await;
@@ -76,12 +76,17 @@ impl Runner {
     /// 立即压缩：摘要旧消息，轮转新分段，写入摘要与保留窗口。
     ///
     /// 设计 §8.1：摘要块固定包含 `previous_session`，当前分段的路径由 runtime 注入。
-    pub async fn compact_now(&self, reason: &str) -> Result<serde_json::Value> {
+    #[cfg(test)]
+    pub(crate) async fn compact_now(&self, reason: &str) -> Result<serde_json::Value> {
         self.compact_chat(reason, ChatId::Private(self.config.owner_qq))
             .await
     }
 
-    pub async fn compact_chat(&self, reason: &str, chat: ChatId) -> Result<serde_json::Value> {
+    pub(crate) async fn compact_chat(
+        &self,
+        reason: &str,
+        chat: ChatId,
+    ) -> Result<serde_json::Value> {
         let history = self.history_for(chat).await;
         let sessions = self.session_for(chat).await;
         self.compact_scope(reason, history, sessions).await
