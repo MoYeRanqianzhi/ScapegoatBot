@@ -41,7 +41,7 @@
 
 - [x] `queue.cap_batches` 已删除（d807e4c）。
 - [x] `agent.compact` 支持可选 `chat` 参数（2608061）。
-- [x] 本地 tag `v0.2.0-alpha.35` 已创建，CHANGELOG 已更新到 372 测试。
+- [x] 本地 tag `v0.2.0-alpha.35` 已创建；CHANGELOG 更新到 372 测试；本地 `cargo build --release` 通过（12 MB，`sbot --version` 正确）。
 - [ ] push tag / GitHub release / 服务器部署需用户确认；服务器 `sbot.service` 仍停止。
 - [ ] 历史重写后其他 clone 必须重新 clone 或
       `git fetch --all --prune --tags --force && git reset --hard origin/main`；旧 SHA 失效。
@@ -72,4 +72,5 @@
 - [x] storage/session 的 `pub fn` 已降为 `pub(crate)`，全仓 `pub fn` 381→332（48ed2b2）。
 - [x] agent/security 方法已降为 `pub(crate)`，只为外部测试保留 `ActionGate/ApprovalQueue/JevJudge` 构造器；全仓 `pub fn` 332→287（0eedbca）。
 - [x] `tools` 方法已降为 `pub(crate)`，只为集成测试保留 `ApiTool::new/with_action_gate`、`ToolContext::new`；全仓 `pub fn` 287→246（5ce2684）。
+- [x] `#[allow(dead_code)]` 清零（10→0），删除 `Secret::raw` 与 `SbotPaths` 四个未用路径 helper（6b3ed9c）。
 - [x] hold 语义修正：只拒绝 QQ 操作（`napcat.*`），MCP/下载/Web 不再被 hold 拦截（d21eed4）。
