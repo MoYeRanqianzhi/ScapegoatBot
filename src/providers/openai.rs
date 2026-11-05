@@ -7,27 +7,19 @@
 //! - 流事件带 `response.*` 前缀；
 //! - 用量在 `response.completed` 里。
 
-use std::sync::Arc;
-
-use futures_util::StreamExt;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 
 use crate::config::models::Protocol;
 use crate::llm::types::{RefusalDetails, StopReason, Usage};
 
-use super::sse::{SseParser, Utf8Stream};
 use super::{
-    ContentBlock, EventReceiver, LlmRequest, Provider, ProviderError, ProviderErrorKind,
-    ProviderEvent, Role, ThinkingOptions,
+    Auth, ContentBlock, EventReceiver, HttpProviderCore, LlmRequest, Provider, ProviderError,
+    ProviderErrorKind, ProviderEvent, Role, ThinkingOptions,
 };
 
 /// Responses provider。
 pub struct OpenAiProvider {
-    client: reqwest::Client,
-    base_url: String,
-    api_key: String,
-    model_id: String,
+    core: HttpProviderCore,
 }
 
 impl OpenAiProvider {
@@ -37,15 +29,8 @@ impl OpenAiProvider {
         model_id: impl Into<String>,
         timeout_secs: u64,
     ) -> Result<Self, ProviderError> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
-            .build()
-            .map_err(|error| ProviderError::new(ProviderErrorKind::Config, error.to_string()))?;
         Ok(Self {
-            client,
-            base_url: base_url.into(),
-            api_key: api_key.into(),
-            model_id: model_id.into(),
+            core: HttpProviderCore::new(base_url, api_key, model_id, timeout_secs)?,
         })
     }
 
@@ -327,6 +312,22 @@ impl StreamState {
     }
 }
 
+impl super::StreamDecoder for StreamState {
+    fn decode(&mut self, event: super::sse::SseEvent) -> Vec<ProviderEvent> {
+        self.handle(&event.data)
+    }
+
+    fn finish(&mut self) -> Vec<ProviderEvent> {
+        if self.stop_sent {
+            return Vec::new();
+        }
+        vec![ProviderEvent::Error(ProviderError::new(
+            ProviderErrorKind::Network,
+            "stream ended without a stop event",
+        ))]
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for OpenAiProvider {
     fn protocol(&self) -> Protocol {
@@ -334,110 +335,14 @@ impl Provider for OpenAiProvider {
     }
 
     fn model_id(&self) -> &str {
-        &self.model_id
+        self.core.model_id()
     }
 
     async fn stream(&self, request: LlmRequest) -> Result<EventReceiver, ProviderError> {
-        let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
         let body = Self::build_body(&request);
-
-        let response = self
-            .client
-            .post(url)
-            .header("authorization", format!("Bearer {}", self.api_key))
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
+        self.core
+            .send_stream("/responses", Auth::Bearer, &body, StreamState::default())
             .await
-            .map_err(|error| ProviderError::new(ProviderErrorKind::Network, error.to_string()))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let headers = response.headers().clone();
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::from_response(
-                status.as_u16(),
-                Some(&headers),
-                &text,
-            ));
-        }
-
-        let (tx, rx) = mpsc::channel(256);
-        tokio::spawn(async move {
-            pump(response, tx).await;
-        });
-        Ok(rx)
-    }
-}
-
-async fn pump(response: reqwest::Response, tx: mpsc::Sender<ProviderEvent>) {
-    let mut stream = response.bytes_stream();
-    let mut parser = SseParser::new();
-    // 网络 chunk 可能切在多字节字符中间，必须做增量解码。
-    let mut decoder = Utf8Stream::new();
-    let mut state = StreamState::default();
-    let sender = Arc::new(tx);
-
-    loop {
-        let chunk =
-            match tokio::time::timeout(std::time::Duration::from_secs(30), stream.next()).await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break,
-                Err(_) => {
-                    let _ = sender
-                        .send(ProviderEvent::Error(ProviderError::new(
-                            ProviderErrorKind::Network,
-                            "stream idle timeout (30s)",
-                        )))
-                        .await;
-                    return;
-                }
-            };
-        let bytes = match chunk {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let _ = sender
-                    .send(ProviderEvent::Error(ProviderError::new(
-                        ProviderErrorKind::Network,
-                        error.to_string(),
-                    )))
-                    .await;
-                return;
-            }
-        };
-        let text = decoder.push(&bytes);
-        for event in parser.push(&text) {
-            for outgoing in state.handle(&event.data) {
-                if sender.send(outgoing).await.is_err() {
-                    return;
-                }
-            }
-        }
-    }
-    let tail = decoder.finish();
-    if !tail.is_empty() {
-        for event in parser.push(&tail) {
-            for outgoing in state.handle(&event.data) {
-                if sender.send(outgoing).await.is_err() {
-                    return;
-                }
-            }
-        }
-    }
-    for event in parser.finish() {
-        for outgoing in state.handle(&event.data) {
-            if sender.send(outgoing).await.is_err() {
-                return;
-            }
-        }
-    }
-    if !state.stop_sent {
-        let _ = sender
-            .send(ProviderEvent::Error(ProviderError::new(
-                ProviderErrorKind::Network,
-                "stream ended without a stop event",
-            )))
-            .await;
     }
 }
 

@@ -8,27 +8,19 @@
 //! - 工具结果用 `role: "tool"` + `tool_call_id`；
 //! - 没有服务端工具，web 工具只能走用户配置的 HTTP 后端。
 
-use std::sync::Arc;
-
-use futures_util::StreamExt;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 
 use crate::config::models::Protocol;
 use crate::llm::types::{StopReason, Usage};
 
-use super::sse::{SseParser, Utf8Stream};
 use super::{
-    ContentBlock, EventReceiver, LlmRequest, Provider, ProviderError, ProviderErrorKind,
-    ProviderEvent, Role, ThinkingOptions, map_stop_reason,
+    Auth, ContentBlock, EventReceiver, HttpProviderCore, LlmRequest, Provider, ProviderError,
+    ProviderErrorKind, ProviderEvent, Role, ThinkingOptions, map_stop_reason,
 };
 
 /// Chat Completions provider。
 pub struct ChatProvider {
-    client: reqwest::Client,
-    base_url: String,
-    api_key: String,
-    model_id: String,
+    core: HttpProviderCore,
 }
 
 impl ChatProvider {
@@ -38,15 +30,8 @@ impl ChatProvider {
         model_id: impl Into<String>,
         timeout_secs: u64,
     ) -> Result<Self, ProviderError> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs.max(1)))
-            .build()
-            .map_err(|error| ProviderError::new(ProviderErrorKind::Config, error.to_string()))?;
         Ok(Self {
-            client,
-            base_url: base_url.into(),
-            api_key: api_key.into(),
-            model_id: model_id.into(),
+            core: HttpProviderCore::new(base_url, api_key, model_id, timeout_secs)?,
         })
     }
 
@@ -320,6 +305,29 @@ impl StreamState {
     }
 }
 
+impl super::StreamDecoder for StreamState {
+    fn decode(&mut self, event: super::sse::SseEvent) -> Vec<ProviderEvent> {
+        self.handle(&event.data)
+    }
+
+    /// Chat 兼容服务的 `finish_reason` 可能先到、`[DONE]` 后到；这里补发延迟的
+    /// stop，而不是把它当成“没有 stop”的错误。
+    fn finish(&mut self) -> Vec<ProviderEvent> {
+        if self.stop_sent {
+            return Vec::new();
+        }
+        if self.stop_reason.is_some() {
+            let mut out = Vec::new();
+            self.emit_stop(&mut out);
+            return out;
+        }
+        vec![ProviderEvent::Error(ProviderError::new(
+            ProviderErrorKind::Network,
+            "stream ended without finish_reason",
+        ))]
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for ChatProvider {
     fn protocol(&self) -> Protocol {
@@ -327,118 +335,19 @@ impl Provider for ChatProvider {
     }
 
     fn model_id(&self) -> &str {
-        &self.model_id
+        self.core.model_id()
     }
 
     async fn stream(&self, request: LlmRequest) -> Result<EventReceiver, ProviderError> {
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
         let body = Self::build_body(&request);
-
-        let response = self
-            .client
-            .post(url)
-            .header("authorization", format!("Bearer {}", self.api_key))
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
+        self.core
+            .send_stream(
+                "/chat/completions",
+                Auth::Bearer,
+                &body,
+                StreamState::default(),
+            )
             .await
-            .map_err(|error| ProviderError::new(ProviderErrorKind::Network, error.to_string()))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let headers = response.headers().clone();
-            let text = response.text().await.unwrap_or_default();
-            return Err(ProviderError::from_response(
-                status.as_u16(),
-                Some(&headers),
-                &text,
-            ));
-        }
-
-        let (tx, rx) = mpsc::channel(256);
-        tokio::spawn(async move {
-            pump(response, tx).await;
-        });
-        Ok(rx)
-    }
-}
-
-async fn pump(response: reqwest::Response, tx: mpsc::Sender<ProviderEvent>) {
-    let mut stream = response.bytes_stream();
-    let mut parser = SseParser::new();
-    // 网络 chunk 可能切在多字节字符中间，必须做增量解码。
-    let mut decoder = Utf8Stream::new();
-    let mut state = StreamState::default();
-    let sender = Arc::new(tx);
-
-    loop {
-        let chunk =
-            match tokio::time::timeout(std::time::Duration::from_secs(30), stream.next()).await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break,
-                Err(_) => {
-                    let _ = sender
-                        .send(ProviderEvent::Error(ProviderError::new(
-                            ProviderErrorKind::Network,
-                            "stream idle timeout (30s)",
-                        )))
-                        .await;
-                    return;
-                }
-            };
-        let bytes = match chunk {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let _ = sender
-                    .send(ProviderEvent::Error(ProviderError::new(
-                        ProviderErrorKind::Network,
-                        error.to_string(),
-                    )))
-                    .await;
-                return;
-            }
-        };
-        let text = decoder.push(&bytes);
-        for event in parser.push(&text) {
-            for outgoing in state.handle(&event.data) {
-                if sender.send(outgoing).await.is_err() {
-                    return;
-                }
-            }
-        }
-    }
-    let tail = decoder.finish();
-    if !tail.is_empty() {
-        for event in parser.push(&tail) {
-            for outgoing in state.handle(&event.data) {
-                if sender.send(outgoing).await.is_err() {
-                    return;
-                }
-            }
-        }
-    }
-    for event in parser.finish() {
-        for outgoing in state.handle(&event.data) {
-            if sender.send(outgoing).await.is_err() {
-                return;
-            }
-        }
-    }
-    if !state.stop_sent {
-        if state.stop_reason.is_some() {
-            let mut tail = Vec::new();
-            state.emit_stop(&mut tail);
-            for outgoing in tail {
-                let _ = sender.send(outgoing).await;
-            }
-        } else {
-            let _ = sender
-                .send(ProviderEvent::Error(ProviderError::new(
-                    ProviderErrorKind::Network,
-                    "stream ended without finish_reason",
-                )))
-                .await;
-        }
     }
 }
 
