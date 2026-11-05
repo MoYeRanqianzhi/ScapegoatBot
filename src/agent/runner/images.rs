@@ -400,4 +400,13 @@ mod tests {
         assert_eq!(mime_for_bytes(&jpeg), "image/jpeg");
         assert_eq!(mime_for_bytes(b"not an image"), "image/jpeg");
     }
+
+    #[test]
+    fn quoted_image_parser_has_a_depth_limit() {
+        let mut value = serde_json::json!({"type": "image", "data": {"file": "deep.png"}});
+        for _ in 0..20 {
+            value = serde_json::json!({"data": value});
+        }
+        assert!(image_segments_from_value(&value).is_empty());
+    }
 }
