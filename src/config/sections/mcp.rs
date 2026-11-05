@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
+use super::{ConfigError, non_empty};
 
 // ---------------------------------------------------------------------------
 // [mcp]
@@ -21,23 +21,14 @@ impl McpConfig {
         let mut seen = HashSet::new();
         for (index, server) in self.servers.iter().enumerate() {
             let field = format!("mcp.servers[{index}]");
-            if server.name.trim().is_empty() {
-                errors.push(ConfigError::new(
-                    format!("{field}.name"),
-                    "must not be empty",
-                ));
-            } else if !seen.insert(server.name.as_str()) {
+            non_empty(errors, format!("{field}.name"), &server.name);
+            if !server.name.trim().is_empty() && !seen.insert(server.name.as_str()) {
                 errors.push(ConfigError::new(
                     format!("{field}.name"),
                     format!("{:?} is listed more than once", server.name),
                 ));
             }
-            if server.command.trim().is_empty() {
-                errors.push(ConfigError::new(
-                    format!("{field}.command"),
-                    "must not be empty",
-                ));
-            }
+            non_empty(errors, format!("{field}.command"), &server.command);
         }
         if self.enabled && self.servers.iter().all(|server| !server.enabled) {
             errors.push(ConfigError::new(

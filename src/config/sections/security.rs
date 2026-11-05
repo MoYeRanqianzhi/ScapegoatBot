@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
+use super::{ConfigError, non_zero};
 
 // ---------------------------------------------------------------------------
 // [security]
@@ -114,12 +114,11 @@ impl Default for SecurityConfig {
 
 impl SecurityConfig {
     pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
-        if self.check_timeout_secs == 0 {
-            errors.push(ConfigError::new(
-                "security.check_timeout_secs",
-                "must be greater than zero",
-            ));
-        }
+        non_zero(
+            errors,
+            "security.check_timeout_secs",
+            self.check_timeout_secs,
+        );
         self.guard.validate(errors);
     }
 }

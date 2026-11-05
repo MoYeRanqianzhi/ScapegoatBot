@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
+use super::{ConfigError, non_zero};
 
 // ---------------------------------------------------------------------------
 // [gate]
@@ -38,11 +38,10 @@ impl Default for GateConfig {
 
 impl GateConfig {
     pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
-        if self.max_per_minute == 0 {
-            errors.push(ConfigError::new(
-                "gate.max_per_minute",
-                "must be greater than zero",
-            ));
-        }
+        non_zero(
+            errors,
+            "gate.max_per_minute",
+            u64::from(self.max_per_minute),
+        );
     }
 }

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
+use super::{ConfigError, non_empty, non_zero};
 
 // ---------------------------------------------------------------------------
 // [swarm]
@@ -35,12 +35,8 @@ impl SwarmConfig {
             ("swarm.max_concurrency", self.max_concurrency),
             ("swarm.default_max_steps", self.default_max_steps),
         ] {
-            if value == 0 {
-                errors.push(ConfigError::new(field, "must be greater than zero"));
-            }
+            non_zero(errors, field, u64::from(value));
         }
-        if self.agents_dir.trim().is_empty() {
-            errors.push(ConfigError::new("swarm.agents_dir", "must not be empty"));
-        }
+        non_empty(errors, "swarm.agents_dir", &self.agents_dir);
     }
 }

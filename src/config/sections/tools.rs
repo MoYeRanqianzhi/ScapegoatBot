@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
+use super::{ConfigError, non_zero};
 
 // ---------------------------------------------------------------------------
 // [tools]
@@ -102,18 +102,16 @@ impl Default for ToolsConfig {
 
 impl ToolsConfig {
     pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
-        if self.max_result_bytes == 0 {
-            errors.push(ConfigError::new(
-                "tools.max_result_bytes",
-                "must be greater than zero",
-            ));
-        }
-        if self.max_schema_tokens == 0 {
-            errors.push(ConfigError::new(
-                "tools.max_schema_tokens",
-                "must be greater than zero",
-            ));
-        }
+        non_zero(
+            errors,
+            "tools.max_result_bytes",
+            self.max_result_bytes as u64,
+        );
+        non_zero(
+            errors,
+            "tools.max_schema_tokens",
+            self.max_schema_tokens as u64,
+        );
         if self.web_search.backend == WebBackend::Tool && self.web_search.base_url.trim().is_empty()
         {
             errors.push(ConfigError::new(
@@ -127,23 +125,16 @@ impl ToolsConfig {
                 "is required when backend = \"tool\"",
             ));
         }
-        if self.web_search.count == 0 {
-            errors.push(ConfigError::new(
-                "tools.web_search.count",
-                "must be greater than zero",
-            ));
-        }
-        if self.web_fetch.max_content_tokens == 0 {
-            errors.push(ConfigError::new(
-                "tools.web_fetch.max_content_tokens",
-                "must be greater than zero",
-            ));
-        }
-        if self.download.max_bytes == 0 {
-            errors.push(ConfigError::new(
-                "tools.download.max_bytes",
-                "must be greater than zero",
-            ));
-        }
+        non_zero(
+            errors,
+            "tools.web_search.count",
+            u64::from(self.web_search.count),
+        );
+        non_zero(
+            errors,
+            "tools.web_fetch.max_content_tokens",
+            u64::from(self.web_fetch.max_content_tokens),
+        );
+        non_zero(errors, "tools.download.max_bytes", self.download.max_bytes);
     }
 }

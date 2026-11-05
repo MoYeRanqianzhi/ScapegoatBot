@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
+use super::{ConfigError, non_empty, non_zero};
 
 // ---------------------------------------------------------------------------
 // [skills]
@@ -28,20 +28,16 @@ impl Default for SkillsConfig {
 
 impl SkillsConfig {
     pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
-        if self.shared_dir.trim().is_empty() {
-            errors.push(ConfigError::new("skills.shared_dir", "must not be empty"));
-        }
-        if self.curator_interval_hours == 0 {
-            errors.push(ConfigError::new(
-                "skills.curator_interval_hours",
-                "must be greater than zero",
-            ));
-        }
-        if self.curator_min_new_skills == 0 {
-            errors.push(ConfigError::new(
-                "skills.curator_min_new_skills",
-                "must be greater than zero",
-            ));
-        }
+        non_empty(errors, "skills.shared_dir", &self.shared_dir);
+        non_zero(
+            errors,
+            "skills.curator_interval_hours",
+            u64::from(self.curator_interval_hours),
+        );
+        non_zero(
+            errors,
+            "skills.curator_min_new_skills",
+            u64::from(self.curator_min_new_skills),
+        );
     }
 }
