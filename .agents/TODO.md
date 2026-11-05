@@ -53,7 +53,11 @@
 - [x] MessageStore 读路径：按文件批量解码，load_indexed/rebuild_index 不再逐行重读（本次）。
 - [x] transcript 恢复上界改用 message_count；扫描候选改为物理位置 ±64 优先、每行上限 128（本次）。
 - [x] steering 早退落库只写 transcript，由 pending_history 注入一次（8f92843）。
-- [ ] 冗余大头：provider pump 外壳 180-220 行、5 份 complete_text 90-120 行、
-      monitor 三组复制 55-75 行、session/messages 信封 60-80 行。
-- [ ] 上帝对象残留：Runner 25 字段/1073 行、ApiTool、Assembly build_agent 18 参、
-      Monitor 23 字段/add 17 参、VfsStore 39 方法；7 对模块 2-循环（providers→agent 最应优先解）。
+- [x] provider `HttpProviderCore`/`pump` 外壳合并；5 份 `complete_text`/`truncate_chars` 合并（e41f5a8）。
+- [ ] monitor 内部仍有 lookup/limit/system_delivery 三组复制（本次只改了 add 的 MonitorSpec）。
+- [ ] session/messages 加密信封 60-80 行仍可抽 `storage/envelope.rs`。
+- [x] `build_agent` 18 参改 `AgentInputs`；`MonitorManager::add` 16 参改 `MonitorSpec`（16e97b8/44e7f6e）。
+- [x] providers→agent 循环依赖已解：`Usage/StopReason/RefusalDetails` 移到 `src/llm/types.rs`（2a0f851）。
+- [ ] 其余 6 对模块 2-循环（agent↔tools/providers/session/security/memory/swarm、security↔tools）仍在。
+- [ ] 上帝对象仍存：Runner 25 字段、ApiTool `execute`、VfsStore 39 方法（未拆）。
+- [x] hold 语义修正：只拒绝 QQ 操作（`napcat.*`），MCP/下载/Web 不再被 hold 拦截（d21eed4）。
