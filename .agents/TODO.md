@@ -33,8 +33,9 @@
 ## 结构
 
 - [x] `src/app.rs` 拆为 `src/app/{mod,assembly,events,bootstrap}.rs`（45155bd）。
-- [ ] `src/agent/runner.rs` 3132 行 / 25 字段仍是上帝对象，待拆 scope/compact/injected/images/review。
-- [ ] `src/config/sections.rs` 1876 行拆分在 `refactor/cleanup` 分支，待合并。
+- [x] `src/agent/runner.rs` 已拆为 `runner/{scope,compaction,review,injected,images,evidence}.rs`（7de8177），
+      `runner.rs` 从 3229 行降到 2295 行。
+- [x] `src/config/sections.rs` 已拆为 `src/config/sections/` 19 个 section 文件（e0a4121）。
 
 ## P2 / 发布
 
