@@ -231,7 +231,10 @@ impl Default for MonitorConfig {
 }
 
 /// 校验全部 monitor；错误带 `monitor[i]` 位置。
-pub(in crate::config) fn validate_monitors(monitors: &[MonitorConfig], errors: &mut Vec<ConfigError>) {
+pub(in crate::config) fn validate_monitors(
+    monitors: &[MonitorConfig],
+    errors: &mut Vec<ConfigError>,
+) {
     let mut names = HashSet::new();
     for (index, monitor) in monitors.iter().enumerate() {
         let field = format!("monitor[{index}]");

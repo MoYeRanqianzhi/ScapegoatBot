@@ -185,7 +185,11 @@ impl AgentConfig {
     }
 
     /// 需要模型清单的校验。
-    pub(in crate::config) fn validate_with_models(&self, models: &ModelsFile, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate_with_models(
+        &self,
+        models: &ModelsFile,
+        errors: &mut Vec<ConfigError>,
+    ) {
         let Some(model) = models.find(&self.model) else {
             errors.push(ConfigError::new(
                 "agent.model",
