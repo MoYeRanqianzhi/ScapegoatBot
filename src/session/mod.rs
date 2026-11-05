@@ -224,8 +224,20 @@ impl SessionStore {
             .context("transcript header has no file_id")?
             .to_owned();
 
+        // AAD 行号按写入时的 message_count 生成（append 用 count+1）；删除行后物理
+        // 行数会小于最大行号。扫描上界取两者较大值，避免删掉 ≥2 行后仍漏掉后半段。
+        let recorded_count: usize = self
+            .db
+            .lock()
+            .query_row(
+                "SELECT message_count FROM transcript_files WHERE file = ?1",
+                [file_name],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+            .max(0) as usize;
         let mut messages = Vec::with_capacity(lines.len().saturating_sub(1));
-        let max_line = lines.len();
+        let max_line = lines.len().max(recorded_count);
         for (line_no, line) in lines.iter().enumerate().skip(1) {
             match self.decode_line(line, &file_id, line_no, max_line) {
                 Ok(message) => messages.push(message),

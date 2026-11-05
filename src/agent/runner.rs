@@ -507,9 +507,9 @@ impl Runner {
             let turn_lock = self.turn_lock_for(chat).await;
             let _turn_guard = turn_lock.lock().await;
             let sessions = self.session_for(chat).await;
-            let history = self.history_for(chat).await;
+            // 只写 transcript：下一回合的 pending_history 会把“上次回复以来”的消息
+            // 作为上下文注入，若这里同时写 history，同一文本会出现两遍。
             sessions.append(&leftover)?;
-            history.lock().await.extend(leftover);
         }
         result
     }
@@ -1563,14 +1563,16 @@ mod tests {
             "steering message missing from transcript: {transcript:?}"
         );
 
+        // 只落 transcript；下一回合由 pending_history 注入，避免同一文本在
+        // history 与 [chat history since your last reply] 里出现两遍。
         let history = runner.history_for(chat).await;
         let history = history.lock().await;
         assert!(
-            history.iter().any(|message| matches!(
+            !history.iter().any(|message| matches!(
                 message,
                 AgentMessage::User { text, .. } if text.contains("steering survives")
             )),
-            "steering message missing from history: {history:?}"
+            "steering message must not be duplicated into history: {history:?}"
         );
     }
 
