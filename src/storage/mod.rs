@@ -375,7 +375,7 @@ impl Database {
 
     /// 顺序应用未执行的迁移。
     fn apply_migrations(&self) -> Result<()> {
-        let mut conn = self.conn.lock().expect("database mutex poisoned");
+        let mut conn = self.lock();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                  version    INTEGER PRIMARY KEY,
@@ -410,7 +410,7 @@ impl Database {
 
     /// 当前迁移版本，供 `sbot doctor` 与测试使用。
     pub fn schema_version(&self) -> Result<u32> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.lock();
         Ok(conn.query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
             [],
@@ -420,7 +420,7 @@ impl Database {
 
     /// 读取元数据。
     pub fn meta_get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.lock();
         Ok(conn
             .query_row(
                 "SELECT value FROM meta WHERE key = ?1",
@@ -438,7 +438,7 @@ impl Database {
         actor: Option<u64>,
         payload: &[u8],
     ) -> Result<()> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.lock();
         conn.execute(
             "INSERT INTO event_audit (kind, chat, actor, payload_enc, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -449,7 +449,7 @@ impl Database {
 
     /// 最近的事件审计行。
     pub fn recent_events(&self, limit: usize) -> Result<Vec<EventAuditRow>> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.lock();
         let mut statement = conn.prepare(
             "SELECT kind, chat, actor, payload_enc, created_at FROM event_audit
              ORDER BY id DESC LIMIT ?1",
@@ -468,7 +468,7 @@ impl Database {
 
     /// 写入元数据（覆盖）。
     pub fn meta_set(&self, key: &str, value: &[u8]) -> Result<()> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.lock();
         conn.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -479,7 +479,7 @@ impl Database {
 
     /// 写入/覆盖一条 gate 审批记录（只存参数哈希，不存原文）。
     pub fn save_gate_approval(&self, row: &GateApprovalRow) -> Result<()> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.lock();
         conn.execute(
             "INSERT INTO gate_approvals
              (id, action, summary, params_hash, nonce, status, created_at, approved_until)
@@ -503,7 +503,7 @@ impl Database {
 
     /// 读取全部 gate 审批记录（启动恢复用）。
     pub fn gate_approvals(&self) -> Result<Vec<GateApprovalRow>> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.lock();
         let mut statement = conn.prepare(
             "SELECT id, action, summary, params_hash, nonce, status, created_at, approved_until
              FROM gate_approvals ORDER BY created_at ASC",
@@ -526,14 +526,14 @@ impl Database {
 
     /// 删除一条 gate 审批记录。
     pub fn delete_gate_approval(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.lock();
         conn.execute("DELETE FROM gate_approvals WHERE id = ?1", params![id])?;
         Ok(())
     }
 
     /// 记录一次媒体来源（已有记录不覆盖）。
     pub fn record_media_origin(&self, origin: &str, chat: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.lock();
         conn.execute(
             "INSERT INTO media_origins (origin, chat, seen_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(origin) DO NOTHING",
@@ -544,7 +544,7 @@ impl Database {
 
     /// 媒体第一次出现的 chat；没有记录返回 `None`。
     pub fn media_origin(&self, origin: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.lock();
         Ok(conn
             .query_row(
                 "SELECT chat FROM media_origins WHERE origin = ?1",
@@ -581,7 +581,7 @@ impl Database {
 
     /// 查询幂等结果。
     pub fn idempotency_get(&self, key: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.lock();
         Ok(conn
             .query_row(
                 "SELECT response FROM idempotency WHERE key = ?1",
@@ -593,7 +593,7 @@ impl Database {
 
     /// 记录幂等结果。
     pub fn idempotency_put(&self, key: &str, response: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.lock();
         conn.execute(
             "INSERT INTO idempotency (key, response, created_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO NOTHING",
@@ -612,7 +612,7 @@ impl Database {
 
     /// 写入一条控制通道输入，返回自增 id。
     pub fn insert_control_input(&self, text_enc: &[u8], actor: &str) -> Result<i64> {
-        let conn = self.conn.lock().expect("database mutex poisoned");
+        let conn = self.lock();
         conn.execute(
             "INSERT INTO control_inputs (text_enc, actor, created_at) VALUES (?1, ?2, ?3)",
             params![text_enc, actor, now_rfc3339()],
