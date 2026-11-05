@@ -504,21 +504,23 @@ pub fn specs() -> &'static [ActionSpec] {
             ("agent.status", "Hold state, recent verdicts, budget usage and scopes."),
             ("agent.resume", "Re-check the current context; clears the hold when it passes."),
             ("agent.quarantine", "Move a suspicious excerpt into /quarantine/ and mark it non-executable."),
-            ("agent.compact", "Run compaction now."),
+            ("agent.compact", "Run compaction now; `chat` chooses the session to compact."),
             ("agent.clear_context", "Discard the in-memory context and start a new segment."),
         ] {
             list.push(ActionSpec {
                 action,
                 category: Category::Agent,
                 summary,
-                params: if action == "agent.quarantine" {
-                    json!({
+                params: match action {
+                    "agent.quarantine" => json!({
                         "message_id": {"type": "number"},
                         "text": {"type": "string"},
                         "reason": {"type": "string"}
-                    })
-                } else {
-                    json!({})
+                    }),
+                    "agent.compact" => json!({
+                        "chat": {"type": "string"}
+                    }),
+                    _ => json!({}),
                 },
                 returns: "JSON object.",
                 requires_owner_intent: false,
