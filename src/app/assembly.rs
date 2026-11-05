@@ -460,27 +460,70 @@ async fn install_wake_presets(monitors: &Arc<MonitorManager>, db: &Arc<Database>
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn build_agent(
-    loaded: &LoadedConfig,
-    config_handle: Arc<RwLock<LoadedConfig>>,
-    models: &ModelsFile,
-    auth: &AuthFile,
-    db: Arc<Database>,
-    key: Arc<crate::storage::crypto::MasterKey>,
-    vfs: Arc<VfsStore>,
-    messages: Arc<MessageStore>,
-    sessions: Arc<SessionStore>,
-    turn_buffer: Arc<TurnBufferStore>,
-    gate: Arc<Gate>,
-    qq: Option<Arc<QqClient>>,
-    self_id: u64,
-    owner_qq: u64,
-    master_qq: u64,
-    ai_enabled: Arc<AtomicBool>,
-    estop_file: PathBuf,
-    agents_dir: PathBuf,
-) -> Result<Option<Arc<AgentRuntime>>> {
+/// `build_agent` 的全部输入；参数太多，打包成结构体。
+///
+/// 三个引用（`loaded` / `models` / `auth`）只借用调用方的数据，其余句柄都是
+/// `Arc` 克隆：装配过程中会分发到 runner、工具表与后台任务，调用方仍需持有。
+pub(super) struct AgentInputs<'a> {
+    /// 已校验的配置（含配置目录）。
+    pub loaded: &'a LoadedConfig,
+    /// `/config` 热加载替换用的配置句柄。
+    pub config_handle: Arc<RwLock<LoadedConfig>>,
+    /// 模型清单（内置 + 用户覆盖）。
+    pub models: &'a ModelsFile,
+    /// 凭据。
+    pub auth: &'a AuthFile,
+    /// SQLite。
+    pub db: Arc<Database>,
+    /// 主密钥。
+    pub key: Arc<MasterKey>,
+    /// 虚拟文件系统。
+    pub vfs: Arc<VfsStore>,
+    /// 消息归档。
+    pub messages: Arc<MessageStore>,
+    /// transcript。
+    pub sessions: Arc<SessionStore>,
+    /// 未完成回合的缓冲。
+    pub turn_buffer: Arc<TurnBufferStore>,
+    /// 安全闸。
+    pub gate: Arc<Gate>,
+    /// NapCat 连接；未连接时为 `None`。
+    pub qq: Option<Arc<QqClient>>,
+    /// 登录账号。
+    pub self_id: u64,
+    /// 主人 QQ。
+    pub owner_qq: u64,
+    /// 最高权限 QQ。
+    pub master_qq: u64,
+    /// LLM 调用开关。
+    pub ai_enabled: Arc<AtomicBool>,
+    /// 急停文件。
+    pub estop_file: PathBuf,
+    /// 自定义子代理定义目录。
+    pub agents_dir: PathBuf,
+}
+
+pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<AgentRuntime>>> {
+    let AgentInputs {
+        loaded,
+        config_handle,
+        models,
+        auth,
+        db,
+        key,
+        vfs,
+        messages,
+        sessions,
+        turn_buffer,
+        gate,
+        qq,
+        self_id,
+        owner_qq,
+        master_qq,
+        ai_enabled,
+        estop_file,
+        agents_dir,
+    } = input;
     let config = &loaded.config;
     let provider: Arc<dyn Provider> = match build_provider(models, auth, &config.agent.model) {
         Ok(provider) => provider,
