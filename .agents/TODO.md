@@ -42,6 +42,7 @@
 - [x] `queue.cap_batches` 已删除（d807e4c）。
 - [x] `agent.compact` 支持可选 `chat` 参数（2608061）。
 - [x] 本地 tag `v0.2.0-alpha.35` 已创建；CHANGELOG 更新到 372 测试；本地 `cargo build --release` 通过（12 MB，`sbot --version` 正确）。
+- [x] `RUSTDOCFLAGS=-D warnings cargo doc --no-deps` 通过（修复 3 处 intra-doc 链接，86ad96d）。
 - [ ] push tag / GitHub release / 服务器部署需用户确认；服务器 `sbot.service` 仍停止。
 - [ ] 历史重写后其他 clone 必须重新 clone 或
       `git fetch --all --prune --tags --force && git reset --hard origin/main`；旧 SHA 失效。
