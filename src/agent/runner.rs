@@ -1352,11 +1352,40 @@ impl Runner {
         }
     }
 
-    /// 跑一个完整回合。
+    /// 跑一个完整回合，并接管 steering 通道的收尾。
     async fn execute(
         &self,
         input: TurnInput,
         mut steering_rx: mpsc::UnboundedReceiver<AgentMessage>,
+    ) -> Result<()> {
+        let chat = input.chat;
+        let result = self.run_turn(input, &mut steering_rx).await;
+
+        // 先关闭再排空：关闭后 `send` 会失败，`ChatQueue::ingest` 据此把消息回填
+        // pending；已缓冲的消息仍可从 receiver 取出。排空用 `recv().await` 而不是
+        // `try_recv()`：tokio 保证 `close()` 后 `recv()` 返回 `None` 时所有被接受的
+        // 发送都已落进缓冲，`try_recv()` 则可能撞上尚未完成的 `send`。
+        steering_rx.close();
+        let mut leftover = Vec::new();
+        while let Some(message) = steering_rx.recv().await {
+            leftover.push(message);
+        }
+        if !leftover.is_empty() {
+            let turn_lock = self.turn_lock_for(chat).await;
+            let _turn_guard = turn_lock.lock().await;
+            let sessions = self.session_for(chat).await;
+            let history = self.history_for(chat).await;
+            sessions.append(&leftover)?;
+            history.lock().await.extend(leftover);
+        }
+        result
+    }
+
+    /// 回合主体：前置检查、模型循环与提交都在这里。
+    async fn run_turn(
+        &self,
+        input: TurnInput,
+        steering_rx: &mut mpsc::UnboundedReceiver<AgentMessage>,
     ) -> Result<()> {
         // `sbot ai stop` 与 `ESTOP` 都只暂停新回合；消息已经入库，下一回合可见。
         if !self.ai_enabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1548,7 +1577,7 @@ impl Runner {
                 &mut working,
                 prompts,
                 &mut steering,
-                Some(&mut steering_rx),
+                Some(&mut *steering_rx),
                 &events_tx,
             )
             .await;
@@ -1577,15 +1606,14 @@ impl Runner {
             });
         }
 
-        // 先把 local SteeringQueue（early return 时已取出的消息）与 channel 都排空；
-        // 然后关闭 receiver，让之后到达的消息走 ChatQueue 的 send-failure 回填。
+        // 把 local SteeringQueue（early return 时已取出的消息）与 channel 已到达的
+        // 消息一并并入本回合；receiver 由外层关闭并排空，这里不关闭，避免重复处理。
         for message in steering.drain() {
             working.push(message);
         }
         while let Ok(message) = steering_rx.try_recv() {
             working.push(message);
         }
-        drop(steering_rx);
 
         // 5) 提交新块：buffer -> transcript -> 共享历史。
         let new_blocks: Vec<AgentMessage> = working[base + runtime_blocks..].to_vec();
@@ -2409,6 +2437,50 @@ mod tests {
         );
         let _ = Usage::default();
         let _ = messages.usage().unwrap();
+    }
+
+    #[tokio::test]
+    async fn paused_turn_keeps_steering_messages() {
+        let (runner, gate, _dir) = runner_with(None, Vec::new(), 120_000, 20_000).await;
+        gate.pause_agent("test pause");
+        assert!(gate.agent_paused());
+
+        let chat = ChatId::Group(1);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(AgentMessage::user("[Alice] steering survives"))
+            .unwrap();
+        runner
+            .handle(
+                TurnInput {
+                    chat,
+                    messages: vec![inbound(chat, 1, "hi")],
+                    dropped: 0,
+                },
+                rx,
+            )
+            .await
+            .unwrap();
+
+        let sessions = runner.session_for(chat).await;
+        let current = sessions.current().unwrap();
+        let transcript = sessions.read_segment(&current.file).unwrap();
+        assert!(
+            transcript.iter().any(|message| matches!(
+                message,
+                AgentMessage::User { text, .. } if text.contains("steering survives")
+            )),
+            "steering message missing from transcript: {transcript:?}"
+        );
+
+        let history = runner.history_for(chat).await;
+        let history = history.lock().await;
+        assert!(
+            history.iter().any(|message| matches!(
+                message,
+                AgentMessage::User { text, .. } if text.contains("steering survives")
+            )),
+            "steering message missing from history: {history:?}"
+        );
     }
 
     #[tokio::test]
