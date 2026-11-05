@@ -67,7 +67,7 @@ sbot gate reject g3        # 拒绝
 |------|------|------|
 | `sbot ai stop` | 不发起新的模型请求；消息照收照存 | `sbot ai start` |
 | `sbot pause`（ESTOP） | 不开始新回合；消息照收照存 | `sbot resume` |
-| hold | 拒绝所有 QQ 动作与对外工具 | 过闸后 `sbot security resume` 或 `agent.resume` |
+| hold | 拒绝所有 QQ 动作（`napcat.*`） | 过闸后 `sbot security resume` 或 `agent.resume` |
 | `agent_paused` | 安全审查 `critical` 后连新回合也暂停 | 同上；控制通道 `chat` 仍可用 |
 
 `ai stop` 与 ESTOP 都只挡“新回合”，不会中断已经在跑的回合。

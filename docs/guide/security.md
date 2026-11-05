@@ -96,7 +96,7 @@ timeout_ms = 800
 
 - 写 `~/.sbot/SECURITY_HOLD`（重启仍然有效）；
 - 所有 `napcat.*` 动作返回 `Disabled during hold`，包括拉黑、禁言、踢人；
-- `Download`、`WebSearch`、`WebFetch`、`MCP` 同样拒绝；
+- 其余工具（文件、记忆、`WebSearch`、`WebFetch`、`MCP`、`Download`）不受影响；
 - `agent.*` 与 `api.*` 只读查询仍可用，agent 可以看状态、写记忆、自查；
 - `critical` 暂停的新回合在 `agent_paused` 置位后跳过；控制通道仍可 `chat`。
 

@@ -462,10 +462,7 @@ impl Tool for McpTool {
         &[Permission::Network]
     }
 
-    async fn execute(&self, ctx: &ToolContext, args: Value) -> ToolResult {
-        if ctx.hold_active() {
-            return ToolResult::error(crate::tools::HOLD_DISABLED);
-        }
+    async fn execute(&self, _ctx: &ToolContext, args: Value) -> ToolResult {
         let server = args.get("server").and_then(Value::as_str);
         let tool = args.get("tool").and_then(Value::as_str);
         let arguments = args.get("args").cloned().unwrap_or_else(|| json!({}));

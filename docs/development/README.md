@@ -53,7 +53,7 @@
 
 - 改行为时同步更新 `docs/guide/`、`docs/development/` 与 `README.md` 的「已知限制」。
 - 新增存储字段必须追加迁移，不能改已发布的迁移。
-- 新增工具要声明参数 schema、执行模式与 `Permission`；对外工具要在 hold 期间拒绝。
+- 新增工具要声明参数 schema、执行模式与 `Permission`；操作 QQ 的工具要在 hold 期间拒绝。
 - `config.example.toml` 由 `tests/config_example.rs` 校验：改配置 schema 时同步改样例。
 - 提交前至少运行 `cargo fmt --check`、`cargo test --all-targets`、
   `cargo clippy --all-targets -- -D warnings`；CI 会跑同样三项。

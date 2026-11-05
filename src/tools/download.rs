@@ -82,10 +82,7 @@ impl Tool for DownloadTool {
         &[Permission::Network, Permission::Write]
     }
 
-    async fn execute(&self, ctx: &ToolContext, args: Value) -> ToolResult {
-        if ctx.hold_active() {
-            return ToolResult::error(crate::tools::HOLD_DISABLED);
-        }
+    async fn execute(&self, _ctx: &ToolContext, args: Value) -> ToolResult {
         let raw_url = match arg_str(&args, "url") {
             Ok(url) => url,
             Err(error) => return error,
