@@ -63,5 +63,7 @@
 - [x] 已解：security↔tools（action 元数据移到 crate 根 `actions`，`chat_of`/`qq_number` 随迁）。
 - [x] 所有模块 2-循环已清零。
 - [x] ApiTool `execute` 拆出 `api/policy.rs`、媒体拆出 `api/media.rs`；VfsStore 拆出 `sqlite/{codec,tree}.rs`（2608061/1f0106d）。
-- [ ] Runner `run_turn` 仍约 263 行、25 字段；MessageStore 33 个 pub 方法；`actions.rs` 已按 namespace 拆成 9 个 helper；6 处 Box::leak 已清零（15757a1、7026425）。
+- [x] `actions.rs` 已按 namespace 拆成 9 个 helper；Box::leak 清零（15757a1、7026425）。
+- [x] `run_turn` 已拆为 `drive_turn`/`commit_turn`（155+83 行）。
+- [ ] Runner 仍有 25 字段；MessageStore 33 个 pub 方法待拆。
 - [x] hold 语义修正：只拒绝 QQ 操作（`napcat.*`），MCP/下载/Web 不再被 hold 拦截（d21eed4）。
