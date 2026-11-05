@@ -339,7 +339,6 @@ mod tests {
             mode: QueueMode::Steer,
             max_concurrent: 2,
             cap_messages: 3,
-            cap_batches: 20,
             drop: DropPolicy::Summarize,
             debounce_ms: 100,
         }
@@ -516,18 +515,19 @@ mod tests {
         let chat = ChatId::Group(1);
 
         queue.ingest(msg(chat, 1)).await;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            handler.closed.notified(),
-        )
-        .await
-        .expect("the first turn should start and close its steering receiver");
+        tokio::time::timeout(std::time::Duration::from_secs(2), handler.closed.notified())
+            .await
+            .expect("the first turn should start and close its steering receiver");
         // close 已生效：这条 send 会失败，ChatQueue 必须把它回填到 pending。
         queue.ingest(msg(chat, 2)).await;
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
         let calls = handler.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2, "the requeued message should open a second turn");
+        assert_eq!(
+            calls.len(),
+            2,
+            "the requeued message should open a second turn"
+        );
         assert_eq!(calls[1].messages[0].message_id, 2);
     }
 }

@@ -1440,7 +1440,15 @@ mod tests {
     #[tokio::test]
     async fn agent_compact_prefers_chat_then_origin() {
         let ops = Arc::new(FakeOps::default());
-        let tool = ApiTool::new(None, Some(Arc::clone(&ops)), 1, 1, None, Vec::new(), None);
+        let tool = ApiTool::new(
+            None,
+            Some(Arc::clone(&ops) as Arc<dyn AgentOps>),
+            1,
+            1,
+            None,
+            Vec::new(),
+            None,
+        );
         let ctx = intent_ctx("group:1");
 
         for params in [
