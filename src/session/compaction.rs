@@ -11,7 +11,7 @@
 //!
 //! 轮转与写入由 `Runner::compact_now` 完成。
 
-use crate::agent::message::{AgentMessage, AssistantBlock};
+use crate::transcript::{AgentMessage, AssistantBlock};
 use crate::providers::{
     CompletionError, Provider, ProviderError, ProviderErrorKind, SystemBlock, complete_text,
     truncate_chars,
@@ -230,7 +230,7 @@ pub async fn summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::message::{AssistantMessage, StopReason, ToolCall, Usage};
+    use crate::transcript::{AssistantMessage, StopReason, ToolCall, Usage};
 
     fn user(text: &str) -> AgentMessage {
         AgentMessage::user(text)
@@ -250,7 +250,7 @@ mod tests {
     }
 
     fn tool(id: &str) -> AgentMessage {
-        AgentMessage::Tool(crate::agent::message::ToolResultMessage {
+        AgentMessage::Tool(crate::transcript::ToolResultMessage {
             tool_call_id: id.to_owned(),
             tool_name: "Read".to_owned(),
             content: "ok".to_owned(),
@@ -311,24 +311,24 @@ mod tests {
 
     #[test]
     fn estimate_uses_actual_usage_and_charges_images() {
-        let assistant = AgentMessage::Assistant(crate::agent::message::AssistantMessage {
-            content: vec![crate::agent::message::AssistantBlock::Text {
+        let assistant = AgentMessage::Assistant(crate::transcript::AssistantMessage {
+            content: vec![crate::transcript::AssistantBlock::Text {
                 text: "ok".to_owned(),
             }],
-            stop_reason: crate::agent::StopReason::EndTurn,
-            usage: crate::agent::message::Usage {
+            stop_reason: crate::transcript::StopReason::EndTurn,
+            usage: crate::transcript::Usage {
                 input_tokens: 10_000,
                 output_tokens: 200,
                 ..Default::default()
             },
             refusal: None,
         });
-        let image = AgentMessage::Tool(crate::agent::message::ToolResultMessage {
+        let image = AgentMessage::Tool(crate::transcript::ToolResultMessage {
             tool_call_id: "t".to_owned(),
             tool_name: "Read".to_owned(),
             content: "image".to_owned(),
             is_error: false,
-            images: vec![crate::agent::message::ImageAttachment {
+            images: vec![crate::transcript::ImageAttachment {
                 mime: "image/png".to_owned(),
                 data_base64: "AA==".to_owned(),
             }],

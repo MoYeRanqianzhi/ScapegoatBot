@@ -251,7 +251,7 @@ mod tests {
                     .await;
                 let _ = tx
                     .send(ProviderEvent::Stop {
-                        reason: crate::agent::StopReason::EndTurn,
+                        reason: crate::llm::types::StopReason::EndTurn,
                         refusal: None,
                     })
                     .await;
