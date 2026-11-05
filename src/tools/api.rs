@@ -1393,6 +1393,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watermark_renders_unicode_and_rejects_unknown_glyphs() {
+        let vfs = media_vfs();
+        seed_image(&vfs, "/tmp/src.png", 40, 16);
+        let tool = tool(None, None);
+        let ctx = ToolContext::new(Arc::clone(&vfs), None);
+
+        let result = run_media(
+            &tool,
+            &ctx,
+            "media.image_watermark",
+            json!({"path": "/tmp/src.png", "out": "/tmp/unicode.png", "text": "café α"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        let source = load_output(&vfs, "/tmp/src.png").to_rgba8();
+        let marked = load_output(&vfs, "/tmp/unicode.png").to_rgba8();
+        assert!(
+            source.pixels().zip(marked.pixels()).any(|(a, b)| a != b),
+            "unicode watermark did not change any pixel"
+        );
+
+        let result = run_media(
+            &tool,
+            &ctx,
+            "media.image_watermark",
+            json!({"path": "/tmp/src.png", "out": "/tmp/cjk.png", "text": "你好"}),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("font8x8"), "{}", result.content);
+    }
+
+    #[tokio::test]
     async fn agent_compact_prefers_chat_then_origin() {
         let ops = Arc::new(FakeOps::default());
         let tool = ApiTool::new(

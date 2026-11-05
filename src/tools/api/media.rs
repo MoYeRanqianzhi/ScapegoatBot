@@ -2,8 +2,6 @@
 //!
 //! NapCat 的发送策略不在这里；`media.*` 不会产生对外影响。
 
-use font8x8::UnicodeFonts;
-
 use super::*;
 use crate::vfs::Vfs;
 
@@ -151,19 +149,26 @@ impl ApiTool {
             }
             "media.image_watermark" => {
                 let text = params.get("text").and_then(Value::as_str).unwrap_or("sbot");
-                if !text.is_ascii() {
-                    return ToolResult::error("media.image_watermark only supports ASCII text");
+                let chars: Vec<char> = text.chars().collect();
+                let mut glyphs = Vec::with_capacity(chars.len());
+                for &ch in &chars {
+                    match watermark_glyph(ch) {
+                        Some(glyph) => glyphs.push(glyph),
+                        None => {
+                            return ToolResult::error(format!(
+                                "media.image_watermark cannot render U+{:04X};                                  font8x8 has no CJK glyphs",
+                                ch as u32
+                            ));
+                        }
+                    }
                 }
                 let mut rgba = image.to_rgba8();
                 let (w, h) = rgba.dimensions();
                 let scale = 2u32;
-                let text_w = text.chars().count() as u32 * 8 * scale;
+                let text_w = chars.len() as u32 * 8 * scale;
                 let x0 = w.saturating_sub(text_w + 8);
                 let y0 = h.saturating_sub(8 * scale + 8);
-                for (i, ch) in text.chars().enumerate() {
-                    let Some(glyph) = font8x8::BASIC_FONTS.get(ch) else {
-                        continue;
-                    };
+                for (i, glyph) in glyphs.iter().enumerate() {
                     for (row, bits) in glyph.iter().enumerate() {
                         for col in 0..8 {
                             if bits & (1 << col) == 0 {
@@ -249,4 +254,22 @@ impl ApiTool {
         }
         out
     }
+}
+
+/// 在 font8x8 的各个 Unicode 字库中查找字形；CJK 不在其中（需要字体文件）。
+fn watermark_glyph(ch: char) -> Option<[u8; 8]> {
+    use font8x8::UnicodeFonts;
+    [
+        font8x8::BASIC_FONTS.get(ch),
+        font8x8::LATIN_FONTS.get(ch),
+        font8x8::GREEK_FONTS.get(ch),
+        font8x8::BLOCK_FONTS.get(ch),
+        font8x8::BOX_FONTS.get(ch),
+        font8x8::HIRAGANA_FONTS.get(ch),
+        font8x8::MISC_FONTS.get(ch),
+        font8x8::SGA_FONTS.get(ch),
+    ]
+    .into_iter()
+    .flatten()
+    .next()
 }
