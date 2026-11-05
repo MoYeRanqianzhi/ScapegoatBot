@@ -486,6 +486,39 @@ impl Runner {
             .clone()
     }
 
+    /// 主回合与注入回合共用的循环配置。
+    ///
+    /// 模型字段取当前 provider 快照，其余取 `RunnerConfig`；集中一处后，
+    /// 热切换或新增字段时两个入口不会出现配置漂移。
+    fn loop_config(&self) -> LoopConfig {
+        let slot = self.provider_snapshot();
+        LoopConfig {
+            model: slot.api_model,
+            system: self.system(),
+            max_tokens: slot.max_tokens,
+            thinking: slot.thinking,
+            server_tools: self.config.server_tools.clone(),
+            max_steps: self.config.max_steps,
+            retry: self.config.retry,
+            max_state_chars: self.config.max_state_chars,
+            prune: self.config.prune,
+            prune_soft_limit: self.config.prune_soft_limit as usize,
+            prune_keep_turns: self.config.prune_keep_turns,
+            max_turn_tokens: self
+                .config
+                .budget
+                .as_ref()
+                .map(|budget| budget.turn_tokens())
+                .unwrap_or(0),
+            max_wall_secs: self
+                .config
+                .budget
+                .as_ref()
+                .map(|budget| budget.wall_secs())
+                .unwrap_or(0),
+        }
+    }
+
     /// 跑一个完整回合，并接管 steering 通道的收尾。
     async fn execute(
         &self,
@@ -665,31 +698,7 @@ impl Runner {
             self.fallbacks.clone(),
             executor,
             Arc::clone(&self.gate),
-            LoopConfig {
-                model: slot.api_model.clone(),
-                system: self.system(),
-                max_tokens: slot.max_tokens,
-                thinking: slot.thinking.clone(),
-                server_tools: self.config.server_tools.clone(),
-                max_steps: self.config.max_steps,
-                retry: self.config.retry,
-                max_state_chars: self.config.max_state_chars,
-                prune: self.config.prune,
-                prune_soft_limit: self.config.prune_soft_limit as usize,
-                prune_keep_turns: self.config.prune_keep_turns,
-                max_turn_tokens: self
-                    .config
-                    .budget
-                    .as_ref()
-                    .map(|budget| budget.turn_tokens())
-                    .unwrap_or(0),
-                max_wall_secs: self
-                    .config
-                    .budget
-                    .as_ref()
-                    .map(|budget| budget.wall_secs())
-                    .unwrap_or(0),
-            },
+            self.loop_config(),
         );
         let (events_tx, mut events_rx) = mpsc::channel(256);
         let logger = tokio::spawn(async move {
