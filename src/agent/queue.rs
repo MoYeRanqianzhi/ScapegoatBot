@@ -71,11 +71,21 @@ pub struct ChatQueue {
 impl ChatQueue {
     pub fn new(config: QueueConfig, handler: Arc<dyn TurnHandler>) -> Arc<Self> {
         let max = config.max_concurrent.max(1);
+        Self::with_slots(config, handler, Arc::new(Semaphore::new(max)))
+    }
+
+    /// 复用外部信号量：主 agent 的并发配额由 runner 持有，队列、控制与 monitor
+    /// 共用同一上限，避免两套 semaphore 相加后超过配置值。
+    pub fn with_slots(
+        config: QueueConfig,
+        handler: Arc<dyn TurnHandler>,
+        semaphore: Arc<Semaphore>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config: std::sync::RwLock::new(config),
             handler,
             states: Mutex::new(HashMap::new()),
-            semaphore: Arc::new(Semaphore::new(max)),
+            semaphore,
             counter: AtomicU64::new(0),
         })
     }

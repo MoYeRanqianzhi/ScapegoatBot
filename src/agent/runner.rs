@@ -56,6 +56,9 @@ pub struct RunnerConfig {
     pub supports_images: bool,
     pub thinking: ThinkingOptions,
     pub max_steps: u32,
+    /// 主 agent 回合的全局并发上限（队列、控制与 monitor 共用）。
+    /// 来自 `[queue].max_concurrent`；shared transcript 下 turn_lock 仍会串行化实际回合。
+    pub max_concurrent: usize,
     pub retry: crate::agent::agent_loop::RetryPolicy,
     /// 注入“上次回复以来的群消息”时最多取多少条。
     pub chat_history_limit: u32,
@@ -225,8 +228,8 @@ pub struct Runner {
     review_lock: Mutex<()>,
     /// 每个 transcript scope 一个回合锁；shared 模式天然只有一个锁。
     turn_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// 控制通道排队上限，避免一次灌入无限任务。
-    control_slots: tokio::sync::Semaphore,
+    /// 主 agent 回合的并发配额；队列、控制与 monitor 共用同一个信号量。
+    turn_slots: Arc<tokio::sync::Semaphore>,
     /// 当前正在跑的主/injected 回合数；idle_only 用。
     active_turns: std::sync::atomic::AtomicUsize,
 }
@@ -367,6 +370,8 @@ impl Runner {
             thinking: config.thinking.clone(),
         }));
 
+        // 队列与控制/monitor 共用这一个配额，避免两套上限相加后超过配置值。
+        let max_concurrent = config.max_concurrent.max(1);
         let runner = Arc::new(Self {
             slot,
             fallbacks,
@@ -391,7 +396,7 @@ impl Runner {
             review_failures: std::sync::atomic::AtomicU32::new(0),
             review_lock: Mutex::new(()),
             turn_locks: Mutex::new(HashMap::new()),
-            control_slots: tokio::sync::Semaphore::new(4),
+            turn_slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
             active_turns: std::sync::atomic::AtomicUsize::new(0),
         });
         let _ = runner
@@ -424,6 +429,11 @@ impl Runner {
 
     pub fn is_busy(&self) -> bool {
         self.active_turns.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    /// 主 agent 回合的并发配额；`ChatQueue` 与控制/monitor 回合共用。
+    pub fn turn_slots(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.turn_slots)
     }
 
     async fn turn_lock_for(&self, chat: ChatId) -> Arc<tokio::sync::Mutex<()>> {
@@ -973,10 +983,13 @@ impl Runner {
     }
 
     pub async fn run_control(&self, text: &str, control_id: i64) -> Result<LoopOutcome> {
+        // 与队列/monitor 共用主 agent 配额；等待而不是直接拒绝，避免队列满载时
+        // 管理命令永久不可用。
         let _permit = self
-            .control_slots
-            .try_acquire()
-            .map_err(|_| anyhow::anyhow!("too many queued control turns"))?;
+            .turn_slots
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("the turn limiter is closed"))?;
         if !self.ai_enabled.load(std::sync::atomic::Ordering::Relaxed) {
             anyhow::bail!("AI calls are stopped; run `sbot ai start` first");
         }
@@ -1000,6 +1013,12 @@ impl Runner {
         if self.estop_file.exists() {
             anyhow::bail!("ESTOP is active");
         }
+        // monitor 投递也算主 agent 回合，和队列/控制共享同一并发上限。
+        let _permit = self
+            .turn_slots
+            .acquire()
+            .await
+            .map_err(|_| anyhow::anyhow!("the turn limiter is closed"))?;
         let message = AgentMessage::user(format!(
             "[monitor: {} | {} | {}]\n{}",
             name,
@@ -2216,6 +2235,7 @@ mod tests {
                 supports_images: true,
                 thinking: ThinkingOptions::default(),
                 max_steps: 8,
+                max_concurrent: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
                 chat_history_limit: 10,
                 hooks: crate::config::HooksConfig::default().context,
@@ -2383,6 +2403,7 @@ mod tests {
                 supports_images: true,
                 thinking: ThinkingOptions::default(),
                 max_steps: 4,
+                max_concurrent: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
                 chat_history_limit: 10,
                 hooks: crate::config::HooksConfig::default().context,
@@ -2572,6 +2593,7 @@ mod tests {
                 supports_images: true,
                 thinking: ThinkingOptions::default(),
                 max_steps: 4,
+                max_concurrent: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
                 chat_history_limit: 10,
                 hooks: crate::config::HooksConfig::default().context,
@@ -2724,6 +2746,7 @@ mod tests {
                 supports_images: true,
                 thinking: ThinkingOptions::default(),
                 max_steps: 2,
+                max_concurrent: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
                 chat_history_limit: 10,
                 hooks: crate::config::HooksConfig::default().context,
@@ -2897,6 +2920,7 @@ mod tests {
                 supports_images: true,
                 thinking: ThinkingOptions::default(),
                 max_steps: 4,
+                max_concurrent: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
                 chat_history_limit: 10,
                 hooks: crate::config::HooksConfig::default().context,
@@ -3078,6 +3102,7 @@ mod tests {
                 supports_images: true,
                 thinking: ThinkingOptions::default(),
                 max_steps: 4,
+                max_concurrent: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
                 chat_history_limit: 10,
                 hooks: crate::config::HooksConfig::default().context,
