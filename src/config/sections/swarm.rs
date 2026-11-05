@@ -29,7 +29,7 @@ impl Default for SwarmConfig {
 }
 
 impl SwarmConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         for (field, value) in [
             ("swarm.max_depth", self.max_depth),
             ("swarm.max_concurrency", self.max_concurrency),

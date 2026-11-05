@@ -27,7 +27,7 @@ impl Default for SkillsConfig {
 }
 
 impl SkillsConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         if self.shared_dir.trim().is_empty() {
             errors.push(ConfigError::new("skills.shared_dir", "must not be empty"));
         }

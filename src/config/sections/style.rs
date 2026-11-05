@@ -25,7 +25,7 @@ impl Default for StyleConfig {
 }
 
 impl StyleConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         if self.max_chars == 0 {
             errors.push(ConfigError::new(
                 "style.max_chars",

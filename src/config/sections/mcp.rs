@@ -17,7 +17,7 @@ pub struct McpConfig {
 }
 
 impl McpConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         let mut seen = HashSet::new();
         for (index, server) in self.servers.iter().enumerate() {
             let field = format!("mcp.servers[{index}]");

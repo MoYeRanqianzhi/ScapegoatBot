@@ -155,7 +155,7 @@ pub struct QqMessage {
     pub reply_to: Option<i64>,
     /// 是否为 agent 自己发出的（`message_sent` echo 或 `self_id` 匹配）。
     pub is_self: bool,
-    /// 是否由断线补消息产生（`[backfill]`，不触发回合）。
+    /// 历史字段：断线补消息已删除，生产路径恒为 false；仅为旧记录兼容保留。
     pub backfilled: bool,
     /// 原始事件，保留供审计。
     pub raw: Value,

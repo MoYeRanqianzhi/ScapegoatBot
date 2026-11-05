@@ -23,7 +23,7 @@ impl Default for IpcConfig {
 }
 
 impl IpcConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         let name = &self.name;
         if name.is_empty()
             || !name

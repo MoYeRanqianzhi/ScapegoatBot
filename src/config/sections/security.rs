@@ -57,7 +57,7 @@ impl Default for GuardConfig {
 }
 
 impl GuardConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         if !(0.5..=0.99).contains(&self.threshold) {
             errors.push(ConfigError::new(
                 "security.guard.threshold",
@@ -113,7 +113,7 @@ impl Default for SecurityConfig {
 }
 
 impl SecurityConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         if self.check_timeout_secs == 0 {
             errors.push(ConfigError::new(
                 "security.check_timeout_secs",

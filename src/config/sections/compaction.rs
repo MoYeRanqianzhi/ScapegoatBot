@@ -37,7 +37,7 @@ impl Default for CompactionConfig {
 }
 
 impl CompactionConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>, agent: &AgentConfig) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>, agent: &AgentConfig) {
         for (field, value) in [
             ("compaction.reserve_tokens", self.reserve_tokens),
             ("compaction.turn_context_budget", self.turn_context_budget),

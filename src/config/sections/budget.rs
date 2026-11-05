@@ -33,7 +33,7 @@ impl Default for BudgetConfig {
 }
 
 impl BudgetConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>, compaction: &CompactionConfig) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>, compaction: &CompactionConfig) {
         if !self.daily_usd.is_finite() || self.daily_usd < 0.0 {
             errors.push(ConfigError::new(
                 "budget.daily_usd",

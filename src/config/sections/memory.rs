@@ -48,7 +48,7 @@ impl Default for MemoryConfig {
 }
 
 impl MemoryConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         for (field, value) in [
             ("memory.max_entry_chars", self.max_entry_chars),
             ("memory.max_index_lines", self.max_index_lines),

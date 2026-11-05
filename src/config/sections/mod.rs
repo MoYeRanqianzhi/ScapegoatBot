@@ -50,7 +50,7 @@ pub use style::StyleConfig;
 pub use swarm::SwarmConfig;
 pub use tools::{DownloadConfig, ToolsConfig, WebBackend, WebFetchConfig, WebSearchConfig};
 
-pub(crate) use monitor::validate_monitors;
+pub(in crate::config) use monitor::validate_monitors;
 
 use super::{ConfigError, ModelsFile};
 

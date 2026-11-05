@@ -55,7 +55,7 @@ impl Default for QueueConfig {
 }
 
 impl QueueConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         if self.max_concurrent == 0 {
             errors.push(ConfigError::new(
                 "queue.max_concurrent",

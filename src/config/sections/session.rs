@@ -31,7 +31,7 @@ impl Default for SessionConfig {
 }
 
 impl SessionConfig {
-    pub(crate) fn validate(&self, _errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, _errors: &mut Vec<ConfigError>) {
         // 枚举已由 serde 约束；保留方法以便未来增加取值相关的检查。
     }
 }

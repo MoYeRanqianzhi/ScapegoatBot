@@ -17,7 +17,7 @@ pub struct FilterConfig {
 }
 
 impl FilterConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         if self.ignore_groups.contains(&0) {
             errors.push(ConfigError::new(
                 "filter.ignore_groups",

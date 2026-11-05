@@ -37,7 +37,7 @@ impl Default for GateConfig {
 }
 
 impl GateConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         if self.max_per_minute == 0 {
             errors.push(ConfigError::new(
                 "gate.max_per_minute",

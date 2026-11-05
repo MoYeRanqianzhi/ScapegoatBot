@@ -182,7 +182,7 @@ impl Default for HooksConfig {
 }
 
 impl HooksConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         let mut names = HashSet::new();
         for (index, hook) in self.context.iter().enumerate() {
             let field = format!("hooks.context[{index}]");

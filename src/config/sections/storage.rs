@@ -46,7 +46,7 @@ impl Default for StorageConfig {
 }
 
 impl StorageConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         if self.path.trim().is_empty() {
             errors.push(ConfigError::new("storage.path", "must not be empty"));
         }

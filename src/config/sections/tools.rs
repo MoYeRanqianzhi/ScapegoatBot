@@ -101,7 +101,7 @@ impl Default for ToolsConfig {
 }
 
 impl ToolsConfig {
-    pub(crate) fn validate(&self, errors: &mut Vec<ConfigError>) {
+    pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
         if self.max_result_bytes == 0 {
             errors.push(ConfigError::new(
                 "tools.max_result_bytes",
