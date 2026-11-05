@@ -1,11 +1,8 @@
 use super::*;
 
 impl Runner {
+    /// 控制通道回合；主代理不受并发配额限制，串行化由 turn_lock 负责。
     pub async fn run_control(&self, text: &str, control_id: i64) -> Result<LoopOutcome> {
-        let _permit = self
-            .control_slots
-            .try_acquire()
-            .map_err(|_| anyhow::anyhow!("too many queued control turns"))?;
         if !self.ai_enabled.load(std::sync::atomic::Ordering::Relaxed) {
             anyhow::bail!("AI calls are stopped; run `sbot ai start` first");
         }

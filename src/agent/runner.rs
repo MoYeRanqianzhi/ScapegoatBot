@@ -172,8 +172,6 @@ pub struct Runner {
     review_lock: Mutex<()>,
     /// 每个 transcript scope 一个回合锁；shared 模式天然只有一个锁。
     turn_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// 控制通道排队上限，避免一次灌入无限任务。
-    control_slots: tokio::sync::Semaphore,
     /// 当前正在跑的主/injected 回合数；idle_only 用。
     active_turns: std::sync::atomic::AtomicUsize,
 }
@@ -338,7 +336,6 @@ impl Runner {
             review_failures: std::sync::atomic::AtomicU32::new(0),
             review_lock: Mutex::new(()),
             turn_locks: Mutex::new(HashMap::new()),
-            control_slots: tokio::sync::Semaphore::new(4),
             active_turns: std::sync::atomic::AtomicUsize::new(0),
         });
         let _ = runner
