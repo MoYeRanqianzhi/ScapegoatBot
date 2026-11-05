@@ -12,6 +12,8 @@ pub mod budget;
 pub mod cli;
 pub mod config;
 pub mod ipc;
+// LLM 公共类型：provider 与 agent 共享的用量、停止原因与拒绝细节。
+pub mod llm;
 // MCP 可选，默认关闭；启用时由 app 连接 stdio 服务器。
 pub mod mcp;
 // 后台复盘：记忆候选与 /STYLE.md；只在空闲时运行。

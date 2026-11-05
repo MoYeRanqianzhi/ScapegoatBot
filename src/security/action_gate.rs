@@ -20,9 +20,7 @@ use serde_json::{Value, json};
 
 use crate::agent::TurnEvidence;
 use crate::config::{GateConfig, GateMode};
-use crate::providers::{
-    ContentBlock, LlmRequest, Provider, ProviderEvent, ProviderMessage, Role, SystemBlock,
-};
+use crate::providers::{CompletionError, Provider, SystemBlock, complete_text, truncate_chars};
 use crate::storage::Database;
 use crate::tools::actions::{ActionSpec, Category};
 
@@ -417,50 +415,32 @@ impl ActionReviewer for LlmActionReviewer {
         params: &Value,
         evidence: &TurnEvidence,
     ) -> Result<bool, String> {
-        let request = LlmRequest {
-            model: self.model.clone(),
-            system: vec![SystemBlock {
+        let prompt = format!(
+            "action: {action}\nparams: {}\nowner_intent: {}\norigin_chat: {}",
+            truncate_chars(&params.to_string(), 4_000),
+            evidence.owner_intent,
+            evidence.origin_chat.as_deref().unwrap_or("unknown")
+        );
+        let text = match complete_text(
+            self.provider.as_ref(),
+            &self.model,
+            vec![SystemBlock {
                 text: REVIEW_SYSTEM.to_owned(),
                 cache: false,
             }],
-            messages: vec![ProviderMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: format!(
-                        "action: {action}\nparams: {}\nowner_intent: {}\norigin_chat: {}",
-                        truncate(&params.to_string(), 4_000),
-                        evidence.owner_intent,
-                        evidence.origin_chat.as_deref().unwrap_or("unknown")
-                    ),
-                }],
-            }],
-            tools: Vec::new(),
-            max_tokens: 256,
-            thinking: Default::default(),
-            server_tools: Vec::new(),
+            prompt,
+            256,
+            Some(self.timeout),
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(CompletionError::Request(error) | CompletionError::Stream(error)) => {
+                return Err(error.to_string());
+            }
+            Err(CompletionError::TimedOut) => return Err("review timed out".to_owned()),
+            Err(CompletionError::Ended) => return Err("review stream ended".to_owned()),
         };
-        let mut receiver = self
-            .provider
-            .stream(request)
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut text = String::new();
-        let deadline = tokio::time::Instant::now() + self.timeout;
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                return Err("review timed out".to_owned());
-            }
-            let event = tokio::time::timeout_at(deadline, receiver.recv())
-                .await
-                .map_err(|_| "review timed out".to_owned())?
-                .ok_or_else(|| "review stream ended".to_owned())?;
-            match event {
-                ProviderEvent::TextDelta(delta) => text.push_str(&delta),
-                ProviderEvent::Error(error) => return Err(error.to_string()),
-                ProviderEvent::Stop { .. } => break,
-                _ => {}
-            }
-        }
         let parsed = parse_review(&text).ok_or_else(|| format!("unparseable review: {text}"))?;
         Ok(parsed)
     }
@@ -471,15 +451,6 @@ fn parse_review(text: &str) -> Option<bool> {
     let end = text.rfind('}')?;
     let value: Value = serde_json::from_str(&text[start..=end]).ok()?;
     value.get("allow").and_then(Value::as_bool)
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_owned();
-    }
-    let mut out: String = text.chars().take(max_chars).collect();
-    out.push('…');
-    out
 }
 
 /// 发送参数里的媒体引用（图片/文件/语音/视频）。

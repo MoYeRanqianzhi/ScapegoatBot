@@ -11,15 +11,19 @@
 //! - `stop_reason = refusal` 不重试、不换模型（设计 §3.2）。
 //! - 服务端工具（web search / fetch）由协议适配层声明与归一化。
 
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::agent::message::{RefusalDetails, StopReason, Usage};
 use crate::config::auth::AuthFile;
 use crate::config::models::{ModelsFile, Protocol};
+use crate::llm::types::{RefusalDetails, StopReason, Usage};
+
+use self::sse::{SseEvent, SseParser, Utf8Stream};
 
 pub mod anthropic;
 pub mod chat;
@@ -221,7 +225,7 @@ impl ProviderError {
             _ if status >= 500 => ProviderErrorKind::Server,
             _ => ProviderErrorKind::InvalidRequest,
         };
-        Self::new(kind, truncate(body, 800)).with_status(status)
+        Self::new(kind, truncate_chars(body, 800)).with_status(status)
     }
 
     /// 由完整 HTTP 响应构造：在状态码之外读取 `Retry-After`。
@@ -271,8 +275,8 @@ impl std::fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
-/// 截断过长的错误正文，避免把整页 HTML 塞进上下文/日志。
-fn truncate(text: &str, limit: usize) -> String {
+/// 截断过长文本，避免把整页 HTML 塞进上下文/日志；按字符而不是字节计数。
+pub fn truncate_chars(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_owned();
     }
@@ -294,6 +298,245 @@ pub trait Provider: Send + Sync {
 
     /// 发起流式请求；返回事件接收端，任务在后台读取网络流。
     async fn stream(&self, request: LlmRequest) -> Result<EventReceiver, ProviderError>;
+}
+
+/// [`complete_text`] 的失败原因。
+///
+/// 调用方各自把失败映射到自己的错误类型；保留这四种区别是为了不改变原有的
+/// 错误文案与超时语义（尤其是“请求失败”与“流内错误”在不同调用方的措辞）。
+#[derive(Debug)]
+pub enum CompletionError {
+    /// `Provider::stream` 调用本身失败（网络、鉴权、状态码等）。
+    Request(ProviderError),
+    /// 流内 `ProviderEvent::Error`。
+    Stream(ProviderError),
+    /// 超过调用方给出的总时限。
+    TimedOut,
+    /// 事件通道关闭，但没有收到 `Stop`。
+    Ended,
+}
+
+/// 单轮纯文本补全：可选 system、单条 user 消息、无工具、默认思考配置。
+///
+/// 返回 `Stop` 之前累计的文本；空文本不在这里判断，由调用方按各自的语义处理。
+/// `timeout` 从事件接收端建立后开始计时，覆盖整个收流过程。
+pub async fn complete_text(
+    provider: &dyn Provider,
+    model: &str,
+    system: Vec<SystemBlock>,
+    prompt: String,
+    max_tokens: u32,
+    timeout: Option<Duration>,
+) -> Result<String, CompletionError> {
+    let request = LlmRequest {
+        model: model.to_owned(),
+        system,
+        messages: vec![ProviderMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: prompt }],
+        }],
+        tools: Vec::new(),
+        max_tokens,
+        thinking: ThinkingOptions::default(),
+        server_tools: Vec::new(),
+    };
+    let mut receiver = provider
+        .stream(request)
+        .await
+        .map_err(CompletionError::Request)?;
+    let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+    let mut text = String::new();
+    loop {
+        let event = match deadline {
+            Some(deadline) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(CompletionError::TimedOut);
+                }
+                tokio::time::timeout_at(deadline, receiver.recv())
+                    .await
+                    .map_err(|_| CompletionError::TimedOut)?
+            }
+            None => receiver.recv().await,
+        };
+        let Some(event) = event else {
+            return Err(CompletionError::Ended);
+        };
+        match event {
+            ProviderEvent::TextDelta(delta) => text.push_str(&delta),
+            ProviderEvent::Stop { .. } => return Ok(text),
+            ProviderEvent::Error(error) => return Err(CompletionError::Stream(error)),
+            _ => {}
+        }
+    }
+}
+
+/// 协议差异中的鉴权头部分。
+pub(crate) enum Auth {
+    /// `x-api-key` 加 `anthropic-version`。
+    Anthropic(&'static str),
+    /// `authorization: Bearer <key>`。
+    Bearer,
+}
+
+/// 三种 HTTP 协议共享的外壳：客户端、基址、密钥与模型 id。
+///
+/// 协议实现只保留请求体构造与流解码；请求头差异通过 [`Auth`] 传入，
+/// 状态码映射、事件通道与后台任务都在这里统一处理。
+pub(crate) struct HttpProviderCore {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+    model_id: String,
+}
+
+impl HttpProviderCore {
+    pub(crate) fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model_id: impl Into<String>,
+        timeout_secs: u64,
+    ) -> Result<Self, ProviderError> {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs.max(1)))
+            .build()
+            .map_err(|error| ProviderError::new(ProviderErrorKind::Config, error.to_string()))?;
+        Ok(Self {
+            client,
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            model_id: model_id.into(),
+        })
+    }
+
+    pub(crate) fn model_id(&self) -> &str {
+        &self.model_id
+    }
+
+    /// 发起流式请求；成功时把响应流交给后台的 [`pump`]。
+    pub(crate) async fn send_stream<S: StreamDecoder + Send + 'static>(
+        &self,
+        path: &str,
+        auth: Auth,
+        body: &Value,
+        state: S,
+    ) -> Result<EventReceiver, ProviderError> {
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let request = self
+            .client
+            .post(url)
+            .header("content-type", "application/json");
+        let request = match auth {
+            Auth::Anthropic(version) => request
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", version),
+            Auth::Bearer => request.header("authorization", format!("Bearer {}", self.api_key)),
+        };
+        let response =
+            request.json(body).send().await.map_err(|error| {
+                ProviderError::new(ProviderErrorKind::Network, error.to_string())
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let text = response.text().await.unwrap_or_default();
+            return Err(ProviderError::from_response(
+                status.as_u16(),
+                Some(&headers),
+                &text,
+            ));
+        }
+
+        let (tx, rx) = mpsc::channel(256);
+        tokio::spawn(async move {
+            pump(response, tx, state).await;
+        });
+        Ok(rx)
+    }
+}
+
+/// 协议各自的 SSE 解码与 EOF 收尾。
+///
+/// [`pump`] 只负责共享的读流管线；各协议的差异（事件字段、延迟 stop、
+/// 无 stop 时的错误文案）由各自的 `StreamState` 实现。
+pub(crate) trait StreamDecoder {
+    /// 处理一个 SSE 事件，返回要发送给上层的事件。
+    fn decode(&mut self, event: SseEvent) -> Vec<ProviderEvent>;
+
+    /// SSE 正常结束后的收尾事件；已经发过 `Stop` 时通常为空。
+    fn finish(&mut self) -> Vec<ProviderEvent>;
+}
+
+/// 持续读取网络流并转发解析后的事件。
+///
+/// 30s 空闲超时、UTF-8 增量解码、SSE 尾部 flush 与发送失败退出都在这里；
+/// 协议差异全部交给 [`StreamDecoder`]。
+async fn pump<S: StreamDecoder>(
+    response: reqwest::Response,
+    tx: mpsc::Sender<ProviderEvent>,
+    mut state: S,
+) {
+    let mut stream = response.bytes_stream();
+    let mut parser = SseParser::new();
+    // 网络 chunk 可能切在多字节字符中间，必须做增量解码。
+    let mut decoder = Utf8Stream::new();
+
+    loop {
+        let chunk = match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(_) => {
+                let _ = tx
+                    .send(ProviderEvent::Error(ProviderError::new(
+                        ProviderErrorKind::Network,
+                        "stream idle timeout (30s)",
+                    )))
+                    .await;
+                return;
+            }
+        };
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = tx
+                    .send(ProviderEvent::Error(ProviderError::new(
+                        ProviderErrorKind::Network,
+                        error.to_string(),
+                    )))
+                    .await;
+                return;
+            }
+        };
+        let text = decoder.push(&bytes);
+        for event in parser.push(&text) {
+            for outgoing in state.decode(event) {
+                if tx.send(outgoing).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+
+    let tail = decoder.finish();
+    if !tail.is_empty() {
+        for event in parser.push(&tail) {
+            for outgoing in state.decode(event) {
+                if tx.send(outgoing).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
+    for event in parser.finish() {
+        for outgoing in state.decode(event) {
+            if tx.send(outgoing).await.is_err() {
+                return;
+            }
+        }
+    }
+    for outgoing in state.finish() {
+        let _ = tx.send(outgoing).await;
+    }
 }
 
 /// 按 `provider/id` 构造 provider。

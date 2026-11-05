@@ -22,7 +22,7 @@ use crate::agent::AgentMessage;
 use crate::agent::queue::ChatQueue;
 use crate::agent::runner::SharedProviderSlot;
 use crate::config::{MemoryConfig, MemoryReviewMode, StyleConfig};
-use crate::providers::{ContentBlock, LlmRequest, Provider, ProviderMessage, Role, SystemBlock};
+use crate::providers::{CompletionError, Provider, SystemBlock, complete_text};
 use crate::storage::Database;
 use crate::tools::memory::{MemoryLimits, ReviewEntry, apply_review};
 use crate::vfs::Vfs;
@@ -196,43 +196,30 @@ async fn run_review(
 ) -> Result<usize> {
     let recent: Vec<AgentMessage> = history.iter().rev().take(80).rev().cloned().collect();
     let input = crate::session::compaction::render_for_summary(&recent, 60_000);
-    let request = LlmRequest {
-        model: model.to_owned(),
-        system: vec![SystemBlock {
+    let text = match complete_text(
+        provider.as_ref(),
+        model,
+        vec![SystemBlock {
             text: REVIEW_SYSTEM.to_owned(),
             cache: false,
         }],
-        messages: vec![ProviderMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text { text: input }],
-        }],
-        tools: Vec::new(),
-        max_tokens: 2048,
-        thinking: Default::default(),
-        server_tools: Vec::new(),
-    };
-    let mut receiver = provider
-        .stream(request)
-        .await
-        .context("review request failed")?;
-    let mut text = String::new();
-    let mut stopped = false;
-    while let Some(event) = receiver.recv().await {
-        match event {
-            crate::providers::ProviderEvent::TextDelta(delta) => text.push_str(&delta),
-            crate::providers::ProviderEvent::Stop { .. } => {
-                stopped = true;
-                break;
-            }
-            crate::providers::ProviderEvent::Error(error) => {
-                return Err(anyhow::anyhow!("review provider error: {error}"));
-            }
-            _ => {}
+        input,
+        2048,
+        None,
+    )
+    .await
+    {
+        Ok(text) => text,
+        Err(CompletionError::Request(error)) => {
+            return Err(anyhow::Error::new(error).context("review request failed"));
         }
-    }
-    if !stopped {
-        anyhow::bail!("review request ended without a stop event");
-    }
+        Err(CompletionError::Stream(error)) => {
+            return Err(anyhow::anyhow!("review provider error: {error}"));
+        }
+        Err(CompletionError::TimedOut | CompletionError::Ended) => {
+            anyhow::bail!("review request ended without a stop event");
+        }
+    };
     let json = extract_json(&text).context("review output is not JSON")?;
     let value: Value = serde_json::from_str(json).context("review output is not valid JSON")?;
 

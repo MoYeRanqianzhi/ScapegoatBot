@@ -21,9 +21,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use crate::providers::{
-    ContentBlock, LlmRequest, Provider, ProviderEvent, ProviderMessage, Role, SystemBlock,
-};
+use crate::providers::{CompletionError, Provider, SystemBlock, complete_text, truncate_chars};
 
 use crate::config::{GuardBackend, GuardConfig, GuardMode};
 use crate::storage::Database;
@@ -324,54 +322,40 @@ impl SafetyJudge for LlmJudge {
             Checkpoint::Output => "output before any side effect",
             Checkpoint::Gate => "a planned QQ action",
         };
-        let request = LlmRequest {
-            model: self.model.clone(),
-            system: vec![SystemBlock {
-                text: LLM_JUDGE_SYSTEM.to_owned(),
-                cache: false,
-            }],
-            messages: vec![ProviderMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: format!(
-                        "checkpoint: {where_}
+        let prompt = format!(
+            "checkpoint: {where_}
 
 state:
 {}
 
 new content:
 {delta}",
-                        truncate_chars(state, 24_000)
-                    ),
-                }],
+            truncate_chars(state, 24_000)
+        );
+        let text = match complete_text(
+            self.provider.as_ref(),
+            &self.model,
+            vec![SystemBlock {
+                text: LLM_JUDGE_SYSTEM.to_owned(),
+                cache: false,
             }],
-            tools: Vec::new(),
-            max_tokens: 256,
-            thinking: Default::default(),
-            server_tools: Vec::new(),
-        };
-        let mut receiver = self
-            .provider
-            .stream(request)
-            .await
-            .map_err(|error| GateError::Request(error.to_string()))?;
-        let deadline = tokio::time::Instant::now() + self.timeout;
-        let mut text = String::new();
-        loop {
-            if tokio::time::Instant::now() >= deadline {
+            prompt,
+            256,
+            Some(self.timeout),
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(CompletionError::Request(error) | CompletionError::Stream(error)) => {
+                return Err(GateError::Request(error.to_string()));
+            }
+            Err(CompletionError::TimedOut) => {
                 return Err(GateError::Request("llm judge timed out".to_owned()));
             }
-            let event = tokio::time::timeout_at(deadline, receiver.recv())
-                .await
-                .map_err(|_| GateError::Request("llm judge timed out".to_owned()))?
-                .ok_or_else(|| GateError::Response("judge stream ended".to_owned()))?;
-            match event {
-                ProviderEvent::TextDelta(delta) => text.push_str(&delta),
-                ProviderEvent::Error(error) => return Err(GateError::Request(error.to_string())),
-                ProviderEvent::Stop { .. } => break,
-                _ => {}
+            Err(CompletionError::Ended) => {
+                return Err(GateError::Response("judge stream ended".to_owned()));
             }
-        }
+        };
         let (dangerous, score, reason) = parse_llm_verdict(&text)
             .ok_or_else(|| GateError::Response(format!("unparsable verdict: {text}")))?;
         Ok(Verdict {
@@ -381,15 +365,6 @@ new content:
             reason,
         })
     }
-}
-
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_owned();
-    }
-    let mut out: String = text.chars().take(max_chars).collect();
-    out.push('…');
-    out
 }
 
 fn parse_llm_verdict(text: &str) -> Option<(bool, f32, String)> {
