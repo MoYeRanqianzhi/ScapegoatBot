@@ -31,9 +31,20 @@ impl Runner {
                 return Vec::new();
             }
         };
+        // 回复/转发引用里的图片不在当前 segment 里；把引用消息里的 image segment
+        // 追加成一条合成消息，后面的解析与下载逻辑保持不变。
+        let mut effective: Vec<crate::qq::event::QqMessage> = messages.to_vec();
+        for message in messages {
+            let quoted = self.referenced_image_segments(message).await;
+            if !quoted.is_empty() {
+                let mut extra = message.clone();
+                extra.segments = quoted;
+                effective.push(extra);
+            }
+        }
         let mut prompts = Vec::new();
         let mut image_count = 0usize;
-        for message in messages {
+        for message in &effective {
             for segment in &message.segments {
                 if image_count >= 4 {
                     warn!("more than 4 images in one batch; extra images were not attached");
@@ -210,6 +221,105 @@ fn mime_for_bytes(bytes: &[u8]) -> String {
         .unwrap_or_else(|_| "image/jpeg".to_owned())
 }
 
+impl Runner {
+    /// 取回复/转发引用消息里的图片 segment。
+    ///
+    /// 最多解析 3 条回复与 2 条转发，避免一条消息触发无限次 NapCat 查询。
+    async fn referenced_image_segments(
+        &self,
+        message: &crate::qq::event::QqMessage,
+    ) -> Vec<crate::qq::event::Segment> {
+        let Some(qq) = &self.deps.qq else {
+            return Vec::new();
+        };
+        let mut replies = Vec::new();
+        let mut forwards = Vec::new();
+        for segment in &message.segments {
+            match segment {
+                crate::qq::event::Segment::Reply { id } => replies.push(id.clone()),
+                crate::qq::event::Segment::Other { kind, data }
+                    if matches!(kind.as_str(), "forward" | "json") =>
+                {
+                    if let Some(id) = data
+                        .get("id")
+                        .or_else(|| data.get("data").and_then(|value| value.get("id")))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        forwards.push(id.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(reply) = message.reply_to {
+            replies.push(reply.to_string());
+        }
+        replies.sort();
+        replies.dedup();
+        forwards.sort();
+        forwards.dedup();
+
+        let mut segments = Vec::new();
+        for id in replies.into_iter().take(3) {
+            let params = match id.parse::<i64>() {
+                Ok(message_id) => serde_json::json!({"message_id": message_id}),
+                Err(_) => serde_json::json!({"message_id": id}),
+            };
+            match qq.call("get_msg", params).await {
+                Ok(value) => segments.extend(image_segments_from_value(&value)),
+                Err(error) => warn!(%error, "cannot resolve a replied message"),
+            }
+        }
+        for id in forwards.into_iter().take(2) {
+            match qq
+                .call("get_forward_msg", serde_json::json!({"id": id}))
+                .await
+            {
+                Ok(value) => segments.extend(image_segments_from_value(&value)),
+                Err(error) => warn!(%error, "cannot resolve a forwarded message"),
+            }
+        }
+        segments
+    }
+}
+
+/// 从 OneBot 消息/转发 JSON 里递归提取 image segment。
+fn image_segments_from_value(value: &serde_json::Value) -> Vec<crate::qq::event::Segment> {
+    fn walk(value: &serde_json::Value, out: &mut Vec<crate::qq::event::Segment>) {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, out);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                if map.get("type").and_then(serde_json::Value::as_str) == Some("image") {
+                    let data = map.get("data").unwrap_or(&serde_json::Value::Null);
+                    let text = |key: &str| {
+                        data.get(key)
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_owned()
+                    };
+                    let (url, file, path) = (text("url"), text("file"), text("path"));
+                    if !url.is_empty() || !file.is_empty() || !path.is_empty() {
+                        out.push(crate::qq::event::Segment::Image { url, file, path });
+                    }
+                }
+                for key in ["message", "content", "messages", "data"] {
+                    if let Some(child) = map.get(key) {
+                        walk(child, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +337,31 @@ mod tests {
         )));
         assert!(!is_qq_image_url(&parse("https://evilqq.com/a.png")));
         assert!(!is_qq_image_url(&parse("https://example.com/a.png")));
+    }
+
+    #[test]
+    fn quoted_message_images_are_extracted_recursively() {
+        let get_msg = serde_json::json!({
+            "status": "ok",
+            "data": {"message": [
+                {"type": "text", "data": {"text": "look"}},
+                {"type": "image", "data": {"url": "https://gchat.qpic.cn/a.png", "file": "a.png"}}
+            ]}
+        });
+        let segments = image_segments_from_value(&get_msg);
+        assert_eq!(segments.len(), 1);
+
+        let forward = serde_json::json!({
+            "data": {"messages": [
+                {"message": [{"type": "image", "data": {"file": "b.png"}}]},
+                {"message": [{"type": "text", "data": {"text": "hi"}}]}
+            ]}
+        });
+        let segments = image_segments_from_value(&forward);
+        assert_eq!(segments.len(), 1);
+        assert!(
+            matches!(&segments[0], crate::qq::event::Segment::Image { file, .. } if file == "b.png")
+        );
     }
 
     #[test]
