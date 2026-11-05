@@ -3,7 +3,7 @@ use super::*;
 
 impl MessageStore {
     /// 用量：字节数与消息条数。
-    pub fn usage(&self) -> Result<(u64, u64)> {
+    pub(crate) fn usage(&self) -> Result<(u64, u64)> {
         let conn = self.db.lock();
         let (bytes, count) = conn.query_row(
             "SELECT COALESCE(SUM(bytes), 0), COALESCE(SUM(count), 0) FROM message_files",
@@ -17,7 +17,7 @@ impl MessageStore {
     ///
     /// 启动时用于决定是否需要重建索引（设计 §8.2：索引只是可重建缓存）。
     /// 只遍历文件名，不解析内容，百万级消息下也是 O(文件数)。
-    pub fn index_file_counts(&self) -> Result<(u64, u64)> {
+    pub(crate) fn index_file_counts(&self) -> Result<(u64, u64)> {
         let messages_dir = self.root.join("messages");
         let disk = if messages_dir.exists() {
             walk_files(&messages_dir)?.len() as u64
@@ -35,7 +35,7 @@ impl MessageStore {
     ///
     /// 补 `messages`、`message_files` 与 `inbox_state` 三张表：前两张决定配额、
     /// 保留与月视图，最后一张决定未读数；只补 `messages` 会让其余视图静默失准。
-    pub fn rebuild_index(&self) -> Result<u64> {
+    pub(crate) fn rebuild_index(&self) -> Result<u64> {
         let messages_dir = self.root.join("messages");
         if !messages_dir.exists() {
             return Ok(0);

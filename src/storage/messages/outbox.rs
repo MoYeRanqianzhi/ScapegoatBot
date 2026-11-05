@@ -2,7 +2,7 @@ use super::*;
 
 impl MessageStore {
     /// 发送账本：登记意图（发送前）。
-    pub fn begin_send(&self, id: &str, chat: ChatId, intent: &str) -> Result<()> {
+    pub(crate) fn begin_send(&self, id: &str, chat: ChatId, intent: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let conn = self.db.lock();
         conn.execute(
@@ -15,7 +15,12 @@ impl MessageStore {
     }
 
     /// 发送账本：记录结果。
-    pub fn finish_send(&self, id: &str, status: &str, message_id: Option<i64>) -> Result<()> {
+    pub(crate) fn finish_send(
+        &self,
+        id: &str,
+        status: &str,
+        message_id: Option<i64>,
+    ) -> Result<()> {
         let conn = self.db.lock();
         conn.execute(
             "UPDATE outbound_intents
@@ -30,7 +35,7 @@ impl MessageStore {
     ///
     /// 崩溃/超时可能发生在“对方已收到、本地没记下 message_id”之间；不能当作
     /// 失败自动重试，先标记为不确定，交给 agent 查历史后决定。
-    pub fn mark_stale_intents(&self, age_secs: u64) -> Result<u64> {
+    pub(crate) fn mark_stale_intents(&self, age_secs: u64) -> Result<u64> {
         let cutoff = (Utc::now() - chrono::Duration::seconds(age_secs as i64)).to_rfc3339();
         let conn = self.db.lock();
         let changed = conn.execute(
@@ -42,7 +47,7 @@ impl MessageStore {
     }
 
     /// 未确认的发送（崩溃恢复时先查它们）。
-    pub fn unconfirmed_sends(&self) -> Result<Vec<(String, ChatId, String)>> {
+    pub(crate) fn unconfirmed_sends(&self) -> Result<Vec<(String, ChatId, String)>> {
         let conn = self.db.lock();
         let mut statement = conn.prepare(
             "SELECT id, chat, intent FROM outbound_intents

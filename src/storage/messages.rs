@@ -56,7 +56,7 @@ mod outbox;
 mod retention;
 
 impl InboxState {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Unread => "unread",
             Self::Read => "read",
@@ -64,7 +64,7 @@ impl InboxState {
         }
     }
 
-    pub fn parse(raw: &str) -> Option<Self> {
+    pub(crate) fn parse(raw: &str) -> Option<Self> {
         Some(match raw {
             "unread" => Self::Unread,
             "read" => Self::Read,
@@ -101,7 +101,7 @@ pub struct MessageStore {
 
 impl MessageStore {
     /// 打开存储并确保目录存在。
-    pub fn open(
+    pub(crate) fn open(
         db: Arc<Database>,
         key: Arc<MasterKey>,
         root: PathBuf,
@@ -122,7 +122,7 @@ impl MessageStore {
     }
 
     /// 设置按年龄清理的天数（0 = 关闭）；启动时也可调用 [`Self::enforce_retention`]。
-    pub fn with_retention_days(mut self, days: u32) -> Self {
+    pub(crate) fn with_retention_days(mut self, days: u32) -> Self {
         self.retention_days = days;
         self
     }
@@ -130,7 +130,7 @@ impl MessageStore {
     /// 追加一条消息；已存在（同 chat + message_id）时返回 `false`。
     ///
     /// 返回 `true` 表示新写入，调用方才应触发去抖与回合。
-    pub fn append(&self, message: &QqMessage) -> Result<bool> {
+    pub(crate) fn append(&self, message: &QqMessage) -> Result<bool> {
         let _guard = self
             .append_lock
             .lock()
@@ -252,7 +252,7 @@ impl MessageStore {
     }
 
     /// 按 message_id 找它所属的 chat；`get_msg` 没有 chat 参数时用它做范围校验。
-    pub fn chat_for_message(&self, message_id: i64) -> Result<Option<ChatId>> {
+    pub(crate) fn chat_for_message(&self, message_id: i64) -> Result<Option<ChatId>> {
         let conn = self.db.lock();
         let chat: Option<String> = conn
             .query_row(
@@ -265,7 +265,7 @@ impl MessageStore {
     }
 
     /// 按 chat + message_id 读取消息。
-    pub fn load(&self, chat: ChatId, message_id: i64) -> Result<Option<QqMessage>> {
+    pub(crate) fn load(&self, chat: ChatId, message_id: i64) -> Result<Option<QqMessage>> {
         let row: Option<(String, i64)> = {
             let conn = self.db.lock();
             conn.query_row(
@@ -286,7 +286,7 @@ impl MessageStore {
     }
 
     /// 某天某 chat 的全部消息（按时间升序）。
-    pub fn messages_for_day(&self, chat: ChatId, day: &str) -> Result<Vec<QqMessage>> {
+    pub(crate) fn messages_for_day(&self, chat: ChatId, day: &str) -> Result<Vec<QqMessage>> {
         self.load_indexed(
             "SELECT file_path, line_no, message_id FROM messages
              WHERE chat = ?1 AND day = ?2 ORDER BY ts ASC",
@@ -295,7 +295,7 @@ impl MessageStore {
     }
 
     /// 最近 N 条（按时间升序返回）。
-    pub fn recent(&self, chat: ChatId, limit: u32) -> Result<Vec<QqMessage>> {
+    pub(crate) fn recent(&self, chat: ChatId, limit: u32) -> Result<Vec<QqMessage>> {
         let mut messages = self.load_indexed(
             "SELECT file_path, line_no, message_id FROM messages
              WHERE chat = ?1 ORDER BY ts DESC LIMIT ?2",
@@ -306,7 +306,7 @@ impl MessageStore {
     }
 
     /// 全部未读（可按 chat 过滤），按时间升序。
-    pub fn unread(&self, chat: Option<ChatId>) -> Result<Vec<QqMessage>> {
+    pub(crate) fn unread(&self, chat: Option<ChatId>) -> Result<Vec<QqMessage>> {
         match chat {
             Some(chat) => self.load_indexed(
                 "SELECT m.file_path, m.line_no, m.message_id FROM messages m
@@ -326,7 +326,7 @@ impl MessageStore {
     }
 
     /// 每个来源的未读数。
-    pub fn unread_counts(&self) -> Result<Vec<(ChatId, u64)>> {
+    pub(crate) fn unread_counts(&self) -> Result<Vec<(ChatId, u64)>> {
         let conn = self.db.lock();
         let mut statement = conn.prepare(
             "SELECT chat, COUNT(*) FROM inbox_state WHERE state = 'unread'
@@ -344,7 +344,7 @@ impl MessageStore {
     }
 
     /// 查询某条消息的收件箱状态。
-    pub fn state(&self, chat: ChatId, message_id: i64) -> Result<Option<InboxState>> {
+    pub(crate) fn state(&self, chat: ChatId, message_id: i64) -> Result<Option<InboxState>> {
         let conn = self.db.lock();
         let raw: Option<String> = conn
             .query_row(
@@ -357,7 +357,7 @@ impl MessageStore {
     }
 
     /// 设置状态；`dismissed` 不会被后续 `read` 覆盖。
-    pub fn set_state(&self, chat: ChatId, message_id: i64, state: InboxState) -> Result<()> {
+    pub(crate) fn set_state(&self, chat: ChatId, message_id: i64, state: InboxState) -> Result<()> {
         let conn = self.db.lock();
         conn.execute(
             "INSERT INTO inbox_state (chat, message_id, state, updated_at)
@@ -379,7 +379,7 @@ impl MessageStore {
     }
 
     /// 批量标记已读；“内容进入上下文就算读过”。
-    pub fn mark_read(&self, chat: ChatId, ids: &[i64]) -> Result<usize> {
+    pub(crate) fn mark_read(&self, chat: ChatId, ids: &[i64]) -> Result<usize> {
         let mut marked = 0;
         for id in ids {
             if self.state(chat, *id)? == Some(InboxState::Unread) {
@@ -391,7 +391,7 @@ impl MessageStore {
     }
 
     /// 批量忽略；返回实际忽略的条数。
-    pub fn dismiss(&self, chat: ChatId, ids: &[i64]) -> Result<usize> {
+    pub(crate) fn dismiss(&self, chat: ChatId, ids: &[i64]) -> Result<usize> {
         let mut count = 0;
         for id in ids {
             self.set_state(chat, *id, InboxState::Dismissed)?;
@@ -401,7 +401,7 @@ impl MessageStore {
     }
 
     /// 更新断线游标。
-    pub fn set_cursor(&self, chat: ChatId, message_id: i64, ts: &str) -> Result<()> {
+    pub(crate) fn set_cursor(&self, chat: ChatId, message_id: i64, ts: &str) -> Result<()> {
         let conn = self.db.lock();
         conn.execute(
             "INSERT INTO chat_cursors (chat, last_message_id, last_ts, updated_at)
@@ -416,7 +416,8 @@ impl MessageStore {
     }
 
     /// 已知的最近活跃 chat（供断线重连补消息）。
-    pub fn known_chats(&self) -> Result<Vec<ChatId>> {
+    #[cfg(test)]
+    pub(crate) fn known_chats(&self) -> Result<Vec<ChatId>> {
         let conn = self.db.lock();
         let mut statement = conn.prepare(
             "SELECT chat FROM chat_cursors UNION SELECT chat FROM messages GROUP BY chat",
@@ -428,7 +429,7 @@ impl MessageStore {
     }
 
     /// 某 chat 有数据的月份（升序）。
-    pub fn months(&self, chat: ChatId) -> Result<Vec<String>> {
+    pub(crate) fn months(&self, chat: ChatId) -> Result<Vec<String>> {
         let (scope, peer) = scope_peer(chat);
         let conn = self.db.lock();
         let mut statement = conn.prepare(
@@ -441,7 +442,7 @@ impl MessageStore {
     }
 
     /// 某 chat 某月有数据的日子（`DD`，升序）。
-    pub fn days(&self, chat: ChatId, month: &str) -> Result<Vec<String>> {
+    pub(crate) fn days(&self, chat: ChatId, month: &str) -> Result<Vec<String>> {
         let (scope, peer) = scope_peer(chat);
         let conn = self.db.lock();
         let mut statement = conn.prepare(
@@ -456,7 +457,7 @@ impl MessageStore {
     }
 
     /// 某个 scope（groups / private）下出现过的 peer。
-    pub fn peers(&self, scope: &str) -> Result<Vec<u64>> {
+    pub(crate) fn peers(&self, scope: &str) -> Result<Vec<u64>> {
         let conn = self.db.lock();
         let mut statement = conn.prepare(
             "SELECT DISTINCT peer FROM message_files WHERE scope = ?1 ORDER BY peer ASC",
@@ -467,7 +468,7 @@ impl MessageStore {
     }
 
     /// 读取某天某 chat 的收件箱条目（带状态）。
-    pub fn inbox_for_chat(&self, chat: ChatId, state: InboxState) -> Result<Vec<QqMessage>> {
+    pub(crate) fn inbox_for_chat(&self, chat: ChatId, state: InboxState) -> Result<Vec<QqMessage>> {
         self.load_indexed(
             "SELECT m.file_path, m.line_no, m.message_id FROM messages m
              JOIN inbox_state s ON s.chat = m.chat AND s.message_id = m.message_id

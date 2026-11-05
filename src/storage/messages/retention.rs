@@ -2,7 +2,7 @@ use super::*;
 
 impl MessageStore {
     /// 按年龄与配额清理最旧的完整月份，绝不删除当前月份。
-    pub fn enforce_retention(&self, retention_days: u32) -> Result<CleanupReport> {
+    pub(crate) fn enforce_retention(&self, retention_days: u32) -> Result<CleanupReport> {
         let mut report = CleanupReport::default();
         let current_month = Local::now().format("%Y-%m").to_string();
         let cutoff_month = if retention_days == 0 {

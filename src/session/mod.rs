@@ -72,7 +72,7 @@ pub struct SessionStore {
 
 impl SessionStore {
     /// 打开并确保 `sessions/` 存在。
-    pub fn open(
+    pub(crate) fn open(
         db: Arc<Database>,
         key: Arc<MasterKey>,
         root: PathBuf,
@@ -94,13 +94,13 @@ impl SessionStore {
     }
 
     /// 设置按年龄清理的天数（0 = 关闭）。
-    pub fn with_retention_days(mut self, days: u32) -> Self {
+    pub(crate) fn with_retention_days(mut self, days: u32) -> Self {
         self.retention_days = days;
         self
     }
 
     /// 当前（未关闭）分段；不存在时创建一个。
-    pub fn current(&self) -> Result<SessionFile> {
+    pub(crate) fn current(&self) -> Result<SessionFile> {
         let _guard = self
             .current_lock
             .lock()
@@ -132,12 +132,12 @@ impl SessionStore {
     }
 
     /// 当前分段的虚拟路径，供 system prompt 的 `current_session` 使用。
-    pub fn current_path(&self) -> Result<String> {
+    pub(crate) fn current_path(&self) -> Result<String> {
         Ok(format!("/sessions/{}", self.current()?.file))
     }
 
     /// 追加消息到当前分段。
-    pub fn append(&self, messages: &[AgentMessage]) -> Result<()> {
+    pub(crate) fn append(&self, messages: &[AgentMessage]) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
@@ -175,7 +175,7 @@ impl SessionStore {
     }
 
     /// 读取整个分段。
-    pub fn read_segment(&self, file: &str) -> Result<Vec<AgentMessage>> {
+    pub(crate) fn read_segment(&self, file: &str) -> Result<Vec<AgentMessage>> {
         let _guard = self
             .append_lock
             .lock()
@@ -224,7 +224,7 @@ impl SessionStore {
     }
 
     /// 列出全部分段（从新到旧）。
-    pub fn list(&self) -> Result<Vec<SessionFile>> {
+    pub(crate) fn list(&self) -> Result<Vec<SessionFile>> {
         let conn = self.db.lock();
         let mut statement = conn.prepare(
             "SELECT file, file_id, prev_file, started_at, ended_at, message_count, bytes
@@ -238,7 +238,7 @@ impl SessionStore {
     }
 
     /// 轮转：关闭当前分段并创建新分段（压缩成功后调用）。
-    pub fn rotate(&self) -> Result<SessionFile> {
+    pub(crate) fn rotate(&self) -> Result<SessionFile> {
         let _guard = self
             .append_lock
             .lock()
@@ -270,7 +270,7 @@ impl SessionStore {
     /// 设计 §8.1：`compaction_checkpoints` 用于崩溃恢复与审计；
     /// 分段首行的摘要仍是权威，这里的行只是可查询的缓存。
     /// 只保留最近 [`CHECKPOINT_KEEP`] 条，避免无限增长。
-    pub fn record_checkpoint(&self, from_file: &str, summary: &str) -> Result<()> {
+    pub(crate) fn record_checkpoint(&self, from_file: &str, summary: &str) -> Result<()> {
         let sealed = match self.encryption {
             EncryptionMode::XChaCha20Poly1305 => {
                 self.key
@@ -293,7 +293,8 @@ impl SessionStore {
     }
 
     /// 最近的检查点：`(from_file, summary, created_at)`，最新在前。
-    pub fn checkpoints(&self, limit: usize) -> Result<Vec<(String, String, String)>> {
+    #[cfg(test)]
+    pub(crate) fn checkpoints(&self, limit: usize) -> Result<Vec<(String, String, String)>> {
         let conn = self.db.lock();
         let mut statement = conn.prepare(
             "SELECT from_file, summary_enc, created_at FROM compaction_checkpoints
@@ -326,7 +327,7 @@ impl SessionStore {
     }
 
     /// 用量：字节数与消息条数。
-    pub fn usage(&self) -> Result<(u64, u64)> {
+    pub(crate) fn usage(&self) -> Result<(u64, u64)> {
         let conn = self.db.lock();
         let (bytes, count) = conn.query_row(
             "SELECT COALESCE(SUM(bytes), 0), COALESCE(SUM(message_count), 0)
@@ -338,7 +339,7 @@ impl SessionStore {
     }
 
     /// 按年龄与配额删除最旧的**已关闭**分段，绝不删除当前分段。
-    pub fn enforce_retention(&self, retention_days: u32) -> Result<u64> {
+    pub(crate) fn enforce_retention(&self, retention_days: u32) -> Result<u64> {
         let mut removed = 0u64;
         loop {
             let (bytes, _) = self.usage()?;
@@ -387,7 +388,7 @@ impl SessionStore {
     }
 
     /// 分段的索引信息。
-    pub fn info(&self, file: &str) -> Result<Option<SessionFile>> {
+    pub(crate) fn info(&self, file: &str) -> Result<Option<SessionFile>> {
         let conn = self.db.lock();
         Ok(conn
             .query_row(

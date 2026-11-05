@@ -34,7 +34,7 @@ pub enum TurnState {
 }
 
 impl TurnState {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Open => "open",
             Self::Committing => "committing",
@@ -52,7 +52,7 @@ pub struct TurnBufferStore {
 }
 
 impl TurnBufferStore {
-    pub fn new(db: Arc<Database>, key: Arc<MasterKey>, encryption: EncryptionMode) -> Self {
+    pub(crate) fn new(db: Arc<Database>, key: Arc<MasterKey>, encryption: EncryptionMode) -> Self {
         Self {
             db,
             key,
@@ -64,7 +64,7 @@ impl TurnBufferStore {
     ///
     /// `scope` 是回合所属的 transcript 作用域（`shared` 或 `group-<id>`）；
     /// 崩溃恢复按 scope 重放，避免把 A 聊天的未提交块写进 B 的链。
-    pub fn append(
+    pub(crate) fn append(
         &self,
         turn_id: &str,
         seq: u64,
@@ -91,7 +91,7 @@ impl TurnBufferStore {
     }
 
     /// 读取回合内全部块（按 seq 升序）。
-    pub fn load(&self, turn_id: &str) -> Result<Vec<(u64, AgentMessage)>> {
+    pub(crate) fn load(&self, turn_id: &str) -> Result<Vec<(u64, AgentMessage)>> {
         let rows: Vec<(i64, String)> = {
             let conn = self.db.lock();
             let mut statement = conn
@@ -108,7 +108,7 @@ impl TurnBufferStore {
     }
 
     /// 设置整个回合的状态。
-    pub fn set_state(&self, turn_id: &str, state: TurnState) -> Result<()> {
+    pub(crate) fn set_state(&self, turn_id: &str, state: TurnState) -> Result<()> {
         let conn = self.db.lock();
         conn.execute(
             "UPDATE turn_buffer SET state = ?1 WHERE turn_id = ?2",
@@ -121,7 +121,7 @@ impl TurnBufferStore {
     ///
     /// `committing` 表示崩溃发生在“已标记提交、transcript 可能只写了一部分”的窗口，
     /// 也必须重放；完全忽略它会留下永久孤儿行。
-    pub fn open_turns(&self) -> Result<Vec<String>> {
+    pub(crate) fn open_turns(&self) -> Result<Vec<String>> {
         let conn = self.db.lock();
         let mut statement = conn.prepare(
             "SELECT DISTINCT turn_id FROM turn_buffer
@@ -133,7 +133,7 @@ impl TurnBufferStore {
     }
 
     /// 删除某个回合的缓冲（提交或放弃后）。
-    pub fn clear(&self, turn_id: &str) -> Result<()> {
+    pub(crate) fn clear(&self, turn_id: &str) -> Result<()> {
         let conn = self.db.lock();
         conn.execute(
             "DELETE FROM turn_buffer WHERE turn_id = ?1",
