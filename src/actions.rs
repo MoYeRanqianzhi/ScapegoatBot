@@ -80,7 +80,7 @@ pub struct ActionSpec {
     pub target_field: Option<&'static str>,
     /// 是否属于 admin/destructive（目标为 owner 时恒拒绝）。
     pub destructive: bool,
-    pub examples: &'static [&'static str],
+    pub examples: Vec<&'static str>,
 }
 
 impl ActionSpec {
@@ -115,7 +115,7 @@ fn send_spec(
             None
         },
         destructive: false,
-        examples,
+        examples: examples.to_vec(),
     }
 }
 
@@ -170,7 +170,7 @@ pub fn specs() -> &'static [ActionSpec] {
             scope_field: None,
             target_field: None,
             destructive: false,
-            examples: &[r#"{"message_id":55555}"#],
+            examples: vec![r#"{"message_id":55555}"#],
         });
         list.push(ActionSpec {
             action: "napcat.set_msg_emoji_like",
@@ -182,7 +182,7 @@ pub fn specs() -> &'static [ActionSpec] {
             scope_field: None,
             target_field: None,
             destructive: false,
-            examples: &[r#"{"message_id":55555,"emoji_id":"128077"}"#],
+            examples: vec![r#"{"message_id":55555,"emoji_id":"128077"}"#],
         });
         list.push(ActionSpec {
             action: "napcat.send_poke",
@@ -194,7 +194,7 @@ pub fn specs() -> &'static [ActionSpec] {
             scope_field: Some("user_id"),
             target_field: Some("user_id"),
             destructive: false,
-            examples: &[r#"{"user_id":10001,"group_id":123}"#],
+            examples: vec![r#"{"user_id":10001,"group_id":123}"#],
         });
 
         // ---- napcat: query ----
@@ -282,7 +282,7 @@ pub fn specs() -> &'static [ActionSpec] {
                 scope_field: None,
                 target_field: None,
                 destructive: false,
-                examples: Box::leak(Box::new([example])),
+                examples: vec![example],
             });
         }
 
@@ -311,7 +311,7 @@ pub fn specs() -> &'static [ActionSpec] {
                 scope_field: None,
                 target_field: None,
                 destructive: false,
-                examples: Box::leak(Box::new([example])),
+                examples: vec![example],
             });
         }
 
@@ -405,7 +405,7 @@ pub fn specs() -> &'static [ActionSpec] {
                 scope_field: Some("group_id"),
                 target_field: if member_target { Some("user_id") } else { None },
                 destructive: true,
-                examples: Box::leak(Box::new([example])),
+                examples: vec![example],
             });
         }
 
@@ -460,7 +460,7 @@ pub fn specs() -> &'static [ActionSpec] {
                     None
                 },
                 destructive: action.ends_with("delete_group_file"),
-                examples: Box::leak(Box::new([example])),
+                examples: vec![example],
             });
         }
 
@@ -495,7 +495,7 @@ pub fn specs() -> &'static [ActionSpec] {
                 scope_field: None,
                 target_field: None,
                 destructive: false,
-                examples: Box::leak(Box::new([example])),
+                examples: vec![example],
             });
         }
 
@@ -527,7 +527,7 @@ pub fn specs() -> &'static [ActionSpec] {
                 scope_field: None,
                 target_field: None,
                 destructive: false,
-                examples: &[],
+                examples: vec![],
             });
         }
 
@@ -592,7 +592,7 @@ pub fn specs() -> &'static [ActionSpec] {
                 scope_field: None,
                 target_field: None,
                 destructive: false,
-                examples: Box::leak(Box::new([example])),
+                examples: vec![example],
             });
         }
 
@@ -613,7 +613,7 @@ pub fn specs() -> &'static [ActionSpec] {
             scope_field: None,
             target_field: None,
             destructive: false,
-            examples: &[r#"{"namespace":"napcat","category":"admin"}"#],
+            examples: vec![r#"{"namespace":"napcat","category":"admin"}"#],
         });
         list.push(ActionSpec {
             action: "api.help",
@@ -625,7 +625,7 @@ pub fn specs() -> &'static [ActionSpec] {
             scope_field: None,
             target_field: None,
             destructive: false,
-            examples: &[r#"{"action":"napcat.set_group_ban"}"#],
+            examples: vec![r#"{"action":"napcat.set_group_ban"}"#],
         });
 
         list
