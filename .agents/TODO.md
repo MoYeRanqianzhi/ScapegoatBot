@@ -8,8 +8,7 @@
       正常回合已 drain local SteeringQueue 并提前关闭 receiver。
 - [x] swarm 重启代数：旧 run 完成不会覆盖新状态；send 失败会走重启。
 - [ ] 控制/monitor 回合现在计入 `Runner::is_busy`，但控制 semaphore 与 `queue.max_concurrent` 是两套上限，
-      总主 agent 并发仍可超过配置值；`agent.compact` 在 per_chat 固定压 owner private 链。
-- [ ] per-scope 统计仍是全局：`compaction_failures` / `unchecked_tokens` / `review_failures` 跨 chat 互相影响。
+      总主 agent 并发仍可超过配置值。
 - [x] per_chat 的 append/current 锁已按 scope 独立；shared 仍共用。
 
 ## transcript
@@ -28,6 +27,8 @@
 ## P2 / 发布
 
 - [ ] `queue.cap_batches` 作为 deprecated 字段仍可解析，不参与调度。
+- [ ] `agent.compact` 没有目标参数，只能压当前回合所在链；control/monitor 回合固定在 owner private 链
+      （`run_injected`），所以控制台里无法指定压缩某个群的上下文。
 - [ ] 无 alpha.35 tag；按要求暂缓发布/部署，服务器 `sbot.service` 停止。
 - [ ] 历史重写后其他 clone 必须重新 clone 或
       `git fetch --all --prune --tags --force && git reset --hard origin/main`；旧 SHA 失效。
