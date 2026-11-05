@@ -6,7 +6,7 @@
 //! - 文件：`sessions/<YYYYMMDDTHHMMSSZ>-<seq>.jsonl`，名称字典序即时间序。
 //! - 首行明文文件头；之后每行一条 `AgentMessage`，AAD 绑定 `session:<file_id>:<line_no>`。
 //! - `transcript_files` 只是可重建索引；`/sessions` 视图由内容动态渲染。
-//! - 每次压缩成功后轮转新分段（由 runner 调用 [`SessionStore::rotate`]）。
+//! - 每次压缩成功后轮转新分段（由 runner 调用 `SessionStore::rotate`）。
 
 pub mod compaction;
 pub mod turn_buffer;
