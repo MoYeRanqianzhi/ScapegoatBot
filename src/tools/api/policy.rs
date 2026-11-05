@@ -77,7 +77,7 @@ impl ApiTool {
         // 同一 chat 的回复有明确理由，不需要额外证据；跨 chat 发送、加好友、
         // 改资料等扩张动作必须有证据。
         if spec.requires_owner_intent && !ctx.evidence.owner_intent {
-            let target = Self::chat_of(spec, &params);
+            let target = crate::actions::chat_of(spec, &params);
             let same_chat = spec.category == Category::Message
                 && target.as_ref().is_some_and(|chat| {
                     ctx.evidence.origin_chat.as_deref() == Some(chat.to_string().as_str())
@@ -131,7 +131,7 @@ impl ApiTool {
         // 发送作用域检查（fail-closed）。召回/表情回应只要 message_id，
         // 没有 chat 目标，不能因此判为错误。
         if spec.category == Category::Message {
-            match Self::chat_of(spec, &params) {
+            match crate::actions::chat_of(spec, &params) {
                 Some(chat) => {
                     if !self.scope_allowed(chat) {
                         return ToolResult::error(format!(
@@ -158,7 +158,7 @@ impl ApiTool {
             params
         };
         if spec.category == Category::Message
-            && let Some(chat) = Self::chat_of(spec, &params)
+            && let Some(chat) = crate::actions::chat_of(spec, &params)
             && let Err(error) = crate::hooks::before_send(&self.event_hooks, chat, &mut params)
         {
             return ToolResult::error(format!("BeforeSend hook blocked the send: {error}"));
@@ -171,7 +171,9 @@ impl ApiTool {
                 chrono::Utc::now().timestamp_millis(),
                 self.counter.fetch_add(1, Ordering::Relaxed)
             );
-            if let (Some(messages), Some(chat)) = (&self.messages, Self::chat_of(spec, &params)) {
+            if let (Some(messages), Some(chat)) =
+                (&self.messages, crate::actions::chat_of(spec, &params))
+            {
                 let _ = messages.begin_send(&id, chat, spec.action);
             }
             Some(id)
@@ -184,13 +186,15 @@ impl ApiTool {
                 // 只有成功才计入重复/跨群规则；失败重试不被自己的记录挡住。
                 if let Some(action_gate) = &self.action_gate
                     && spec.category == Category::Message
-                    && let Some(chat) = Self::chat_of(spec, &params)
+                    && let Some(chat) = crate::actions::chat_of(spec, &params)
                 {
                     action_gate.note_send(&params, &chat.to_string());
                 }
-                if let (Some(id), Some(chat), Some(messages)) =
-                    (&ledger_id, Self::chat_of(spec, &params), &self.messages)
-                {
+                if let (Some(id), Some(chat), Some(messages)) = (
+                    &ledger_id,
+                    crate::actions::chat_of(spec, &params),
+                    &self.messages,
+                ) {
                     let message_id = response
                         .get("message_id")
                         .or_else(|| response.pointer("/data/message_id"))

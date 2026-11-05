@@ -631,3 +631,49 @@ pub fn specs() -> &'static [ActionSpec] {
         list
     })
 }
+
+/// 把 QQ 号参数解析成整数：兼容数字与数字字符串。
+pub(crate) fn qq_number(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_i64().and_then(|value| u64::try_from(value).ok())),
+        serde_json::Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// 从 action 参数推导目标会话（发送范围与跨群规则用）。
+pub(crate) fn chat_of(
+    spec: &ActionSpec,
+    params: &serde_json::Value,
+) -> Option<crate::qq::event::ChatId> {
+    if spec.action == "napcat.send_msg" {
+        let message_type = params
+            .get("message_type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if message_type == "group" || (message_type.is_empty() && params.get("group_id").is_some())
+        {
+            return params
+                .get("group_id")
+                .and_then(qq_number)
+                .map(crate::qq::event::ChatId::Group);
+        }
+        return params
+            .get("user_id")
+            .and_then(qq_number)
+            .map(crate::qq::event::ChatId::Private);
+    }
+    match spec.scope_field {
+        Some("group_id") => params
+            .get("group_id")
+            .and_then(qq_number)
+            .map(crate::qq::event::ChatId::Group),
+        Some("user_id") => params
+            .get("user_id")
+            .and_then(qq_number)
+            .map(crate::qq::event::ChatId::Private),
+        _ => None,
+    }
+}

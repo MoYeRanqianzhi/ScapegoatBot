@@ -18,10 +18,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::actions::{ActionSpec, Category};
 use crate::config::{GateConfig, GateMode};
 use crate::providers::{CompletionError, Provider, SystemBlock, complete_text, truncate_chars};
 use crate::storage::Database;
-use crate::tools::actions::{ActionSpec, Category};
 use crate::transcript::TurnEvidence;
 
 use super::events::{self, Checkpoint};
@@ -782,7 +782,7 @@ impl ActionGate {
         }
 
         if spec.category == Category::Message
-            && let Some(chat) = crate::tools::api::ApiTool::chat_of(spec, params)
+            && let Some(chat) = crate::actions::chat_of(spec, params)
             && let Err(reason) = self.send_rule(params, evidence, &chat.to_string())
         {
             self.record_audit(spec.action, false, &reason);
@@ -842,7 +842,7 @@ fn message_content(params: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::actions::specs;
+    use crate::actions::specs;
 
     fn spec(action: &str) -> &'static ActionSpec {
         specs()

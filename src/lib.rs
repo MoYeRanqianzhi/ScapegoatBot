@@ -5,6 +5,7 @@
 //! - 未来 `sbot doctor` 等工具能复用同一套实现。
 
 // Agent 循环：内/外循环、事件流、steering 与工具执行。
+pub mod actions;
 pub mod agent;
 pub mod app;
 // 运行预算：每日 token/USD、回合上限与 guard 花费。

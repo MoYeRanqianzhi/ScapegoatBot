@@ -15,7 +15,7 @@ pub(crate) const DYNAMIC_READ_ONLY: &str = "Dynamic views are read-only.";
 /// 运行时未挂载动态视图时的统一提示。
 pub(crate) const DYNAMIC_UNAVAILABLE: &str = "Dynamic views are not available in this runtime.";
 
-pub mod actions;
+pub use crate::actions;
 pub mod agent;
 pub mod api;
 pub mod download;

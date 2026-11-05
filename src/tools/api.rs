@@ -26,8 +26,8 @@ use crate::security::Gate;
 use crate::storage::messages::MessageStore;
 use crate::transcript::ToolResult;
 
-use super::actions::{ActionSpec, Category, specs};
 use super::{Permission, Tool, ToolContext, arg_str, object_schema};
+use crate::actions::{ActionSpec, Category, qq_number, specs};
 
 mod media;
 mod policy;
@@ -147,40 +147,6 @@ impl ApiTool {
         spec.target_field
             .and_then(|field| params.get(field))
             .and_then(qq_number)
-    }
-
-    /// 会话（用于发送范围）。
-    pub(crate) fn chat_of(spec: &ActionSpec, params: &Value) -> Option<ChatId> {
-        // `send_msg` 同时接受群与私聊，靠 message_type/参数决定目标。
-        if spec.action == "napcat.send_msg" {
-            let message_type = params
-                .get("message_type")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if message_type == "group"
-                || (message_type.is_empty() && params.get("group_id").is_some())
-            {
-                return params
-                    .get("group_id")
-                    .and_then(qq_number)
-                    .map(ChatId::Group);
-            }
-            return params
-                .get("user_id")
-                .and_then(qq_number)
-                .map(ChatId::Private);
-        }
-        match spec.scope_field {
-            Some("group_id") => params
-                .get("group_id")
-                .and_then(qq_number)
-                .map(ChatId::Group),
-            Some("user_id") => params
-                .get("user_id")
-                .and_then(qq_number)
-                .map(ChatId::Private),
-            _ => None,
-        }
     }
 
     fn scope_allowed(&self, chat: ChatId) -> bool {
@@ -450,19 +416,6 @@ fn suggestions(action: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // 注册表
 // ---------------------------------------------------------------------------
-
-/// 把 QQ 号参数解析成整数：兼容数字与数字字符串（OneBot 两种都接受）。
-///
-/// 解析失败返回 `None`；调用方在保护路径上应把 `None` 当成拒绝。
-fn qq_number(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(number) => number
-            .as_u64()
-            .or_else(|| number.as_i64().and_then(|value| u64::try_from(value).ok())),
-        Value::String(text) => text.trim().parse().ok(),
-        _ => None,
-    }
-}
 
 /// 把发送参数还原成一条 `self` 消息，供 transcript/收件箱去重使用。
 fn self_message_from_params(chat: ChatId, params: &Value) -> QqMessage {
