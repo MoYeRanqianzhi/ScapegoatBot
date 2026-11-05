@@ -649,8 +649,33 @@ impl Runner {
         let runtime_blocks = prompts.len();
         prompts.extend(image_prompts);
 
-        // 4) 运行循环。工具执行器带上本回合证据。
         let prompt_tokens = crate::session::compaction::estimate_messages(&prompts);
+        let outcome = self
+            .drive_turn(chat, &mut working, prompts, evidence, steering_rx)
+            .await;
+        self.commit_turn(
+            chat,
+            &turn_id,
+            &sessions,
+            &history,
+            &working,
+            base,
+            runtime_blocks,
+            prompt_tokens,
+            &outcome,
+        )
+        .await
+    }
+    /// 跑模型循环，并把本回合产生的新块与 steering 消息并入 `working`。
+    async fn drive_turn(
+        &self,
+        chat: ChatId,
+        working: &mut Vec<AgentMessage>,
+        prompts: Vec<AgentMessage>,
+        evidence: TurnEvidence,
+        steering_rx: &mut mpsc::UnboundedReceiver<AgentMessage>,
+    ) -> LoopOutcome {
+        // 4) 运行循环。工具执行器带上本回合证据。
         let slot = self.provider_snapshot();
         let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {
             registry: Arc::clone(&self.tools),
@@ -680,7 +705,7 @@ impl Runner {
         let mut steering = SteeringQueue::default();
         let outcome = loop_
             .run_with_steering(
-                &mut working,
+                working,
                 prompts,
                 &mut steering,
                 Some(&mut *steering_rx),
@@ -720,29 +745,51 @@ impl Runner {
         while let Ok(message) = steering_rx.try_recv() {
             working.push(message);
         }
+        outcome
+    }
 
+    /// 提交本回合新块：buffer → transcript → 共享历史，并跑周期检查。
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_turn(
+        &self,
+        chat: ChatId,
+        turn_id: &str,
+        sessions: &Arc<SessionStore>,
+        history: &Arc<Mutex<Vec<AgentMessage>>>,
+        working: &[AgentMessage],
+        base: usize,
+        runtime_blocks: usize,
+        prompt_tokens: usize,
+        outcome: &LoopOutcome,
+    ) -> Result<()> {
         // 5) 提交新块：buffer -> transcript -> 共享历史。
         let new_blocks: Vec<AgentMessage> = working[base + runtime_blocks..].to_vec();
         if !new_blocks.is_empty() {
             let scope = "shared".to_owned();
             for (seq, message) in new_blocks.iter().enumerate() {
                 self.turn_buffer
-                    .append(&turn_id, seq as u64, &scope, message)?;
+                    .append(turn_id, seq as u64, &scope, message)?;
             }
-            self.turn_buffer.commit(&sessions, &turn_id).await?;
+            self.turn_buffer.commit(sessions, turn_id).await?;
             let mut shared = history.lock().await;
             shared.extend(new_blocks.clone());
         }
         self.accumulate_review_tokens(
             prompt_tokens + crate::session::compaction::estimate_messages(&new_blocks),
         );
-        self.maybe_security_review(&history).await;
+        self.maybe_security_review(history).await;
 
         // 6) 已读标记（模拟真人；失败不影响回合结果）。
         if let Some(qq) = &self.qq {
             let _ = qq.mark_read(chat).await;
         }
 
+        debug!(
+            chat = %chat,
+            stop = ?outcome.stop_reason,
+            turns = outcome.turns,
+            "turn completed"
+        );
         debug!(
             chat = %chat,
             stop = ?outcome.stop_reason,
