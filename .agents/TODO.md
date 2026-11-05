@@ -60,7 +60,8 @@
 - [x] 已解：providers→agent、session→agent、security→agent、swarm→agent（消息模型/证据移到 `src/transcript.rs`）。
 - [x] 已解：agent↔tools（`ExecutionMode`/`ToolExecutor` 移到 `tools`，`hooks` 移到 crate 根）。
 - [x] 已解：agent↔memory（`ProviderSlot` 移到 `providers`，memory 用 `QueueActivity` 注入队列活跃度）。
-- [ ] 仍余：security↔tools 一对循环。
+- [x] 已解：security↔tools（action 元数据移到 crate 根 `actions`，`chat_of`/`qq_number` 随迁）。
+- [x] 所有模块 2-循环已清零。
 - [x] ApiTool `execute` 拆出 `api/policy.rs`、媒体拆出 `api/media.rs`；VfsStore 拆出 `sqlite/{codec,tree}.rs`（2608061/1f0106d）。
 - [ ] Runner `run_turn` 仍约 263 行、25 字段；MessageStore 33 个 pub 方法；`actions.rs` 509 行表与 6 处 Box::leak。
 - [x] hold 语义修正：只拒绝 QQ 操作（`napcat.*`），MCP/下载/Web 不再被 hold 拦截（d21eed4）。
