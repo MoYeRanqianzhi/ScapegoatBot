@@ -68,5 +68,6 @@
 - [x] MessageStore 已拆为 `messages/{codec,index,outbox,retention}.rs`（960 行主文件）。
 - [x] Runner 的 9 个存储/运行时字段收进 `RunnerDeps`，字段数 25→15（22ea723）。
 - [x] 内部模块 `ipc/mcp/monitor/paths/prompt/transcript/llm` 改为 `pub(crate)`（ed88080）。
-- [ ] 公开类型上的 `pub fn` 仍需按集成测试实际使用继续收（focused 在 agent/tools/security/storage）。
+- [x] storage/session 的 `pub fn` 已降为 `pub(crate)`，全仓 `pub fn` 381→332（48ed2b2）。
+- [ ] agent/tools/security 的公开方法仍需按集成测试继续收。
 - [x] hold 语义修正：只拒绝 QQ 操作（`napcat.*`），MCP/下载/Web 不再被 hold 拦截（d21eed4）。
