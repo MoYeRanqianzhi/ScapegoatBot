@@ -14,8 +14,8 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::agent::message::{StopReason, Usage};
 use crate::config::models::Protocol;
+use crate::llm::types::{StopReason, Usage};
 
 use super::sse::{SseParser, Utf8Stream};
 use super::{

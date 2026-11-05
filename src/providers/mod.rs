@@ -17,9 +17,9 @@ use tokio::sync::mpsc;
 
 use std::sync::Arc;
 
-use crate::agent::message::{RefusalDetails, StopReason, Usage};
 use crate::config::auth::AuthFile;
 use crate::config::models::{ModelsFile, Protocol};
+use crate::llm::types::{RefusalDetails, StopReason, Usage};
 
 pub mod anthropic;
 pub mod chat;
