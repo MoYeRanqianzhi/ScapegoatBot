@@ -610,9 +610,26 @@ impl MessageStore {
                 continue;
             };
             let month = day.get(..7).unwrap_or(day).to_owned();
+            let file_id = header
+                .get("file_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let encryption = match header.get("encryption").and_then(Value::as_str) {
+                Some("none") => EncryptionMode::None,
+                Some("xchacha20poly1305") => EncryptionMode::XChaCha20Poly1305,
+                _ => self.encryption,
+            };
+            // 行已读进内存，后面的逐行解码复用这份副本，不再按索引重新读文件。
+            let message_file = MessageFile {
+                path: relative.clone(),
+                file_id,
+                encryption,
+                lines,
+            };
             let mut count = 0u64;
             let mut bytes = 0u64;
-            for (line_no, line) in lines.iter().enumerate().skip(1) {
+            for (line_no, line) in message_file.lines.iter().enumerate().skip(1) {
                 bytes += line.len() as u64 + 1;
                 let Ok(value) = serde_json::from_str::<Value>(line) else {
                     continue;
@@ -648,7 +665,9 @@ impl MessageStore {
                 if already {
                     continue;
                 }
-                let Some(message) = self.read_line(&entry, line_no, Some(message_id))? else {
+                let Some(message) =
+                    self.decode_message_at(&message_file, line_no, Some(message_id))?
+                else {
                     continue;
                 };
                 let local = message.time.with_timezone(&Local);
@@ -813,7 +832,7 @@ impl MessageStore {
         Ok(report)
     }
 
-    /// 从索引行读取消息；任何一条失败都跳过而不是让整个视图失败。
+    /// 从索引行读取消息；同一文件的索引行复用一次文件读取。
     fn load_indexed(&self, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<Vec<QqMessage>> {
         let rows: Vec<(String, i64, i64)> = {
             let conn = self.db.lock();
@@ -823,12 +842,21 @@ impl MessageStore {
                 .collect::<Result<Vec<_>, _>>()?
         };
         let mut messages = Vec::with_capacity(rows.len());
+        let mut files: HashMap<String, Option<MessageFile>> = HashMap::new();
         for (file_path, line_no, message_id) in rows {
-            match self.read_line(
-                &self.root.join(&file_path),
-                line_no as usize,
-                Some(message_id),
-            ) {
+            let file = files.entry(file_path.clone()).or_insert_with(|| {
+                match open_message_file(&self.root.join(&file_path), self.encryption) {
+                    Ok(file) => file,
+                    Err(error) => {
+                        warn!(%error, file = %file_path, "cannot open message file");
+                        None
+                    }
+                }
+            });
+            let Some(file) = file.as_ref() else {
+                continue;
+            };
+            match self.decode_message_at(file, line_no as usize, Some(message_id)) {
                 Ok(Some(message)) => messages.push(message),
                 Ok(None) => {}
                 Err(error) => {
@@ -925,31 +953,20 @@ impl MessageStore {
         line_no: usize,
         expected_id: Option<i64>,
     ) -> Result<Option<QqMessage>> {
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let lines: Vec<String> = BufReader::new(file)
-            .lines()
-            .collect::<Result<Vec<_>, _>>()?;
-        let Some(header) = lines.first() else {
+        let Some(file) = open_message_file(path, self.encryption)? else {
             return Ok(None);
         };
-        let header: Value = serde_json::from_str(header)?;
-        let file_id = header
-            .get("file_id")
-            .and_then(Value::as_str)
-            .context("message file has no file_id")?
-            .to_owned();
-        // 按文件头记录的算法解密：切换 `[storage].encryption` 后旧文件仍然可读。
-        let encryption = match header.get("encryption").and_then(Value::as_str) {
-            Some("none") => EncryptionMode::None,
-            Some("xchacha20poly1305") => EncryptionMode::XChaCha20Poly1305,
-            // 旧文件没有该字段时退回当前配置。
-            _ => self.encryption,
-        };
-        let Some(line) = lines.get(line_no) else {
+        self.decode_message_at(&file, line_no, expected_id)
+    }
+
+    /// 在已读入内存的消息文件上解码一行；索引视图按文件复用，避免 O(N²) 读取。
+    fn decode_message_at(
+        &self,
+        file: &MessageFile,
+        line_no: usize,
+        expected_id: Option<i64>,
+    ) -> Result<Option<QqMessage>> {
+        let Some(line) = file.lines.get(line_no) else {
             return Ok(None);
         };
         let value: Value = serde_json::from_str(line)?;
@@ -969,7 +986,7 @@ impl MessageStore {
             && expected != message_id
         {
             warn!(
-                file = %path.display(),
+                file = %file.path,
                 line = line_no,
                 expected,
                 actual = message_id,
@@ -980,7 +997,7 @@ impl MessageStore {
         let ct = base64::engine::general_purpose::STANDARD
             .decode(value.get("ct").and_then(Value::as_str).unwrap_or_default())?;
 
-        let plain = match encryption {
+        let plain = match file.encryption {
             EncryptionMode::XChaCha20Poly1305 => {
                 let nonce = base64::engine::general_purpose::STANDARD.decode(
                     value
@@ -991,7 +1008,10 @@ impl MessageStore {
                 let mut sealed = Vec::with_capacity(nonce.len() + ct.len());
                 sealed.extend_from_slice(&nonce);
                 sealed.extend_from_slice(&ct);
-                let aad = format!("message:{scope}:{peer}:{message_id}:{file_id}:{line_no}");
+                let aad = format!(
+                    "message:{scope}:{peer}:{message_id}:{}:{line_no}",
+                    file.file_id
+                );
                 self.key.open("message", aad.as_bytes(), &sealed)?
             }
             EncryptionMode::None => ct,
@@ -1084,6 +1104,47 @@ fn walk_files(dir: &Path) -> Result<Vec<PathBuf>> {
 pub fn current_month() -> String {
     let now = Local::now();
     format!("{:04}-{:02}", now.year(), now.month())
+}
+
+/// 已读入内存的消息文件；同一索引视图按文件复用，避免逐行重读整文件。
+struct MessageFile {
+    path: String,
+    file_id: String,
+    encryption: EncryptionMode,
+    lines: Vec<String>,
+}
+
+/// 打开并读入一个消息文件；不存在返回 `None`。
+fn open_message_file(path: &Path, fallback: EncryptionMode) -> Result<Option<MessageFile>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let lines: Vec<String> = BufReader::new(file)
+        .lines()
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(header) = lines.first() else {
+        return Ok(None);
+    };
+    let header: Value = serde_json::from_str(header)?;
+    let file_id = header
+        .get("file_id")
+        .and_then(Value::as_str)
+        .context("message file has no file_id")?
+        .to_owned();
+    // 按文件头记录的算法解密：切换 `[storage].encryption` 后旧文件仍然可读。
+    let encryption = match header.get("encryption").and_then(Value::as_str) {
+        Some("none") => EncryptionMode::None,
+        Some("xchacha20poly1305") => EncryptionMode::XChaCha20Poly1305,
+        _ => fallback,
+    };
+    Ok(Some(MessageFile {
+        path: path.display().to_string(),
+        file_id,
+        encryption,
+        lines,
+    }))
 }
 
 #[cfg(test)]

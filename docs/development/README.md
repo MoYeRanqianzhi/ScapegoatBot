@@ -23,7 +23,7 @@
 | `cli/mod.rs` | 子命令、IPC 客户端、重启 | `run()` |
 | `cli/backup.rs` | 在线 SQLite 快照 + 文件归档 | `run()` / `run_with_paths()` |
 | `cli/doctor.rs` | 只读诊断 | `run()` / `collect()` |
-| `app.rs` | 运行时装配、IPC handler、QQ 管线 | `Runtime::start`、`build_agent`、`assemble_tools` |
+| `app/` | 运行时装配、IPC handler、QQ 管线 | `Runtime::start`、`assembly::build_agent`、`assembly::assemble_tools` |
 | `paths.rs` | `~/.sbot` 布局、逻辑根解析 | `SbotPaths` |
 | `config/mod.rs` | 根结构、加载、环境变量覆盖、校验分派 | `SbotConfig::load` |
 | `config/sections/` | 分节 schema（agent/queue/security/monitor/hooks…），每节一个文件 | 各 `Config` 结构 |
@@ -44,7 +44,7 @@
 ## 结构约定
 
 - 单函数尽量 <200 行、单结构字段尽量 <20；超了就按职责拆（`tools/actions.rs`、
-  `config/sections/`、`tools/views/*`、`app::assemble_tools`、`ScopeCache` 是先例）。
+  `config/sections/`、`tools/views/*`、`app::assembly::assemble_tools`、`ScopeCache` 是先例）。
 - 模型面文本（system prompt、工具描述、错误）保持英文；代码注释用中文。
 - 不要在文档或注释里承诺未实现的行为；未实现项集中写在
   [`../guide/limits.md`](../guide/limits.md)。

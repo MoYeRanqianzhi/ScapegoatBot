@@ -49,10 +49,10 @@
 ## 架构审查（ba81e80）
 
 - [x] ActionGate note_send 只保留 120s，导致 1h/10min 规则失效；改为保留 3600s（已修）。
-- [ ] TurnBuffer `Committing` 状态不可恢复：崩溃在 set(Committing)→append 之间会留下永久孤儿行。
-- [ ] MessageStore 读路径 O(N²)：read_line 每次整文件读取，load_indexed/rebuild_index 逐行调用。
-- [ ] transcript 恢复上界用物理行数，删 ≥2 行时仍偏小；错钥时扫描退化为 O(n²)。
-- [ ] steering 早退落库的消息会被下一回合 pending_history 重复注入（上下文重复，非重复持久化）。
+- [x] TurnBuffer `Committing` 恢复：open_turns 纳入 committing，按已写前缀去重后补写（ce5971d）。
+- [x] MessageStore 读路径：按文件批量解码，load_indexed/rebuild_index 不再逐行重读（本次）。
+- [x] transcript 恢复上界改用 message_count；扫描候选改为物理位置 ±64 优先、每行上限 128（本次）。
+- [x] steering 早退落库只写 transcript，由 pending_history 注入一次（8f92843）。
 - [ ] 冗余大头：provider pump 外壳 180-220 行、5 份 complete_text 90-120 行、
       monitor 三组复制 55-75 行、session/messages 信封 60-80 行。
 - [ ] 上帝对象残留：Runner 25 字段/1073 行、ApiTool、Assembly build_agent 18 参、

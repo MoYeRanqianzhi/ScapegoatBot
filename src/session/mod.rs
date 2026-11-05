@@ -30,6 +30,12 @@ use crate::storage::crypto::MasterKey;
 
 /// 行格式版本。
 const LINE_VERSION: u32 = 1;
+/// 单行恢复扫描最多尝试的候选行号数。
+///
+/// 正常写入时信封行号就是 AAD 行号，不需要扫描；扫描只用于缺字段/位置漂移。
+/// 候选先取物理位置 ±64，再退回全范围。若整段都解不开（错 key、file_id 不匹配），
+/// 每行最多 128 次 AEAD 尝试，避免旧实现「逐行扫全文件」的 O(n²) 卡顿。
+const SCAN_PER_LINE: usize = 128;
 /// 检查点摘要的加密域。
 const CHECKPOINT_PURPOSE: &str = "compaction-checkpoint";
 /// 保留的检查点条数。
@@ -618,14 +624,29 @@ impl SessionStore {
                 // 已知取舍：扫描会接受位置被移动但可解的行，所以它恢复的是可读性，
                 // 不是位置完整性；位置完整性仍待签名或链式摘要方案。
                 let first = envelope_line.unwrap_or(line_no);
-                let candidates = std::iter::once(first)
-                    .chain(std::iter::once(line_no).filter(move |candidate| *candidate != first))
-                    .chain(
-                        (1..=max_line)
-                            .filter(move |candidate| *candidate != first && *candidate != line_no),
-                    );
+                // 位置漂移通常很小（删/插几行）。先试信封与物理行号，再试物理位置
+                // 附近的候选，最后才退回全范围；长分段末尾的行不必从 1 扫起。
+                let mut candidates = Vec::new();
+                candidates.push(first);
+                if line_no != first {
+                    candidates.push(line_no);
+                }
+                for delta in 1..=64usize {
+                    if line_no + delta <= max_line {
+                        candidates.push(line_no + delta);
+                    }
+                    if line_no > delta {
+                        candidates.push(line_no - delta);
+                    }
+                }
+                candidates.extend(
+                    (1..=max_line).filter(|candidate| *candidate != first && *candidate != line_no),
+                );
                 let mut plain = None;
-                for candidate in candidates {
+                for (scanned, candidate) in candidates.into_iter().enumerate() {
+                    if scanned >= SCAN_PER_LINE {
+                        break;
+                    }
                     let aad = format!("session:{file_id}:{candidate}");
                     if let Ok(value) = self.key.open("session", aad.as_bytes(), &sealed) {
                         plain = Some(value);
