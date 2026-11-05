@@ -464,7 +464,7 @@ impl Tool for McpTool {
 
     async fn execute(&self, ctx: &ToolContext, args: Value) -> ToolResult {
         if ctx.hold_active() {
-            return ToolResult::error("Disabled during hold");
+            return ToolResult::error(crate::tools::HOLD_DISABLED);
         }
         let server = args.get("server").and_then(Value::as_str);
         let tool = args.get("tool").and_then(Value::as_str);

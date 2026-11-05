@@ -337,7 +337,7 @@ impl Tool for ApiTool {
             "napcat" => {
                 // hold 期间一律拒绝，包括拉黑/禁言/踢人。
                 if self.gate.as_ref().is_some_and(|gate| gate.hold_active()) {
-                    return ToolResult::error("Disabled during hold");
+                    return ToolResult::error(crate::tools::HOLD_DISABLED);
                 }
                 if spec.category == Category::Query
                     && let Some(chat) = Self::query_chat(&params)
@@ -613,7 +613,7 @@ impl ApiTool {
                 "returns": spec.returns,
                 "requires_owner_intent": spec.requires_owner_intent,
                 "scope_field": spec.scope_field,
-                "hold": if spec.hold_allowed() { "available" } else { "Disabled during hold" },
+                "hold": if spec.hold_allowed() { "available" } else { crate::tools::HOLD_DISABLED },
                 "examples": spec.examples,
             }))
             .unwrap_or_default(),
@@ -1177,7 +1177,7 @@ mod tests {
         for action in ["napcat.get_login_info", "napcat.set_group_kick"] {
             let result = call(&tool, action, json!({"group_id": 1, "user_id": 2})).await;
             assert!(result.is_error);
-            assert!(result.content.contains("Disabled during hold"));
+            assert!(result.content.contains(crate::tools::HOLD_DISABLED));
         }
         assert!(gateway.calls.lock().unwrap().is_empty());
 

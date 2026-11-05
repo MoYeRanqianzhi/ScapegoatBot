@@ -8,6 +8,13 @@
 //! 权限标记（[`Permission`]）是**声明**，不是执行点：真正的门禁与 `hold`
 //! 检查在 runtime（API 工具与安全闸）；声明用于审计与策略表。
 
+/// `hold` 生效时所有写操作的统一拒绝文案。
+pub(crate) const HOLD_DISABLED: &str = "Disabled during hold";
+/// 动态视图只读的统一提示。
+pub(crate) const DYNAMIC_READ_ONLY: &str = "Dynamic views are read-only.";
+/// 运行时未挂载动态视图时的统一提示。
+pub(crate) const DYNAMIC_UNAVAILABLE: &str = "Dynamic views are not available in this runtime.";
+
 pub mod actions;
 pub mod agent;
 pub mod api;

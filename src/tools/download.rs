@@ -84,7 +84,7 @@ impl Tool for DownloadTool {
 
     async fn execute(&self, ctx: &ToolContext, args: Value) -> ToolResult {
         if ctx.hold_active() {
-            return ToolResult::error("Disabled during hold");
+            return ToolResult::error(crate::tools::HOLD_DISABLED);
         }
         let raw_url = match arg_str(&args, "url") {
             Ok(url) => url,

@@ -91,7 +91,7 @@ impl Tool for ReadTool {
 
         if views::is_dynamic_target(&target) {
             let Some(views) = &ctx.views else {
-                return ToolResult::error("Dynamic views are not available in this runtime.");
+                return ToolResult::error(crate::tools::DYNAMIC_UNAVAILABLE);
             };
             return match views.read(&target).await {
                 Ok(views::ViewRead::Text(text)) => ToolResult::ok(text),
@@ -222,7 +222,7 @@ impl Tool for WriteTool {
             };
         }
         if views::Views::handles(&path) {
-            return ToolResult::error("Dynamic views are read-only.");
+            return ToolResult::error(crate::tools::DYNAMIC_READ_ONLY);
         }
         match ctx.vfs.write_text(&path, content, None) {
             Ok(meta) => ToolResult::ok(format!(
@@ -315,7 +315,7 @@ impl Tool for EditTool {
             };
         }
         if views::Views::handles(&path) {
-            return ToolResult::error("Dynamic views are read-only.");
+            return ToolResult::error(crate::tools::DYNAMIC_READ_ONLY);
         }
         match ctx
             .vfs
@@ -371,7 +371,7 @@ impl Tool for LsTool {
 
         if views::is_dynamic_target(&target) {
             let Some(views) = &ctx.views else {
-                return ToolResult::error("Dynamic views are not available in this runtime.");
+                return ToolResult::error(crate::tools::DYNAMIC_UNAVAILABLE);
             };
             let entries = if recursive {
                 views.walk(&target.path).await
@@ -486,7 +486,7 @@ impl Tool for GrepTool {
 
         if views::Views::handles(&root) {
             let Some(views) = &ctx.views else {
-                return ToolResult::error("Dynamic views are not available in this runtime.");
+                return ToolResult::error(crate::tools::DYNAMIC_UNAVAILABLE);
             };
             return match views.grep(&root, &regex, file_ext).await {
                 Ok(matches) => ToolResult::ok(render_matches(&matches, &[])),
@@ -619,7 +619,7 @@ impl Tool for GlobTool {
 
         let entries = if views::Views::handles(&root) {
             let Some(views) = &ctx.views else {
-                return ToolResult::error("Dynamic views are not available in this runtime.");
+                return ToolResult::error(crate::tools::DYNAMIC_UNAVAILABLE);
             };
             match views.walk(&root).await {
                 Ok(entries) => entries,
@@ -750,7 +750,7 @@ impl Tool for RmTool {
             .is_some_and(|root| root == "inbox")
         {
             let Some(views) = &ctx.views else {
-                return ToolResult::error("Dynamic views are not available in this runtime.");
+                return ToolResult::error(crate::tools::DYNAMIC_UNAVAILABLE);
             };
             return match views.dismiss(&target) {
                 Ok(count) => ToolResult::ok(format!(
@@ -761,7 +761,7 @@ impl Tool for RmTool {
             };
         }
         if views::Views::handles(&target.path) {
-            return ToolResult::error("Dynamic views are read-only.");
+            return ToolResult::error(crate::tools::DYNAMIC_READ_ONLY);
         }
 
         // 目录必须显式 recursive。
@@ -830,7 +830,7 @@ impl Tool for MvTool {
             return ToolResult::error("Parameters \"from\" and \"to\" are required.");
         };
         if views::Views::handles(&from) || views::Views::handles(&to) {
-            return ToolResult::error("Dynamic views are read-only.");
+            return ToolResult::error(crate::tools::DYNAMIC_READ_ONLY);
         }
         match ctx.vfs.rename(&from, &to) {
             Ok(()) => ToolResult::ok(format!("Moved {from} to {to}.")),
@@ -884,7 +884,7 @@ impl Tool for CpTool {
             Err(error) => return error,
         };
         if views::Views::handles(&from) || views::Views::handles(&to) {
-            return ToolResult::error("Dynamic views are read-only.");
+            return ToolResult::error(crate::tools::DYNAMIC_READ_ONLY);
         }
         match ctx.vfs.stat(&from) {
             Ok(meta) if meta.kind == NodeKind::Dir && !recursive => {
@@ -937,7 +937,7 @@ impl Tool for MkdirTool {
             Err(error) => return error,
         };
         if views::Views::handles(&path) {
-            return ToolResult::error("Dynamic views are read-only.");
+            return ToolResult::error(crate::tools::DYNAMIC_READ_ONLY);
         }
         let parents = match arg_opt_bool(&args, "parents") {
             Ok(value) => value,
@@ -987,7 +987,7 @@ impl Tool for StatTool {
         };
         if views::Views::handles(&path) {
             let Some(views) = &ctx.views else {
-                return ToolResult::error("Dynamic views are not available in this runtime.");
+                return ToolResult::error(crate::tools::DYNAMIC_UNAVAILABLE);
             };
             return match views.stat(&path).await {
                 Ok(entry) => ToolResult::ok(format!(
