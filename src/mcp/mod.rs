@@ -594,4 +594,80 @@ mod tests {
         assert_eq!(mime, "image/jpeg");
         assert!(data.len() < encoded.len());
     }
+
+    #[tokio::test]
+    async fn call_tool_wires_large_image_compression() {
+        use base64::Engine as _;
+        let mut raw = image::RgbImage::new(1600, 1600);
+        for (x, y, pixel) in raw.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8]);
+        }
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(raw)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+        assert!(
+            encoded.len() > 1_000_000,
+            "fixture must cross the compress threshold"
+        );
+
+        let (client_side, server_side) = duplex(8192);
+        let (server_read, server_write) = tokio::io::split(server_side);
+        let mut server_read = BufReader::new(server_read);
+        let mut server_write = server_write;
+        let payload = encoded.clone();
+        tokio::spawn(async move {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if server_read.read_line(&mut line).await.unwrap_or(0) == 0 {
+                    break;
+                }
+                let request: Value = serde_json::from_str(line.trim()).unwrap();
+                let method = request["method"].as_str().unwrap_or_default();
+                let Some(id) = request.get("id").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let result = match method {
+                    "initialize" => json!({"protocolVersion": PROTOCOL_VERSION}),
+                    "tools/list" => {
+                        json!({"tools": [{"name": "shot", "inputSchema": {"type": "object"}}]})
+                    }
+                    "tools/call" => json!({
+                        "content": [
+                            {"type": "text", "text": "screenshot"},
+                            {"type": "image", "data": payload, "mimeType": "image/png"}
+                        ],
+                        "isError": false
+                    }),
+                    _ => json!({}),
+                };
+                let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
+                server_write
+                    .write_all(
+                        format!(
+                            "{response}
+"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                server_write.flush().await.unwrap();
+            }
+        });
+
+        let (reader, writer) = tokio::io::split(client_side);
+        let mut client =
+            McpClient::from_io(Box::new(reader), Box::new(writer), "fake".to_owned(), None);
+        client.initialize().await.unwrap();
+        client.tools = client.list_tools().await.unwrap();
+        let (text, is_error, images) = client.call_tool("shot", json!({})).await.unwrap();
+        assert!(!is_error);
+        assert_eq!(text, "screenshot");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime, "image/jpeg");
+        assert!(images[0].data_base64.len() < encoded.len());
+    }
 }
