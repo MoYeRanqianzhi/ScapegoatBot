@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::agent::ToolResult;
-use crate::monitor::{CronSchedule, MonitorManager, TimerSpec};
+use crate::monitor::{CronSchedule, MonitorManager, MonitorSpec, TimerSpec};
 
 use super::{Tool, ToolContext, arg_opt_str, arg_str, object_schema};
 
@@ -203,9 +203,9 @@ impl MonitorTool {
 
         match self
             .manager
-            .add(
-                name.to_owned(),
-                source_kind,
+            .add(MonitorSpec {
+                name: name.to_owned(),
+                source: source_kind,
                 timer,
                 when,
                 prompt,
@@ -217,10 +217,10 @@ impl MonitorTool {
                 idle_only,
                 batch_window,
                 target,
-                crate::config::CatchUp::Coalesce,
-                false,
-                crate::config::OnMissing::Queue,
-            )
+                catch_up: crate::config::CatchUp::Coalesce,
+                cc: false,
+                on_missing: crate::config::OnMissing::Queue,
+            })
             .await
         {
             Ok(()) => ToolResult::ok(json!({"added": name, "max_events": max_events}).to_string()),

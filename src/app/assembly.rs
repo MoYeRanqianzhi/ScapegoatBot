@@ -17,7 +17,7 @@ use crate::config::{
     AgentMode, AuthFile, EncryptionMode, LoadedConfig, ModelsFile, SbotConfig, SessionScope,
 };
 use crate::mcp::{McpManager, McpTool};
-use crate::monitor::{MonitorManager, MonitorSink};
+use crate::monitor::{MonitorManager, MonitorSink, MonitorSpec};
 use crate::paths::SbotPaths;
 use crate::providers::{Provider, ServerToolKind, ThinkingOptions, build_provider};
 use crate::qq::filter::MessageFilter;
@@ -435,24 +435,24 @@ async fn install_wake_presets(monitors: &Arc<MonitorManager>, db: &Arc<Database>
             continue;
         }
         if let Err(error) = monitors
-            .add(
-                name.to_owned(),
-                "qq".to_owned(),
-                None,
-                Some(when),
-                Some(prompt),
-                true,
-                1_000_000,
-                None,
-                false,
-                std::time::Duration::ZERO,
-                false,
-                std::time::Duration::ZERO,
-                None,
-                crate::config::CatchUp::Coalesce,
-                false,
-                crate::config::OnMissing::Queue,
-            )
+            .add(MonitorSpec {
+                name: name.to_owned(),
+                source: "qq".to_owned(),
+                timer: None,
+                when: Some(when),
+                prompt: Some(prompt),
+                as_prompt: true,
+                max_events: 1_000_000,
+                expires: None,
+                one_shot: false,
+                min_interval: std::time::Duration::ZERO,
+                idle_only: false,
+                batch_window: std::time::Duration::ZERO,
+                target: None,
+                catch_up: crate::config::CatchUp::Coalesce,
+                cc: false,
+                on_missing: crate::config::OnMissing::Queue,
+            })
             .await
         {
             warn!(%error, preset = name, "cannot install a wake preset");

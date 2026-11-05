@@ -11,7 +11,7 @@ use async_trait::async_trait;
 
 use super::{Permission, Tool, ToolContext, arg_opt_str, arg_str, object_schema};
 use crate::agent::ToolResult;
-use crate::monitor::{CronSchedule, MonitorManager, TimerSpec};
+use crate::monitor::{CronSchedule, MonitorManager, MonitorSpec, TimerSpec};
 use crate::swarm::{AgentHub, AgentType};
 
 /// 子代理管理器句柄；runner 构造完成后注入。
@@ -146,9 +146,9 @@ impl AgentTool {
 
         let name = format!("{id}:monitor");
         manager
-            .add(
-                name.clone(),
-                kind,
+            .add(MonitorSpec {
+                name: name.clone(),
+                source: kind,
                 timer,
                 when,
                 prompt,
@@ -159,11 +159,11 @@ impl AgentTool {
                 min_interval,
                 idle_only,
                 batch_window,
-                Some(id.to_owned()),
-                crate::config::CatchUp::Coalesce,
-                false,
-                crate::config::OnMissing::Queue,
-            )
+                target: Some(id.to_owned()),
+                catch_up: crate::config::CatchUp::Coalesce,
+                cc: false,
+                on_missing: crate::config::OnMissing::Queue,
+            })
             .await?;
         Ok(name)
     }
