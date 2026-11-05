@@ -23,7 +23,7 @@
 
 ## 图片
 
-- [ ] 真实 `get_image` 契约仍未实测；http/get_image 实际返回需启动 NapCat 验证。
+- [ ] 真实 `get_image` 契约未实测：2026-11-06 直连验证时发现 NapCat 已退出登录（11-05 05:22 起持续 QR 登录失败），WS 握手被 reset；需用户扫码登录后重试。
 - [ ] 转发/回复引用图片、control/monitor 注入回合仍不自动注入。
 - [ ] `media.image_watermark` 只支持 ASCII。
 - [x] `media.image_compress` 支持 JPEG/PNG/WebP（14f6a31）；WebP 仅无损，quality 只作用于 JPEG。
