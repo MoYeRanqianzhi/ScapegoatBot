@@ -666,11 +666,6 @@ impl ApiTool {
         {
             return ToolResult::error("media output must end with .png/.jpg/.jpeg/.webp");
         }
-        if spec.action == "media.image_compress"
-            && !(ext.ends_with(".jpg") || ext.ends_with(".jpeg"))
-        {
-            return ToolResult::error("media.image_compress requires a .jpg/.jpeg output path");
-        }
         let output = match spec.action {
             "media.image_resize" => {
                 let w = params.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -724,12 +719,24 @@ impl ApiTool {
                     .and_then(Value::as_u64)
                     .unwrap_or(80)
                     .clamp(1, 100) as u8;
+                // 扩展名已在上面校验过，只剩 png/jpg/jpeg/webp 四种。
+                let format = if ext.ends_with(".png") {
+                    image::ImageFormat::Png
+                } else if ext.ends_with(".webp") {
+                    image::ImageFormat::WebP
+                } else {
+                    image::ImageFormat::Jpeg
+                };
                 let mut encoded = Vec::new();
-                let rgb = image.to_rgb8();
-                let mut encoder =
-                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, quality);
-                if let Err(error) = encoder.encode_image(&rgb) {
-                    return ToolResult::error(format!("cannot encode JPEG: {error}"));
+                let result = if format == image::ImageFormat::Jpeg {
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, quality)
+                        .encode_image(&image.to_rgb8())
+                } else {
+                    let mut cursor = std::io::Cursor::new(&mut encoded);
+                    image.write_to(&mut cursor, format).map(|_| ())
+                };
+                if let Err(error) = result {
+                    return ToolResult::error(format!("cannot encode {format:?}: {error}"));
                 }
                 if let Err(error) =
                     ctx.vfs
@@ -741,8 +748,8 @@ impl ApiTool {
                     json!({
                         "path": out,
                         "source": input,
-                        "width": rgb.width(),
-                        "height": rgb.height(),
+                        "width": width,
+                        "height": height,
                         "bytes": encoded.len(),
                         "quality": quality,
                     })
@@ -999,6 +1006,8 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    use image::GenericImageView;
+
     use crate::config::{GuardBackend, GuardConfig, GuardMode};
 
     #[derive(Default)]
@@ -1083,6 +1092,52 @@ mod tests {
             json!({"action": action, "params": params}),
         )
         .await
+    }
+
+    fn media_vfs() -> Arc<crate::vfs::sqlite::VfsStore> {
+        Arc::new(
+            crate::vfs::sqlite::VfsStore::open(
+                Arc::new(crate::storage::Database::open_in_memory().unwrap()),
+                Arc::new(crate::storage::crypto::MasterKey::from_bytes([2u8; 32])),
+                tempfile::tempdir().unwrap().keep(),
+                crate::vfs::quota::Limits::default(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// 造一张带渐变、能看出编码差异的小图。
+    fn seed_image(vfs: &crate::vfs::sqlite::VfsStore, path: &str, width: u32, height: u32) {
+        let image = image::RgbaImage::from_fn(width, height, |x, y| {
+            image::Rgba([
+                (x * 37 % 256) as u8,
+                (y * 53 % 256) as u8,
+                ((x + y) * 29 % 256) as u8,
+                255,
+            ])
+        });
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let path = crate::vfs::path::VfsPath::parse(path).unwrap();
+        vfs.write_binary(&path, &encoded.into_inner(), crate::vfs::NodeKind::Image)
+            .unwrap();
+    }
+
+    fn load_output(vfs: &crate::vfs::sqlite::VfsStore, path: &str) -> image::DynamicImage {
+        let path = crate::vfs::path::VfsPath::parse(path).unwrap();
+        image::load_from_memory(&vfs.read_bytes(&path).unwrap()).unwrap()
+    }
+
+    async fn run_media(
+        tool: &ApiTool,
+        ctx: &ToolContext,
+        action: &str,
+        params: Value,
+    ) -> ToolResult {
+        tool.execute(ctx, json!({"action": action, "params": params}))
+            .await
     }
 
     #[tokio::test]
@@ -1666,6 +1721,162 @@ mod tests {
         assert!(
             vfs.stat(&crate::vfs::path::VfsPath::parse("/tmp/wm.png").unwrap())
                 .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn media_image_compress_honors_output_extension() {
+        let vfs = media_vfs();
+        seed_image(&vfs, "/tmp/src.png", 5, 4);
+        let tool = tool(None, None);
+        let ctx = ToolContext::new(Arc::clone(&vfs), None);
+
+        for (out, expected) in [
+            ("/tmp/out.jpg", image::ImageFormat::Jpeg),
+            ("/tmp/out.jpeg", image::ImageFormat::Jpeg),
+            ("/tmp/out.png", image::ImageFormat::Png),
+            ("/tmp/out.webp", image::ImageFormat::WebP),
+        ] {
+            let result = run_media(
+                &tool,
+                &ctx,
+                "media.image_compress",
+                json!({"path": "/tmp/src.png", "out": out, "quality": 55}),
+            )
+            .await;
+            assert!(!result.is_error, "{out}: {}", result.content);
+            let value: Value = serde_json::from_str(&result.content).unwrap();
+            assert_eq!(value["quality"], 55);
+
+            let path = crate::vfs::path::VfsPath::parse(out).unwrap();
+            let bytes = vfs.read_bytes(&path).unwrap();
+            assert_eq!(value["bytes"].as_u64(), Some(bytes.len() as u64));
+            assert_eq!(image::guess_format(&bytes).unwrap(), expected, "{out}");
+            assert_eq!(image::ImageFormat::from_path(out).unwrap(), expected);
+            let decoded = image::load_from_memory(&bytes).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (5, 4), "{out}");
+        }
+    }
+
+    #[tokio::test]
+    async fn media_image_compress_rejects_unknown_output_extension() {
+        let vfs = media_vfs();
+        seed_image(&vfs, "/tmp/src.png", 2, 2);
+        let tool = tool(None, None);
+        let ctx = ToolContext::new(Arc::clone(&vfs), None);
+
+        for out in ["/tmp/out.gif", "/tmp/out.bmp", "/tmp/out.txt", "/tmp/out"] {
+            let result = run_media(
+                &tool,
+                &ctx,
+                "media.image_compress",
+                json!({"path": "/tmp/src.png", "out": out, "quality": 80}),
+            )
+            .await;
+            assert!(
+                result.is_error,
+                "{out} should be rejected: {}",
+                result.content
+            );
+            assert!(
+                result.content.contains(".png") && result.content.contains(".webp"),
+                "unclear error for {out}: {}",
+                result.content
+            );
+            let path = crate::vfs::path::VfsPath::parse(out).unwrap();
+            assert!(vfs.stat(&path).is_err(), "{out} should not be written");
+        }
+    }
+
+    #[tokio::test]
+    async fn media_tools_transform_images() {
+        let vfs = media_vfs();
+        seed_image(&vfs, "/tmp/src.png", 16, 10);
+        let tool = tool(None, None);
+        let ctx = ToolContext::new(Arc::clone(&vfs), None);
+
+        let result = run_media(
+            &tool,
+            &ctx,
+            "media.image_resize",
+            json!({"path": "/tmp/src.png", "out": "/tmp/resized.png", "width": 8, "height": 5}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(load_output(&vfs, "/tmp/resized.png").dimensions(), (8, 5));
+
+        let result = run_media(
+            &tool,
+            &ctx,
+            "media.image_crop",
+            json!({
+                "path": "/tmp/src.png", "out": "/tmp/cropped.png",
+                "x": 2, "y": 1, "width": 4, "height": 4
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(load_output(&vfs, "/tmp/cropped.png").dimensions(), (4, 4));
+
+        let result = run_media(
+            &tool,
+            &ctx,
+            "media.image_rotate",
+            json!({"path": "/tmp/src.png", "out": "/tmp/rotated.png", "degrees": 90}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(load_output(&vfs, "/tmp/rotated.png").dimensions(), (10, 16));
+
+        let result = run_media(
+            &tool,
+            &ctx,
+            "media.image_thumbnail",
+            json!({
+                "path": "/tmp/src.png", "out": "/tmp/thumb.png",
+                "max_width": 4, "max_height": 4
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(load_output(&vfs, "/tmp/thumb.png").dimensions(), (4, 3));
+
+        let result = run_media(
+            &tool,
+            &ctx,
+            "media.image_convert",
+            json!({"path": "/tmp/src.png", "out": "/tmp/converted.jpg"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(
+            load_output(&vfs, "/tmp/converted.jpg").dimensions(),
+            (16, 10)
+        );
+        let converted = crate::vfs::path::VfsPath::parse("/tmp/converted.jpg").unwrap();
+        assert_eq!(
+            image::guess_format(&vfs.read_bytes(&converted).unwrap()).unwrap(),
+            image::ImageFormat::Jpeg
+        );
+
+        let result = run_media(
+            &tool,
+            &ctx,
+            "media.image_watermark",
+            json!({"path": "/tmp/src.png", "out": "/tmp/watermarked.png", "text": "sbot"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        let watermarked = load_output(&vfs, "/tmp/watermarked.png");
+        assert_eq!(watermarked.dimensions(), (16, 10));
+        let source = load_output(&vfs, "/tmp/src.png").to_rgba8();
+        let watermarked = watermarked.to_rgba8();
+        assert!(
+            source
+                .pixels()
+                .zip(watermarked.pixels())
+                .any(|(before, after)| before != after),
+            "watermark did not change any pixel"
         );
     }
 

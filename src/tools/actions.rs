@@ -569,7 +569,7 @@ pub fn specs() -> &'static [ActionSpec] {
             ),
             (
                 "media.image_compress",
-                "Re-encode an image as JPEG with a quality value (1-100).",
+                "Re-encode as JPEG, PNG or WebP based on the output extension; quality (1-100) applies to JPEG.",
                 json!({"path": {"type": "string"}, "out": {"type": "string"}, "quality": {"type": "number"}}),
                 r#"{"path":"/tmp/a.png","out":"/tmp/a.jpg","quality":80}"#,
             ),

@@ -27,7 +27,7 @@
 - 连续 tool 结果合并为一个 user 消息，图片排在全部 tool_result 之后。
 - 补 GIF/BMP 解码；MCP image-only 结果不再把 base64 复制进正文。
 - `get_image` 支持返回 base64；API 响应中的 base64/image 自动转图片附件。
-- `media.image_compress` 要求 .jpg/.jpeg 输出，避免 JPEG 字节标成 PNG。
+- `media.image_compress` 按输出扩展名编码为 JPEG/PNG/WebP，未知扩展名报错；WebP 为无损编码，quality 只作用于 JPEG。
 - 回合 early-return 前排空 local SteeringQueue；关闭 receiver 让晚到消息回填 ChatQueue。
 - API base64/image 响应重新接入图片附件；User 图片计入 token 估算与裁剪。
 - 自动入站图片按模型 `input`/`vision` 门控。
@@ -36,7 +36,7 @@
 
 ### 测试
 
-- `cargo test --all-targets`：365 项通过（353 lib + 12 integration），2 ignored；`clippy -D warnings` 通过。
+- `cargo test --all-targets`：368 项通过（356 lib + 12 integration），2 ignored；`clippy -D warnings` 通过。
 
 ## [0.2.0-alpha.34] - 2026-11-04
 
