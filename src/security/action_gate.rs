@@ -44,6 +44,9 @@ const MASS_TARGETS: usize = 3;
 const NGRAM_SIZE: usize = 5;
 /// 跨 chat 内容重叠的时间窗口。
 const NGRAM_WINDOW: Duration = Duration::from_secs(600);
+/// 发送记录保留时长：取所有规则窗口的最大值（每小时发送上限）。
+/// 各规则自己按各自的更短窗口过滤；以前只 retain 120s，小时规则看不到旧记录。
+const SEND_HISTORY: Duration = Duration::from_secs(3600);
 /// 只有足够长的内容才做 n-gram 比对，避免短句误伤。
 const NGRAM_MIN_CHARS: usize = 24;
 /// 共享 n-gram 数达到该值即视为搬运。
@@ -757,7 +760,7 @@ impl ActionGate {
         }
         let mut sends = self.sends.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        sends.retain(|record| now.duration_since(record.at) <= MASS_WINDOW);
+        sends.retain(|record| now.duration_since(record.at) <= SEND_HISTORY);
         sends.push_back(SendRecord {
             at: now,
             chat: chat.to_owned(),
