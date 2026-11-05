@@ -13,10 +13,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::providers::{
-    ContentBlock, LlmRequest, Provider, ProviderError, ProviderEvent, ProviderMessage, Role,
-    SystemBlock,
-};
+use crate::providers::{CompletionError, Provider, SystemBlock, complete_text, truncate_chars};
 
 /// 风险级别；`Ord` 用于比较。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -113,46 +110,30 @@ impl SecurityReviewer {
             text: REVIEW_SYSTEM.to_owned(),
             cache: false,
         });
-        let request = LlmRequest {
-            model: self.model.clone(),
+        let prompt = format!(
+            "<transcript_window>\n{}\n</transcript_window>\n\nReview the window above.",
+            truncate_chars(window, 60_000)
+        );
+        let text = match complete_text(
+            self.provider.as_ref(),
+            &self.model,
             system,
-            messages: vec![ProviderMessage {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: format!(
-                        "<transcript_window>\n{}\n</transcript_window>\n\nReview the window above.",
-                        truncate(window, 60_000)
-                    ),
-                }],
-            }],
-            tools: Vec::new(),
+            prompt,
             // 检查只需要一个短 JSON；thinking 关闭，避免额外费用。
-            max_tokens: 512,
-            thinking: Default::default(),
-            server_tools: Vec::new(),
+            512,
+            Some(self.timeout),
+        )
+        .await
+        {
+            Ok(text) => text,
+            Err(CompletionError::Request(error) | CompletionError::Stream(error)) => {
+                return Err(error.to_string());
+            }
+            Err(CompletionError::TimedOut) => return Err("security review timed out".to_owned()),
+            Err(CompletionError::Ended) => {
+                return Err("security review stream ended".to_owned());
+            }
         };
-        let mut receiver = self
-            .provider
-            .stream(request)
-            .await
-            .map_err(|error: ProviderError| error.to_string())?;
-        let deadline = tokio::time::Instant::now() + self.timeout;
-        let mut text = String::new();
-        loop {
-            if tokio::time::Instant::now() >= deadline {
-                return Err("security review timed out".to_owned());
-            }
-            let event = tokio::time::timeout_at(deadline, receiver.recv())
-                .await
-                .map_err(|_| "security review timed out".to_owned())?
-                .ok_or_else(|| "security review stream ended".to_owned())?;
-            match event {
-                ProviderEvent::TextDelta(delta) => text.push_str(&delta),
-                ProviderEvent::Error(error) => return Err(error.to_string()),
-                ProviderEvent::Stop { .. } => break,
-                _ => {}
-            }
-        }
         parse_outcome(&text)
     }
 }
@@ -166,15 +147,6 @@ impl SecurityCheck for SecurityReviewer {
     fn set_system(&self, system: Vec<SystemBlock>) {
         SecurityReviewer::set_system(self, system);
     }
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_owned();
-    }
-    let mut out: String = text.chars().take(max_chars).collect();
-    out.push('…');
-    out
 }
 
 /// 解析检查结果；容忍模型在 JSON 外面加解释。
@@ -221,6 +193,7 @@ pub fn parse_outcome(text: &str) -> Result<ReviewOutcome, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::{LlmRequest, ProviderError, ProviderEvent};
 
     #[test]
     fn parses_review_json_with_surrounding_text() {

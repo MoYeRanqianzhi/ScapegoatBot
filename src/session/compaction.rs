@@ -13,8 +13,8 @@
 
 use crate::agent::message::{AgentMessage, AssistantBlock};
 use crate::providers::{
-    ContentBlock, LlmRequest, Provider, ProviderError, ProviderEvent, ProviderMessage, Role,
-    SystemBlock, ThinkingOptions,
+    CompletionError, Provider, ProviderError, ProviderErrorKind, SystemBlock, complete_text,
+    truncate_chars,
 };
 
 /// 摘要系统提示（英文，面向聊天而不是任务）。
@@ -145,21 +145,13 @@ pub fn render_for_summary(messages: &[AgentMessage], max_chars: usize) -> String
             // 保留首尾：前半已写入，追加截断标记后从后面的消息里补一段尾部。
             let remaining = max_chars.saturating_sub(out.len());
             if remaining > 200 {
-                out.push_str(&truncate(&rendered, remaining));
+                out.push_str(&truncate_chars(&rendered, remaining));
             }
             out.push_str("\n[older messages omitted from the compaction input]\n");
             break;
         }
         out.push_str(&rendered);
         out.push('\n');
-    }
-    out
-}
-
-fn truncate(text: &str, max_chars: usize) -> String {
-    let mut out: String = text.chars().take(max_chars).collect();
-    if text.chars().count() > max_chars {
-        out.push('…');
     }
     out
 }
@@ -209,44 +201,30 @@ pub async fn summarize(
     input: &str,
     max_tokens: u32,
 ) -> Result<String, ProviderError> {
-    let request = LlmRequest {
-        model: model.to_owned(),
-        system: vec![SystemBlock {
+    let summary = match complete_text(
+        provider,
+        model,
+        vec![SystemBlock {
             text: SUMMARY_SYSTEM.to_owned(),
             cache: false,
         }],
-        messages: vec![ProviderMessage {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: input.to_owned(),
-            }],
-        }],
-        tools: Vec::new(),
+        input.to_owned(),
         max_tokens,
-        thinking: ThinkingOptions::default(),
-        server_tools: Vec::new(),
+        None,
+    )
+    .await
+    {
+        Ok(summary) => Some(summary),
+        Err(CompletionError::Request(error) | CompletionError::Stream(error)) => return Err(error),
+        Err(CompletionError::TimedOut | CompletionError::Ended) => None,
     };
-    let mut receiver = provider.stream(request).await?;
-    let mut text = String::new();
-    let mut stopped = false;
-    while let Some(event) = receiver.recv().await {
-        match event {
-            ProviderEvent::TextDelta(delta) => text.push_str(&delta),
-            ProviderEvent::Stop { .. } => {
-                stopped = true;
-                break;
-            }
-            ProviderEvent::Error(error) => return Err(error),
-            _ => {}
-        }
-    }
-    if !stopped || text.trim().is_empty() {
-        return Err(ProviderError::new(
-            crate::providers::ProviderErrorKind::Server,
+    match summary {
+        Some(summary) if !summary.trim().is_empty() => Ok(summary),
+        _ => Err(ProviderError::new(
+            ProviderErrorKind::Server,
             "the compaction request returned no summary",
-        ));
+        )),
     }
-    Ok(text)
 }
 
 #[cfg(test)]

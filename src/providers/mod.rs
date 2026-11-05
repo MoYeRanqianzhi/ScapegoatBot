@@ -16,6 +16,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::auth::AuthFile;
 use crate::config::models::{ModelsFile, Protocol};
@@ -221,7 +222,7 @@ impl ProviderError {
             _ if status >= 500 => ProviderErrorKind::Server,
             _ => ProviderErrorKind::InvalidRequest,
         };
-        Self::new(kind, truncate(body, 800)).with_status(status)
+        Self::new(kind, truncate_chars(body, 800)).with_status(status)
     }
 
     /// 由完整 HTTP 响应构造：在状态码之外读取 `Retry-After`。
@@ -271,8 +272,8 @@ impl std::fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
-/// 截断过长的错误正文，避免把整页 HTML 塞进上下文/日志。
-fn truncate(text: &str, limit: usize) -> String {
+/// 截断过长文本，避免把整页 HTML 塞进上下文/日志；按字符而不是字节计数。
+pub fn truncate_chars(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
         return text.to_owned();
     }
@@ -294,6 +295,76 @@ pub trait Provider: Send + Sync {
 
     /// 发起流式请求；返回事件接收端，任务在后台读取网络流。
     async fn stream(&self, request: LlmRequest) -> Result<EventReceiver, ProviderError>;
+}
+
+/// [`complete_text`] 的失败原因。
+///
+/// 调用方各自把失败映射到自己的错误类型；保留这四种区别是为了不改变原有的
+/// 错误文案与超时语义（尤其是“请求失败”与“流内错误”在不同调用方的措辞）。
+#[derive(Debug)]
+pub enum CompletionError {
+    /// `Provider::stream` 调用本身失败（网络、鉴权、状态码等）。
+    Request(ProviderError),
+    /// 流内 `ProviderEvent::Error`。
+    Stream(ProviderError),
+    /// 超过调用方给出的总时限。
+    TimedOut,
+    /// 事件通道关闭，但没有收到 `Stop`。
+    Ended,
+}
+
+/// 单轮纯文本补全：可选 system、单条 user 消息、无工具、默认思考配置。
+///
+/// 返回 `Stop` 之前累计的文本；空文本不在这里判断，由调用方按各自的语义处理。
+/// `timeout` 从事件接收端建立后开始计时，覆盖整个收流过程。
+pub async fn complete_text(
+    provider: &dyn Provider,
+    model: &str,
+    system: Vec<SystemBlock>,
+    prompt: String,
+    max_tokens: u32,
+    timeout: Option<Duration>,
+) -> Result<String, CompletionError> {
+    let request = LlmRequest {
+        model: model.to_owned(),
+        system,
+        messages: vec![ProviderMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: prompt }],
+        }],
+        tools: Vec::new(),
+        max_tokens,
+        thinking: ThinkingOptions::default(),
+        server_tools: Vec::new(),
+    };
+    let mut receiver = provider
+        .stream(request)
+        .await
+        .map_err(CompletionError::Request)?;
+    let deadline = timeout.map(|timeout| tokio::time::Instant::now() + timeout);
+    let mut text = String::new();
+    loop {
+        let event = match deadline {
+            Some(deadline) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(CompletionError::TimedOut);
+                }
+                tokio::time::timeout_at(deadline, receiver.recv())
+                    .await
+                    .map_err(|_| CompletionError::TimedOut)?
+            }
+            None => receiver.recv().await,
+        };
+        let Some(event) = event else {
+            return Err(CompletionError::Ended);
+        };
+        match event {
+            ProviderEvent::TextDelta(delta) => text.push_str(&delta),
+            ProviderEvent::Stop { .. } => return Ok(text),
+            ProviderEvent::Error(error) => return Err(CompletionError::Stream(error)),
+            _ => {}
+        }
+    }
 }
 
 /// 按 `provider/id` 构造 provider。
