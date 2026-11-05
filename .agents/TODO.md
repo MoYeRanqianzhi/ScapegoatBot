@@ -10,8 +10,10 @@
 ## P1
 
 - [x] `execute` 前置早退丢 steering 消息：外层 close + 排空 + 落库，已加回归测试（c0fc680）。
-- [ ] 控制/monitor 回合与 `queue.max_concurrent` 是两套上限（写死 `control_slots = 4`），
-      总主 agent 并发可超过配置值；待统一成一个 semaphore。
+- [x] 并发只作用于子代理（`[swarm].max_concurrency`）；主代理不加全局并发上限，
+      已回滚共享 turn limiter（13aaebf），主代理回合仍由 session turn_lock 串行。
+- [ ] 控制通道仍有写死的 4 槽位排队保护（`control_slots`）；它只是控制请求的准入保护，
+      不是主代理并发上限，是否去掉待定。
 - [x] per_chat 的 append/current 锁已按 scope 独立；shared 仍共用。
 
 ## transcript
