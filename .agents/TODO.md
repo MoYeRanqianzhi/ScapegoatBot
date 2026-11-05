@@ -28,7 +28,8 @@
 - [x] `media.image_compress` 支持 JPEG/PNG/WebP（14f6a31）；WebP 仅无损，quality 只作用于 JPEG。
 - [x] 已补 media 各动作测试；provider `image_url` 序列化已有覆盖。
 - [x] MCP 图片压缩已补端到端测试（`call_tool` → `ToolResult.images`，373 测试）。
-- [ ] 缺 inbound image resolver 与 User 图片 estimate/prune 测试。
+- [x] inbound resolver 的 URL 白名单/mime helper、User image estimate/prune 已有测试（949ec46）。
+- [ ] `inbound_image_prompts` 的真实 HTTP 下载（QQ CDN）仍未测；需 NapCat 登录后的图片消息。
 
 ## 结构
 
