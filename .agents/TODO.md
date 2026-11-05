@@ -39,9 +39,8 @@
 
 ## P2 / 发布
 
-- [ ] `queue.cap_batches` 作为 deprecated 字段仍可解析，不参与调度。
-- [ ] `agent.compact` 没有目标参数，只能压当前回合所在链；control/monitor 回合固定在 owner private 链
-      （`run_injected`），所以控制台里无法指定压缩某个群的上下文。
+- [x] `queue.cap_batches` 已删除（d807e4c）。
+- [x] `agent.compact` 支持可选 `chat` 参数（2608061）。
 - [ ] 无 alpha.35 tag；按要求暂缓发布/部署，服务器 `sbot.service` 停止。
 - [ ] 历史重写后其他 clone 必须重新 clone 或
       `git fetch --all --prune --tags --force && git reset --hard origin/main`；旧 SHA 失效。
@@ -54,10 +53,11 @@
 - [x] transcript 恢复上界改用 message_count；扫描候选改为物理位置 ±64 优先、每行上限 128（本次）。
 - [x] steering 早退落库只写 transcript，由 pending_history 注入一次（8f92843）。
 - [x] provider `HttpProviderCore`/`pump` 外壳合并；5 份 `complete_text`/`truncate_chars` 合并（e41f5a8）。
-- [ ] monitor 内部仍有 lookup/limit/system_delivery 三组复制（本次只改了 add 的 MonitorSpec）。
-- [ ] session/messages 加密信封 60-80 行仍可抽 `storage/envelope.rs`。
+- [x] monitor lookup/rate_limit/system_delivery 三组复制已收敛（5b4ca65）。
+- [x] session/messages 加密信封已抽 `storage/envelope.rs`（6d48111）。
 - [x] `build_agent` 18 参改 `AgentInputs`；`MonitorManager::add` 16 参改 `MonitorSpec`（16e97b8/44e7f6e）。
 - [x] providers→agent 循环依赖已解：`Usage/StopReason/RefusalDetails` 移到 `src/llm/types.rs`（2a0f851）。
 - [ ] 其余 6 对模块 2-循环（agent↔tools/providers/session/security/memory/swarm、security↔tools）仍在。
-- [ ] 上帝对象仍存：Runner 25 字段、ApiTool `execute`、VfsStore 39 方法（未拆）。
+- [x] ApiTool `execute` 拆出 `api/policy.rs`、媒体拆出 `api/media.rs`；VfsStore 拆出 `sqlite/{codec,tree}.rs`（2608061/1f0106d）。
+- [ ] Runner `run_turn` 仍约 263 行、25 字段；MessageStore 33 个 pub 方法；`actions.rs` 509 行表与 6 处 Box::leak。
 - [x] hold 语义修正：只拒绝 QQ 操作（`napcat.*`），MCP/下载/Web 不再被 hold 拦截（d21eed4）。
