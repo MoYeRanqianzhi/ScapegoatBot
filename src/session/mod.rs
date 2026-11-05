@@ -225,8 +225,9 @@ impl SessionStore {
             .to_owned();
 
         let mut messages = Vec::with_capacity(lines.len().saturating_sub(1));
+        let max_line = lines.len();
         for (line_no, line) in lines.iter().enumerate().skip(1) {
-            match self.decode_line(line, &file_id, line_no) {
+            match self.decode_line(line, &file_id, line_no, max_line) {
                 Ok(message) => messages.push(message),
                 Err(error) => {
                     // 单个坏行不等于整个分段不可用；记录并跳过。
@@ -562,15 +563,25 @@ impl SessionStore {
         ))
     }
 
-    fn decode_line(&self, line: &str, file_id: &str, line_no: usize) -> Result<AgentMessage> {
+    /// 解密一行；`max_line` 是所在分段的总行数，用于限定恢复扫描范围。
+    ///
+    /// AAD 是 `session:<file_id>:<line_no>`，行号在写入时决定；信封里的 `line`
+    /// 只是提示。正常情况下信封行号即 AAD 行号，先按它解；缺失或漂移时才
+    /// 在分段行数内枚举 AAD 行号，把还能解开的行恢复出来。
+    fn decode_line(
+        &self,
+        line: &str,
+        file_id: &str,
+        line_no: usize,
+        max_line: usize,
+    ) -> Result<AgentMessage> {
         let value: Value = serde_json::from_str(line)?;
         let ct = base64::engine::general_purpose::STANDARD
             .decode(value.get("ct").and_then(Value::as_str).unwrap_or_default())?;
-        let line_no = value
+        let envelope_line = value
             .get("line")
             .and_then(Value::as_u64)
-            .map(|line| line as usize)
-            .unwrap_or(line_no);
+            .map(|line| line as usize);
         let plain = match self.encryption {
             EncryptionMode::XChaCha20Poly1305 => {
                 let nonce = base64::engine::general_purpose::STANDARD.decode(
@@ -582,8 +593,27 @@ impl SessionStore {
                 let mut sealed = Vec::with_capacity(nonce.len() + ct.len());
                 sealed.extend_from_slice(&nonce);
                 sealed.extend_from_slice(&ct);
+                // 信封行号优先（正常写入时它就是 AAD 行号）；失败后再试物理行号，
+                // 最后才扫描。
+                //
+                // 扫描存在的原因：AAD 绑定写入时的行号，而分段被重写、拼接，
+                // 或前后插入/删除行之后，物理位置会漂移，信封也可能缺字段，
+                // 此时只能按「能否解开」反推行号。
+                //
+                // 上界用分段总行数而不是固定值：扫描范围随分段增长，长分段靠后的行
+                // 不会在固定值处被截断；候选上限也与读取方实际掌握的文件长度一致。
+                //
+                // 已知取舍：扫描会接受位置被移动但可解的行，所以它恢复的是可读性，
+                // 不是位置完整性；位置完整性仍待签名或链式摘要方案。
+                let first = envelope_line.unwrap_or(line_no);
+                let candidates = std::iter::once(first)
+                    .chain(std::iter::once(line_no).filter(move |candidate| *candidate != first))
+                    .chain(
+                        (1..=max_line)
+                            .filter(move |candidate| *candidate != first && *candidate != line_no),
+                    );
                 let mut plain = None;
-                for candidate in std::iter::once(line_no).chain(1..=4096) {
+                for candidate in candidates {
                     let aad = format!("session:{file_id}:{candidate}");
                     if let Ok(value) = self.key.open("session", aad.as_bytes(), &sealed) {
                         plain = Some(value);
@@ -592,7 +622,9 @@ impl SessionStore {
                 }
                 plain.ok_or_else(|| {
                     anyhow::anyhow!(
-                        "cannot decrypt transcript line {line_no} (tried physical and shifted line numbers)"
+                        "cannot decrypt transcript line at physical position {line_no} \
+                         (envelope line: {envelope_line:?}; scanned sealed line numbers \
+                         1..={max_line})"
                     )
                 })?
             }
@@ -797,5 +829,135 @@ mod tests {
         assert!(
             matches!(&group_messages[0], AgentMessage::User { text, .. } if text.contains("group message"))
         );
+    }
+
+    #[test]
+    fn recovery_scan_covers_segments_longer_than_4096_lines() {
+        let (store, dir) = store();
+        let current = store.current().unwrap();
+        let messages: Vec<AgentMessage> = (1..=4100)
+            .map(|index| AgentMessage::user(format!("message-{index}")))
+            .collect();
+        store.append(&messages).unwrap();
+
+        let path = segment_path(dir.path(), &current.file);
+        let mut lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        // 删掉首条消息：其后所有物理行号前移一位，而 AAD 仍是写入时的行号。
+        lines.remove(1);
+        // 目标行原本物理行 4100、AAD 4100；现在物理行 4099 且信封没有
+        // `line`。固定上限 1..=4096 够不到 4100，只有按文件行数扫描才能恢复。
+        let target = lines.last_mut().unwrap();
+        let mut value: Value = serde_json::from_str(target).unwrap();
+        value.as_object_mut().unwrap().remove("line");
+        *target = value.to_string();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let read = store.read_segment(&current.file).unwrap();
+        assert_eq!(read.len(), 4099);
+        assert_eq!(read.first(), Some(&AgentMessage::user("message-2")));
+        assert!(
+            matches!(read.last(), Some(AgentMessage::User { text, .. }) if text == "message-4100"),
+            "recovery must reach the shifted line beyond 4096"
+        );
+    }
+
+    #[test]
+    fn concurrent_append_read_rotate_keeps_segments_consistent() {
+        let (store, dir) = store();
+        let store = Arc::new(store);
+        let mut handles = Vec::new();
+
+        for worker in 0..2 {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                for round in 0..40 {
+                    store
+                        .append(&[AgentMessage::user(format!("w{worker}-r{round}"))])
+                        .unwrap();
+                }
+            }));
+        }
+
+        {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..20 {
+                    for file in store.list().unwrap() {
+                        let messages = store.read_segment(&file.file).unwrap();
+                        for message in messages {
+                            match message {
+                                AgentMessage::User { text, .. } => {
+                                    assert!(text.starts_with('w'), "unexpected {text}");
+                                }
+                                other => panic!("unexpected {other:?}"),
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+
+        {
+            let store = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..8 {
+                    store.rotate().unwrap();
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut texts = Vec::new();
+        for file in store.list().unwrap() {
+            let info = store.info(&file.file).unwrap().unwrap();
+            let raw_lines = std::fs::read_to_string(segment_path(dir.path(), &file.file))
+                .unwrap()
+                .lines()
+                .count();
+            // 每条消息恰好一行：既没有半截行，也没有重复写入。
+            assert_eq!(raw_lines as u64, info.message_count + 1);
+            for message in store.read_segment(&file.file).unwrap() {
+                match message {
+                    AgentMessage::User { text, .. } => texts.push(text),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+        assert_eq!(texts.len(), 80);
+        let unique: std::collections::HashSet<_> = texts.iter().collect();
+        assert_eq!(unique.len(), 80);
+    }
+
+    #[test]
+    fn wrong_master_key_reports_error_and_read_segment_skips_lines() {
+        let (store, dir) = store();
+        store.append(&[AgentMessage::user("secret")]).unwrap();
+        let current = store.current().unwrap();
+        let wrong = SessionStore::open(
+            Arc::clone(&store.db),
+            Arc::new(MasterKey::from_bytes([1u8; 32])),
+            dir.path().to_path_buf(),
+            0,
+            EncryptionMode::XChaCha20Poly1305,
+        )
+        .unwrap();
+
+        let file = std::fs::read_to_string(segment_path(dir.path(), &current.file)).unwrap();
+        let line = file.lines().nth(1).unwrap();
+        let error = wrong.decode_line(line, &current.file_id, 1, 2).unwrap_err();
+        assert!(
+            error.to_string().contains("1..=2"),
+            "error must name the scanned range: {error}"
+        );
+
+        // 坏行只记日志并跳过，整段读取仍返回成功而不是 panic。
+        assert!(wrong.read_segment(&current.file).unwrap().is_empty());
     }
 }
