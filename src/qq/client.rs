@@ -7,7 +7,7 @@
 //! - 提供统一的 action 调用（`API` 工具直接复用）；
 //! - 把发送结果解析成消息 id，供发送账本与去重使用。
 //!
-//! 断线重连由 NapCatLink 内置的退避策略负责；补消息与去重在本模块之上（`resync`）。
+//! 断线重连由 NapCatLink 内置的退避策略负责。
 
 use anyhow::{Context, Result, bail};
 use napcat_link::{EventSubscription, MessageSegment, NapLink};
