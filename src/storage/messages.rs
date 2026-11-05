@@ -395,18 +395,6 @@ impl MessageStore {
         Ok(count)
     }
 
-    /// 读取断线游标。
-    pub fn cursor(&self, chat: ChatId) -> Result<Option<(i64, String)>> {
-        let conn = self.db.lock();
-        Ok(conn
-            .query_row(
-                "SELECT last_message_id, last_ts FROM chat_cursors WHERE chat = ?1",
-                params![chat.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?)
-    }
-
     /// 更新断线游标。
     pub fn set_cursor(&self, chat: ChatId, message_id: i64, ts: &str) -> Result<()> {
         let conn = self.db.lock();
@@ -1264,15 +1252,11 @@ mod tests {
     }
 
     #[test]
-    fn cursor_roundtrip() {
+    fn set_cursor_registers_the_chat() {
         let (store, _dir) = store();
         let chat = ChatId::Group(1);
-        assert_eq!(store.cursor(chat).unwrap(), None);
+        assert!(store.known_chats().unwrap().is_empty());
         store.set_cursor(chat, 7, "2026-10-29T00:00:00Z").unwrap();
-        assert_eq!(
-            store.cursor(chat).unwrap(),
-            Some((7, "2026-10-29T00:00:00Z".to_owned()))
-        );
         assert_eq!(store.known_chats().unwrap(), vec![chat]);
     }
 
