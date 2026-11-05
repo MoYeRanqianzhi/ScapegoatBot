@@ -336,4 +336,21 @@ mod tests {
         let estimate = estimate_messages(&[assistant, image]);
         assert!(estimate >= 12_200, "estimate was {estimate}");
     }
+
+    #[test]
+    fn user_images_are_charged_too() {
+        let plain = vec![AgentMessage::user("hello")];
+        let image = AgentMessage::User {
+            text: "hello".to_owned(),
+            images: vec![crate::transcript::ImageAttachment {
+                mime: "image/png".to_owned(),
+                data_base64: "AA==".to_owned(),
+            }],
+        };
+        let with_image = vec![image];
+        assert!(
+            estimate_messages(&with_image) >= estimate_messages(&plain) + 1_900,
+            "user image was not charged"
+        );
+    }
 }

@@ -1722,4 +1722,46 @@ mod tests {
         assert_eq!(fixed.delay_ms(1, None), 400);
         assert_eq!(fixed.delay_ms(4, None), 400);
     }
+
+    #[test]
+    fn prune_detaches_images_from_old_turns_only() {
+        let image = crate::transcript::ImageAttachment {
+            mime: "image/png".to_owned(),
+            data_base64: "AA==".to_owned(),
+        };
+        let mut history = vec![
+            AgentMessage::User {
+                text: "old".to_owned(),
+                images: vec![image.clone()],
+            },
+            AgentMessage::Tool(crate::transcript::ToolResultMessage {
+                tool_call_id: "old".to_owned(),
+                tool_name: "Read".to_owned(),
+                content: "ok".to_owned(),
+                is_error: false,
+                images: vec![image.clone()],
+            }),
+            AgentMessage::user("new"),
+            AgentMessage::User {
+                text: "new".to_owned(),
+                images: vec![image.clone()],
+            },
+        ];
+        prune_tool_results(&mut history, 1, 20);
+        match &history[0] {
+            AgentMessage::User { images, .. } => assert!(images.is_empty()),
+            other => panic!("unexpected {other:?}"),
+        }
+        match &history[1] {
+            AgentMessage::Tool(result) => {
+                assert!(result.images.is_empty());
+                assert!(result.content.contains("[image detached]"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &history[3] {
+            AgentMessage::User { images, .. } => assert_eq!(images.len(), 1),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }

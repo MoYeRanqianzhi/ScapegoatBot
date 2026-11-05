@@ -209,3 +209,42 @@ fn mime_for_bytes(bytes: &[u8]) -> String {
         .map(|format| format.to_mime_type().to_owned())
         .unwrap_or_else(|_| "image/jpeg".to_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qq_image_urls_require_https_and_qq_domains() {
+        let parse = |raw: &str| reqwest::Url::parse(raw).unwrap();
+        assert!(is_qq_image_url(&parse(
+            "https://multimedia.nt.qq.com.cn/a.png"
+        )));
+        assert!(is_qq_image_url(&parse("https://gchat.qpic.cn/a.png")));
+        assert!(is_qq_image_url(&parse("https://example.qq.com/a.png")));
+        assert!(!is_qq_image_url(&parse(
+            "http://multimedia.nt.qq.com.cn/a.png"
+        )));
+        assert!(!is_qq_image_url(&parse("https://evilqq.com/a.png")));
+        assert!(!is_qq_image_url(&parse("https://example.com/a.png")));
+    }
+
+    #[test]
+    fn mime_sniffs_known_formats_and_falls_back() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(1, 1))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(mime_for_bytes(&png), "image/png");
+
+        let mut jpeg = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(1, 1))
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpeg),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        assert_eq!(mime_for_bytes(&jpeg), "image/jpeg");
+        assert_eq!(mime_for_bytes(b"not an image"), "image/jpeg");
+    }
+}
