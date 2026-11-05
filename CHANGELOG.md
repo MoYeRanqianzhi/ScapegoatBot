@@ -140,7 +140,7 @@
 
 ### 测试
 
-- `cargo test --all-targets`：350 项通过；`cargo fmt --check`、
+- `cargo test --all-targets`：370 项通过；`cargo fmt --check`、
   `clippy -D warnings` 通过。
 
 ## [0.2.0-alpha.28] - 2026-11-04

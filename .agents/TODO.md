@@ -2,27 +2,37 @@
 
 剩余问题；已完成项删除（git 有记录）。
 
+## 构建规则
+
+- 子代理禁止运行任何 `cargo` 命令；构建只在主 checkout 用默认 `target/` 统一执行。
+- 不使用 C: 盘放构建产物；G: 空间不足时先清 worktree target / incremental，再报告。
+
 ## P1
 
-- [ ] `execute` 的前置早退（ai stopped / ESTOP / paused / daily-budget）仍可能丢 `steering_rx` 中已发送的消息；
-      正常回合已 drain local SteeringQueue 并提前关闭 receiver。
-- [x] swarm 重启代数：旧 run 完成不会覆盖新状态；send 失败会走重启。
-- [ ] 控制/monitor 回合现在计入 `Runner::is_busy`，但控制 semaphore 与 `queue.max_concurrent` 是两套上限，
-      总主 agent 并发仍可超过配置值。
+- [x] `execute` 前置早退丢 steering 消息：外层 close + 排空 + 落库，已加回归测试（c0fc680）。
+- [ ] 控制/monitor 回合与 `queue.max_concurrent` 是两套上限（写死 `control_slots = 4`），
+      总主 agent 并发可超过配置值；待统一成一个 semaphore。
 - [x] per_chat 的 append/current 锁已按 scope 独立；shared 仍共用。
 
 ## transcript
 
-- [ ] AAD 行号恢复限制 1..=4096；更大偏移不可读，任意候选削弱位置完整性。需要迁移/签名策略。
-- [ ] 缺 transcript 偏移恢复、并发 append/read/rotate、wrong-key 的测试。
+- [x] AAD 行号恢复上限 4096 已去掉，改为按文件行数扫描（279eedc）；位置完整性仍待签名/链式方案。
+- [x] 已补 >4096 偏移恢复、并发 append/read/rotate、wrong-key 测试。
 
 ## 图片
 
-- [ ] 真实 `get_image` 契约仍未实测；重定向 host 与流式大小已校验，但 http/get_image 实际返回仍需实测。
-- [x] daily/chat budget 早退时图片会持久化；转发/回复引用图片、control/monitor 注入回合仍不自动注入。
-- [x] MCP 图片 >1 MB 时缩到 2000px JPEG。
-- [ ] `media.image_watermark` 只支持 ASCII；`image_compress` 强制 JPEG。
-- [ ] 缺 inbound resolver、provider image body、User image estimate/prune、MCP 图片、media 各动作测试。
+- [ ] 真实 `get_image` 契约仍未实测；http/get_image 实际返回需启动 NapCat 验证。
+- [ ] 转发/回复引用图片、control/monitor 注入回合仍不自动注入。
+- [ ] `media.image_watermark` 只支持 ASCII。
+- [x] `media.image_compress` 支持 JPEG/PNG/WebP（14f6a31）；WebP 仅无损，quality 只作用于 JPEG。
+- [x] 已补 media 各动作测试；provider `image_url` 序列化已有覆盖。
+- [ ] 缺 inbound resolver、User image estimate/prune、MCP 图片（已有压缩测试）的端到端测试。
+
+## 结构
+
+- [x] `src/app.rs` 拆为 `src/app/{mod,assembly,events,bootstrap}.rs`（45155bd）。
+- [ ] `src/agent/runner.rs` 3132 行 / 25 字段仍是上帝对象，待拆 scope/compact/injected/images/review。
+- [ ] `src/config/sections.rs` 1876 行拆分在 `refactor/cleanup` 分支，待合并。
 
 ## P2 / 发布
 
