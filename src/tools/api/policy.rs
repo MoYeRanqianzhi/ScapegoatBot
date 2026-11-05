@@ -159,8 +159,7 @@ impl ApiTool {
         };
         if spec.category == Category::Message
             && let Some(chat) = Self::chat_of(spec, &params)
-            && let Err(error) =
-                crate::agent::hooks::before_send(&self.event_hooks, chat, &mut params)
+            && let Err(error) = crate::hooks::before_send(&self.event_hooks, chat, &mut params)
         {
             return ToolResult::error(format!("BeforeSend hook blocked the send: {error}"));
         }

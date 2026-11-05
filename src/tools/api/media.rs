@@ -214,7 +214,7 @@ impl ApiTool {
     /// 调用方（provider）会转成 image block，和 Playwright 截图的行为一致。
     pub(super) fn images_from_response(
         response: &Value,
-    ) -> Vec<crate::agent::message::ImageAttachment> {
+    ) -> Vec<crate::transcript::ImageAttachment> {
         let data = response.get("data").unwrap_or(response);
         let mut out = Vec::new();
         for (key, mime) in [
@@ -240,7 +240,7 @@ impl ApiTool {
                 "image/png" | "image/jpeg" | "image/gif" | "image/webp"
             ) && payload.len() <= 4_700_000
             {
-                out.push(crate::agent::message::ImageAttachment {
+                out.push(crate::transcript::ImageAttachment {
                     mime,
                     data_base64: payload,
                 });

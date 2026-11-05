@@ -11,6 +11,7 @@ pub mod app;
 pub mod budget;
 pub mod cli;
 pub mod config;
+pub mod hooks;
 pub mod ipc;
 // LLM 公共类型：provider 与 agent 共享的用量、停止原因与拒绝细节。
 pub mod llm;

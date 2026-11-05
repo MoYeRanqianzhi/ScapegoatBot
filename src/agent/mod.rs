@@ -12,7 +12,7 @@
 #[path = "loop.rs"]
 pub mod agent_loop;
 pub mod event;
-pub mod hooks;
+pub use crate::hooks;
 pub mod message;
 pub mod queue;
 pub mod runner;
@@ -24,32 +24,6 @@ pub use message::{
     ToolResult, ToolResultMessage, Usage,
 };
 
-use crate::providers::ToolSpec;
-
-/// 工具执行模式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionMode {
-    /// 与同批其它工具并行。
-    Parallel,
-    /// 强制整批串行（有副作用或共享状态）。
-    Sequential,
-}
-
 pub use crate::transcript::{ContextSource, TurnEvidence};
 
-/// 工具执行器。
-///
-/// 运行时的 `ToolRegistry` 实现它；测试用 fake 实现。
-#[async_trait::async_trait]
-pub trait ToolExecutor: Send + Sync {
-    /// 当前可用工具声明，顺序稳定（影响 prompt 缓存）。
-    fn specs(&self) -> Vec<ToolSpec>;
-
-    /// 某个工具的执行模式；未知工具按并行处理。
-    fn execution_mode(&self, _name: &str) -> ExecutionMode {
-        ExecutionMode::Parallel
-    }
-
-    /// 执行一次调用。实现方必须保证不 panic；错误通过 [`ToolResult::error`] 返回。
-    async fn execute(&self, call: &ToolCall) -> ToolResult;
-}
+pub use crate::tools::{ExecutionMode, ToolExecutor};

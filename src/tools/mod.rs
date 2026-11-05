@@ -34,11 +34,37 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::agent::{ExecutionMode, ToolCall, ToolExecutor, ToolResult};
 use crate::providers::ToolSpec;
+use crate::transcript::{ToolCall, ToolResult};
 use crate::vfs::path::ParsedTarget;
 use crate::vfs::sqlite::VfsStore;
 use crate::vfs::{FileContent, VfsPath};
+
+/// 工具执行模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// 与同批其它工具并行。
+    Parallel,
+    /// 强制整批串行（有副作用或共享状态）。
+    Sequential,
+}
+
+/// 工具执行器。
+///
+/// 运行时的 `ToolRegistry` 实现它；测试用 fake 实现。
+#[async_trait::async_trait]
+pub trait ToolExecutor: Send + Sync {
+    /// 当前可用工具声明，顺序稳定（影响 prompt 缓存）。
+    fn specs(&self) -> Vec<ToolSpec>;
+
+    /// 某个工具的执行模式；未知工具按并行处理。
+    fn execution_mode(&self, _name: &str) -> ExecutionMode {
+        ExecutionMode::Parallel
+    }
+
+    /// 执行一次调用。实现方必须保证不 panic；错误通过 [`ToolResult::error`] 返回。
+    async fn execute(&self, call: &ToolCall) -> ToolResult;
+}
 
 /// 工具声明的权限。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,7 +87,7 @@ pub struct ToolContext {
     /// 安全闸；`None` 只用于单元测试。
     pub gate: Option<Arc<crate::security::gate::Gate>>,
     /// 本回合的运行时证据（owner intent / origin_chat）；门禁只消费它。
-    pub evidence: crate::agent::TurnEvidence,
+    pub evidence: crate::transcript::TurnEvidence,
 }
 
 impl ToolContext {
@@ -70,12 +96,12 @@ impl ToolContext {
             vfs,
             views,
             gate: None,
-            evidence: crate::agent::TurnEvidence::default(),
+            evidence: crate::transcript::TurnEvidence::default(),
         }
     }
 
     /// 注入回合证据；`API` 的 owner intent 检查读取它。
-    pub fn with_evidence(mut self, evidence: crate::agent::TurnEvidence) -> Self {
+    pub fn with_evidence(mut self, evidence: crate::transcript::TurnEvidence) -> Self {
         self.evidence = evidence;
         self
     }
@@ -242,7 +268,7 @@ impl ToolExecutor for ToolRegistry {
     }
 
     async fn execute(&self, call: &ToolCall) -> ToolResult {
-        self.execute_with_evidence(call, crate::agent::TurnEvidence::default())
+        self.execute_with_evidence(call, crate::transcript::TurnEvidence::default())
             .await
     }
 }
@@ -250,12 +276,12 @@ impl ToolExecutor for ToolRegistry {
 impl ToolRegistry {
     /// 带回合证据执行一次工具调用。
     ///
-    /// `ToolExecutor` 的签名不带上下文；runner 用 [`crate::agent::TurnEvidence`]
+    /// `ToolExecutor` 的签名不带上下文；runner 用 [`crate::transcript::TurnEvidence`]
     /// 包装一层，把 owner intent 与 origin_chat 传进来。
     pub async fn execute_with_evidence(
         &self,
         call: &ToolCall,
-        evidence: crate::agent::TurnEvidence,
+        evidence: crate::transcript::TurnEvidence,
     ) -> ToolResult {
         let Some(tool) = self.get(&call.name) else {
             return ToolResult::error(format!(

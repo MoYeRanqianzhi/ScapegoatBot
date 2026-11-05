@@ -13,8 +13,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent::ToolResult;
 use crate::monitor::{CronSchedule, MonitorManager, MonitorSpec, TimerSpec};
+use crate::transcript::ToolResult;
 
 use super::{Tool, ToolContext, arg_opt_str, arg_str, object_schema};
 

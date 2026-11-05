@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent::ToolResult;
+use crate::transcript::ToolResult;
 use crate::vfs::sqlite::VfsStore;
 use crate::vfs::{NodeKind, Vfs, VfsPath, guess_mime};
 

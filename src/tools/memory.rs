@@ -16,8 +16,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent::ToolResult;
 use crate::storage::Database;
+use crate::transcript::ToolResult;
 use crate::vfs::sqlite::VfsStore;
 use crate::vfs::{Vfs, VfsPath};
 
@@ -595,8 +595,8 @@ impl Tool for MemoryTool {
         &[Permission::Write]
     }
 
-    fn execution_mode(&self) -> crate::agent::ExecutionMode {
-        crate::agent::ExecutionMode::Sequential
+    fn execution_mode(&self) -> crate::tools::ExecutionMode {
+        crate::tools::ExecutionMode::Sequential
     }
 
     async fn execute(&self, _ctx: &ToolContext, args: Value) -> ToolResult {

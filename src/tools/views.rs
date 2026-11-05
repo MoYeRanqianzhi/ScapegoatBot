@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 
-use crate::agent::message::{AgentMessage, AssistantBlock};
 use crate::config::models::ModelsFile;
 use crate::config::{LoadedConfig, SbotConfig};
 use crate::qq::event::{ChatId, QqMessage};
@@ -25,6 +24,7 @@ use crate::security::gate::Gate;
 use crate::session::SessionStore;
 use crate::storage::Database;
 use crate::storage::messages::{InboxState, MessageStore};
+use crate::transcript::{AgentMessage, AssistantBlock};
 use crate::vfs::sqlite::VfsStore;
 use crate::vfs::{NodeKind, Vfs, VfsError, VfsPath, path::ParsedTarget};
 

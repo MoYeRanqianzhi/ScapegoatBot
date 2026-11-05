@@ -16,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent::ToolResult;
+use crate::transcript::ToolResult;
 
 use super::net::NetPolicy;
 use super::{Permission, Tool, ToolContext, arg_opt_u64, arg_str, object_schema};

@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use crate::agent::{ExecutionMode, ToolResult};
+use super::ExecutionMode;
+use crate::transcript::ToolResult;
 use crate::vfs::{FileContent, NodeKind, Vfs, VfsError, VfsPath};
 use base64::Engine as _;
 /// 超过视觉上限时缩到 2000px 内并转 JPEG；返回新 mime 与字节。
@@ -148,7 +149,7 @@ impl Tool for ReadTool {
             }
             return ToolResult::with_images(
                 note,
-                vec![crate::agent::message::ImageAttachment {
+                vec![crate::transcript::ImageAttachment {
                     mime,
                     data_base64: BASE64.encode(bytes),
                 }],
@@ -1053,14 +1054,14 @@ pub async fn read_static(ctx: &ToolContext, raw_path: &str) -> Result<String, Vf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::ToolCall;
-    use crate::agent::ToolExecutor;
     use crate::config::EncryptionMode;
     use crate::session::SessionStore;
     use crate::storage::Database;
     use crate::storage::crypto::MasterKey;
     use crate::storage::messages::MessageStore;
+    use crate::tools::ToolExecutor;
     use crate::tools::views::Views;
+    use crate::transcript::ToolCall;
     use crate::vfs::quota::Limits;
     use crate::vfs::sqlite::VfsStore;
 

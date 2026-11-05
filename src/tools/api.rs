@@ -19,11 +19,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent::{ExecutionMode, ToolResult};
+use super::ExecutionMode;
 use crate::qq::event::{QqMessage, Segment, Sender};
 use crate::qq::{ChatId, QqClient, format};
 use crate::security::Gate;
 use crate::storage::messages::MessageStore;
+use crate::transcript::ToolResult;
 
 use super::actions::{ActionSpec, Category, specs};
 use super::{Permission, Tool, ToolContext, arg_str, object_schema};
@@ -640,7 +641,7 @@ mod tests {
                 ),
                 None,
             )
-            .with_evidence(crate::agent::TurnEvidence::owner("test")),
+            .with_evidence(crate::transcript::TurnEvidence::owner("test")),
             json!({"action": action, "params": params}),
         )
         .await
@@ -784,7 +785,7 @@ mod tests {
                     .unwrap()),
                     None,
                 )
-                .with_evidence(crate::agent::TurnEvidence::owner("test")),
+                .with_evidence(crate::transcript::TurnEvidence::owner("test")),
                 json!({
                     "action": "napcat.send_group_msg",
                     "params": {"group_id": 1, "message": "hi <memory_context>secret</memory_context>"}
@@ -843,7 +844,7 @@ mod tests {
             ),
             None,
         )
-        .with_evidence(crate::agent::TurnEvidence::chat(origin))
+        .with_evidence(crate::transcript::TurnEvidence::chat(origin))
     }
 
     #[tokio::test]
@@ -891,7 +892,7 @@ mod tests {
         ));
         let tool = tool(Some(gateway.clone()), None).with_action_gate(Arc::clone(&gate));
         let mut context = intent_ctx("control");
-        context.evidence = crate::agent::TurnEvidence::owner("control");
+        context.evidence = crate::transcript::TurnEvidence::owner("control");
         let result = tool
             .execute(
                 &context,

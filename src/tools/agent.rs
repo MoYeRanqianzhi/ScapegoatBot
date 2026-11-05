@@ -10,9 +10,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::{Permission, Tool, ToolContext, arg_opt_str, arg_str, object_schema};
-use crate::agent::ToolResult;
 use crate::monitor::{CronSchedule, MonitorManager, MonitorSpec, TimerSpec};
 use crate::swarm::{AgentHub, AgentType};
+use crate::transcript::ToolResult;
 
 /// 子代理管理器句柄；runner 构造完成后注入。
 pub type HubHandle = std::sync::OnceLock<Arc<AgentHub>>;
