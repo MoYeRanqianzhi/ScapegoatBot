@@ -39,7 +39,9 @@ use crate::tools::api::AgentOps;
 use crate::vfs::Vfs;
 use crate::vfs::sqlite::VfsStore;
 
-use self::assembly::{build_agent, connect_qq, load_models, open_stores, resolve_principals};
+use self::assembly::{
+    AgentInputs, build_agent, connect_qq, load_models, open_stores, resolve_principals,
+};
 use self::bootstrap::{
     InstanceLock, ensure_default_config, persist_agent_setting, remove_sentinel,
     report_missing_credentials, terminate_signal, write_sentinel,
@@ -175,26 +177,26 @@ impl Runtime {
 
         let (owner_qq, master_qq) = resolve_principals(&loaded.config, self_id)?;
         let config_handle = Arc::new(RwLock::new(loaded.clone()));
-        let agent = build_agent(
-            &loaded,
-            Arc::clone(&config_handle),
-            &models,
-            &auth,
-            Arc::clone(&db),
-            Arc::clone(&key),
-            Arc::clone(&vfs),
-            Arc::clone(&messages),
-            Arc::clone(&sessions),
+        let agent = build_agent(AgentInputs {
+            loaded: &loaded,
+            config_handle: Arc::clone(&config_handle),
+            models: &models,
+            auth: &auth,
+            db: Arc::clone(&db),
+            key: Arc::clone(&key),
+            vfs: Arc::clone(&vfs),
+            messages: Arc::clone(&messages),
+            sessions: Arc::clone(&sessions),
             turn_buffer,
-            Arc::clone(&gate),
-            qq.as_ref().map(|(client, _)| Arc::clone(client)),
+            gate: Arc::clone(&gate),
+            qq: qq.as_ref().map(|(client, _)| Arc::clone(client)),
             self_id,
             owner_qq,
             master_qq,
-            Arc::clone(&ai_enabled),
-            paths.estop_file(),
-            paths.resolve(&loaded.config.swarm.agents_dir, &loaded.dir),
-        )
+            ai_enabled: Arc::clone(&ai_enabled),
+            estop_file: paths.estop_file(),
+            agents_dir: paths.resolve(&loaded.config.swarm.agents_dir, &loaded.dir),
+        })
         .await?;
 
         if agent.is_some() {

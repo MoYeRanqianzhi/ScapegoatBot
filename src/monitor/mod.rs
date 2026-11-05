@@ -211,6 +211,45 @@ struct Monitor {
     on_missing: crate::config::OnMissing,
 }
 
+/// 一个 monitor 的完整定义；`MonitorManager::add` 的唯一参数。
+///
+/// 字段与 `[[monitor]]` 配置一一对应，位置无关：运行时创建、配置文件加载与
+/// 唤醒预设都用具名字面量构造，布尔与 `Duration` 不会再被顺序放错。
+pub struct MonitorSpec {
+    /// 唯一名字；重复时 `add` 报错。
+    pub name: String,
+    /// `qq` / `timer` / `internal:<kind>` / `stream`。
+    pub source: String,
+    /// 定时源；`None` 表示事件驱动。
+    pub timer: Option<TimerSpec>,
+    /// 谓词表达式；`None` 匹配该 source 的全部事件。
+    pub when: Option<String>,
+    /// `as_prompt = true` 时的模板，支持 `{{event.text}}` / `{{event.chat}}` / `{{count}}`。
+    pub prompt: Option<String>,
+    /// 投递形式：`true` 投递指令，`false` 投递原始事件。
+    pub as_prompt: bool,
+    /// 投递次数上限；达到后停用并通知。
+    pub max_events: u64,
+    /// 有效时长；`None` 表示不过期。
+    pub expires: Option<Duration>,
+    /// 投递一次后停用（配合定时源）。
+    pub one_shot: bool,
+    /// 两次投递的最小间隔。
+    pub min_interval: Duration,
+    /// 只在 agent 空闲时投递。
+    pub idle_only: bool,
+    /// 批处理窗口；0 表示逐个投递。
+    pub batch_window: Duration,
+    /// 投递目标；`None` 表示主代理。
+    pub target: Option<String>,
+    /// 定时源错过触发时的处理方式。
+    pub catch_up: CatchUp,
+    /// 是否把投递抄送主代理。
+    pub cc: bool,
+    /// 目标不存在时：丢弃 / 排队 / 新建子代理。
+    pub on_missing: crate::config::OnMissing,
+}
+
 /// 管理器。
 pub struct MonitorManager {
     monitors: RwLock<HashMap<String, Arc<Monitor>>>,
@@ -247,26 +286,25 @@ impl MonitorManager {
     }
 
     /// 新增一个 monitor。运行时创建默认有界（2h、50 次）由调用方给出。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn add(
-        &self,
-        name: String,
-        source: String,
-        timer: Option<TimerSpec>,
-        when: Option<String>,
-        prompt: Option<String>,
-        as_prompt: bool,
-        max_events: u64,
-        expires: Option<Duration>,
-        one_shot: bool,
-        min_interval: Duration,
-        idle_only: bool,
-        batch_window: Duration,
-        target: Option<String>,
-        catch_up: CatchUp,
-        cc: bool,
-        on_missing: crate::config::OnMissing,
-    ) -> Result<()> {
+    pub async fn add(&self, spec: MonitorSpec) -> Result<()> {
+        let MonitorSpec {
+            name,
+            source,
+            timer,
+            when,
+            prompt,
+            as_prompt,
+            max_events,
+            expires,
+            one_shot,
+            min_interval,
+            idle_only,
+            batch_window,
+            target,
+            catch_up,
+            cc,
+            on_missing,
+        } = spec;
         if let Some(db) = self.db.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let _ = db.meta_set(&format!("monitor.removed.{name}"), b"0");
         }
@@ -952,32 +990,32 @@ pub async fn load_config_monitors(
             raw => crate::config::parse_duration_secs(raw).map(Duration::from_secs),
         };
         manager
-            .add(
-                monitor.name.clone(),
+            .add(MonitorSpec {
+                name: monitor.name.clone(),
                 source,
                 timer,
-                monitor.when.clone(),
-                if monitor.deliver.as_ == crate::config::DeliverAs::Prompt {
+                when: monitor.when.clone(),
+                prompt: if monitor.deliver.as_ == crate::config::DeliverAs::Prompt {
                     Some(monitor.deliver.prompt.clone())
                 } else {
                     None
                 },
-                monitor.deliver.as_ == crate::config::DeliverAs::Prompt,
-                monitor.lifecycle.max_events,
+                as_prompt: monitor.deliver.as_ == crate::config::DeliverAs::Prompt,
+                max_events: monitor.lifecycle.max_events,
                 expires,
-                monitor.lifecycle.one_shot,
-                Duration::from_secs(monitor.lifecycle.min_interval_secs),
-                monitor.lifecycle.idle_only,
-                Duration::from_millis(monitor.deliver.batch_window_ms),
-                if monitor.deliver.to == "main" {
+                one_shot: monitor.lifecycle.one_shot,
+                min_interval: Duration::from_secs(monitor.lifecycle.min_interval_secs),
+                idle_only: monitor.lifecycle.idle_only,
+                batch_window: Duration::from_millis(monitor.deliver.batch_window_ms),
+                target: if monitor.deliver.to == "main" {
                     None
                 } else {
                     Some(monitor.deliver.to.clone())
                 },
-                monitor.lifecycle.catch_up,
-                monitor.deliver.cc,
-                monitor.on_missing,
-            )
+                catch_up: monitor.lifecycle.catch_up,
+                cc: monitor.deliver.cc,
+                on_missing: monitor.on_missing,
+            })
             .await?;
 
         // `backlog = "inbox"`：创建时把匹配的未读消息补投一次；
@@ -1135,24 +1173,24 @@ mod tests {
         let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
         manager.set_self_id(1);
         manager
-            .add(
-                "at-me".to_owned(),
-                "qq".to_owned(),
-                None,
-                Some("event.mentions_self".to_owned()),
-                None,
-                false,
-                100,
-                None,
-                false,
-                Duration::ZERO,
-                false,
-                Duration::ZERO,
-                None,
-                CatchUp::Coalesce,
-                false,
-                crate::config::OnMissing::Queue,
-            )
+            .add(MonitorSpec {
+                name: "at-me".to_owned(),
+                source: "qq".to_owned(),
+                timer: None,
+                when: Some("event.mentions_self".to_owned()),
+                prompt: None,
+                as_prompt: false,
+                max_events: 100,
+                expires: None,
+                one_shot: false,
+                min_interval: Duration::ZERO,
+                idle_only: false,
+                batch_window: Duration::ZERO,
+                target: None,
+                catch_up: CatchUp::Coalesce,
+                cc: false,
+                on_missing: crate::config::OnMissing::Queue,
+            })
             .await
             .unwrap();
 
@@ -1181,24 +1219,24 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
         manager
-            .add(
-                "cced".to_owned(),
-                "qq".to_owned(),
-                None,
-                None,
-                None,
-                false,
-                10,
-                None,
-                false,
-                Duration::ZERO,
-                false,
-                Duration::ZERO,
-                Some("sa-1".to_owned()),
-                CatchUp::Coalesce,
-                true,
-                crate::config::OnMissing::Queue,
-            )
+            .add(MonitorSpec {
+                name: "cced".to_owned(),
+                source: "qq".to_owned(),
+                timer: None,
+                when: None,
+                prompt: None,
+                as_prompt: false,
+                max_events: 10,
+                expires: None,
+                one_shot: false,
+                min_interval: Duration::ZERO,
+                idle_only: false,
+                batch_window: Duration::ZERO,
+                target: Some("sa-1".to_owned()),
+                catch_up: CatchUp::Coalesce,
+                cc: true,
+                on_missing: crate::config::OnMissing::Queue,
+            })
             .await
             .unwrap();
         manager.fire("cced").await.unwrap();
@@ -1214,24 +1252,24 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
         manager
-            .add(
-                "once".to_owned(),
-                "qq".to_owned(),
-                None,
-                None,
-                None,
-                false,
-                1,
-                None,
-                false,
-                Duration::ZERO,
-                false,
-                Duration::ZERO,
-                None,
-                CatchUp::Coalesce,
-                false,
-                crate::config::OnMissing::Queue,
-            )
+            .add(MonitorSpec {
+                name: "once".to_owned(),
+                source: "qq".to_owned(),
+                timer: None,
+                when: None,
+                prompt: None,
+                as_prompt: false,
+                max_events: 1,
+                expires: None,
+                one_shot: false,
+                min_interval: Duration::ZERO,
+                idle_only: false,
+                batch_window: Duration::ZERO,
+                target: None,
+                catch_up: CatchUp::Coalesce,
+                cc: false,
+                on_missing: crate::config::OnMissing::Queue,
+            })
             .await
             .unwrap();
         manager.fire("once").await.unwrap();
@@ -1247,24 +1285,24 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
         manager
-            .add(
-                "m".to_owned(),
-                "qq".to_owned(),
-                None,
-                None,
-                None,
-                false,
-                10,
-                None,
-                false,
-                Duration::ZERO,
-                false,
-                Duration::ZERO,
-                None,
-                CatchUp::Coalesce,
-                false,
-                crate::config::OnMissing::Queue,
-            )
+            .add(MonitorSpec {
+                name: "m".to_owned(),
+                source: "qq".to_owned(),
+                timer: None,
+                when: None,
+                prompt: None,
+                as_prompt: false,
+                max_events: 10,
+                expires: None,
+                one_shot: false,
+                min_interval: Duration::ZERO,
+                idle_only: false,
+                batch_window: Duration::ZERO,
+                target: None,
+                catch_up: CatchUp::Coalesce,
+                cc: false,
+                on_missing: crate::config::OnMissing::Queue,
+            })
             .await
             .unwrap();
         assert_eq!(manager.list().await.len(), 1);
@@ -1278,24 +1316,24 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
         manager
-            .add(
-                "batched".to_owned(),
-                "qq".to_owned(),
-                None,
-                None,
-                None,
-                false,
-                10,
-                None,
-                false,
-                Duration::ZERO,
-                false,
-                Duration::from_millis(50),
-                None,
-                CatchUp::Coalesce,
-                false,
-                crate::config::OnMissing::Queue,
-            )
+            .add(MonitorSpec {
+                name: "batched".to_owned(),
+                source: "qq".to_owned(),
+                timer: None,
+                when: None,
+                prompt: None,
+                as_prompt: false,
+                max_events: 10,
+                expires: None,
+                one_shot: false,
+                min_interval: Duration::ZERO,
+                idle_only: false,
+                batch_window: Duration::from_millis(50),
+                target: None,
+                catch_up: CatchUp::Coalesce,
+                cc: false,
+                on_missing: crate::config::OnMissing::Queue,
+            })
             .await
             .unwrap();
 
@@ -1326,24 +1364,24 @@ mod tests {
         sink.idle.store(false, Ordering::SeqCst);
         let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
         manager
-            .add(
-                "idle".to_owned(),
-                "qq".to_owned(),
-                None,
-                None,
-                None,
-                false,
-                10,
-                None,
-                false,
-                Duration::ZERO,
-                true,
-                Duration::ZERO,
-                None,
-                CatchUp::Coalesce,
-                false,
-                crate::config::OnMissing::Queue,
-            )
+            .add(MonitorSpec {
+                name: "idle".to_owned(),
+                source: "qq".to_owned(),
+                timer: None,
+                when: None,
+                prompt: None,
+                as_prompt: false,
+                max_events: 10,
+                expires: None,
+                one_shot: false,
+                min_interval: Duration::ZERO,
+                idle_only: true,
+                batch_window: Duration::ZERO,
+                target: None,
+                catch_up: CatchUp::Coalesce,
+                cc: false,
+                on_missing: crate::config::OnMissing::Queue,
+            })
             .await
             .unwrap();
 
@@ -1392,24 +1430,24 @@ mod tests {
         let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
         manager.set_db(Arc::clone(&db));
         manager
-            .add(
-                "wake-on-owner".to_owned(),
-                "qq".to_owned(),
-                None,
-                Some("event.type == 'message'".to_owned()),
-                None,
-                false,
-                10,
-                None,
-                false,
-                Duration::ZERO,
-                false,
-                Duration::ZERO,
-                None,
-                CatchUp::Coalesce,
-                false,
-                crate::config::OnMissing::Queue,
-            )
+            .add(MonitorSpec {
+                name: "wake-on-owner".to_owned(),
+                source: "qq".to_owned(),
+                timer: None,
+                when: Some("event.type == 'message'".to_owned()),
+                prompt: None,
+                as_prompt: false,
+                max_events: 10,
+                expires: None,
+                one_shot: false,
+                min_interval: Duration::ZERO,
+                idle_only: false,
+                batch_window: Duration::ZERO,
+                target: None,
+                catch_up: CatchUp::Coalesce,
+                cc: false,
+                on_missing: crate::config::OnMissing::Queue,
+            })
             .await
             .unwrap();
         assert!(manager.remove("wake-on-owner").await);
@@ -1427,24 +1465,24 @@ mod tests {
         let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
         manager.set_owner_qq(322);
         manager
-            .add(
-                "owner".to_owned(),
-                "qq".to_owned(),
-                None,
-                Some("event.sender == '322'".to_owned()),
-                None,
-                false,
-                10,
-                None,
-                false,
-                Duration::ZERO,
-                false,
-                Duration::ZERO,
-                None,
-                CatchUp::Coalesce,
-                false,
-                crate::config::OnMissing::Queue,
-            )
+            .add(MonitorSpec {
+                name: "owner".to_owned(),
+                source: "qq".to_owned(),
+                timer: None,
+                when: Some("event.sender == '322'".to_owned()),
+                prompt: None,
+                as_prompt: false,
+                max_events: 10,
+                expires: None,
+                one_shot: false,
+                min_interval: Duration::ZERO,
+                idle_only: false,
+                batch_window: Duration::ZERO,
+                target: None,
+                catch_up: CatchUp::Coalesce,
+                cc: false,
+                on_missing: crate::config::OnMissing::Queue,
+            })
             .await
             .unwrap();
         let raw = serde_json::json!({
