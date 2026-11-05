@@ -13,23 +13,23 @@ pub mod budget;
 pub mod cli;
 pub mod config;
 pub mod hooks;
-pub mod ipc;
+pub(crate) mod ipc;
 // LLM 公共类型：provider 与 agent 共享的用量、停止原因与拒绝细节。
-pub mod llm;
+pub(crate) mod llm;
 // MCP 可选，默认关闭；启用时由 app 连接 stdio 服务器。
-pub mod mcp;
+pub(crate) mod mcp;
 // 后台复盘：记忆候选与 /STYLE.md；只在空闲时运行。
 pub mod memory;
-pub mod monitor;
-pub mod paths;
+pub(crate) mod monitor;
+pub(crate) mod paths;
 // 提示词：静态前缀 + 动态 hooks + 每回合 runtime 上下文。
-pub mod prompt;
+pub(crate) mod prompt;
 // Provider：Anthropic Messages、OpenAI Responses、Chat Completions 与 SSE。
 pub mod providers;
 // 安全闸：规则层 + Jev 分类器；shadow / enforce 由配置决定。
 pub mod security;
 pub mod storage;
-pub mod transcript;
+pub(crate) mod transcript;
 // 工具层：注册表、文件/API/记忆/技能/网络/监视器与动态视图。
 pub mod tools;
 // QQ 接入：事件归一化、消息格式与准入过滤。
