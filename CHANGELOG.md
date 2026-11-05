@@ -5,7 +5,7 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [0.2.0-alpha.35] - 2026-11-04
+## [0.2.0-alpha.35] - 2026-11-06
 
 收尾审计 P2。
 
@@ -14,7 +14,6 @@
 - `prune_tool_results` 只裁剪发给 provider 的副本，不再改写已提交历史。
 - `Monitor fire` 在 `min_interval` 内返回错误，而不是假报成功。
 - 子代理续聊加 dispatch 锁，避免并发重启覆盖历史。
-- 控制通道最多 4 个排队回合，超出直接拒绝。
 - `cap_batches` 死分支移除。
 - QQ 入站图片按 NapCat segment 的 `url` / `file`（URL、`base64://`、容器路径）解析；
   容器路径通过 `get_image` 换取 URL，再下载为 image prompt（仅 QQ CDN，≤3.5 MB）。
@@ -34,9 +33,21 @@
 - 解析 NapCat image segment 的 `path` 字段；`get_image` 可用 path 作为 fallback。
 - `rotate()` 持 current 锁；`idle_only` 也检查运行中的 injected 回合。
 
+### 重构与结构
+
+- 单会话化：删除 `[session].scope`、`SessionScope`、`ScopeCache` 与 `SessionStore.scope`；运行时只有一条 transcript，由单个 `turn_lock` 串行。
+- `app.rs` 拆为 `app/{mod,assembly,events,bootstrap}.rs`；`config/sections.rs` 拆为 19 个 section；`runner.rs` 拆出 `scope/compaction/review/injected/images/evidence/ops`；`MessageStore` 拆出 `codec/index/outbox/retention`；`ApiTool` 拆出 `policy/media`；`VfsStore` 拆出 `codec/tree`。
+- 模块 2-循环清零：`ExecutionMode`/`ToolExecutor` 归 `tools`，消息与证据归 `transcript`，`ProviderSlot` 归 `providers`，action 元数据归 crate 根 `actions`。
+- `Runner` 字段 25→15（`RunnerDeps`）；`run_turn` 拆为 `drive_turn`/`commit_turn`。
+- provider 外壳合并为 `HttpProviderCore` + 泛型 `pump`；5 份单轮补全合并为 `providers::complete_text`。
+- `hold` 只拒绝 QQ 操作（`napcat.*`）；MCP、下载、Web 与本地工具不再受 hold 影响。
+- 公开面收缩：7 个内部模块改 `pub(crate)`，全仓 `pub fn` 381→246。
+- `actions` 注册表按 namespace 拆为 9 个 helper，`Box::leak` 清零。
+- 水印支持 font8x8 的 Unicode 字库（拉丁/希腊/平假名等）；CJK 仍无字形。
+
 ### 测试
 
-- `cargo test --all-targets`：368 项通过（356 lib + 12 integration），2 ignored；`clippy -D warnings` 通过。
+- `cargo test --all-targets`：372 项通过（360 lib + 12 integration），2 ignored；`cargo fmt --check`、`clippy -D warnings` 通过。
 
 ## [0.2.0-alpha.34] - 2026-11-04
 
