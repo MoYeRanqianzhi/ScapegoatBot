@@ -16,7 +16,7 @@ use base64::Engine;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::message::{AgentMessage, AssistantBlock, ToolResult, ToolResultMessage};
+use crate::transcript::{AgentMessage, AssistantBlock, ToolResult, ToolResultMessage};
 use crate::config::EncryptionMode;
 use crate::storage::Database;
 use crate::storage::crypto::MasterKey;
@@ -325,7 +325,7 @@ pub fn load_context(turn_id: &str, store: &TurnBufferStore) -> Result<Vec<(u64, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::message::{AssistantMessage, StopReason, Usage};
+    use crate::transcript::{AssistantMessage, StopReason, Usage};
 
     fn setup() -> (TurnBufferStore, SessionStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -345,7 +345,7 @@ mod tests {
 
     fn assistant_with_call(id: &str) -> AgentMessage {
         AgentMessage::Assistant(AssistantMessage {
-            content: vec![AssistantBlock::ToolCall(crate::agent::message::ToolCall {
+            content: vec![AssistantBlock::ToolCall(crate::transcript::ToolCall {
                 id: id.to_owned(),
                 name: "Read".to_owned(),
                 arguments: serde_json::json!({"path": "/AGENTS.md"}),

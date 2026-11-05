@@ -27,6 +27,7 @@ pub mod providers;
 // 安全闸：规则层 + Jev 分类器；shadow / enforce 由配置决定。
 pub mod security;
 pub mod storage;
+pub mod transcript;
 // 工具层：注册表、文件/API/记忆/技能/网络/监视器与动态视图。
 pub mod tools;
 // QQ 接入：事件归一化、消息格式与准入过滤。

@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::agent::message::AgentMessage;
+use crate::transcript::AgentMessage;
 use crate::config::EncryptionMode;
 use crate::storage::Database;
 use crate::storage::crypto::MasterKey;
@@ -688,7 +688,7 @@ pub fn segment_path(root: &Path, file: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::message::{AssistantMessage, StopReason, Usage};
+    use crate::transcript::{AssistantMessage, StopReason, Usage};
 
     fn store() -> (SessionStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -707,7 +707,7 @@ mod tests {
 
     fn assistant(text: &str) -> AgentMessage {
         AgentMessage::Assistant(AssistantMessage {
-            content: vec![crate::agent::message::AssistantBlock::Text {
+            content: vec![crate::transcript::AssistantBlock::Text {
                 text: text.to_owned(),
             }],
             stop_reason: StopReason::EndTurn,
