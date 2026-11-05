@@ -70,5 +70,5 @@
 - [x] 内部模块 `ipc/mcp/monitor/paths/prompt/transcript/llm` 改为 `pub(crate)`（ed88080）。
 - [x] storage/session 的 `pub fn` 已降为 `pub(crate)`，全仓 `pub fn` 381→332（48ed2b2）。
 - [x] agent/security 方法已降为 `pub(crate)`，只为外部测试保留 `ActionGate/ApprovalQueue/JevJudge` 构造器；全仓 `pub fn` 332→287（0eedbca）。
-- [ ] `tools` 的公开方法仍需按集成测试继续收。
+- [x] `tools` 方法已降为 `pub(crate)`，只为集成测试保留 `ApiTool::new/with_action_gate`、`ToolContext::new`；全仓 `pub fn` 287→246（5ce2684）。
 - [x] hold 语义修正：只拒绝 QQ 操作（`napcat.*`），MCP/下载/Web 不再被 hold 拦截（d21eed4）。
