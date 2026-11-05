@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ConfigError, ModelsFile, check_available, validate_scopes};
+use super::{ConfigError, ModelsFile, check_available, non_empty, non_zero, validate_scopes};
 
 // ---------------------------------------------------------------------------
 // [agent]
@@ -88,9 +88,7 @@ impl Default for AgentConfig {
 
 impl AgentConfig {
     pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
-        if self.name.trim().is_empty() {
-            errors.push(ConfigError::new("agent.name", "must not be empty"));
-        }
+        non_empty(errors, "agent.name", &self.name);
         if self.owner_name.chars().count() > 64 {
             errors.push(ConfigError::new(
                 "agent.owner_name",
@@ -156,30 +154,22 @@ impl AgentConfig {
                 ));
             }
         }
-        if self.retry_attempts == 0 {
-            errors.push(ConfigError::new(
-                "agent.retry_attempts",
-                "must be greater than zero",
-            ));
-        }
-        if self.retry_base_ms == 0 || self.retry_max_ms == 0 {
-            errors.push(ConfigError::new(
-                "agent.retry_base_ms / agent.retry_max_ms",
-                "must be greater than zero",
-            ));
-        }
-        if self.max_steps == 0 {
-            errors.push(ConfigError::new(
-                "agent.max_steps",
-                "must be greater than zero",
-            ));
-        }
-        if self.max_output_tokens == 0 {
-            errors.push(ConfigError::new(
-                "agent.max_output_tokens",
-                "must be greater than zero",
-            ));
-        }
+        non_zero(
+            errors,
+            "agent.retry_attempts",
+            u64::from(self.retry_attempts),
+        );
+        non_zero(
+            errors,
+            "agent.retry_base_ms / agent.retry_max_ms",
+            self.retry_base_ms.min(self.retry_max_ms),
+        );
+        non_zero(errors, "agent.max_steps", u64::from(self.max_steps));
+        non_zero(
+            errors,
+            "agent.max_output_tokens",
+            u64::from(self.max_output_tokens),
+        );
         validate_scopes("agent.receive_scopes", &self.receive_scopes, errors);
         validate_scopes("agent.send_scopes", &self.send_scopes, errors);
     }

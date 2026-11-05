@@ -97,3 +97,17 @@ pub(super) fn check_available(
         ));
     }
 }
+
+/// 整型配置必须大于零。
+pub(super) fn non_zero(errors: &mut Vec<ConfigError>, field: impl Into<String>, value: u64) {
+    if value == 0 {
+        errors.push(ConfigError::new(field, "must be greater than zero"));
+    }
+}
+
+/// 字符串配置去掉首尾空白后不能为空。
+pub(super) fn non_empty(errors: &mut Vec<ConfigError>, field: impl Into<String>, value: &str) {
+    if value.trim().is_empty() {
+        errors.push(ConfigError::new(field, "must not be empty"));
+    }
+}

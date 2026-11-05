@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{CompactionConfig, ConfigError};
+use super::{CompactionConfig, ConfigError, non_zero};
 
 // ---------------------------------------------------------------------------
 // [budget]
@@ -50,18 +50,16 @@ impl BudgetConfig {
                 "must be a non-negative number",
             ));
         }
-        if self.chat_sends_per_hour == 0 || self.chat_turns_per_hour == 0 {
-            errors.push(ConfigError::new(
-                "budget.chat_*_per_hour",
-                "must be greater than zero",
-            ));
-        }
-        if self.round_trip_wall_secs == 0 {
-            errors.push(ConfigError::new(
-                "budget.round_trip_wall_secs",
-                "must be greater than zero",
-            ));
-        }
+        non_zero(
+            errors,
+            "budget.chat_*_per_hour",
+            u64::from(self.chat_sends_per_hour.min(self.chat_turns_per_hour)),
+        );
+        non_zero(
+            errors,
+            "budget.round_trip_wall_secs",
+            self.round_trip_wall_secs,
+        );
         // `turn_tokens` 是回合累计用量，`turn_context_budget` 是单次请求工作集；
         // 两者量纲不同，不设大小关系（设计 §9.6 已据此修正）。
         let _ = compaction;

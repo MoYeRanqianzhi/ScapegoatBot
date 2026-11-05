@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
+use super::{ConfigError, non_zero};
 
 // ---------------------------------------------------------------------------
 // [memory]
@@ -60,9 +60,7 @@ impl MemoryConfig {
                 self.review_interval_minutes,
             ),
         ] {
-            if value == 0 {
-                errors.push(ConfigError::new(field, "must be greater than zero"));
-            }
+            non_zero(errors, field, u64::from(value));
         }
     }
 }

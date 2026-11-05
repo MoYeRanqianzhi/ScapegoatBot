@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
+use super::{ConfigError, non_empty, non_zero};
 
 // ---------------------------------------------------------------------------
 // [storage]
@@ -47,14 +47,7 @@ impl Default for StorageConfig {
 
 impl StorageConfig {
     pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
-        if self.path.trim().is_empty() {
-            errors.push(ConfigError::new("storage.path", "must not be empty"));
-        }
-        if self.max_blob_bytes == 0 {
-            errors.push(ConfigError::new(
-                "storage.max_blob_bytes",
-                "must be greater than zero",
-            ));
-        }
+        non_empty(errors, "storage.path", &self.path);
+        non_zero(errors, "storage.max_blob_bytes", self.max_blob_bytes);
     }
 }

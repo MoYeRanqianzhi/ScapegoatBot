@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
+use super::{ConfigError, non_zero};
 
 // ---------------------------------------------------------------------------
 // [style]
@@ -26,12 +26,7 @@ impl Default for StyleConfig {
 
 impl StyleConfig {
     pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
-        if self.max_chars == 0 {
-            errors.push(ConfigError::new(
-                "style.max_chars",
-                "must be greater than zero",
-            ));
-        }
+        non_zero(errors, "style.max_chars", u64::from(self.max_chars));
         if !self.profile_path.starts_with('/') {
             errors.push(ConfigError::new(
                 "style.profile_path",

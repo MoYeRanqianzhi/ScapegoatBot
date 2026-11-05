@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
+use super::{ConfigError, non_empty, non_zero};
 use crate::config::parse_duration_secs;
 
 // ---------------------------------------------------------------------------
@@ -239,12 +239,8 @@ pub(in crate::config) fn validate_monitors(
     for (index, monitor) in monitors.iter().enumerate() {
         let field = format!("monitor[{index}]");
 
-        if monitor.name.trim().is_empty() {
-            errors.push(ConfigError::new(
-                format!("{field}.name"),
-                "must not be empty",
-            ));
-        } else if !names.insert(monitor.name.as_str()) {
+        non_empty(errors, format!("{field}.name"), &monitor.name);
+        if !monitor.name.trim().is_empty() && !names.insert(monitor.name.as_str()) {
             errors.push(ConfigError::new(
                 format!("{field}.name"),
                 format!("duplicate monitor name {:?}", monitor.name),
@@ -319,12 +315,8 @@ pub(in crate::config) fn validate_monitors(
             ));
         }
 
-        if monitor.deliver.to.trim().is_empty() {
-            errors.push(ConfigError::new(
-                format!("{field}.deliver.to"),
-                "must not be empty",
-            ));
-        } else if monitor.deliver.to != "main"
+        non_empty(errors, format!("{field}.deliver.to"), &monitor.deliver.to);
+        if monitor.deliver.to != "main"
             && let Some(name) = monitor.deliver.to.strip_prefix("agent:")
             && name.is_empty()
         {
@@ -341,12 +333,11 @@ pub(in crate::config) fn validate_monitors(
             ));
         }
 
-        if monitor.deliver.batch_window_ms == 0 {
-            errors.push(ConfigError::new(
-                format!("{field}.deliver.batch_window_ms"),
-                "must be greater than zero",
-            ));
-        }
+        non_zero(
+            errors,
+            format!("{field}.deliver.batch_window_ms"),
+            monitor.deliver.batch_window_ms,
+        );
 
         match parse_duration_secs(&monitor.lifecycle.expires) {
             Some(_) => {}
@@ -363,11 +354,10 @@ pub(in crate::config) fn validate_monitors(
             ));
         }
 
-        if monitor.lifecycle.max_events == 0 {
-            errors.push(ConfigError::new(
-                format!("{field}.lifecycle.max_events"),
-                "must be greater than zero",
-            ));
-        }
+        non_zero(
+            errors,
+            format!("{field}.lifecycle.max_events"),
+            monitor.lifecycle.max_events,
+        );
     }
 }

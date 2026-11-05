@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::ConfigError;
+use super::{ConfigError, non_empty};
 
 // ---------------------------------------------------------------------------
 // [hooks]
@@ -186,12 +186,8 @@ impl HooksConfig {
         let mut names = HashSet::new();
         for (index, hook) in self.context.iter().enumerate() {
             let field = format!("hooks.context[{index}]");
-            if hook.name.trim().is_empty() {
-                errors.push(ConfigError::new(
-                    format!("{field}.name"),
-                    "must not be empty",
-                ));
-            } else if !names.insert(hook.name.as_str()) {
+            non_empty(errors, format!("{field}.name"), &hook.name);
+            if !hook.name.trim().is_empty() && !names.insert(hook.name.as_str()) {
                 errors.push(ConfigError::new(
                     format!("{field}.name"),
                     format!("duplicate hook name {:?}", hook.name),

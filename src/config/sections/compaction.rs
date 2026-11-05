@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::{AgentConfig, ConfigError};
+use super::{AgentConfig, ConfigError, non_zero};
 
 // ---------------------------------------------------------------------------
 // [compaction]
@@ -46,9 +46,7 @@ impl CompactionConfig {
             ("compaction.prune_soft_limit", self.prune_soft_limit),
             ("compaction.prune_keep_turns", self.prune_keep_turns),
         ] {
-            if value == 0 {
-                errors.push(ConfigError::new(field, "must be greater than zero"));
-            }
+            non_zero(errors, field, u64::from(value));
         }
         if self.reserve_tokens < agent.max_output_tokens {
             errors.push(ConfigError::new(

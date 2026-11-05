@@ -7,6 +7,7 @@
 //! VFS、消息索引、发送账本等表在各自阶段追加迁移，**只增不改**。
 
 pub mod crypto;
+pub(crate) mod envelope;
 pub mod messages;
 
 use std::path::Path;
