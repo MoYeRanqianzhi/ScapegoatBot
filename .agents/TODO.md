@@ -41,7 +41,8 @@
 
 - [x] `queue.cap_batches` 已删除（d807e4c）。
 - [x] `agent.compact` 支持可选 `chat` 参数（2608061）。
-- [ ] 无 alpha.35 tag；按要求暂缓发布/部署，服务器 `sbot.service` 停止。
+- [x] 本地 tag `v0.2.0-alpha.35` 已创建，CHANGELOG 已更新到 372 测试。
+- [ ] push tag / GitHub release / 服务器部署需用户确认；服务器 `sbot.service` 仍停止。
 - [ ] 历史重写后其他 clone 必须重新 clone 或
       `git fetch --all --prune --tags --force && git reset --hard origin/main`；旧 SHA 失效。
 
