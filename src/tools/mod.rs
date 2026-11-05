@@ -101,20 +101,10 @@ impl ToolContext {
     }
 
     /// 注入回合证据；`API` 的 owner intent 检查读取它。
-    pub fn with_evidence(mut self, evidence: crate::transcript::TurnEvidence) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_evidence(mut self, evidence: crate::transcript::TurnEvidence) -> Self {
         self.evidence = evidence;
         self
-    }
-
-    /// 注入安全闸；工具据此拒绝 hold 期间的外部访问。
-    pub fn with_gate(mut self, gate: Arc<crate::security::gate::Gate>) -> Self {
-        self.gate = Some(gate);
-        self
-    }
-
-    /// 当前是否处于 hold：对外工具一律拒绝，避免绕过 `napcat.*` 的限制。
-    pub fn hold_active(&self) -> bool {
-        self.gate.as_ref().is_some_and(|gate| gate.hold_active())
     }
 }
 
@@ -151,13 +141,8 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    /// 不带上下文的空注册表（测试用）。
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
     /// 以 VFS 作为执行上下文的注册表。
-    pub fn new(vfs: Arc<VfsStore>, views: Option<Arc<views::Views>>) -> Self {
+    pub(crate) fn new(vfs: Arc<VfsStore>, views: Option<Arc<views::Views>>) -> Self {
         Self {
             tools: BTreeMap::new(),
             vfs: Some(vfs),
@@ -170,25 +155,25 @@ impl ToolRegistry {
     }
 
     /// 截断超长工具结果，避免一次 `Read`/`Grep` 把上下文撑爆。
-    pub fn with_max_result_bytes(mut self, bytes: usize) -> Self {
+    pub(crate) fn with_max_result_bytes(mut self, bytes: usize) -> Self {
         self.max_result_bytes = bytes;
         self
     }
 
     /// 限制全部工具 schema 的近似 token；超限时优先压缩描述。
-    pub fn with_max_schema_tokens(mut self, tokens: usize) -> Self {
+    pub(crate) fn with_max_schema_tokens(mut self, tokens: usize) -> Self {
         self.max_schema_tokens = tokens;
         self
     }
 
     /// 提供只读 `API` 实例；`read_only()` 会用它替换完整版本。
-    pub fn with_read_only_api(mut self, tool: Arc<dyn Tool>) -> Self {
+    pub(crate) fn with_read_only_api(mut self, tool: Arc<dyn Tool>) -> Self {
         self.read_only_api = Some(tool);
         self
     }
 
     /// 把 `API` 换成只允许 `api.*` 的实例。
-    pub fn read_only(mut self) -> Self {
+    pub(crate) fn read_only(mut self) -> Self {
         if let Some(api) = &self.read_only_api {
             self.tools.insert("API", Arc::clone(api));
         }
@@ -196,28 +181,28 @@ impl ToolRegistry {
     }
 
     /// 注入安全闸；`hold` 期间 Download / Web* / MCP 会被拒绝。
-    pub fn with_gate(mut self, gate: Arc<crate::security::gate::Gate>) -> Self {
+    pub(crate) fn with_gate(mut self, gate: Arc<crate::security::gate::Gate>) -> Self {
         self.gate = Some(gate);
         self
     }
 
     /// 注册一个工具；同名后注册者覆盖先注册者（用于测试替身）。
-    pub fn register(&mut self, tool: Arc<dyn Tool>) {
+    pub(crate) fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(tool.name(), tool);
     }
 
-    pub fn names(&self) -> Vec<&'static str> {
+    pub(crate) fn names(&self) -> Vec<&'static str> {
         self.tools.keys().copied().collect()
     }
 
-    pub fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
+    pub(crate) fn get(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.get(name)
     }
 
     /// 复制注册表，只保留 `allowed` 中的工具；上下文（VFS/视图）沿用。
     ///
     /// 子代理用它实现“工具集是父代理的子集”。
-    pub fn filtered(&self, allowed: &[&'static str]) -> Self {
+    pub(crate) fn filtered(&self, allowed: &[&'static str]) -> Self {
         let mut tools = BTreeMap::new();
         for name in allowed {
             if let Some(tool) = self.tools.get(name) {
@@ -235,14 +220,8 @@ impl ToolRegistry {
         }
     }
 
-    /// 删除一个工具，返回是否存在（用于子代理去掉 `API` 发送能力）。
-    pub fn without(mut self, name: &str) -> Self {
-        self.tools.remove(name);
-        self
-    }
-
     /// 全部工具声明，顺序稳定（BTreeMap）。
-    pub fn specs(&self) -> Vec<ToolSpec> {
+    pub(crate) fn specs(&self) -> Vec<ToolSpec> {
         let specs = self
             .tools
             .values()
@@ -278,7 +257,7 @@ impl ToolRegistry {
     ///
     /// `ToolExecutor` 的签名不带上下文；runner 用 [`crate::transcript::TurnEvidence`]
     /// 包装一层，把 owner intent 与 origin_chat 传进来。
-    pub async fn execute_with_evidence(
+    pub(crate) async fn execute_with_evidence(
         &self,
         call: &ToolCall,
         evidence: crate::transcript::TurnEvidence,

@@ -24,7 +24,7 @@ pub struct MonitorTool {
 }
 
 impl MonitorTool {
-    pub fn new(manager: Arc<MonitorManager>) -> Self {
+    pub(crate) fn new(manager: Arc<MonitorManager>) -> Self {
         Self { manager }
     }
 }

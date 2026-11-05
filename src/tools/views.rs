@@ -103,7 +103,7 @@ impl Default for ViewContext {
 }
 
 impl Views {
-    pub fn new(
+    pub(crate) fn new(
         vfs: Arc<VfsStore>,
         messages: Arc<MessageStore>,
         sessions: Arc<SessionStore>,
@@ -120,7 +120,7 @@ impl Views {
     }
 
     /// 接入配置热更新回调；写入成功后调用。
-    pub fn set_hot_reload(&self, callback: HotReload) {
+    pub(crate) fn set_hot_reload(&self, callback: HotReload) {
         *self.hot_reload.lock().expect("hot reload lock") = Some(callback);
     }
 
@@ -133,7 +133,7 @@ impl Views {
     }
 
     /// 接入 `/config` 与 `/system` 所需的运行时句柄。
-    pub fn with_context(mut self, context: ViewContext) -> Self {
+    pub(crate) fn with_context(mut self, context: ViewContext) -> Self {
         self.context = context;
         self
     }
@@ -147,12 +147,12 @@ impl Views {
     }
 
     /// 路径是否属于动态视图。
-    pub fn handles(path: &VfsPath) -> bool {
+    pub(crate) fn handles(path: &VfsPath) -> bool {
         crate::vfs::path::is_dynamic(path)
     }
 
     /// 列出目录。
-    pub async fn list(&self, target: &ParsedTarget) -> Result<Vec<ViewEntry>, VfsError> {
+    pub(crate) async fn list(&self, target: &ParsedTarget) -> Result<Vec<ViewEntry>, VfsError> {
         let path = &target.path;
         let mut entries = match path.segments() {
             [root] if root == "messages" => self.list_messages_root(),
@@ -189,7 +189,7 @@ impl Views {
     }
 
     /// 读取一个动态文件；内容进入上下文即标记已读。
-    pub async fn read(&self, target: &ParsedTarget) -> Result<ViewRead, VfsError> {
+    pub(crate) async fn read(&self, target: &ParsedTarget) -> Result<ViewRead, VfsError> {
         self.read_internal(target, true).await
     }
 
@@ -197,7 +197,7 @@ impl Views {
     ///
     /// 工具描述承诺“只扫描的文件不算读过”；搜索时把候选文件整体读一遍
     /// 不能悄悄把未读清空。
-    pub async fn peek(&self, target: &ParsedTarget) -> Result<ViewRead, VfsError> {
+    pub(crate) async fn peek(&self, target: &ParsedTarget) -> Result<ViewRead, VfsError> {
         self.read_internal(target, false).await
     }
 
@@ -257,7 +257,7 @@ impl Views {
     }
 
     /// 元信息（不标记读）。
-    pub async fn stat(&self, path: &VfsPath) -> Result<ViewEntry, VfsError> {
+    pub(crate) async fn stat(&self, path: &VfsPath) -> Result<ViewEntry, VfsError> {
         let target = ParsedTarget {
             path: path.clone(),
             query: None,
@@ -289,7 +289,7 @@ impl Views {
     }
 
     /// 递归遍历（Glob / Grep 使用）。
-    pub async fn walk(&self, path: &VfsPath) -> Result<Vec<ViewEntry>, VfsError> {
+    pub(crate) async fn walk(&self, path: &VfsPath) -> Result<Vec<ViewEntry>, VfsError> {
         let mut out = Vec::new();
         let mut stack = vec![path.clone()];
         while let Some(current) = stack.pop() {
@@ -336,7 +336,7 @@ impl Views {
     }
 
     /// `/inbox` 的忽略语义：`dismiss` 不删除消息本体。
-    pub fn dismiss(&self, target: &ParsedTarget) -> Result<usize, VfsError> {
+    pub(crate) fn dismiss(&self, target: &ParsedTarget) -> Result<usize, VfsError> {
         let path = &target.path;
         match path.segments() {
             [root, chat] if root == "inbox" => {
@@ -400,7 +400,7 @@ impl Views {
     }
 
     /// 动态路径中的 grep：只返回匹配，并把匹配条目记为已读。
-    pub async fn grep(
+    pub(crate) async fn grep(
         &self,
         root: &VfsPath,
         regex: &regex::Regex,

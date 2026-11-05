@@ -114,25 +114,26 @@ impl ApiTool {
     }
 
     /// 限制 `napcat.*` 查询能读到哪些 chat；`["*"]` = 全部。
-    pub fn with_receive_scopes(mut self, scopes: Vec<String>) -> Self {
+    pub(crate) fn with_receive_scopes(mut self, scopes: Vec<String>) -> Self {
         self.receive_scopes = Some(scopes);
         self
     }
 
     /// 接入消息库：`get_msg` 的 chat 反查与发送记账用。
-    pub fn with_messages(mut self, messages: Arc<MessageStore>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_messages(mut self, messages: Arc<MessageStore>) -> Self {
         self.messages = Some(messages);
         self
     }
 
     /// 接入 `BeforeSend` 事件 hook。
-    pub fn with_event_hooks(mut self, hooks: Vec<crate::config::EventHookConfig>) -> Self {
+    pub(crate) fn with_event_hooks(mut self, hooks: Vec<crate::config::EventHookConfig>) -> Self {
         self.event_hooks = hooks;
         self
     }
 
     /// 只读副本：只暴露 `api.list` / `api.help`，不能发送或执行 QQ 动作。
-    pub fn read_only(mut self) -> Self {
+    pub(crate) fn read_only(mut self) -> Self {
         self.read_only = true;
         self
     }

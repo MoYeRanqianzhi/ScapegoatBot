@@ -26,7 +26,7 @@ pub struct DownloadTool {
 }
 
 impl DownloadTool {
-    pub fn new(vfs: Arc<VfsStore>, policy: NetPolicy) -> Result<Self, String> {
+    pub(crate) fn new(vfs: Arc<VfsStore>, policy: NetPolicy) -> Result<Self, String> {
         let client = policy.client()?;
         Ok(Self {
             vfs,

@@ -26,12 +26,12 @@ pub struct SkillTool {
 }
 
 impl SkillTool {
-    pub fn new(vfs: Arc<VfsStore>) -> Self {
+    pub(crate) fn new(vfs: Arc<VfsStore>) -> Self {
         Self { vfs, db: None }
     }
 
     /// 接入使用记录。
-    pub fn with_db(mut self, db: Arc<Database>) -> Self {
+    pub(crate) fn with_db(mut self, db: Arc<Database>) -> Self {
         self.db = Some(db);
         self
     }

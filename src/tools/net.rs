@@ -66,7 +66,7 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
 
 impl NetPolicy {
     /// 构造 reqwest 客户端（重定向策略在 `check_hop` 之外由调用方逐跳检查）。
-    pub fn client(&self) -> Result<reqwest::Client, String> {
+    pub(crate) fn client(&self) -> Result<reqwest::Client, String> {
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs.max(1)))
             .redirect(reqwest::redirect::Policy::none());
@@ -77,7 +77,7 @@ impl NetPolicy {
     }
 
     /// 校验 URL 的协议与域名；不解析 DNS。
-    pub fn check_url(&self, raw: &str) -> Result<Url, String> {
+    pub(crate) fn check_url(&self, raw: &str) -> Result<Url, String> {
         let url = Url::parse(raw).map_err(|error| format!("invalid URL: {error}"))?;
         if !matches!(url.scheme(), "http" | "https") {
             return Err("only http and https URLs are allowed".to_owned());
@@ -104,7 +104,7 @@ impl NetPolicy {
     }
 
     /// 解析并校验每个 IP；拒绝非公网地址。
-    pub async fn resolve_public(&self, url: &Url) -> Result<(), String> {
+    pub(crate) async fn resolve_public(&self, url: &Url) -> Result<(), String> {
         if self.allow_private {
             return Ok(());
         }
@@ -141,7 +141,7 @@ impl NetPolicy {
     }
 
     /// 跟随有限次重定向，每一跳都重新校验。
-    pub async fn send(
+    pub(crate) async fn send(
         &self,
         client: &reqwest::Client,
         url: Url,

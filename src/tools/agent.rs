@@ -26,7 +26,7 @@ pub struct AgentTool {
 }
 
 impl AgentTool {
-    pub fn new(hub: Arc<HubHandle>, depth: u32) -> Self {
+    pub(crate) fn new(hub: Arc<HubHandle>, depth: u32) -> Self {
         Self {
             hub,
             depth,
@@ -35,7 +35,7 @@ impl AgentTool {
     }
 
     /// 接入 monitor 管理器，支持 `Agent spawn` 的 `monitor` 绑定。
-    pub fn with_monitors(mut self, monitors: Arc<MonitorManager>) -> Self {
+    pub(crate) fn with_monitors(mut self, monitors: Arc<MonitorManager>) -> Self {
         self.monitors = Some(monitors);
         self
     }

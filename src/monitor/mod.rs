@@ -435,6 +435,7 @@ impl MonitorManager {
     }
 
     /// 手动触发一次。
+    #[cfg(test)]
     pub async fn fire(&self, name: &str) -> Result<()> {
         let monitor = self.get_or_bail(name).await?;
         if monitor.cancelled.load(Ordering::SeqCst)

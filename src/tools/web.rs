@@ -30,7 +30,10 @@ pub struct WebBackend {
 }
 
 impl WebBackend {
-    pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Result<Self, String> {
+    pub(crate) fn new(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::limited(3))
@@ -70,7 +73,7 @@ pub struct WebSearchTool {
 }
 
 impl WebSearchTool {
-    pub fn new(backend: Arc<WebBackend>, default_count: u32) -> Self {
+    pub(crate) fn new(backend: Arc<WebBackend>, default_count: u32) -> Self {
         Self {
             backend,
             default_count,
@@ -78,7 +81,7 @@ impl WebSearchTool {
     }
 
     /// 请求体，独立成函数便于测试。
-    pub fn build_body(query: &str, count: u32, domains: &[String]) -> Value {
+    pub(crate) fn build_body(query: &str, count: u32, domains: &[String]) -> Value {
         json!({
             "query": query,
             "count": count,
@@ -155,7 +158,11 @@ pub struct WebFetchTool {
 }
 
 impl WebFetchTool {
-    pub fn new(backend: Arc<WebBackend>, default_max_tokens: u32, policy: NetPolicy) -> Self {
+    pub(crate) fn new(
+        backend: Arc<WebBackend>,
+        default_max_tokens: u32,
+        policy: NetPolicy,
+    ) -> Self {
         Self {
             backend,
             default_max_tokens,
@@ -165,7 +172,7 @@ impl WebFetchTool {
     }
 
     /// 本地抓取模式；重定向逐跳校验，不经过 HTTP 后端。
-    pub fn with_local(mut self, local: bool) -> Self {
+    pub(crate) fn with_local(mut self, local: bool) -> Self {
         self.local = local;
         self
     }
@@ -244,7 +251,7 @@ impl WebFetchTool {
         Err("too many redirects".to_owned())
     }
 
-    pub fn build_body(url: &str, max_content_tokens: u32) -> Value {
+    pub(crate) fn build_body(url: &str, max_content_tokens: u32) -> Value {
         json!({
             "url": url,
             "max_content_tokens": max_content_tokens,

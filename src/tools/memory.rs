@@ -83,7 +83,7 @@ pub struct MemoryTool {
 }
 
 impl MemoryTool {
-    pub fn new(
+    pub(crate) fn new(
         vfs: Arc<VfsStore>,
         max_entry_chars: u32,
         max_index_lines: u32,
@@ -101,7 +101,7 @@ impl MemoryTool {
     }
 
     /// 接入 `memory_entries` 索引；doctor 与 `/system/memory` 依赖它。
-    pub fn with_db(mut self, db: Arc<Database>) -> Self {
+    pub(crate) fn with_db(mut self, db: Arc<Database>) -> Self {
         self.db = Some(db);
         self
     }
