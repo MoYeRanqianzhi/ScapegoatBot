@@ -123,7 +123,6 @@ pub struct CostDef {
 ///
 /// `provider_name` / `provider` 用于组装请求与估算成本。
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub struct ModelRef<'a> {
     pub provider_name: &'a str,
     pub provider: &'a ProviderDef,

@@ -904,17 +904,6 @@ impl crate::swarm::SubagentRunner for Runner {
     }
 }
 
-/// 回合结果摘要（供 CLI/日志使用）。
-#[allow(dead_code)]
-pub fn summarize(outcome: &LoopOutcome) -> String {
-    format!(
-        "stop={:?} turns={} tokens={}",
-        outcome.stop_reason,
-        outcome.turns,
-        outcome.usage.input_tokens + outcome.usage.output_tokens
-    )
-}
-
 /// `agent.*` 操作的运行时实现。
 pub struct RuntimeOps {
     /// 压缩与上下文操作需要 runner；构造顺序决定了这里只能后置注入。
@@ -1050,25 +1039,6 @@ impl crate::tools::api::AgentOps for RuntimeOps {
             .await
             .map_err(|error| error.to_string())
     }
-}
-
-/// 从消息存储构造待注入的运行上下文（供其他模块复用）。
-#[allow(dead_code)]
-pub fn inbox_summary(messages: &MessageStore) -> String {
-    messages
-        .unread_counts()
-        .map(|counts| {
-            if counts.is_empty() {
-                "nothing unread".to_owned()
-            } else {
-                counts
-                    .iter()
-                    .map(|(chat, count)| format!("{chat}: {count}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            }
-        })
-        .unwrap_or_else(|_| "unknown".to_owned())
 }
 
 #[cfg(test)]
