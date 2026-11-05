@@ -12,8 +12,7 @@
 - [x] `execute` 前置早退丢 steering 消息：外层 close + 排空 + 落库，已加回归测试（c0fc680）。
 - [x] 并发只作用于子代理（`[swarm].max_concurrency`）；主代理不加全局并发上限，
       已回滚共享 turn limiter（13aaebf），主代理回合仍由 session turn_lock 串行。
-- [ ] 控制通道仍有写死的 4 槽位排队保护（`control_slots`）；它只是控制请求的准入保护，
-      不是主代理并发上限，是否去掉待定。
+- [x] `control_slots` 已删除（runner-ops 重构），控制通道只保留 `ai_enabled` 检查。
 - [x] per_chat 已彻底删除：`[session]` 配置、`SessionScope`、`ScopeCache`、`SessionStore.scope`/`for_scope`（2f2948c）。
 
 ## transcript
@@ -28,7 +27,8 @@
 - [x] `media.image_watermark` 支持 font8x8 的 Unicode 字库（拉丁/希腊/平假名等）；CJK 仍无字形（需字体文件）。
 - [x] `media.image_compress` 支持 JPEG/PNG/WebP（14f6a31）；WebP 仅无损，quality 只作用于 JPEG。
 - [x] 已补 media 各动作测试；provider `image_url` 序列化已有覆盖。
-- [ ] 缺 inbound resolver、User image estimate/prune、MCP 图片（已有压缩测试）的端到端测试。
+- [x] MCP 图片压缩已补端到端测试（`call_tool` → `ToolResult.images`，373 测试）。
+- [ ] 缺 inbound image resolver 与 User 图片 estimate/prune 测试。
 
 ## 结构
 
