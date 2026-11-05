@@ -473,7 +473,10 @@ OwnerIntent { kind: control | owner_message | standing, chat_id?, message_id?, c
 
 任一闸命中即 `hold`：
 
-- **对外交互全部拒绝**：`API` 的 `napcat.*` 一律返回 `Disabled during hold`——发消息、群管理、拉黑、踢人、加好友，一个都不行。停机期间不做任何对外动作，包括“处理坏人”。
+> 2026-11-06 修正：hold 的边界是 QQ 操作（`napcat.*`）。MCP、Download、WebSearch/WebFetch
+> 以及本地文件/记忆不受 hold 限制；原设计里“关闭全部对外接口”的表述已不再使用。
+
+- **QQ 操作全部拒绝**：`API` 的 `napcat.*` 一律返回 `Disabled during hold`——发消息、群管理、拉黑、踢人、加好友，一个都不行。停机期间不做任何 QQ 动作，包括“处理坏人”。
 - **对内动作照常可用**：`API` 的 `agent.*`（`status` / `resume` / `quarantine` / `compact` / `clear_context`）不受限制。它们不产生对外影响，是停机期间 agent 唯一能做的事——也就是只能和自己解决问题。
 - 不接纳新的 QQ 回合；消息照收照存，但不触发回复。
 - 内部维护（压缩、记忆整理、复盘）继续。
