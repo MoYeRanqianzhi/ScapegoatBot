@@ -480,4 +480,54 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         assert!(queue.is_idle().await);
     }
+
+    struct ClosingHandler {
+        calls: StdMutex<Vec<TurnInput>>,
+        closed: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnHandler for ClosingHandler {
+        async fn handle(
+            &self,
+            input: TurnInput,
+            mut steering: mpsc::UnboundedReceiver<AgentMessage>,
+        ) -> Result<()> {
+            self.calls.lock().unwrap().push(input);
+            if self.calls.lock().unwrap().len() == 1 {
+                // 模拟 Runner::execute 收尾：先 close，让后续 send 立即失败。
+                steering.close();
+                self.closed.notify_one();
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn send_after_close_requeues_the_message() {
+        let handler = Arc::new(ClosingHandler {
+            calls: StdMutex::new(Vec::new()),
+            closed: tokio::sync::Notify::new(),
+        });
+        let mut cfg = config();
+        cfg.debounce_ms = 20;
+        let queue = ChatQueue::new(cfg, handler.clone());
+        let chat = ChatId::Group(1);
+
+        queue.ingest(msg(chat, 1)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handler.closed.notified(),
+        )
+        .await
+        .expect("the first turn should start and close its steering receiver");
+        // close 已生效：这条 send 会失败，ChatQueue 必须把它回填到 pending。
+        queue.ingest(msg(chat, 2)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let calls = handler.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "the requeued message should open a second turn");
+        assert_eq!(calls[1].messages[0].message_id, 2);
+    }
 }
