@@ -8,7 +8,7 @@
 //! 权限标记（[`Permission`]）是**声明**，不是执行点：真正的门禁与 `hold`
 //! 检查在 runtime（API 工具与安全闸）；声明用于审计与策略表。
 
-/// `hold` 生效时所有写操作的统一拒绝文案。
+/// `hold` 生效期间拒绝外部动作（NapCat API、MCP、下载、Web）的统一文案。
 pub(crate) const HOLD_DISABLED: &str = "Disabled during hold";
 /// 动态视图只读的统一提示。
 pub(crate) const DYNAMIC_READ_ONLY: &str = "Dynamic views are read-only.";
