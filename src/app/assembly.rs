@@ -690,7 +690,6 @@ pub(super) async fn build_agent(
                     .any(|cap| cap == "vision"),
             thinking,
             max_steps: config.agent.max_steps,
-            max_concurrent: config.queue.max_concurrent,
             retry: crate::agent::agent_loop::RetryPolicy {
                 attempts: config.agent.retry_attempts,
                 base_ms: config.agent.retry_base_ms,
@@ -749,11 +748,9 @@ pub(super) async fn build_agent(
     install_wake_presets(&monitors, &db, owner_qq).await;
 
     let filter = MessageFilter::from_config(&config.filter);
-    // 与 Runner 共用同一个主 agent 配额：控制与 monitor 回合也计入同一上限。
-    let queue = ChatQueue::with_slots(
+    let queue = ChatQueue::new(
         config.queue.clone(),
         Arc::clone(&runner) as Arc<dyn crate::agent::queue::TurnHandler>,
-        runner.turn_slots(),
     );
     // `idle_only` monitor 依赖队列的活跃回合数。
     let _ = sink.queue.set(Arc::clone(&queue));
