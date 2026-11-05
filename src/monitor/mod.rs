@@ -211,6 +211,38 @@ struct Monitor {
     on_missing: crate::config::OnMissing,
 }
 
+impl Monitor {
+    /// 构造一条系统通知（到期、上限、谓词失败）；它们不来自任何用户。
+    ///
+    /// `source` 保留各调用点原来的分类：配置错误记 `internal`，生命周期事件记
+    /// monitor 自身的 source。
+    fn system_delivery(&self, source: &str, text: String) -> MonitorDelivery {
+        MonitorDelivery {
+            name: self.name.clone(),
+            source: source.to_owned(),
+            target: self.target.clone(),
+            as_prompt: false,
+            text,
+            system: true,
+            owner_intent: false,
+            message: None,
+            on_missing: self.on_missing,
+        }
+    }
+
+    /// `min_interval` 内的重复投递一律拒绝；通过时占用当前时间窗。
+    fn rate_limit_ok(&self) -> bool {
+        let mut last = self.last_delivery.lock().expect("monitor lock");
+        if let Some(previous) = *last
+            && previous.elapsed() < self.min_interval
+        {
+            return false;
+        }
+        *last = Some(std::time::Instant::now());
+        true
+    }
+}
+
 /// 一个 monitor 的完整定义；`MonitorManager::add` 的唯一参数。
 ///
 /// 字段与 `[[monitor]]` 配置一一对应，位置无关：运行时创建、配置文件加载与
@@ -390,8 +422,8 @@ impl MonitorManager {
         out
     }
 
-    /// 手动触发一次。
-    pub async fn fire(&self, name: &str) -> Result<()> {
+    /// 按名字取 monitor；不存在时报错。
+    async fn get_or_bail(&self, name: &str) -> Result<Arc<Monitor>> {
         let monitor = {
             let monitors = self.monitors.read().await;
             monitors.get(name).cloned()
@@ -399,6 +431,12 @@ impl MonitorManager {
         let Some(monitor) = monitor else {
             anyhow::bail!("monitor {name:?} does not exist");
         };
+        Ok(monitor)
+    }
+
+    /// 手动触发一次。
+    pub async fn fire(&self, name: &str) -> Result<()> {
+        let monitor = self.get_or_bail(name).await?;
         if monitor.cancelled.load(Ordering::SeqCst)
             || monitor
                 .expires_at
@@ -406,14 +444,8 @@ impl MonitorManager {
         {
             anyhow::bail!("monitor {name:?} is no longer deliverable");
         }
-        {
-            let mut last = monitor.last_delivery.lock().expect("monitor lock");
-            if let Some(previous) = *last
-                && previous.elapsed() < monitor.min_interval
-            {
-                anyhow::bail!("monitor {name:?} is rate limited");
-            }
-            *last = Some(std::time::Instant::now());
+        if !monitor.rate_limit_ok() {
+            anyhow::bail!("monitor {name:?} is rate limited");
         }
         deliver_once(&monitor, &*self.sink, None, 0, true).await;
         Ok(())
@@ -421,21 +453,9 @@ impl MonitorManager {
 
     /// 工具调用用：后台投递，避免在工具栈里同步跑回合、重入 turn_lock。
     pub async fn fire_async(&self, name: &str) -> Result<()> {
-        let monitor = {
-            let monitors = self.monitors.read().await;
-            monitors.get(name).cloned()
-        };
-        let Some(monitor) = monitor else {
-            anyhow::bail!("monitor {name:?} does not exist");
-        };
-        {
-            let mut last = monitor.last_delivery.lock().expect("monitor lock");
-            if let Some(previous) = *last
-                && previous.elapsed() < monitor.min_interval
-            {
-                anyhow::bail!("monitor {name:?} is rate limited");
-            }
-            *last = Some(std::time::Instant::now());
+        let monitor = self.get_or_bail(name).await?;
+        if !monitor.rate_limit_ok() {
+            anyhow::bail!("monitor {name:?} is rate limited");
         }
         let sink = Arc::clone(&self.sink);
         tokio::spawn(async move {
@@ -446,13 +466,7 @@ impl MonitorManager {
 
     /// 以一条合成事件投递一次；用于 `backlog = "inbox"` 的首次补投。
     pub async fn deliver_text(&self, name: &str, text: String) -> Result<()> {
-        let monitor = {
-            let monitors = self.monitors.read().await;
-            monitors.get(name).cloned()
-        };
-        let Some(monitor) = monitor else {
-            anyhow::bail!("monitor {name:?} does not exist");
-        };
+        let monitor = self.get_or_bail(name).await?;
         let event = MonitorEvent {
             text,
             ..MonitorEvent::default()
@@ -485,20 +499,13 @@ impl MonitorManager {
                 Err(error) => {
                     warn!(%error, monitor = %monitor.name, "monitor predicate failed");
                     self.sink
-                        .deliver(MonitorDelivery {
-                            name: monitor.name.clone(),
-                            source: "internal".to_owned(),
-                            target: monitor.target.clone(),
-                            as_prompt: false,
-                            text: format!(
+                        .deliver(monitor.system_delivery(
+                            "internal",
+                            format!(
                                 "system: monitor {:?} has an invalid `when` expression: {error}",
                                 monitor.name
                             ),
-                            system: true,
-                            owner_intent: false,
-                            message: None,
-                            on_missing: monitor.on_missing,
-                        })
+                        ))
                         .await;
                 }
             }
@@ -578,20 +585,13 @@ async fn deliver_once(
         .is_some_and(|deadline| Local::now() > deadline)
     {
         monitor.cancelled.store(true, Ordering::SeqCst);
-        sink.deliver(MonitorDelivery {
-            name: monitor.name.clone(),
-            source: monitor.source.clone(),
-            target: monitor.target.clone(),
-            as_prompt: false,
-            text: format!(
+        sink.deliver(monitor.system_delivery(
+            &monitor.source,
+            format!(
                 "system: monitor {:?} expired and was disabled",
                 monitor.name
             ),
-            system: true,
-            owner_intent: false,
-            message: None,
-            on_missing: monitor.on_missing,
-        })
+        ))
         .await;
         return;
     }
@@ -613,14 +613,8 @@ async fn deliver_once(
 
     if force {
         *monitor.last_delivery.lock().expect("monitor lock") = Some(std::time::Instant::now());
-    } else {
-        let mut last = monitor.last_delivery.lock().expect("monitor lock");
-        if let Some(previous) = *last
-            && previous.elapsed() < monitor.min_interval
-        {
-            return;
-        }
-        *last = Some(std::time::Instant::now());
+    } else if !monitor.rate_limit_ok() {
+        return;
     }
 
     let text = match (&monitor.prompt, event) {
@@ -643,20 +637,13 @@ async fn deliver_once(
         // 回滚预留；并发的两个投递只有一个能拿到最后一个名额。
         monitor.delivered.fetch_sub(1, Ordering::SeqCst);
         if !monitor.cancelled.swap(true, Ordering::SeqCst) {
-            sink.deliver(MonitorDelivery {
-                name: monitor.name.clone(),
-                source: monitor.source.clone(),
-                target: monitor.target.clone(),
-                as_prompt: false,
-                text: format!(
+            sink.deliver(monitor.system_delivery(
+                &monitor.source,
+                format!(
                     "system: monitor {:?} reached its event limit and was disabled",
                     monitor.name
                 ),
-                system: true,
-                owner_intent: false,
-                message: None,
-                on_missing: monitor.on_missing,
-            })
+            ))
             .await;
         }
         return;
@@ -730,20 +717,13 @@ fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, timer: TimerSp
                     {
                         Ok(duration) => duration,
                         Err(error) => {
-                            sink.deliver(MonitorDelivery {
-                                name: monitor.name.clone(),
-                                source: "internal".to_owned(),
-                                target: monitor.target.clone(),
-                                as_prompt: false,
-                                text: format!(
+                            sink.deliver(monitor.system_delivery(
+                                "internal",
+                                format!(
                                     "system: monitor {:?} has an invalid cron expression: {error}",
                                     monitor.name
                                 ),
-                                system: true,
-                                owner_intent: false,
-                                message: None,
-                                on_missing: monitor.on_missing,
-                            })
+                            ))
                             .await;
                             break;
                         }
