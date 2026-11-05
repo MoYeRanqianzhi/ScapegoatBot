@@ -47,7 +47,7 @@
 
 ### 测试
 
-- `cargo test --all-targets`：377 项通过（365 lib + 12 integration），2 ignored；`cargo fmt --check`、`clippy -D warnings` 通过。
+- `cargo test --all-targets`：378 项通过（366 lib + 12 integration），2 ignored；`cargo fmt --check`、`clippy -D warnings` 通过。
 
 ## [0.2.0-alpha.34] - 2026-11-04
 

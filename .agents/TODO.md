@@ -23,7 +23,8 @@
 ## 图片
 
 - [ ] 真实 `get_image` 契约未实测：2026-11-06 直连验证时发现 NapCat 已退出登录（11-05 05:22 起持续 QR 登录失败），WS 握手被 reset；需用户扫码登录后重试。
-- [ ] 转发/回复引用图片、control/monitor 注入回合仍不自动注入。
+- [x] 转发/回复引用图片自动解析（get_msg/get_forward_msg，最多 3 回复/2 转发；47e4260）。
+- [ ] control/monitor 注入回合本身没有图片片段，仍不注入图片。
 - [x] `media.image_watermark` 支持 font8x8 的 Unicode 字库（拉丁/希腊/平假名等）；CJK 仍无字形（需字体文件）。
 - [x] `media.image_compress` 支持 JPEG/PNG/WebP（14f6a31）；WebP 仅无损，quality 只作用于 JPEG。
 - [x] 已补 media 各动作测试；provider `image_url` 序列化已有覆盖。
