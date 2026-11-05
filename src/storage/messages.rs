@@ -36,6 +36,7 @@ use crate::config::EncryptionMode;
 use crate::qq::event::{ChatId, QqMessage};
 use crate::storage::Database;
 use crate::storage::crypto::MasterKey;
+use crate::storage::envelope;
 
 /// 行格式版本。
 const LINE_VERSION: u32 = 1;
@@ -916,12 +917,7 @@ impl MessageStore {
                     "message:{scope}:{peer}:{}:{file_id}:{line_no}",
                     message.message_id
                 );
-                let sealed = self.key.seal("message", aad.as_bytes(), &payload)?;
-                let (nonce, ct) = sealed.split_at(24);
-                (
-                    base64::engine::general_purpose::STANDARD.encode(nonce),
-                    base64::engine::general_purpose::STANDARD.encode(ct),
-                )
+                envelope::seal(&self.key, "message", aad.as_bytes(), &payload)?
             }
             EncryptionMode::None => (
                 String::new(),
@@ -994,27 +990,21 @@ impl MessageStore {
             );
             return Ok(None);
         }
-        let ct = base64::engine::general_purpose::STANDARD
-            .decode(value.get("ct").and_then(Value::as_str).unwrap_or_default())?;
+        let ct_b64 = value.get("ct").and_then(Value::as_str).unwrap_or_default();
 
         let plain = match file.encryption {
             EncryptionMode::XChaCha20Poly1305 => {
-                let nonce = base64::engine::general_purpose::STANDARD.decode(
-                    value
-                        .get("nonce")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                )?;
-                let mut sealed = Vec::with_capacity(nonce.len() + ct.len());
-                sealed.extend_from_slice(&nonce);
-                sealed.extend_from_slice(&ct);
+                let nonce_b64 = value
+                    .get("nonce")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let aad = format!(
                     "message:{scope}:{peer}:{message_id}:{}:{line_no}",
                     file.file_id
                 );
-                self.key.open("message", aad.as_bytes(), &sealed)?
+                envelope::open(&self.key, "message", aad.as_bytes(), nonce_b64, ct_b64)?
             }
-            EncryptionMode::None => ct,
+            EncryptionMode::None => base64::engine::general_purpose::STANDARD.decode(ct_b64)?,
         };
         Ok(Some(serde_json::from_slice(&plain)?))
     }
