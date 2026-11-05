@@ -34,8 +34,14 @@ impl Runner {
         // 回复/转发引用里的图片不在当前 segment 里；把引用消息里的 image segment
         // 追加成一条合成消息，后面的解析与下载逻辑保持不变。
         let mut effective: Vec<crate::qq::event::QqMessage> = messages.to_vec();
+        let mut quoted_budget = 4usize;
         for message in messages {
-            let quoted = self.referenced_image_segments(message).await;
+            if quoted_budget == 0 {
+                break;
+            }
+            let quoted = self
+                .referenced_image_segments(message, &mut quoted_budget)
+                .await;
             if !quoted.is_empty() {
                 let mut extra = message.clone();
                 extra.segments = quoted;
@@ -228,6 +234,7 @@ impl Runner {
     async fn referenced_image_segments(
         &self,
         message: &crate::qq::event::QqMessage,
+        budget: &mut usize,
     ) -> Vec<crate::qq::event::Segment> {
         let Some(qq) = &self.deps.qq else {
             return Vec::new();
@@ -261,6 +268,10 @@ impl Runner {
 
         let mut segments = Vec::new();
         for id in replies.into_iter().take(3) {
+            if *budget == 0 {
+                break;
+            }
+            *budget -= 1;
             let params = match id.parse::<i64>() {
                 Ok(message_id) => serde_json::json!({"message_id": message_id}),
                 Err(_) => serde_json::json!({"message_id": id}),
@@ -271,6 +282,10 @@ impl Runner {
             }
         }
         for id in forwards.into_iter().take(2) {
+            if *budget == 0 {
+                break;
+            }
+            *budget -= 1;
             match qq
                 .call("get_forward_msg", serde_json::json!({"id": id}))
                 .await
@@ -285,11 +300,14 @@ impl Runner {
 
 /// 从 OneBot 消息/转发 JSON 里递归提取 image segment。
 fn image_segments_from_value(value: &serde_json::Value) -> Vec<crate::qq::event::Segment> {
-    fn walk(value: &serde_json::Value, out: &mut Vec<crate::qq::event::Segment>) {
+    fn walk(value: &serde_json::Value, out: &mut Vec<crate::qq::event::Segment>, depth: usize) {
+        if depth > 16 {
+            return;
+        }
         match value {
             serde_json::Value::Array(items) => {
                 for item in items {
-                    walk(item, out);
+                    walk(item, out, depth + 1);
                 }
             }
             serde_json::Value::Object(map) => {
@@ -308,7 +326,7 @@ fn image_segments_from_value(value: &serde_json::Value) -> Vec<crate::qq::event:
                 }
                 for key in ["message", "content", "messages", "data"] {
                     if let Some(child) = map.get(key) {
-                        walk(child, out);
+                        walk(child, out, depth + 1);
                     }
                 }
             }
@@ -316,7 +334,7 @@ fn image_segments_from_value(value: &serde_json::Value) -> Vec<crate::qq::event:
         }
     }
     let mut out = Vec::new();
-    walk(value, &mut out);
+    walk(value, &mut out, 0);
     out
 }
 
