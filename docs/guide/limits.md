@@ -54,8 +54,7 @@
 
 ## 已知行为细节
 
-- `[session].scope = shared` 时跨 chat 上下文互相可见，这是替身场景的默认设计；
-  需要隔离用 `per_chat`。
+- 只有一条 transcript：跨 chat 上下文互相可见，这是替身场景的设计。
 - 子代理嵌套受 `max_depth`（默认 8）限制；`monitor` 绑定随子代理结束删除。
 - 压缩失败连续达到 `[compaction].max_failures` 后，自动压缩停止尝试，直到重启或
   一次手动 `agent.compact` 成功。

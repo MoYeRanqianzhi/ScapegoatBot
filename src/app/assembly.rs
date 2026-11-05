@@ -13,9 +13,7 @@ use tracing::{info, warn};
 
 use crate::agent::queue::ChatQueue;
 use crate::agent::runner::{Runner, RunnerConfig, RuntimeOps};
-use crate::config::{
-    AgentMode, AuthFile, EncryptionMode, LoadedConfig, ModelsFile, SbotConfig, SessionScope,
-};
+use crate::config::{AgentMode, AuthFile, EncryptionMode, LoadedConfig, ModelsFile, SbotConfig};
 use crate::mcp::{McpManager, McpTool};
 use crate::monitor::{MonitorManager, MonitorSink, MonitorSpec};
 use crate::paths::SbotPaths;
@@ -717,10 +715,6 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
             owner_qq,
             master_qq,
             owner_name: config.agent.owner_name.clone(),
-            session_scope: match config.session.scope {
-                SessionScope::Shared => "shared".to_owned(),
-                SessionScope::PerChat => "per_chat".to_owned(),
-            },
             receive_scopes: config.agent.receive_scopes.clone(),
             send_scopes: config.agent.send_scopes.clone(),
             gate_mode: config.gate.mode,

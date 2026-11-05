@@ -54,7 +54,6 @@ pub struct RunnerConfig {
     pub owner_qq: u64,
     pub master_qq: u64,
     pub owner_name: String,
-    pub session_scope: String,
     pub receive_scopes: Vec<String>,
     pub send_scopes: Vec<String>,
     pub gate_mode: GateMode,
@@ -154,8 +153,8 @@ pub struct Runner {
     config: RunnerConfig,
     /// 已提交的全局 transcript（内存镜像）。
     history: Arc<Mutex<Vec<AgentMessage>>>,
-    /// per_chat 的会话链与历史缓存；shared 模式不持有任何 per-chat 状态。
-    scopes: scope::ScopeCache,
+    /// 单会话：所有回合共用一把锁。
+    turn_lock: Arc<tokio::sync::Mutex<()>>,
     /// 静态 + hooks 组成的 system 块；压缩成功后重建（`PostCompact` 语义）。
     system: std::sync::RwLock<Vec<SystemBlock>>,
     /// 压缩互斥：同一时刻只允许一次。
@@ -171,7 +170,6 @@ pub struct Runner {
     /// 周期检查互斥。
     review_lock: Mutex<()>,
     /// 每个 transcript scope 一个回合锁；shared 模式天然只有一个锁。
-    turn_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 当前正在跑的主/injected 回合数；idle_only 用。
     active_turns: std::sync::atomic::AtomicUsize,
 }
@@ -261,29 +259,17 @@ impl Runner {
         ai_enabled: Arc<std::sync::atomic::AtomicBool>,
         estop_file: std::path::PathBuf,
     ) -> Result<Arc<Self>> {
-        let per_chat = config.session_scope == "per_chat";
         // 恢复崩溃前未提交的回合，再载入当前分段。
-        if !per_chat {
-            let recovered = turn_buffer.recover_open(&sessions, "shared").await?;
-            if recovered > 0 {
-                warn!(
-                    recovered,
-                    "recovered interrupted turns from the turn buffer"
-                );
-            }
-        } else {
-            // 按 buffer 里记录的作用域恢复：只知道 chat 列表不够，崩溃的回合可能
-            // 属于一个还没有任何已提交分段的 chat。
-            for scope in turn_buffer.open_scopes()? {
-                let scoped = sessions.for_scope(&scope);
-                if let Err(error) = turn_buffer.recover_open(&scoped, &scope).await {
-                    warn!(%error, %scope, "cannot recover a per-chat turn");
-                }
-            }
+        let recovered = turn_buffer.recover_open(&sessions).await?;
+        if recovered > 0 {
+            warn!(
+                recovered,
+                "recovered interrupted turns from the turn buffer"
+            );
         }
-        if !per_chat {
-            let current = sessions.current()?;
-            let recovered_history = sessions.read_segment(&current.file)?;
+        let current = sessions.current()?;
+        let recovered_history = sessions.read_segment(&current.file)?;
+        {
             let mut shared = history.lock().await;
             // 只在此处初始化一次；重复构造会重置内存历史。
             if shared.is_empty() {
@@ -327,7 +313,7 @@ impl Runner {
             qq,
             config,
             history,
-            scopes: scope::ScopeCache::new(per_chat),
+            turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             system: std::sync::RwLock::new(system),
             compaction_lock: Mutex::new(()),
             compaction_failures: std::sync::atomic::AtomicU32::new(0),
@@ -335,7 +321,6 @@ impl Runner {
             unchecked_tokens: std::sync::atomic::AtomicU64::new(0),
             review_failures: std::sync::atomic::AtomicU32::new(0),
             review_lock: Mutex::new(()),
-            turn_locks: Mutex::new(HashMap::new()),
             active_turns: std::sync::atomic::AtomicUsize::new(0),
         });
         let _ = runner
@@ -434,7 +419,6 @@ impl Runner {
                 AgentMode::StandIn => "stand_in".to_owned(),
                 AgentMode::Companion => "companion".to_owned(),
             },
-            session_scope: self.config.session_scope.clone(),
             account_qq: self.config.account_qq,
             owner_name: self.config.owner_name.clone(),
             origin_chat: chat.to_string(),
@@ -758,7 +742,7 @@ impl Runner {
         // 5) 提交新块：buffer -> transcript -> 共享历史。
         let new_blocks: Vec<AgentMessage> = working[base + runtime_blocks..].to_vec();
         if !new_blocks.is_empty() {
-            let scope = self.scope_name(chat);
+            let scope = "shared".to_owned();
             for (seq, message) in new_blocks.iter().enumerate() {
                 self.turn_buffer
                     .append(&turn_id, seq as u64, &scope, message)?;
@@ -1140,7 +1124,6 @@ mod tests {
                 owner_qq: 10000,
                 master_qq: 10000,
                 owner_name: "Owner".to_owned(),
-                session_scope: "shared".to_owned(),
                 receive_scopes: vec!["*".to_owned()],
                 send_scopes: vec!["*".to_owned()],
                 gate_mode: GateMode::Auto,
@@ -1307,7 +1290,6 @@ mod tests {
                 owner_qq: 10000,
                 master_qq: 10000,
                 owner_name: String::new(),
-                session_scope: "shared".to_owned(),
                 receive_scopes: vec!["*".to_owned()],
                 send_scopes: vec!["*".to_owned()],
                 gate_mode: GateMode::Auto,
@@ -1498,7 +1480,6 @@ mod tests {
                 owner_qq: 10000,
                 master_qq: 10000,
                 owner_name: String::new(),
-                session_scope: "shared".to_owned(),
                 receive_scopes: vec!["*".to_owned()],
                 send_scopes: vec!["*".to_owned()],
                 gate_mode: GateMode::Auto,
@@ -1558,172 +1539,6 @@ mod tests {
             other => panic!("expected a summary system message, got {other:?}"),
         }
         assert!(new_history.len() < 21);
-    }
-
-    #[tokio::test]
-    async fn per_chat_keeps_separate_transcripts_and_histories() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(crate::storage::Database::open_in_memory().unwrap());
-        let key = Arc::new(MasterKey::from_bytes([9u8; 32]));
-        let vfs = Arc::new(
-            crate::vfs::sqlite::VfsStore::open(
-                Arc::clone(&db),
-                Arc::clone(&key),
-                dir.path().join("data"),
-                Limits::default(),
-            )
-            .unwrap(),
-        );
-        let sessions = Arc::new(
-            crate::session::SessionStore::open(
-                Arc::clone(&db),
-                Arc::clone(&key),
-                dir.path().join("data"),
-                0,
-                EncryptionMode::XChaCha20Poly1305,
-            )
-            .unwrap(),
-        );
-        let message_store = Arc::new(
-            crate::storage::messages::MessageStore::open(
-                Arc::clone(&db),
-                Arc::clone(&key),
-                dir.path().join("data"),
-                0,
-                EncryptionMode::XChaCha20Poly1305,
-            )
-            .unwrap(),
-        );
-        let turn_buffer = Arc::new(TurnBufferStore::new(
-            Arc::clone(&db),
-            Arc::clone(&key),
-            EncryptionMode::XChaCha20Poly1305,
-        ));
-        let gate = Arc::new(Gate::from_config(
-            &GuardConfig {
-                enabled: true,
-                mode: GuardMode::Shadow,
-                backend: GuardBackend::Off,
-                threshold: 0.9,
-                ..GuardConfig::default()
-            },
-            None,
-            None,
-            crate::security::gate::hold_path(dir.path()),
-        ));
-        let tools = Arc::new(crate::tools::ToolRegistry::new(Arc::clone(&vfs), None));
-        let provider = Arc::new(FakeProvider {
-            script: StdMutex::new(
-                vec![
-                    vec![
-                        ProviderEvent::TextDelta("first".to_owned()),
-                        ProviderEvent::Stop {
-                            reason: StopReason::EndTurn,
-                            refusal: None,
-                        },
-                    ],
-                    vec![
-                        ProviderEvent::TextDelta("second".to_owned()),
-                        ProviderEvent::Stop {
-                            reason: StopReason::EndTurn,
-                            refusal: None,
-                        },
-                    ],
-                ]
-                .into(),
-            ),
-        });
-        let history = Arc::new(Mutex::new(Vec::new()));
-        let runner = Runner::new(
-            provider,
-            tools,
-            gate,
-            vfs,
-            message_store,
-            Arc::clone(&sessions),
-            turn_buffer,
-            None,
-            RunnerConfig {
-                model: "fake".to_owned(),
-                mode: AgentMode::StandIn,
-                account_qq: 10000,
-                owner_qq: 10000,
-                master_qq: 10000,
-                owner_name: String::new(),
-                session_scope: "per_chat".to_owned(),
-                receive_scopes: vec!["*".to_owned()],
-                send_scopes: vec!["*".to_owned()],
-                gate_mode: GateMode::Auto,
-                max_tokens: 256,
-                supports_images: true,
-                thinking: ThinkingOptions::default(),
-                max_steps: 2,
-                retry: crate::agent::agent_loop::RetryPolicy::default(),
-                chat_history_limit: 10,
-                hooks: crate::config::HooksConfig::default().context,
-                server_tools: Vec::new(),
-                turn_context_budget: 120_000,
-                keep_recent_tokens: 5,
-                compaction_max_failures: 3,
-                security_review: None,
-                check_every_tokens: 0,
-                check_overlap_tokens: 0,
-                check_on_compaction: false,
-                context_window: 200_000,
-                reserve_tokens: 16_384,
-                prune: false,
-                prune_soft_limit: 4_000,
-                prune_keep_turns: 3,
-                memory_flush: None,
-                post_compact_recall: false,
-                compaction: None,
-                last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-                budget: None,
-                max_state_chars: 32_000,
-                event_hooks: Vec::new(),
-            },
-            history,
-            Arc::new(AtomicBool::new(true)),
-            dir.path().join("ESTOP"),
-        )
-        .await
-        .unwrap();
-
-        for (chat, id, text) in [
-            (ChatId::Group(1), 1, "group one"),
-            (ChatId::Private(2), 2, "private two"),
-        ] {
-            let (_tx, rx) = mpsc::unbounded_channel();
-            runner
-                .handle(
-                    TurnInput {
-                        chat,
-                        messages: vec![inbound(chat, id, text)],
-                        dropped: 0,
-                    },
-                    rx,
-                )
-                .await
-                .unwrap();
-        }
-
-        let files = sessions.list().unwrap();
-        assert_eq!(files.len(), 2);
-        assert!(files.iter().any(|file| file.file.starts_with("group-1-")));
-        assert!(files.iter().any(|file| file.file.starts_with("private-2-")));
-        let histories = runner.scopes.histories.lock().await;
-        assert_eq!(histories.len(), 2);
-        let group = histories.get("group-1").unwrap().lock().await.clone();
-        let private = histories.get("private-2").unwrap().lock().await.clone();
-        assert!(group.iter().any(
-            |message| matches!(message, AgentMessage::User { text, .. } if text.contains("group one"))
-        ));
-        assert!(!group.iter().any(
-            |message| matches!(message, AgentMessage::User { text, .. } if text.contains("private two"))
-        ));
-        assert!(private.iter().any(
-            |message| matches!(message, AgentMessage::User { text, .. } if text.contains("private two"))
-        ));
     }
 
     #[tokio::test]
@@ -1823,7 +1638,6 @@ mod tests {
                 owner_qq: 10000,
                 master_qq: 10000,
                 owner_name: "Owner".to_owned(),
-                session_scope: "shared".to_owned(),
                 receive_scopes: vec!["*".to_owned()],
                 send_scopes: vec!["*".to_owned()],
                 gate_mode: GateMode::Auto,
@@ -2004,7 +1818,6 @@ mod tests {
                 owner_qq: 10000,
                 master_qq: 10000,
                 owner_name: String::new(),
-                session_scope: "shared".to_owned(),
                 receive_scopes: vec!["*".to_owned()],
                 send_scopes: vec!["*".to_owned()],
                 gate_mode: GateMode::Auto,

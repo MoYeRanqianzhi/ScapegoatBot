@@ -291,11 +291,6 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
     if loaded.config.storage.encryption == crate::config::EncryptionMode::None {
         report.warn("storage.encryption = none: data is stored in plaintext");
     }
-    if loaded.config.session.scope == crate::config::SessionScope::Shared {
-        report.warn("session.scope = shared: one transcript spans all chats (by design)");
-    } else {
-        report.ok("session.scope = per_chat: one transcript chain per chat");
-    }
     if !loaded.config.security.guard.enabled {
         report.warn("security.guard.enabled = false: no input/output classifier");
     }

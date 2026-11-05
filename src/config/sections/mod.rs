@@ -17,7 +17,6 @@ mod monitor;
 mod napcat;
 mod queue;
 mod security;
-mod session;
 mod skills;
 mod storage;
 mod style;
@@ -43,7 +42,6 @@ pub use monitor::{
 pub use napcat::NapcatConfig;
 pub use queue::{DropPolicy, QueueConfig, QueueMode};
 pub use security::{GuardBackend, GuardConfig, GuardMode, SecurityConfig};
-pub use session::{SessionConfig, SessionScope};
 pub use skills::SkillsConfig;
 pub use storage::{EncryptionMode, StorageConfig};
 pub use style::StyleConfig;

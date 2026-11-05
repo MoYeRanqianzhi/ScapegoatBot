@@ -43,7 +43,7 @@ impl Runner {
         }
     }
 
-    /// 清空上下文：shared 轮转唯一链；per_chat 轮转所有已打开的链。
+    /// 清空上下文：轮转唯一 transcript，并清空内存历史。
     pub async fn clear_all_context(&self) -> Result<serde_json::Value> {
         let _ = self
             .fire_hooks(crate::config::HookEvent::SessionEnd, None, None)
@@ -52,38 +52,10 @@ impl Runner {
             &self.config.event_hooks,
             crate::config::HookEvent::SessionEnd,
         );
-        if !self.scopes.per_chat {
-            let current = self.sessions.current()?;
-            let next = self.sessions.rotate()?;
-            let mut history = self.history.lock().await;
-            history.clear();
-            for text in &session_end {
-                let message = AgentMessage::System {
-                    text: format!(
-                        "[hook context | SessionEnd]
-{text}"
-                    ),
-                };
-                self.sessions.append(std::slice::from_ref(&message))?;
-                history.push(message);
-            }
-            return Ok(serde_json::json!({
-                "cleared": true,
-                "previous_session": current.file,
-                "current_session": next.file,
-            }));
-        }
-        let stores = self.scopes.all_sessions().await;
-        let mut cleared = Vec::new();
-        for sessions in &stores {
-            let current = sessions.current()?;
-            let next = sessions.rotate()?;
-            cleared.push(serde_json::json!({
-                "previous_session": current.file,
-                "current_session": next.file,
-            }));
-        }
-        self.scopes.clear_histories().await;
+        let current = self.sessions.current()?;
+        let next = self.sessions.rotate()?;
+        let mut history = self.history.lock().await;
+        history.clear();
         for text in &session_end {
             let message = AgentMessage::System {
                 text: format!(
@@ -91,14 +63,14 @@ impl Runner {
 {text}"
                 ),
             };
-            for sessions in &stores {
-                sessions.append(std::slice::from_ref(&message))?;
-            }
-            for history in self.scopes.histories.lock().await.values() {
-                history.lock().await.push(message.clone());
-            }
+            self.sessions.append(std::slice::from_ref(&message))?;
+            history.push(message);
         }
-        Ok(serde_json::json!({"cleared": true, "chains": cleared}))
+        Ok(serde_json::json!({
+            "cleared": true,
+            "previous_session": current.file,
+            "current_session": next.file,
+        }))
     }
 
     /// 立即压缩：摘要旧消息，轮转新分段，写入摘要与保留窗口。

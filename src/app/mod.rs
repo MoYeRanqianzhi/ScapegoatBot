@@ -285,7 +285,6 @@ impl Runtime {
             "ai_enabled": self.ai_enabled.load(Ordering::Relaxed),
             "estop": self.estop_active(),
             "hold": self.gate.hold_active(),
-            "session_scope": config.session.scope,
             "agent": {
                 "available": agent.is_some(),
                 "self_id": agent.as_ref().map(|agent| agent.self_id),

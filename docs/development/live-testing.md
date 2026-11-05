@@ -97,7 +97,7 @@ mark_group_msg_as_read {"group_id":42}
 ## 5. `sbot doctor` / `sbot backup`
 
 ```bash
-sbot doctor    # 12 ok, 2 warning, 0 error（schema v8, per_chat 模式）
+sbot doctor    # 12 ok, 2 warning, 0 error（schema v8, shared 模式）
 sbot backup --output <dir>
 ```
 

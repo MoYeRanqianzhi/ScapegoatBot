@@ -69,15 +69,6 @@ access token 在 `auth.json`，不在这里。
 | `ignore_patterns` | `[]` | 正则；命中即拒收 |
 | `require_mention` | false | 群里只有 @ 自己或回复自己时才接收 |
 
-### `[session]`
-
-| 键 | 默认 | 说明 |
-|----|------|------|
-| `scope` | `shared` | 全部 chat 一条 transcript；`per_chat` 每个 chat 独立 |
-
-`shared` 让 A 群与 B 私聊的上下文互相可见，是替身场景的默认选择；需要强隔离时用
-`per_chat`（文件名带 `group-<id>-` / `private-<id>-` 前缀）。
-
 ### `[queue]`（普通消息只进 inbox；唤醒预设走队列）
 
 | 键 | 默认 | 说明 |

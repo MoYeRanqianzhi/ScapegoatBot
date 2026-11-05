@@ -57,10 +57,6 @@ ignore_patterns = []
 # 群里只有 @ 自己或回复自己时才接收。
 require_mention = false
 
-[session]
-# shared：整个 QQ 号一条 transcript；per_chat：每个 chat 独立。
-scope = "shared"
-
 [queue]
 # steer：回合中到达的消息立即注入；followup / collect 留到下一回合。
 mode = "steer"

@@ -121,23 +121,11 @@ impl TurnBufferStore {
     ///
     /// `committing` 表示崩溃发生在“已标记提交、transcript 可能只写了一部分”的窗口，
     /// 也必须重放；完全忽略它会留下永久孤儿行。
-    pub fn open_turns(&self, scope: &str) -> Result<Vec<String>> {
+    pub fn open_turns(&self) -> Result<Vec<String>> {
         let conn = self.db.lock();
         let mut statement = conn.prepare(
             "SELECT DISTINCT turn_id FROM turn_buffer
-             WHERE state IN ('open', 'committing') AND scope = ?1",
-        )?;
-        Ok(statement
-            .query_map(params![scope], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?)
-    }
-
-    /// 存在未完成回合的作用域（启动恢复用）。
-    pub fn open_scopes(&self) -> Result<Vec<String>> {
-        let conn = self.db.lock();
-        let mut statement = conn.prepare(
-            "SELECT DISTINCT scope FROM turn_buffer
-             WHERE state IN ('open', 'committing') ORDER BY scope ASC",
+             WHERE state IN ('open', 'committing')",
         )?;
         Ok(statement
             .query_map([], |row| row.get(0))?
@@ -176,9 +164,9 @@ impl TurnBufferStore {
     ///
     /// 已写入 transcript 的前缀按内容后缀去重：`committing` 状态下 transcript 可能
     /// 只写了一半，直接重放会重复整段，按后缀匹配只补剩余部分。
-    pub async fn recover_open(&self, sessions: &SessionStore, scope: &str) -> Result<usize> {
+    pub async fn recover_open(&self, sessions: &SessionStore) -> Result<usize> {
         let mut recovered = 0usize;
-        for turn_id in self.open_turns(scope)? {
+        for turn_id in self.open_turns()? {
             let mut messages: Vec<AgentMessage> = self
                 .load(&turn_id)?
                 .into_iter()
@@ -367,12 +355,12 @@ mod tests {
             .append(turn, 1, "shared", &assistant_with_call("c1"))
             .unwrap();
         assert_eq!(buffer.load(turn).unwrap().len(), 2);
-        assert_eq!(buffer.open_turns("shared").unwrap(), vec![turn.to_owned()]);
+        assert_eq!(buffer.open_turns().unwrap(), vec![turn.to_owned()]);
 
         let committed = buffer.commit(&sessions, turn).await.unwrap();
         assert_eq!(committed, 2);
         assert!(buffer.load(turn).unwrap().is_empty());
-        assert!(buffer.open_turns("shared").unwrap().is_empty());
+        assert!(buffer.open_turns().unwrap().is_empty());
 
         let current = sessions.current().unwrap();
         assert_eq!(sessions.read_segment(&current.file).unwrap().len(), 2);
@@ -390,7 +378,7 @@ mod tests {
             .unwrap();
         // 故意不写工具结果。
 
-        let recovered = buffer.recover_open(&sessions, "shared").await.unwrap();
+        let recovered = buffer.recover_open(&sessions).await.unwrap();
         assert_eq!(recovered, 1);
 
         let current = sessions.current().unwrap();
@@ -404,33 +392,6 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn recovery_only_replays_the_matching_scope() {
-        let (buffer, sessions, _dir) = setup();
-        buffer
-            .append("ta", 0, "group-1", &AgentMessage::user("from group one"))
-            .unwrap();
-        buffer
-            .append("tb", 0, "group-2", &AgentMessage::user("from group two"))
-            .unwrap();
-
-        let one = sessions.for_scope("group-1");
-        assert_eq!(buffer.recover_open(&one, "group-1").await.unwrap(), 1);
-        // group-2 的回合还开着，不会被写进 group-1。
-        assert_eq!(buffer.open_turns("group-2").unwrap(), vec!["tb".to_owned()]);
-        let current = one.current().unwrap();
-        let messages = one.read_segment(&current.file).unwrap();
-        assert_eq!(messages.len(), 1);
-        match &messages[0] {
-            AgentMessage::User { text, .. } => assert!(text.contains("group one")),
-            other => panic!("unexpected {other:?}"),
-        }
-
-        let two = sessions.for_scope("group-2");
-        assert_eq!(buffer.recover_open(&two, "group-2").await.unwrap(), 1);
-        assert!(buffer.open_scopes().unwrap().is_empty());
     }
 
     #[test]
@@ -471,14 +432,9 @@ mod tests {
             .append("t4", 1, "shared", &AgentMessage::user("two"))
             .unwrap();
         buffer.set_state("t4", TurnState::Committing).unwrap();
-        assert!(
-            buffer
-                .open_turns("shared")
-                .unwrap()
-                .contains(&"t4".to_owned())
-        );
+        assert!(buffer.open_turns().unwrap().contains(&"t4".to_owned()));
 
-        assert_eq!(buffer.recover_open(&sessions, "shared").await.unwrap(), 1);
+        assert_eq!(buffer.recover_open(&sessions).await.unwrap(), 1);
         let current = sessions.current().unwrap();
         assert_eq!(sessions.read_segment(&current.file).unwrap().len(), 2);
         assert!(buffer.load("t4").unwrap().is_empty());
@@ -497,7 +453,7 @@ mod tests {
         // 模拟崩溃：只有第一个块写进了 transcript。
         sessions.append(&[AgentMessage::user("one")]).unwrap();
 
-        assert_eq!(buffer.recover_open(&sessions, "shared").await.unwrap(), 1);
+        assert_eq!(buffer.recover_open(&sessions).await.unwrap(), 1);
         let current = sessions.current().unwrap();
         let messages = sessions.read_segment(&current.file).unwrap();
         assert_eq!(

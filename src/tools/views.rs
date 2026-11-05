@@ -763,7 +763,6 @@ mod tests {
         match views.read(&target("/system/status")).await.unwrap() {
             ViewRead::Text(text) => {
                 assert!(text.contains("mode: StandIn"), "{text}");
-                assert!(text.contains("session_scope: Shared"), "{text}");
             }
             other => panic!("expected text, got {other:?}"),
         }

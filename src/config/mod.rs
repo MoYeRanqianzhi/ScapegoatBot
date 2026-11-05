@@ -110,7 +110,6 @@ pub struct SbotConfig {
     /// 消息准入门（拒收，不是静音）。
     pub filter: FilterConfig,
     /// 上下文作用域。
-    pub session: SessionConfig,
     /// 回合队列与去抖。
     pub queue: QueueConfig,
     /// 存储与配额。
@@ -151,7 +150,6 @@ impl Default for SbotConfig {
             agent: AgentConfig::default(),
             napcat: NapcatConfig::default(),
             filter: FilterConfig::default(),
-            session: SessionConfig::default(),
             queue: QueueConfig::default(),
             storage: StorageConfig::default(),
             tools: ToolsConfig::default(),
@@ -232,7 +230,6 @@ impl SbotConfig {
         self.ipc.validate(&mut errors);
         self.agent.validate(&mut errors);
         self.filter.validate(&mut errors);
-        self.session.validate(&mut errors);
         self.queue.validate(&mut errors);
         self.storage.validate(&mut errors);
         self.tools.validate(&mut errors);

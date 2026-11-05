@@ -162,7 +162,6 @@ fn truncate(content: &str, max_chars: Option<u32>, max_bytes: Option<u64>) -> St
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeContext {
     pub mode: String,
-    pub session_scope: String,
     pub account_qq: u64,
     pub owner_name: String,
     pub origin_chat: String,
@@ -185,7 +184,6 @@ impl RuntimeContext {
         format!(
             "<runtime_context>\n\
              mode: {mode}\n\
-             session_scope: {scope}\n\
              account_qq: {account}\n\
              owner_name: {owner_name}\n\
              origin_chat: {origin}\n\
@@ -203,12 +201,11 @@ impl RuntimeContext {
              inbox: {inbox}\n\
              </runtime_context>\n\
              \n\
-             These values are authoritative for this request. `mode` and `session_scope` are fixed \
+             These values are authoritative for this request. `mode` is fixed \
              for this process; never try to switch them. `origin_chat` is the chat that started \
              this turn; reply there by default. `master_qq` is the only private channel for \
              reporting to the owner; if it is empty or 0, keep reports internal.",
             mode = self.mode,
-            scope = self.session_scope,
             account = self.account_qq,
             owner_name = self.owner_name,
             origin = self.origin_chat,
@@ -282,7 +279,6 @@ mod tests {
     fn runtime_block_contains_required_fields() {
         let runtime = RuntimeContext {
             mode: "stand_in".to_owned(),
-            session_scope: "shared".to_owned(),
             account_qq: 10000,
             owner_name: "Boss".to_owned(),
             origin_chat: "group:123".to_owned(),

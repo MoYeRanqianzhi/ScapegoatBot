@@ -22,7 +22,6 @@ impl Views {
             "status" => {
                 let mut out = String::from("# Runtime\n");
                 out.push_str(&format!("mode: {:?}\n", config.agent.mode));
-                out.push_str(&format!("session_scope: {:?}\n", config.session.scope));
                 out.push_str(&format!("model: {}\n", config.agent.model));
                 out.push_str(&format!(
                     "thinking_level: {}\n",

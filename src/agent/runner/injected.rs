@@ -131,7 +131,7 @@ impl Runner {
         let new_blocks: Vec<AgentMessage> = working[base + runtime_blocks..].to_vec();
         if !new_blocks.is_empty() {
             let turn_id = new_turn_id();
-            let scope = self.scope_name(chat);
+            let scope = "shared".to_owned();
             for (seq, message) in new_blocks.iter().enumerate() {
                 self.turn_buffer
                     .append(&turn_id, seq as u64, &scope, message)?;
