@@ -798,7 +798,7 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
         history: Arc::clone(&history),
         vfs: Arc::clone(&vfs),
         db: Some(Arc::clone(&db)),
-        queue: Arc::clone(&queue),
+        queue: Arc::clone(&queue) as Arc<dyn crate::memory::QueueActivity>,
         memory: config.memory.clone(),
         style: config.style.clone(),
         ai_enabled: Arc::clone(&ai_enabled),

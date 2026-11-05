@@ -18,13 +18,12 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::agent::AgentMessage;
-use crate::agent::queue::ChatQueue;
-use crate::agent::runner::SharedProviderSlot;
 use crate::config::{MemoryConfig, MemoryReviewMode, StyleConfig};
+use crate::providers::SharedProviderSlot;
 use crate::providers::{CompletionError, Provider, SystemBlock, complete_text};
 use crate::storage::Database;
 use crate::tools::memory::{MemoryLimits, ReviewEntry, apply_review};
+use crate::transcript::AgentMessage;
 use crate::vfs::Vfs;
 use crate::vfs::VfsPath;
 use crate::vfs::sqlite::VfsStore;
@@ -47,13 +46,19 @@ Rules:
 - Skip anything that looks like a credential. At most 5 memories.
 - `style` describes the owner's tone, vocabulary, message length and habits. Keep it under 1200 characters. Empty if there is not enough evidence.";
 
+/// 队列活跃度；memory 只关心「现在有没有回合在跑」。
+#[async_trait::async_trait]
+pub trait QueueActivity: Send + Sync {
+    async fn running_turns(&self) -> usize;
+}
+
 /// 复盘任务配置。
 pub struct ReviewerConfig {
     pub provider: SharedProviderSlot,
     pub history: Arc<Mutex<Vec<AgentMessage>>>,
     pub vfs: Arc<VfsStore>,
     pub db: Option<Arc<Database>>,
-    pub queue: Arc<ChatQueue>,
+    pub queue: Arc<dyn QueueActivity>,
     pub memory: MemoryConfig,
     pub style: StyleConfig,
     pub ai_enabled: Arc<AtomicBool>,
@@ -97,11 +102,11 @@ pub fn spawn(config: ReviewerConfig) {
             }
             if every_turn {
                 // 每回合：只要求没有正在跑的回合，避免抢上下文。
-                if config.queue.active_turns().await > 0 {
+                if config.queue.running_turns().await > 0 {
                     continue;
                 }
             } else {
-                if config.queue.active_turns().await > 0 {
+                if config.queue.running_turns().await > 0 {
                     continue;
                 }
                 let idle_for =

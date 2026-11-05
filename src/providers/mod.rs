@@ -104,6 +104,9 @@ pub struct ToolSpec {
     pub input_schema: Value,
 }
 
+mod slot;
+pub use slot::{ProviderSlot, SharedProviderSlot};
+
 /// 思考配置。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ThinkingOptions {

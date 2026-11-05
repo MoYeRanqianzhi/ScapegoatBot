@@ -267,6 +267,13 @@ impl ChatQueue {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::memory::QueueActivity for ChatQueue {
+    async fn running_turns(&self) -> usize {
+        ChatQueue::active_turns(self).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;

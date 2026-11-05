@@ -22,11 +22,12 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::agent::queue::ChatQueue;
-use crate::agent::runner::{ProviderSlot, Runner, RuntimeOps};
+use crate::agent::runner::{Runner, RuntimeOps};
 use crate::config::{AuthFile, LoadedConfig, ModelsFile, SbotConfig};
 use crate::ipc::{self, AiAction, Handler, Request, RequestBody, Response};
 use crate::monitor::MonitorManager;
 use crate::paths::SbotPaths;
+use crate::providers::ProviderSlot;
 use crate::providers::{ThinkingOptions, build_provider};
 use crate::qq::filter::MessageFilter;
 use crate::security::gate::Gate;
