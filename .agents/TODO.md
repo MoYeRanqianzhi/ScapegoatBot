@@ -66,5 +66,6 @@
 - [x] `actions.rs` 已按 namespace 拆成 9 个 helper；Box::leak 清零（15757a1、7026425）。
 - [x] `run_turn` 已拆为 `drive_turn`/`commit_turn`（155+83 行）。
 - [x] MessageStore 已拆为 `messages/{codec,index,outbox,retention}.rs`（960 行主文件）。
-- [ ] Runner 仍有 25 字段；公开面 pub fn 收缩未做。
+- [x] Runner 的 9 个存储/运行时字段收进 `RunnerDeps`，字段数 25→15（22ea723）。
+- [ ] 公开面 379 个 `pub fn` 收缩未做。
 - [x] hold 语义修正：只拒绝 QQ 操作（`napcat.*`），MCP/下载/Web 不再被 hold 拦截（d21eed4）。
