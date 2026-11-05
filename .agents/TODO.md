@@ -14,7 +14,7 @@
       已回滚共享 turn limiter（13aaebf），主代理回合仍由 session turn_lock 串行。
 - [ ] 控制通道仍有写死的 4 槽位排队保护（`control_slots`）；它只是控制请求的准入保护，
       不是主代理并发上限，是否去掉待定。
-- [x] per_chat 的 append/current 锁已按 scope 独立；shared 仍共用。
+- [x] per_chat 已彻底删除：`[session]` 配置、`SessionScope`、`ScopeCache`、`SessionStore.scope`/`for_scope`（2f2948c）。
 
 ## transcript
 
