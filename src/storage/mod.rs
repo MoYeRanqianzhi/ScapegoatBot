@@ -14,7 +14,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crypto::MasterKey;
 
@@ -600,21 +600,6 @@ impl Database {
             params![key, response, now_rfc3339()],
         )?;
         Ok(())
-    }
-
-    /// 清理过期幂等记录（默认 5 分钟）；由 IPC 幂等表维护使用。
-    #[allow(dead_code)]
-    pub fn idempotency_prune(&self, older_than: chrono::Duration) -> Result<usize> {
-        let cutoff = (chrono::Utc::now() - older_than).to_rfc3339();
-        let conn = self.conn.lock().expect("database mutex poisoned");
-        let removed = conn.execute(
-            "DELETE FROM idempotency WHERE created_at < ?1",
-            params![cutoff],
-        )?;
-        if removed > 0 {
-            warn!(removed, "pruned expired idempotency records");
-        }
-        Ok(removed)
     }
 
     /// 取得连接锁。

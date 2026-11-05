@@ -169,29 +169,6 @@ impl VfsStore {
         Ok(None)
     }
 
-    /// 由节点 id 还原虚拟路径。
-    fn path_of(&self, conn: &Connection, mut id: i64) -> Result<VfsPath, VfsError> {
-        let mut segments = Vec::new();
-        while id != 1 {
-            let (parent_id, name): (Option<i64>, String) = conn.query_row(
-                "SELECT parent_id, name FROM vfs_nodes WHERE id = ?1",
-                params![id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            segments.push(name);
-            match parent_id {
-                Some(parent) => id = parent,
-                None => break,
-            }
-        }
-        segments.reverse();
-        if segments.is_empty() {
-            return Ok(VfsPath::root());
-        }
-        let raw = format!("/{}", segments.join("/"));
-        Ok(VfsPath::parse(&raw).expect("stored segments form a valid path"))
-    }
-
     /// 建立从根到 `path` 的目录链，返回目标目录 id。
     fn ensure_dir(&self, conn: &Connection, path: &VfsPath, now: &str) -> Result<i64, VfsError> {
         let mut current = VfsPath::root();
@@ -627,7 +604,6 @@ impl VfsStore {
 #[derive(Debug, Clone)]
 struct NodeRow {
     id: i64,
-    parent_id: Option<i64>,
     name: String,
     kind: NodeKind,
     content_enc: Option<Vec<u8>>,
@@ -653,7 +629,6 @@ impl NodeRow {
         })?;
         Ok(Self {
             id: row.get(0)?,
-            parent_id: row.get(1)?,
             name: row.get(2)?,
             kind,
             content_enc: row.get(4)?,

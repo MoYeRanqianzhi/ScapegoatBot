@@ -479,29 +479,6 @@ impl Tool for McpTool {
     }
 }
 
-fn compress_mcp_image(data: &str, mime: &str) -> (String, String) {
-    use base64::Engine as _;
-    if data.len() <= 1_000_000 {
-        return (mime.to_owned(), data.to_owned());
-    }
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
-        return (mime.to_owned(), data.to_owned());
-    };
-    let Ok(image) = image::load_from_memory(&bytes) else {
-        return (mime.to_owned(), data.to_owned());
-    };
-    let rgb = image.thumbnail(2000, 2000).to_rgb8();
-    let mut encoded = Vec::new();
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 85);
-    if encoder.encode_image(&rgb).is_err() {
-        return (mime.to_owned(), data.to_owned());
-    }
-    (
-        "image/jpeg".to_owned(),
-        base64::engine::general_purpose::STANDARD.encode(encoded),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,21 +552,5 @@ mod tests {
             .unwrap();
         assert!(!is_error);
         assert_eq!(text, "echoed");
-    }
-
-    #[test]
-    fn large_mcp_images_are_compressed() {
-        use base64::Engine as _;
-        let mut raw = image::RgbImage::new(1200, 1200);
-        for (x, y, pixel) in raw.enumerate_pixels_mut() {
-            *pixel = image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8]);
-        }
-        let image = image::DynamicImage::ImageRgb8(raw);
-        let mut png = std::io::Cursor::new(Vec::new());
-        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
-        let (mime, data) = compress_mcp_image(&encoded, "image/png");
-        assert_eq!(mime, "image/jpeg");
-        assert!(data.len() < encoded.len());
     }
 }
