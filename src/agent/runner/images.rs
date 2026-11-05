@@ -67,7 +67,7 @@ impl Runner {
                     continue;
                 }
                 if !reference.starts_with("http") {
-                    let Some(qq) = &self.qq else {
+                    let Some(qq) = &self.deps.qq else {
                         continue;
                     };
                     match qq

@@ -113,6 +113,19 @@ pub struct CompactionModel {
     pub model: String,
 }
 
+/// Runner 的稳定依赖：存储、工具、QQ 与停机开关。
+struct RunnerDeps {
+    tools: Arc<ToolRegistry>,
+    gate: Arc<Gate>,
+    vfs: Arc<VfsStore>,
+    messages: Arc<MessageStore>,
+    sessions: Arc<SessionStore>,
+    turn_buffer: Arc<TurnBufferStore>,
+    qq: Option<Arc<QqClient>>,
+    ai_enabled: Arc<std::sync::atomic::AtomicBool>,
+    estop_file: std::path::PathBuf,
+}
+
 /// 回合执行器。
 pub struct Runner {
     /// 当前 provider；热切换时由 runtime 原地替换。
@@ -122,16 +135,7 @@ pub struct Runner {
     /// 子代理 hub；后置注入，用于嵌套 spawn 时给子代理注册 `Agent` 工具。
     hub: std::sync::OnceLock<Arc<crate::swarm::AgentHub>>,
     /// `sbot ai stop` 的开关；关闭时不发起新的模型请求。
-    ai_enabled: Arc<std::sync::atomic::AtomicBool>,
-    /// `ESTOP` 哨兵路径；存在时暂停新回合。
-    estop_file: std::path::PathBuf,
-    tools: Arc<ToolRegistry>,
-    gate: Arc<Gate>,
-    vfs: Arc<VfsStore>,
-    messages: Arc<MessageStore>,
-    sessions: Arc<SessionStore>,
-    turn_buffer: Arc<TurnBufferStore>,
-    qq: Option<Arc<QqClient>>,
+    deps: Arc<RunnerDeps>,
     config: RunnerConfig,
     /// 已提交的全局 transcript（内存镜像）。
     history: Arc<Mutex<Vec<AgentMessage>>>,
@@ -280,12 +284,7 @@ impl Runner {
             thinking: config.thinking.clone(),
         }));
 
-        let runner = Arc::new(Self {
-            slot,
-            fallbacks,
-            hub: std::sync::OnceLock::new(),
-            ai_enabled,
-            estop_file,
+        let deps = Arc::new(RunnerDeps {
             tools,
             gate,
             vfs,
@@ -293,6 +292,14 @@ impl Runner {
             sessions,
             turn_buffer,
             qq,
+            ai_enabled,
+            estop_file,
+        });
+        let runner = Arc::new(Self {
+            slot,
+            fallbacks,
+            hub: std::sync::OnceLock::new(),
+            deps,
             config,
             history,
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -336,7 +343,7 @@ impl Runner {
             if !matches!(channel.as_str(), "owner" | "master") || self.config.master_qq == 0 {
                 continue;
             }
-            let Some(qq) = &self.qq else {
+            let Some(qq) = &self.deps.qq else {
                 continue;
             };
             let body = format!(
@@ -361,7 +368,7 @@ impl Runner {
             text: prompt::render_static(self.config.mode),
             cache: true,
         }];
-        for block in prompt::load_hooks(&self.vfs, &self.config.hooks).render() {
+        for block in prompt::load_hooks(&self.deps.vfs, &self.config.hooks).render() {
             system.push(SystemBlock {
                 text: block,
                 cache: false,
@@ -382,6 +389,7 @@ impl Runner {
     /// 组装运行上下文。
     fn runtime_context(&self, chat: ChatId, sessions: &SessionStore) -> RuntimeContext {
         let inbox = self
+            .deps
             .messages
             .unread_counts()
             .map(|counts| {
@@ -518,15 +526,19 @@ impl Runner {
         steering_rx: &mut mpsc::UnboundedReceiver<AgentMessage>,
     ) -> Result<()> {
         // `sbot ai stop` 与 `ESTOP` 都只暂停新回合；消息已经入库，下一回合可见。
-        if !self.ai_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self
+            .deps
+            .ai_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             debug!(chat = %input.chat, "ai is stopped; skipping this turn");
             return Ok(());
         }
-        if self.estop_file.exists() {
+        if self.deps.estop_file.exists() {
             debug!(chat = %input.chat, "ESTOP is active; skipping this turn");
             return Ok(());
         }
-        if self.gate.agent_paused() {
+        if self.deps.gate.agent_paused() {
             debug!(chat = %input.chat, "agent is paused by the security review; skipping this turn");
             return Ok(());
         }
@@ -567,7 +579,8 @@ impl Runner {
             inbound.push(agent_message.clone());
             sessions.append(&[agent_message])?;
             if let Err(error) =
-                self.messages
+                self.deps
+                    .messages
                     .set_cursor(chat, message.message_id, &message.time.to_rfc3339())
             {
                 warn!(%error, "cannot update chat cursor");
@@ -678,14 +691,14 @@ impl Runner {
         // 4) 运行循环。工具执行器带上本回合证据。
         let slot = self.provider_snapshot();
         let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {
-            registry: Arc::clone(&self.tools),
+            registry: Arc::clone(&self.deps.tools),
             evidence,
         });
         let loop_ = AgentLoop::new_with_fallbacks(
             Arc::clone(&slot.provider),
             self.fallbacks.clone(),
             executor,
-            Arc::clone(&self.gate),
+            Arc::clone(&self.deps.gate),
             self.loop_config(),
         );
         let (events_tx, mut events_rx) = mpsc::channel(256);
@@ -767,10 +780,11 @@ impl Runner {
         if !new_blocks.is_empty() {
             let scope = "shared".to_owned();
             for (seq, message) in new_blocks.iter().enumerate() {
-                self.turn_buffer
+                self.deps
+                    .turn_buffer
                     .append(turn_id, seq as u64, &scope, message)?;
             }
-            self.turn_buffer.commit(sessions, turn_id).await?;
+            self.deps.turn_buffer.commit(sessions, turn_id).await?;
             let mut shared = history.lock().await;
             shared.extend(new_blocks.clone());
         }
@@ -780,7 +794,7 @@ impl Runner {
         self.maybe_security_review(history).await;
 
         // 6) 已读标记（模拟真人；失败不影响回合结果）。
-        if let Some(qq) = &self.qq {
+        if let Some(qq) = &self.deps.qq {
             let _ = qq.mark_read(chat).await;
         }
 
@@ -823,7 +837,7 @@ impl crate::swarm::SubagentRunner for Runner {
         let mut incoming = request.incoming;
         let shared_history = request.shared_history.clone();
         let slot = self.provider_snapshot();
-        let mut tools = self.tools.filtered(&request.tools);
+        let mut tools = self.deps.tools.filtered(&request.tools);
         if request.read_only {
             tools = tools.read_only();
         }
@@ -851,7 +865,7 @@ impl crate::swarm::SubagentRunner for Runner {
             Arc::clone(&slot.provider),
             self.fallbacks.clone(),
             tools,
-            Arc::clone(&self.gate),
+            Arc::clone(&self.deps.gate),
             LoopConfig {
                 model: slot.api_model,
                 system,
@@ -1371,8 +1385,8 @@ mod tests {
             .await
             .unwrap();
         // 回合被跳过：没有 assistant 块。
-        let current = runner.sessions.current().unwrap();
-        let transcript = runner.sessions.read_segment(&current.file).unwrap();
+        let current = runner.deps.sessions.current().unwrap();
+        let transcript = runner.deps.sessions.read_segment(&current.file).unwrap();
         assert!(
             !transcript
                 .iter()

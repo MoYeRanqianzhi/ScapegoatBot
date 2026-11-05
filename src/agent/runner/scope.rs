@@ -13,7 +13,7 @@ impl Runner {
 
     /// 单会话：总是返回全局 transcript。
     pub(super) async fn session_for(&self, _chat: ChatId) -> Arc<SessionStore> {
-        Arc::clone(&self.sessions)
+        Arc::clone(&self.deps.sessions)
     }
 
     /// 单会话：总是返回全局历史。

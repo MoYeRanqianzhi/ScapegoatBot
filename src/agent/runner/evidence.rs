@@ -30,6 +30,7 @@ impl Runner {
         first_batch_id: Option<i64>,
     ) -> Option<String> {
         let recent = self
+            .deps
             .messages
             .recent(chat, self.config.chat_history_limit)
             .ok()?;

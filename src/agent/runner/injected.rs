@@ -3,7 +3,11 @@ use super::*;
 impl Runner {
     /// 控制通道回合；主代理不受并发配额限制，串行化由 turn_lock 负责。
     pub async fn run_control(&self, text: &str, control_id: i64) -> Result<LoopOutcome> {
-        if !self.ai_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self
+            .deps
+            .ai_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             anyhow::bail!("AI calls are stopped; run `sbot ai start` first");
         }
         let message = AgentMessage::user(format!(
@@ -20,10 +24,14 @@ impl Runner {
         text: &str,
         owner_intent: bool,
     ) -> Result<LoopOutcome> {
-        if !self.ai_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self
+            .deps
+            .ai_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             anyhow::bail!("AI calls are stopped; run `sbot ai start` first");
         }
-        if self.estop_file.exists() {
+        if self.deps.estop_file.exists() {
             anyhow::bail!("ESTOP is active");
         }
         let message = AgentMessage::user(format!(
@@ -43,7 +51,7 @@ impl Runner {
         message: AgentMessage,
         owner_intent: bool,
     ) -> Result<LoopOutcome> {
-        if origin != "control" && self.gate.agent_paused() {
+        if origin != "control" && self.deps.gate.agent_paused() {
             debug!(%origin, "agent is paused by the security review; skipping this event");
             return Ok(LoopOutcome {
                 stop_reason: crate::agent::StopReason::Aborted,
@@ -94,7 +102,7 @@ impl Runner {
             TurnEvidence::monitor()
         };
         let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {
-            registry: Arc::clone(&self.tools),
+            registry: Arc::clone(&self.deps.tools),
             evidence,
         });
         let slot = self.provider_snapshot();
@@ -102,7 +110,7 @@ impl Runner {
             Arc::clone(&slot.provider),
             self.fallbacks.clone(),
             executor,
-            Arc::clone(&self.gate),
+            Arc::clone(&self.deps.gate),
             self.loop_config(),
         );
         let (tx, mut rx) = mpsc::channel(256);
@@ -133,10 +141,11 @@ impl Runner {
             let turn_id = new_turn_id();
             let scope = "shared".to_owned();
             for (seq, message) in new_blocks.iter().enumerate() {
-                self.turn_buffer
+                self.deps
+                    .turn_buffer
                     .append(&turn_id, seq as u64, &scope, message)?;
             }
-            self.turn_buffer.commit(&sessions, &turn_id).await?;
+            self.deps.turn_buffer.commit(&sessions, &turn_id).await?;
             history.lock().await.extend(new_blocks.clone());
         }
         self.accumulate_review_tokens(

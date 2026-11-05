@@ -52,8 +52,8 @@ impl Runner {
             &self.config.event_hooks,
             crate::config::HookEvent::SessionEnd,
         );
-        let current = self.sessions.current()?;
-        let next = self.sessions.rotate()?;
+        let current = self.deps.sessions.current()?;
+        let next = self.deps.sessions.rotate()?;
         let mut history = self.history.lock().await;
         history.clear();
         for text in &session_end {
@@ -63,7 +63,7 @@ impl Runner {
 {text}"
                 ),
             };
-            self.sessions.append(std::slice::from_ref(&message))?;
+            self.deps.sessions.append(std::slice::from_ref(&message))?;
             history.push(message);
         }
         Ok(serde_json::json!({
@@ -177,6 +177,7 @@ impl Runner {
         // 新回合在 system prompt 重建前“失忆”。只读、不标记已读。
         if self.config.post_compact_recall
             && let Ok(index) = self
+                .deps
                 .vfs
                 .read_text_unrecorded(&crate::vfs::VfsPath::parse("/MEMORY.md").expect("valid"))
             && !index.trim().is_empty()
