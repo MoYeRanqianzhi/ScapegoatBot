@@ -16,10 +16,10 @@ use base64::Engine;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use crate::transcript::{AgentMessage, AssistantBlock, ToolResult, ToolResultMessage};
 use crate::config::EncryptionMode;
 use crate::storage::Database;
 use crate::storage::crypto::MasterKey;
+use crate::transcript::{AgentMessage, AssistantBlock, ToolResult, ToolResultMessage};
 
 use super::SessionStore;
 

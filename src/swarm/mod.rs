@@ -21,9 +21,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, RwLock};
 
+use crate::config::SwarmConfig;
 use crate::transcript::AgentMessage;
 use crate::transcript::{AssistantBlock, AssistantMessage, StopReason, Usage};
-use crate::config::SwarmConfig;
 use crate::vfs::sqlite::VfsStore;
 use crate::vfs::{Vfs, VfsPath};
 

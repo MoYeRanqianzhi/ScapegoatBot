@@ -57,7 +57,8 @@
 - [x] session/messages 加密信封已抽 `storage/envelope.rs`（6d48111）。
 - [x] `build_agent` 18 参改 `AgentInputs`；`MonitorManager::add` 16 参改 `MonitorSpec`（16e97b8/44e7f6e）。
 - [x] providers→agent 循环依赖已解：`Usage/StopReason/RefusalDetails` 移到 `src/llm/types.rs`（2a0f851）。
-- [ ] 其余 6 对模块 2-循环（agent↔tools/providers/session/security/memory/swarm、security↔tools）仍在。
+- [x] 已解：providers→agent、session→agent、security→agent、swarm→agent（消息模型/证据移到 `src/transcript.rs`）。
+- [ ] 仍余：agent↔tools、agent↔memory、security↔tools 三对循环。
 - [x] ApiTool `execute` 拆出 `api/policy.rs`、媒体拆出 `api/media.rs`；VfsStore 拆出 `sqlite/{codec,tree}.rs`（2608061/1f0106d）。
 - [ ] Runner `run_turn` 仍约 263 行、25 字段；MessageStore 33 个 pub 方法；`actions.rs` 509 行表与 6 处 Box::leak。
 - [x] hold 语义修正：只拒绝 QQ 操作（`napcat.*`），MCP/下载/Web 不再被 hold 拦截（d21eed4）。

@@ -18,11 +18,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::transcript::TurnEvidence;
 use crate::config::{GateConfig, GateMode};
 use crate::providers::{CompletionError, Provider, SystemBlock, complete_text, truncate_chars};
 use crate::storage::Database;
 use crate::tools::actions::{ActionSpec, Category};
+use crate::transcript::TurnEvidence;
 
 use super::events::{self, Checkpoint};
 

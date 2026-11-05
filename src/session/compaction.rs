@@ -11,11 +11,11 @@
 //!
 //! 轮转与写入由 `Runner::compact_now` 完成。
 
-use crate::transcript::{AgentMessage, AssistantBlock};
 use crate::providers::{
     CompletionError, Provider, ProviderError, ProviderErrorKind, SystemBlock, complete_text,
     truncate_chars,
 };
+use crate::transcript::{AgentMessage, AssistantBlock};
 
 /// 摘要系统提示（英文，面向聊天而不是任务）。
 pub const SUMMARY_SYSTEM: &str = "\

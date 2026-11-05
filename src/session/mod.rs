@@ -23,11 +23,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::transcript::AgentMessage;
 use crate::config::EncryptionMode;
 use crate::storage::Database;
 use crate::storage::crypto::MasterKey;
 use crate::storage::envelope;
+use crate::transcript::AgentMessage;
 
 /// 行格式版本。
 const LINE_VERSION: u32 = 1;
