@@ -31,18 +31,19 @@ use crate::qq::{QqClient, format};
 use crate::security::gate::Gate;
 use crate::session::SessionStore;
 use crate::session::turn_buffer::{TurnBufferStore, new_turn_id};
-use crate::storage::Database;
 use crate::storage::messages::MessageStore;
 use crate::tools::ToolRegistry;
-use crate::vfs::Vfs;
 use crate::vfs::sqlite::VfsStore;
 
 mod compaction;
 mod evidence;
 mod images;
 mod injected;
+mod ops;
 mod review;
 mod scope;
+
+pub use ops::RuntimeOps;
 
 /// 运行配置。
 #[derive(Clone)]
@@ -171,8 +172,6 @@ pub struct Runner {
     review_lock: Mutex<()>,
     /// 每个 transcript scope 一个回合锁；shared 模式天然只有一个锁。
     turn_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// 控制通道排队上限，避免一次灌入无限任务。
-    control_slots: tokio::sync::Semaphore,
     /// 当前正在跑的主/injected 回合数；idle_only 用。
     active_turns: std::sync::atomic::AtomicUsize,
 }
@@ -337,7 +336,6 @@ impl Runner {
             review_failures: std::sync::atomic::AtomicU32::new(0),
             review_lock: Mutex::new(()),
             turn_locks: Mutex::new(HashMap::new()),
-            control_slots: tokio::sync::Semaphore::new(4),
             active_turns: std::sync::atomic::AtomicUsize::new(0),
         });
         let _ = runner
@@ -483,6 +481,39 @@ impl Runner {
             .read()
             .expect("provider slot lock poisoned")
             .clone()
+    }
+
+    /// 主回合与注入回合共用的循环配置。
+    ///
+    /// 模型字段取当前 provider 快照，其余取 `RunnerConfig`；集中一处后，
+    /// 热切换或新增字段时两个入口不会出现配置漂移。
+    fn loop_config(&self) -> LoopConfig {
+        let slot = self.provider_snapshot();
+        LoopConfig {
+            model: slot.api_model,
+            system: self.system(),
+            max_tokens: slot.max_tokens,
+            thinking: slot.thinking,
+            server_tools: self.config.server_tools.clone(),
+            max_steps: self.config.max_steps,
+            retry: self.config.retry,
+            max_state_chars: self.config.max_state_chars,
+            prune: self.config.prune,
+            prune_soft_limit: self.config.prune_soft_limit as usize,
+            prune_keep_turns: self.config.prune_keep_turns,
+            max_turn_tokens: self
+                .config
+                .budget
+                .as_ref()
+                .map(|budget| budget.turn_tokens())
+                .unwrap_or(0),
+            max_wall_secs: self
+                .config
+                .budget
+                .as_ref()
+                .map(|budget| budget.wall_secs())
+                .unwrap_or(0),
+        }
     }
 
     /// 跑一个完整回合，并接管 steering 通道的收尾。
@@ -664,31 +695,7 @@ impl Runner {
             self.fallbacks.clone(),
             executor,
             Arc::clone(&self.gate),
-            LoopConfig {
-                model: slot.api_model.clone(),
-                system: self.system(),
-                max_tokens: slot.max_tokens,
-                thinking: slot.thinking.clone(),
-                server_tools: self.config.server_tools.clone(),
-                max_steps: self.config.max_steps,
-                retry: self.config.retry,
-                max_state_chars: self.config.max_state_chars,
-                prune: self.config.prune,
-                prune_soft_limit: self.config.prune_soft_limit as usize,
-                prune_keep_turns: self.config.prune_keep_turns,
-                max_turn_tokens: self
-                    .config
-                    .budget
-                    .as_ref()
-                    .map(|budget| budget.turn_tokens())
-                    .unwrap_or(0),
-                max_wall_secs: self
-                    .config
-                    .budget
-                    .as_ref()
-                    .map(|budget| budget.wall_secs())
-                    .unwrap_or(0),
-            },
+            self.loop_config(),
         );
         let (events_tx, mut events_rx) = mpsc::channel(256);
         let logger = tokio::spawn(async move {
@@ -904,143 +911,6 @@ impl crate::swarm::SubagentRunner for Runner {
     }
 }
 
-/// `agent.*` 操作的运行时实现。
-pub struct RuntimeOps {
-    /// 压缩与上下文操作需要 runner；构造顺序决定了这里只能后置注入。
-    pub runner: std::sync::OnceLock<Arc<Runner>>,
-    pub gate: Arc<Gate>,
-    pub vfs: Arc<VfsStore>,
-    pub sessions: Arc<SessionStore>,
-    pub messages: Arc<MessageStore>,
-    pub db: Option<Arc<Database>>,
-    pub history: Arc<Mutex<Vec<AgentMessage>>>,
-    /// 当前模型引用；热切换时由 runtime 更新。
-    pub model: Arc<std::sync::RwLock<String>>,
-    pub owner_qq: u64,
-    pub master_qq: u64,
-    pub receive_scopes: Vec<String>,
-    pub send_scopes: Vec<String>,
-    pub estop_file: std::path::PathBuf,
-}
-
-#[async_trait::async_trait]
-impl crate::tools::api::AgentOps for RuntimeOps {
-    async fn status(&self) -> Result<serde_json::Value, String> {
-        let usage = self.vfs.usage().map_err(|error| error.to_string())?;
-        let events = self
-            .db
-            .as_ref()
-            .and_then(|db| crate::security::events::recent(db, 5).ok())
-            .unwrap_or_default();
-        Ok(serde_json::json!({
-            "hold": self.gate.hold_active(),
-            "estop": self.estop_file.exists(),
-            "model": *self.model.read().expect("model lock poisoned"),
-            "owner_qq": self.owner_qq,
-            "master_qq": self.master_qq,
-            "receive_scopes": self.receive_scopes,
-            "send_scopes": self.send_scopes,
-            "vfs": {
-                "active_bytes": usage.active_bytes,
-                "trash_bytes": usage.trash_bytes,
-                "nodes": usage.nodes,
-            },
-            "recent_security_events": events,
-        }))
-    }
-
-    async fn resume(&self) -> Result<serde_json::Value, String> {
-        if !self.gate.hold_active() {
-            return Ok(serde_json::json!({"hold": false, "note": "not on hold"}));
-        }
-        // 复核真实内容：最近一次被判危险的增量 + 当前历史尾部 + hold 原因。
-        // 旧实现只拿固定串 "resume request" 过闸，规则层看不到任何东西，
-        // 于是任何 hold 都能被一次调用清掉。
-        let mut judged = self.gate.flagged_content().unwrap_or_default();
-        {
-            let history = self.history.lock().await;
-            let mut tail = String::new();
-            for message in history.iter().rev() {
-                let rendered = format!("{message:?}");
-                if tail.len() + rendered.len() > 48_000 {
-                    break;
-                }
-                tail.insert_str(0, &rendered);
-                tail.insert(0, '\n');
-            }
-            judged.push_str(&tail);
-        }
-        if judged.trim().is_empty() {
-            return Err(
-                "The gate has no judged content to re-check; the hold stays in place.".to_owned(),
-            );
-        }
-        let reason = self
-            .gate
-            .hold_reason()
-            .unwrap_or_else(|| "security hold".to_owned());
-        let verdict = self.gate.review(&reason, &judged).await;
-        if verdict.dangerous {
-            return Err(format!(
-                "The gate still blocks this context: {}",
-                verdict.reason
-            ));
-        }
-        self.gate
-            .clear_hold()
-            .map_err(|error| format!("cannot clear the hold file: {error}"))?;
-        Ok(serde_json::json!({
-            "hold": false,
-            "reason": verdict.reason,
-        }))
-    }
-
-    async fn quarantine(&self, params: &serde_json::Value) -> Result<serde_json::Value, String> {
-        let text = params
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "agent.quarantine requires \"text\"".to_owned())?;
-        let reason = params
-            .get("reason")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("flagged by the agent");
-        let name = format!(
-            "/quarantine/{}-{}.md",
-            chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
-            std::process::id()
-        );
-        let path = crate::vfs::VfsPath::parse(&name).map_err(|error| error.to_string())?;
-        let body = format!("# Quarantined content\n\nreason: {reason}\n\n---\n\n{text}\n");
-        self.vfs
-            .write_text(&path, &body, None)
-            .map_err(|error| error.to_string())?;
-        Ok(serde_json::json!({"quarantined": path.to_string()}))
-    }
-
-    async fn compact(&self, chat: Option<ChatId>) -> Result<serde_json::Value, String> {
-        let runner = self
-            .runner
-            .get()
-            .ok_or_else(|| "the runner is not ready yet".to_owned())?;
-        let chat = chat.unwrap_or(ChatId::Private(self.owner_qq));
-        runner
-            .compact_chat("manual", chat)
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    async fn clear_context(&self) -> Result<serde_json::Value, String> {
-        let runner = self
-            .runner
-            .get()
-            .ok_or_else(|| "the runner is not ready yet".to_owned())?;
-        runner
-            .clear_all_context()
-            .await
-            .map_err(|error| error.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -1057,6 +927,7 @@ mod tests {
     };
     use crate::providers::{EventReceiver, LlmRequest, Provider, ProviderError, ProviderEvent};
     use crate::qq::event::{Segment, Sender};
+    use crate::storage::Database;
     use crate::storage::crypto::MasterKey;
     use crate::tools::api::{AgentOps, ApiTool, NapcatGateway};
     use crate::vfs::quota::Limits;

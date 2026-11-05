@@ -1,11 +1,8 @@
 use super::*;
 
 impl Runner {
+    /// 控制通道回合；主代理不受并发配额限制，串行化由 turn_lock 负责。
     pub async fn run_control(&self, text: &str, control_id: i64) -> Result<LoopOutcome> {
-        let _permit = self
-            .control_slots
-            .try_acquire()
-            .map_err(|_| anyhow::anyhow!("too many queued control turns"))?;
         if !self.ai_enabled.load(std::sync::atomic::Ordering::Relaxed) {
             anyhow::bail!("AI calls are stopped; run `sbot ai start` first");
         }
@@ -106,31 +103,7 @@ impl Runner {
             self.fallbacks.clone(),
             executor,
             Arc::clone(&self.gate),
-            LoopConfig {
-                model: slot.api_model.clone(),
-                system: self.system(),
-                max_tokens: slot.max_tokens,
-                thinking: slot.thinking.clone(),
-                server_tools: self.config.server_tools.clone(),
-                max_steps: self.config.max_steps,
-                retry: self.config.retry,
-                max_state_chars: self.config.max_state_chars,
-                prune: self.config.prune,
-                prune_soft_limit: self.config.prune_soft_limit as usize,
-                prune_keep_turns: self.config.prune_keep_turns,
-                max_turn_tokens: self
-                    .config
-                    .budget
-                    .as_ref()
-                    .map(|budget| budget.turn_tokens())
-                    .unwrap_or(0),
-                max_wall_secs: self
-                    .config
-                    .budget
-                    .as_ref()
-                    .map(|budget| budget.wall_secs())
-                    .unwrap_or(0),
-            },
+            self.loop_config(),
         );
         let (tx, mut rx) = mpsc::channel(256);
         let logger = tokio::spawn(async move {
