@@ -223,9 +223,10 @@ fn appended_prefix(existing: &[AgentMessage], pending: &[AgentMessage]) -> usize
     for length in (1..=max).rev() {
         let tail = &existing[existing.len() - length..];
         let head = &pending[..length];
-        let matches = tail.iter().zip(head).all(|(left, right)| {
-            serde_json::to_vec(left).ok() == serde_json::to_vec(right).ok()
-        });
+        let matches = tail
+            .iter()
+            .zip(head)
+            .all(|(left, right)| serde_json::to_vec(left).ok() == serde_json::to_vec(right).ok());
         if matches {
             return length;
         }
@@ -470,7 +471,12 @@ mod tests {
             .append("t4", 1, "shared", &AgentMessage::user("two"))
             .unwrap();
         buffer.set_state("t4", TurnState::Committing).unwrap();
-        assert!(buffer.open_turns("shared").unwrap().contains(&"t4".to_owned()));
+        assert!(
+            buffer
+                .open_turns("shared")
+                .unwrap()
+                .contains(&"t4".to_owned())
+        );
 
         assert_eq!(buffer.recover_open(&sessions, "shared").await.unwrap(), 1);
         let current = sessions.current().unwrap();
@@ -489,14 +495,16 @@ mod tests {
             .unwrap();
         buffer.set_state("t5", TurnState::Committing).unwrap();
         // 模拟崩溃：只有第一个块写进了 transcript。
-        sessions
-            .append(&[AgentMessage::user("one")])
-            .unwrap();
+        sessions.append(&[AgentMessage::user("one")]).unwrap();
 
         assert_eq!(buffer.recover_open(&sessions, "shared").await.unwrap(), 1);
         let current = sessions.current().unwrap();
         let messages = sessions.read_segment(&current.file).unwrap();
-        assert_eq!(messages.len(), 2, "recovery must not duplicate the prefix: {messages:?}");
+        assert_eq!(
+            messages.len(),
+            2,
+            "recovery must not duplicate the prefix: {messages:?}"
+        );
         match (&messages[0], &messages[1]) {
             (AgentMessage::User { text: first, .. }, AgentMessage::User { text: second, .. }) => {
                 assert!(first.contains("one"));
