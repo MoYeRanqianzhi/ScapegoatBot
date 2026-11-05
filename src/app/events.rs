@@ -84,7 +84,7 @@ impl MonitorSink for RunnerSink {
                                 delivery.name, delivery.text
                             ),
                             0,
-                            crate::agent::TurnEvidence::monitor(),
+                            crate::transcript::TurnEvidence::monitor(),
                         )
                         .await
                     {

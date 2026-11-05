@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::agent::AgentMessage;
-use crate::agent::message::{AssistantBlock, AssistantMessage, StopReason, Usage};
+use crate::transcript::AgentMessage;
+use crate::transcript::{AssistantBlock, AssistantMessage, StopReason, Usage};
 use crate::config::SwarmConfig;
 use crate::vfs::sqlite::VfsStore;
 use crate::vfs::{Vfs, VfsPath};
@@ -132,7 +132,7 @@ pub struct SubagentRequest {
     /// 只读：`API` 只保留 `api.*` 查询（docs 与不可发送的自定义子代理）。
     pub read_only: bool,
     /// 继承自 spawn 调用方的回合证据；跨 chat 发送与 owner intent 检查依赖它。
-    pub evidence: crate::agent::TurnEvidence,
+    pub evidence: crate::transcript::TurnEvidence,
     /// 运行中注入的消息（`Agent message`）；在回合边界排空。
     pub incoming: Option<tokio::sync::mpsc::UnboundedReceiver<AgentMessage>>,
     /// 运行结束后把完整历史写回实例，供续聊使用。
@@ -269,7 +269,7 @@ pub struct AgentInstance {
     /// 该实例的 `API` 是否是只读视图；续聊时保持一致。
     read_only: bool,
     /// spawn 时继承的回合证据；续聊沿用。
-    evidence: crate::agent::TurnEvidence,
+    evidence: crate::transcript::TurnEvidence,
     max_steps: u32,
     depth: u32,
     status: Mutex<InstanceStatus>,
@@ -373,7 +373,7 @@ impl AgentHub {
         agent: Option<&str>,
         task: String,
         depth: u32,
-        evidence: crate::agent::TurnEvidence,
+        evidence: crate::transcript::TurnEvidence,
     ) -> Result<serde_json::Value> {
         if !self.config.enabled {
             anyhow::bail!("swarm is disabled in [swarm].enabled");

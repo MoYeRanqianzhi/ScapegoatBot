@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::agent::TurnEvidence;
+use crate::transcript::TurnEvidence;
 use crate::config::{GateConfig, GateMode};
 use crate::providers::{CompletionError, Provider, SystemBlock, complete_text, truncate_chars};
 use crate::storage::Database;
