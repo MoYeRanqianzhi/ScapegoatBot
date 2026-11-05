@@ -50,18 +50,6 @@ impl SbotPaths {
         self.home.join("sbot.toml")
     }
 
-    /// 模型定义文件 `models.json`；启动加载与 `sbot doctor` 使用。
-    #[allow(dead_code)]
-    pub fn models_file(&self) -> PathBuf {
-        self.home.join("models.json")
-    }
-
-    /// 凭据文件 `auth.json`（不挂载 VFS）。
-    #[allow(dead_code)]
-    pub fn auth_file(&self) -> PathBuf {
-        self.home.join("auth.json")
-    }
-
     /// 主密钥文件 `key`（内容加密的唯一秘密）。
     pub fn key_file(&self) -> PathBuf {
         self.home.join("key")
@@ -85,18 +73,6 @@ impl SbotPaths {
     /// 日志目录。
     pub fn logs_dir(&self) -> PathBuf {
         self.home.join("logs")
-    }
-
-    /// 共享技能目录；`Skill` 工具与 curator 使用。
-    #[allow(dead_code)]
-    pub fn skills_dir(&self) -> PathBuf {
-        self.home.join("skills")
-    }
-
-    /// 自定义子代理定义目录；`Agent` 工具使用。
-    #[allow(dead_code)]
-    pub fn agents_dir(&self) -> PathBuf {
-        self.home.join("agents")
     }
 
     /// ESTOP 哨兵：存在即暂停新回合（设计 §2.3）。

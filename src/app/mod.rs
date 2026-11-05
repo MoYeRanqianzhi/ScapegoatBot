@@ -75,7 +75,6 @@ pub struct Runtime {
     /// 模型清单（内置 + 用户覆盖）。
     models: ModelsFile,
     /// 凭据（只读，不挂载 VFS）；`sbot doctor` 会读取。
-    #[allow(dead_code)]
     auth: AuthFile,
     /// SQLite。
     db: Arc<Database>,

@@ -32,7 +32,6 @@ pub struct MasterKey {
 
 impl MasterKey {
     /// 从已有字节构造（测试与迁移使用）。
-    #[allow(dead_code)]
     pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
         Self { bytes }
     }

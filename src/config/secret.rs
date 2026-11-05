@@ -19,15 +19,8 @@ pub struct Secret(String);
 
 impl Secret {
     /// 从 `auth.json` 的原始字符串构造；写回配置时需要原文。
-    #[allow(dead_code)]
     pub fn new(raw: impl Into<String>) -> Self {
         Self(raw.into())
-    }
-
-    /// 原始写法（可能含 `$` 前缀），仅用于写回文件。
-    #[allow(dead_code)]
-    pub fn raw(&self) -> &str {
-        &self.0
     }
 
     /// 解析出实际值。
