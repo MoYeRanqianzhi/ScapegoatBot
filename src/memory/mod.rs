@@ -86,7 +86,10 @@ pub fn spawn(config: ReviewerConfig) {
     };
     tokio::spawn(async move {
         let mut last_reviewed = 0usize;
-        let mut last_review = Instant::now() - interval;
+        // 还没复盘过时为 `None`，第一次不受 `interval` 限制。不能写成
+        // `Instant::now() - interval`：Windows 的 Instant 从开机算起，开机不满
+        // `interval` 时减法会 panic，复盘任务就此静默消失。
+        let mut last_review: Option<Instant> = None;
         loop {
             tokio::time::sleep(tick).await;
             if !config.ai_enabled.load(Ordering::Relaxed) {
@@ -111,14 +114,15 @@ pub fn spawn(config: ReviewerConfig) {
                 }
                 let idle_for =
                     chrono::Utc::now().timestamp() - config.last_activity.load(Ordering::Relaxed);
-                if idle_for < idle.as_secs() as i64 || last_review.elapsed() < interval {
+                let too_soon = last_review.is_some_and(|at| at.elapsed() < interval);
+                if idle_for < idle.as_secs() as i64 || too_soon {
                     continue;
                 }
             }
             match review_once(&config, &history).await {
                 Ok(()) => {
                     last_reviewed = history.len();
-                    last_review = Instant::now();
+                    last_review = Some(Instant::now());
                 }
                 Err(error) => warn!(%error, "background memory review failed"),
             }
@@ -225,7 +229,7 @@ async fn run_review(
             anyhow::bail!("review request ended without a stop event");
         }
     };
-    let json = extract_json(&text).context("review output is not JSON")?;
+    let json = crate::providers::extract_json_object(&text).context("review output is not JSON")?;
     let value: Value = serde_json::from_str(json).context("review output is not valid JSON")?;
 
     let limits = MemoryLimits {
@@ -293,33 +297,4 @@ async fn run_review(
         }
     }
     Ok(added)
-}
-
-/// 从模型输出中提取 JSON 对象；容忍 ```json 代码围栏。
-fn extract_json(text: &str) -> Option<&str> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    if end <= start {
-        return None;
-    }
-    Some(&text[start..=end])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn extracts_json_from_fences() {
-        let text = "```json\n{\"memories\": [], \"style\": \"\"}\n```";
-        assert_eq!(
-            extract_json(text).unwrap(),
-            "{\"memories\": [], \"style\": \"\"}"
-        );
-    }
-
-    #[test]
-    fn rejects_non_json() {
-        assert!(extract_json("no object here").is_none());
-    }
 }

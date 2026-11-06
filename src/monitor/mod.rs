@@ -337,6 +337,17 @@ impl MonitorManager {
             cc,
             on_missing,
         } = spec;
+        // 过期时刻先算出来：参数来自模型与配置，时长再大也只能报错，不能让
+        // `DateTime + Duration` 溢出 panic（release 是 panic = "abort"，会带走整个进程）。
+        let expires_at = match expires {
+            None => None,
+            Some(duration) => Some(
+                chrono::Duration::from_std(duration)
+                    .ok()
+                    .and_then(|duration| Local::now().checked_add_signed(duration))
+                    .ok_or_else(|| anyhow::anyhow!("monitor {name:?}: expires is too far away"))?,
+            ),
+        };
         if let Some(db) = self.db.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let _ = db.meta_set(&format!("monitor.removed.{name}"), b"0");
         }
@@ -354,11 +365,7 @@ impl MonitorManager {
                 as_prompt,
                 min_interval,
                 max_events,
-                expires_at: expires.and_then(|duration| {
-                    chrono::Duration::from_std(duration)
-                        .ok()
-                        .map(|duration| Local::now() + duration)
-                }),
+                expires_at,
                 one_shot,
                 idle_only,
                 batch_window,
@@ -1146,6 +1153,38 @@ mod tests {
             missed_occurrences(&TimerSpec::At { hour: 9, minute: 0 }, last, now),
             2
         );
+    }
+
+    /// 模型可以写任意大的 `expires`；以前 `Local::now() + duration` 溢出会 panic，
+    /// release 下 `panic = "abort"` 会直接带走守护进程。
+    #[tokio::test]
+    async fn absurd_expiry_is_an_error_not_a_panic() {
+        let sink = Arc::new(RecordingSink::default());
+        let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+        let seconds = crate::config::parse_duration_secs("999999999999999s").unwrap();
+        let error = manager
+            .add(MonitorSpec {
+                name: "forever".to_owned(),
+                source: "qq".to_owned(),
+                timer: None,
+                when: None,
+                prompt: None,
+                as_prompt: false,
+                max_events: 1,
+                expires: Some(Duration::from_secs(seconds)),
+                one_shot: false,
+                min_interval: Duration::ZERO,
+                idle_only: false,
+                batch_window: Duration::ZERO,
+                target: None,
+                catch_up: CatchUp::Coalesce,
+                cc: false,
+                on_missing: crate::config::OnMissing::Queue,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("too far"), "{error}");
+        assert!(manager.list().await.is_empty());
     }
 
     #[tokio::test]

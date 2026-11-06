@@ -155,14 +155,10 @@ impl SecurityCheck for SecurityReviewer {
 
 /// 解析检查结果；容忍模型在 JSON 外面加解释。
 pub fn parse_outcome(text: &str) -> Result<ReviewOutcome, String> {
-    let start = text
-        .find('{')
+    let object = crate::providers::extract_json_object(text)
         .ok_or_else(|| format!("no JSON object in review: {text}"))?;
-    let end = text
-        .rfind('}')
-        .ok_or_else(|| format!("no JSON object in review: {text}"))?;
-    let value: Value = serde_json::from_str(&text[start..=end])
-        .map_err(|error| format!("invalid review JSON: {error}"))?;
+    let value: Value =
+        serde_json::from_str(object).map_err(|error| format!("invalid review JSON: {error}"))?;
     let risk = value
         .get("risk")
         .and_then(Value::as_str)

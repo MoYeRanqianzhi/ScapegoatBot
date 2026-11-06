@@ -342,13 +342,15 @@ impl Tool for WebFetchTool {
                         Ok(parsed) => {
                             if let Err(error) = self.policy.resolve_public(&parsed).await {
                                 return ToolResult::error(format!(
-                                    "the web backend redirected to {final_url}, which is not                                      allowed: {error}"
+                                    "the web backend redirected to {final_url}, which is not \
+                                     allowed: {error}"
                                 ));
                             }
                         }
                         Err(error) => {
                             return ToolResult::error(format!(
-                                "the web backend redirected to {final_url}, which is not                                  allowed: {error}"
+                                "the web backend redirected to {final_url}, which is not \
+                                 allowed: {error}"
                             ));
                         }
                     }

@@ -287,6 +287,17 @@ pub fn truncate_chars(text: &str, limit: usize) -> String {
     format!("{truncated}…")
 }
 
+/// 从模型输出里取出最外层的 JSON 对象文本（第一个 `{` 到最后一个 `}`）。
+///
+/// 判定器、审查器与记忆复盘都要求模型回 JSON，但模型常在外面加解释或代码围栏。
+/// 输出里可能先出现 `}` 再出现 `{`（例如 `"} {"`）；这时没有对象，返回 `None`，
+/// 而不是用倒置的区间切片导致 panic。`{`/`}` 都是 ASCII，下标一定落在字符边界上。
+pub(crate) fn extract_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    (end > start).then(|| &text[start..=end])
+}
+
 /// 事件接收端。
 pub type EventReceiver = mpsc::Receiver<ProviderEvent>;
 
@@ -390,9 +401,16 @@ pub(crate) struct HttpProviderCore {
     base_url: String,
     api_key: String,
     model_id: String,
+    /// 等待响应头的上限（models.json 的 `timeout_secs`）。
+    response_timeout: Duration,
 }
 
 impl HttpProviderCore {
+    /// `timeout_secs` 只约束“发出请求到拿到响应头”。
+    ///
+    /// 不能用 `ClientBuilder::timeout`：reqwest 的总超时一直计到响应体读完，
+    /// 长思考的流式回复超过它会被拦腰截断，再被当成网络错误整段重试（每次都计费）。
+    /// 流式响应体由 [`pump`] 的逐块空闲超时（30s）保护，整个回合另有 wall-clock 预算。
     pub(crate) fn new(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
@@ -400,7 +418,7 @@ impl HttpProviderCore {
         timeout_secs: u64,
     ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(timeout_secs.max(1)))
+            .connect_timeout(Duration::from_secs(timeout_secs.clamp(1, 30)))
             .build()
             .map_err(|error| ProviderError::new(ProviderErrorKind::Config, error.to_string()))?;
         Ok(Self {
@@ -408,6 +426,7 @@ impl HttpProviderCore {
             base_url: base_url.into(),
             api_key: api_key.into(),
             model_id: model_id.into(),
+            response_timeout: Duration::from_secs(timeout_secs.max(1)),
         })
     }
 
@@ -434,10 +453,19 @@ impl HttpProviderCore {
                 .header("anthropic-version", version),
             Auth::Bearer => request.header("authorization", format!("Bearer {}", self.api_key)),
         };
-        let response =
-            request.json(body).send().await.map_err(|error| {
-                ProviderError::new(ProviderErrorKind::Network, error.to_string())
-            })?;
+        // 只给“拿到响应头”计时；响应体是流，由 `pump` 的空闲超时负责。
+        let response = tokio::time::timeout(self.response_timeout, request.json(body).send())
+            .await
+            .map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorKind::Network,
+                    format!(
+                        "no response headers within {}s",
+                        self.response_timeout.as_secs()
+                    ),
+                )
+            })?
+            .map_err(|error| ProviderError::new(ProviderErrorKind::Network, error.to_string()))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -601,6 +629,29 @@ pub fn map_stop_reason(raw: &str) -> StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_objects_are_extracted_from_fences_and_prose() {
+        let text = "```json\n{\"memories\": [], \"style\": \"\"}\n```";
+        assert_eq!(
+            extract_json_object(text),
+            Some("{\"memories\": [], \"style\": \"\"}")
+        );
+        assert_eq!(
+            extract_json_object("结论如下：{\"allow\": true}。"),
+            Some("{\"allow\": true}")
+        );
+        assert_eq!(extract_json_object("no object here"), None);
+    }
+
+    /// 判定器的输入含攻击者可控的聊天内容；`} {` 这类输出以前会让切片区间倒置而 panic。
+    #[test]
+    fn inverted_braces_do_not_panic() {
+        assert_eq!(extract_json_object("} {"), None);
+        assert_eq!(extract_json_object("}{"), None);
+        assert_eq!(extract_json_object("}"), None);
+        assert_eq!(extract_json_object("{"), None);
+    }
 
     #[test]
     fn stop_reason_mapping_covers_both_protocols() {

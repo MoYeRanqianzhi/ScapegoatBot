@@ -28,6 +28,8 @@ pub struct ProviderDef {
     /// 协议：`anthropic` / `openai` / `chat`。
     pub api: Protocol,
     pub base_url: String,
+    /// 等待响应头的秒数（连接阶段另限 30 秒内）；流式响应体不受它限制，
+    /// 而是按“30 秒没有新数据”判定中断。
     pub timeout_secs: u64,
     pub max_retries: u32,
     pub models: Vec<ModelDef>,

@@ -448,9 +448,7 @@ impl ActionReviewer for LlmActionReviewer {
 }
 
 fn parse_review(text: &str) -> Option<bool> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    let value: Value = serde_json::from_str(&text[start..=end]).ok()?;
+    let value: Value = serde_json::from_str(crate::providers::extract_json_object(text)?).ok()?;
     value.get("allow").and_then(Value::as_bool)
 }
 
@@ -660,7 +658,8 @@ impl ActionGate {
             });
             if overlapping {
                 return Err(
-                    "content overlaps a message sent to another chat within 10 minutes;                      forwarding requires owner intent"
+                    "content overlaps a message sent to another chat within 10 minutes; \
+                     forwarding requires owner intent"
                         .to_owned(),
                 );
             }
@@ -677,7 +676,8 @@ impl ActionGate {
                     && current.intersection(&ngrams(&source.text)).count() >= NGRAM_SHARED
             }) {
                 return Err(format!(
-                    "outbound content overlaps context from {}; cross-chat forwarding                      requires owner intent",
+                    "outbound content overlaps context from {}; cross-chat forwarding \
+                     requires owner intent",
                     source.chat
                 ));
             }
@@ -703,7 +703,8 @@ impl ActionGate {
                 && source != chat
             {
                 return Err(format!(
-                    "media was first seen in {source}; forwarding it to {chat} requires                      owner intent"
+                    "media was first seen in {source}; forwarding it to {chat} requires \
+                     owner intent"
                 ));
             }
         }
@@ -743,14 +744,8 @@ impl ActionGate {
             return ActionDecision::Block(reason);
         }
 
-        let mutation = matches!(
-            spec.category,
-            Category::Message
-                | Category::Request
-                | Category::Admin
-                | Category::File
-                | Category::Profile
-        );
+        // 会产生对外影响的动作才需要主人确认；查询直接放行（仍受速率限制）。
+        let mutation = spec.category.is_outbound();
 
         if self.mode == GateMode::Approve && mutation {
             if self.approvals.consume(spec.action, params) {

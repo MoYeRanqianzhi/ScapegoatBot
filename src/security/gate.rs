@@ -372,9 +372,7 @@ new content:
 }
 
 fn parse_llm_verdict(text: &str) -> Option<(bool, f32, String)> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    let value: Value = serde_json::from_str(&text[start..=end]).ok()?;
+    let value: Value = serde_json::from_str(crate::providers::extract_json_object(text)?).ok()?;
     let dangerous = value.get("dangerous").and_then(Value::as_bool)?;
     let score = value
         .get("score")

@@ -66,10 +66,15 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
 
 impl NetPolicy {
     /// 构造 reqwest 客户端（重定向策略在 `check_hop` 之外由调用方逐跳检查）。
+    ///
+    /// 必须 `no_proxy()`：reqwest 默认读取 `HTTP(S)_PROXY` / `ALL_PROXY`，走代理时
+    /// 目标域名由代理解析，[`PublicOnlyResolver`] 根本不会被调用，连接层的公网
+    /// 过滤就失效了（只剩请求前那次可被 DNS rebinding 绕过的预检）。
     pub(crate) fn client(&self) -> Result<reqwest::Client, String> {
         let mut builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs.max(1)))
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
         if !self.allow_private {
             builder = builder.dns_resolver(Arc::new(PublicOnlyResolver));
         }
@@ -85,6 +90,7 @@ impl NetPolicy {
         let host = url
             .host_str()
             .ok_or_else(|| "URL has no host".to_owned())?
+            .trim_end_matches('.')
             .to_ascii_lowercase();
 
         for blocked in &self.blocked_domains {
@@ -323,6 +329,8 @@ mod tests {
         assert!(policy.check_url("https://example.com/a").is_ok());
         assert!(policy.check_url("https://sub.example.com/a").is_ok());
         assert!(policy.check_url("https://evil.example.com/a").is_err());
+        // 末尾带点的完全限定域名指向同一个主机，不能绕过阻止列表。
+        assert!(policy.check_url("https://evil.example.com./a").is_err());
         assert!(policy.check_url("https://other.com/a").is_err());
         assert!(policy.check_url("file:///etc/passwd").is_err());
     }
