@@ -12,9 +12,9 @@
 
 ## 当前基线
 
-- HEAD `9f52e00`（图片代码 `48fe69f` + 交接文档）；`cargo test --locked --all-targets` = 377 passed（365 lib + 12 integration），
+- 图片功能代码 `48fe69f`，交接文档在后续提交；`cargo test --locked --all-targets` = 377 passed（365 lib + 12 integration），
   2 ignored；clippy/fmt 通过。
-- 本地 tag `v0.2.0-alpha.35` 落后 HEAD 4 个提交；尚未 push/release/deploy。
+- 本地 tag `v0.2.0-alpha.35` 未指向当前 HEAD；尚未 push/release/deploy。
 - 服务器 `hw1` 的 `sbot.service` 仍停止；NapCat 未登录（QR 登录失败）。
 
 ## 待用户确认
