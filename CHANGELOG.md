@@ -5,6 +5,51 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+审查整改第一批：安全与数据正确性。
+
+### 安全
+
+- 发往 NapCat 的文件引用一律内联为 `base64://`：VFS 路径由 sbot 读出，公网 URL 按
+  Download 网络策略下载；`file://`、宿主机路径、`data:` 拒绝。此前模型写的字符串
+  原样交给 NapCat，而 NapCat 会读取宿主机上存在的任意路径（可把 `~/.sbot/auth.json`
+  发进群里），也会自己去请求内网 URL。
+- `napcat.*` 只接受注册表声明过的参数；未声明字段（例如 NapCat 会当文件读取的
+  `send_group_notice.image`）直接报错。
+- `send_scopes` 覆盖所有对外动作（群管理、上传、改资料），并在门禁之前检查：
+  越界请求不再生成待确认项、不再私聊主人。
+- `napcat.send_msg` 要求恰好一个目标；`group_id` 与 `user_id` 同时出现时拒绝
+  （NapCat 在私聊对象查不到时会改发到群里，原先的作用域判断会被绕过）。
+- `approve` 的私聊确认码只接受 owner/master 从**另一个账号**发来的回复；本账号发出的
+  消息与 agent 自己发的无法区分，不再可能用于批准。`master_qq` 就是本账号时通知里
+  不带确认码。确认码回复不再写入消息归档。
+- 网络工具的 HTTP 客户端禁用系统代理：走 `HTTP(S)_PROXY` 时目标由代理解析，
+  连接层的公网过滤会失效。阻止列表现在也匹配末尾带点的域名。
+- 图片解码限制宽高 ≤ 8192（解压炸弹）；任意角度旋转先算画布，超限拒绝而不是分配；
+  `image.text` 最多 1000 字符。
+- 判定器/审查器/复盘解析模型 JSON 时，`"} {"` 一类输出不再使区间倒置 panic。
+
+### 修复
+
+- 自己发出的私聊回声（`message_sent`）按 `target_id` 归到对方的会话，而不是
+  `private:<本账号>`；与发送账本按真实 `message_id` 去重，不再存两份。
+- 只有带 `message` 的发送才写入 `self` 归档；戳一戳不再被记成一条消息，带 `group_id`
+  的戳一戳作用于那个群。
+- `VfsStore::read_bytes` 支持文本节点（以前对文本文件返回 NotFound 或空）。
+- provider 的 `timeout_secs` 改为只限制“拿到响应头”；此前是 reqwest 的总超时，
+  超过 120 秒的长思考流会被截断并整段重试计费。流式响应体由 30 秒空闲超时保护。
+- 后台记忆复盘在 Windows 开机不满一个复盘间隔时不再因 `Instant` 下溢 panic。
+- monitor 的 `expires` 过大时返回错误，不再因时间相加溢出 panic（release 下会终止进程）。
+- `get_group_file_url` / `get_group_file_system_info` 归为查询：受 `receive_scopes`
+  约束，`approve` 模式下不再需要主人确认。
+
+### 文档
+
+- 安装指南：NapCat 必须配置“WebSocket 服务器”（正向），并说明
+  `messagePostFormat` / `reportSelfMessage`。
+- 审批、发送范围、发出的文件与媒体按新行为重写。
+
 ## [0.2.0-alpha.35] - 2026-11-06
 
 收尾审计 P2。

@@ -50,16 +50,21 @@ approval_required: napcat.send_group_msg is pending as g3. ...
 
 主人确认（二选一）：
 
-- 机器人会私聊 master 一个 6 位 nonce；主人在该私聊里直接回复 nonce 即批准；
-- 或用控制通道：
+- 机器人会私聊 `master_qq` 一条确认通知。如果 `master_qq` 是**另一个账号**
+  （companion 模式，或 stand_in 下把 `[agent].master` 设成主人的小号），通知里带
+  6 位确认码，主人从那个账号直接回复确认码即批准；
+- 如果 `master_qq` 就是机器人登录的账号（stand_in 的默认 `master = "self"`），
+  私聊回复无法批准：本账号发出的消息与 agent 自己发的分不开，接受它们等于让 agent
+  自我批准。此时通知里不带确认码，只能用控制通道：
 
 ```bash
 sbot gate pending          # 看请求、参数与等待时间
-sbot gate approve g3       # 批准；120 秒内让 agent 重试该动作
+sbot gate approve g3       # 批准；120 秒内让 agent 用相同参数重试该动作
 sbot gate reject g3        # 拒绝
 ```
 
-请求 60 秒未确认自动失效；批准是一次性的。群聊或他人回复不构成确认。
+请求 60 秒未确认自动失效；批准只放行一次完全相同的调用。群聊或他人回复不构成确认，
+确认码回复本身不进入消息归档。
 
 ## 三个开关的区别
 

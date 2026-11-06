@@ -150,16 +150,18 @@ owner intent 由 runtime 核实，不接受模型自报或聊天里的“主人�
 - `llm_review = true`：对变更类动作追加一次审查，审查失败/超时按拒绝处理。
 
 `approve`：变更类动作返回 `approval_required` 和请求 id（60 秒内有效）。机器人同时
-用 NapCat 私聊 master 发送 6 位 nonce；主人在该私聊里直接回复 nonce 即批准，也可用
-控制通道：
+私聊 `master_qq` 一条通知。只有 `master_qq` 与机器人登录账号不同时，通知才带 6 位
+确认码、主人在那个私聊里回复确认码即批准；`master_qq` 就是本账号时（stand_in 默认），
+本账号发出的消息与 agent 自己发的无法区分，私聊回复一律不算，只能用控制通道：
 
 ```bash
 sbot gate pending
-sbot gate approve <id>   # 批准后 120 秒内重试一次
+sbot gate approve <id>   # 批准后 120 秒内用相同参数重试一次
 sbot gate reject <id>
 ```
 
-批准是一次性的；普通群聊/他人回复不构成确认。队列持久化到 `gate_approvals`（只存
+批准是一次性的，并绑定 action 与参数哈希；普通群聊/他人回复不构成确认。发送范围检查
+在门禁之前，越界的请求不会生成待确认项。队列持久化到 `gate_approvals`（只存
 参数哈希），重启后未过期的批准仍可消费一次。
 
 ## 主人保护
@@ -173,11 +175,27 @@ sbot gate reject <id>
 
 ## 发送范围
 
-`[agent].send_scopes` 控制能发到哪些 chat：
+`[agent].send_scopes` 控制能对哪些 chat 产生影响——发消息、戳一戳、群管理、
+上传文件、改群名片/群名/公告都算：
 
-- 空列表 = 禁止一切发送（fail-closed）；
+- 空列表 = 禁止一切对外动作（fail-closed）；
 - `["*"]` = 不限制；
 - 否则只允许列出的 `group:<gid>` / `private:<qq>`。
+
+`napcat.send_msg` 必须恰好给出一个目标（`group_id` 或 `user_id`）。NapCat 在私聊对象
+查不到时会改发到同时给出的 `group_id`，两者同时出现时无法确定真实目标，直接拒绝。
+
+## 发出的文件与媒体
+
+消息里的 image/record/video/file 段，以及 `upload_*_file`、`set_qq_avatar` 的 `file`，
+只接受三种写法：VFS 绝对路径（如 `/tmp/a.png`）、公网 `http(s)://` URL、`base64://`。
+NapCat 收到的永远是 `base64://`：VFS 路径由 sbot 自己读出，URL 由 sbot 按 Download
+的网络策略下载（只连公网、逐跳检查重定向）。`file://`、宿主机路径、`data:` 一律拒绝——
+NapCat 会读取宿主机上存在的任意路径，原样转交就等于让一次提示注入把
+`~/.sbot/auth.json` 发进群里。单次调用内联的内容合计不超过 20 MiB。
+
+action 只接受注册表声明过的参数（`api.help` 可查），未声明的字段直接报错，
+不会被转交给 NapCat。
 
 `[agent].receive_scopes` 控制能读哪些 chat：消息视图、收件箱、联系人视图与带
 `group_id` / `user_id` 的 API 查询都会过滤；空列表 = 拒绝一切读取。`get_msg` 只有

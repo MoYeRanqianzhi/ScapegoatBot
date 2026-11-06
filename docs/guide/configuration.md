@@ -245,9 +245,10 @@ key 放 `auth.json`：
     2 分钟内同内容发到 3 个以上 chat、10 分钟内跨 chat 的 5-gram 重叠、跨 chat 转发媒体、
     无 owner intent 的 @全体；
     `llm_review = true` 时对变更类动作追加一次 LLM 审查，失败按拒绝。
-  - `approve`：变更类动作返回 `approval_required` 与请求 id，并私聊 master 一个
-    6 位 nonce；主人回复 nonce 或用 `sbot gate approve <id>` 批准，120 秒内重试一次
-    即可，60 秒未确认自动失效。队列持久化到数据库（只存参数哈希）。
+  - `approve`：变更类动作返回 `approval_required` 与请求 id，并私聊 `master_qq` 一条
+    通知；`master_qq` 是另一个账号时通知带 6 位确认码、回复即批准，否则只能用
+    `sbot gate approve <id>`。批准后 120 秒内用相同参数重试一次即可，60 秒未确认
+    自动失效。队列持久化到数据库（只存参数哈希）。
 - `[hooks.context]`：`name`、`path`、`kind`、`when`、`inject`、`max_bytes`；
   自定义注入到 system prompt 的上下文文件。
 - `[hooks.events]`：所有事件都会触发 `log` / `block` / `inject_context` / `notify`；

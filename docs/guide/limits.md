@@ -11,9 +11,10 @@
 
 ## 安全边界
 
-- **`approve` 的 nonce**：通过 master 私聊发送 6 位码，只接受 owner/master 私聊回复；
-  队列持久化只保存 action、摘要、参数哈希与 nonce，不保存消息原文。nonce 不是
-  密码学令牌，靠“只有主人能私聊机器人”这一边界。
+- **`approve` 的确认码**：只在 `master_qq` 是另一个账号时发出，只接受该账号或 owner
+  从**另一个账号**发来的私聊回复；`master_qq` 就是机器人账号时只能用 `sbot gate`。
+  队列持久化只保存 action、摘要、参数哈希与确认码，不保存消息原文。确认码约 20 位熵、
+  由时间与进程号派生，不是密码学令牌，靠“只有主人能从自己的账号私聊机器人”这一边界。
 - **`auto` 的发送规则**：频率、同 chat 重复、跨群同文、@全体、跨 chat 5-gram
   重叠（≥24 字、共享 5 个 5-gram）、上下文来源与媒体来源都会拦。`context_sources`
   覆盖本轮消息、pending history、`Read /messages|/inbox` 与 `API` 历史查询；

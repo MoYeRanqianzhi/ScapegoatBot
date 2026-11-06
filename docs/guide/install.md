@@ -23,12 +23,17 @@ cargo build --release
 ## NapCat
 
 1. 按 NapCat 文档登录 QQ。
-2. 打开 OneBot 11 的 WebSocket 服务（反向或正向均可）。正向示例：
-   - 地址：`ws://127.0.0.1:3001`
-   - 若设置了 access token，填到 `~/.sbot/auth.json` 的 `napcat.access_token`。
+2. 在 NapCat 的 OneBot 11 网络配置里添加一个 **WebSocket 服务器**（正向 WS，
+   配置项 `network.websocketServers`）。sbot 只作为客户端去连接它，NapCat 的
+   “WebSocket 客户端”（反向 WS）连不上 sbot。示例：
+   - 地址：`ws://127.0.0.1:3001`（填到 `sbot.toml` 的 `[napcat].url`）；
+   - `messagePostFormat` 保持默认的 `array`；
+   - 想让 agent 看到自己（以及 stand_in 下主人在手机上）发出的消息，打开
+     `reportSelfMessage`；
+   - 若设置了 `token`，填到 `~/.sbot/auth.json` 的 `napcat.access_token`。
 3. 确认 NapCat 与 QQ 都处于登录状态。
 
-ScapegoatBot 只作为 WebSocket 客户端连接，不修改 NapCat 配置。
+sbot 不修改 NapCat 配置。
 
 ## 首次启动
 

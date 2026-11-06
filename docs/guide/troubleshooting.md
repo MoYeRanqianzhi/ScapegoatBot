@@ -46,7 +46,7 @@ NapCat connection timed out
    `models.json` 的 provider 名是否对上；
 3. 模型是否在 `[agent].available_models` 白名单里；
 4. 消息是否被 `[filter]` 拒收（日志 `message rejected by the admission filter`）；
-5. 群是否在 `send_scopes` 里（发送范围只对发送生效，不影响读）；
+5. 群是否在 `send_scopes` 里（发送范围管发送与群管理，不影响读）；
 6. `sbot ai stop` 是否被误执行。
 
 ## hold
