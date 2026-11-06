@@ -130,7 +130,7 @@ pub struct ToolRegistry {
     /// 执行上下文；`None` 只用于不依赖 VFS 的测试工具。
     vfs: Option<Arc<VfsStore>>,
     views: Option<Arc<views::Views>>,
-    /// 安全闸；`hold` 期间对外工具统一拒绝。
+    /// 安全闸；`hold` 期间只有 API 的 `napcat.*` 分支拒绝。
     gate: Option<Arc<crate::security::gate::Gate>>,
     /// 只读 `API` 的替身；docs 等子代理用。
     read_only_api: Option<Arc<dyn Tool>>,
@@ -180,7 +180,7 @@ impl ToolRegistry {
         self
     }
 
-    /// 注入安全闸；`hold` 期间 Download / Web* / MCP 会被拒绝。
+    /// 注入安全闸；hold 只由 API 的 `napcat.*` 分支执行，Download/Web/MCP 不受影响。
     pub(crate) fn with_gate(mut self, gate: Arc<crate::security::gate::Gate>) -> Self {
         self.gate = Some(gate);
         self

@@ -91,10 +91,10 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 
 - `napcat.*`：QQ 操作。hold 期间全部拒绝。
 - `agent.*`：`status`、`resume`、`quarantine`、`compact`、`clear_context`。
-- `media.*`：本地图片处理：`image_info`、`image_resize`、`image_crop`、`image_convert`、
-  `image_rotate`、`image_thumbnail`、`image_compress`、`image_watermark`；
-  处理结果写回 VFS，随后可直接 `Read`。水印支持 font8x8 的 Unicode 字库
-  （拉丁/希腊/平假名等）；CJK 需要外部字体，当前返回明确错误。
+- `image.*`：VFS 图片处理：`info`、`transform`（裁剪/任意角度旋转/缩放/缩略）、
+  `convert`（PNG/JPEG/WebP，quality 只作用于 JPEG）、`text`（字体、位置、颜色、透明度）、
+  `fonts`（列出系统字体）。不内置字体，`image.text` 使用系统安装的字体；
+  没有字体时 `image.fonts` 返回空列表，`image.text` 返回明确错误。
 - `api.*`：`list`（过滤/分页）、`help`（单个 action 的 schema）。
 
 `Read` 读取 VFS 图片时会把图片作为 tool result 的 image attachment 交给 provider；

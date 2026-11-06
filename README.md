@@ -123,8 +123,8 @@ url = "ws://127.0.0.1:3001"
 ## 安全模型
 
 - **两层内容闸**：输入与输出各过一遍；规则层先行，Jev 或主模型分类器补充。
-  `enforce` 命中后写 `SECURITY_HOLD`，所有 `napcat.*` 与 Download/Web/MCP 被拒绝，
-  只有 `agent.*` 自管理可用。默认 `shadow`（只记录）；启用 `enforce` 前请配好分类器
+  `enforce` 命中后写 `SECURITY_HOLD`，仅 `napcat.*` 被拒绝；Download/Web/MCP、
+  文件、记忆以及 `agent.*`/`api.*` 仍可用。默认 `shadow`（只记录）；启用 `enforce` 前请配好分类器
   或显式 `backend = "off"`。
 - **动作门禁**：`trusted` / `auto` / `approve`；`auto` 拦截速率超限、同 chat 重复、
   跨群同文与无 owner intent 的 @全体；`approve` 通过 `sbot gate` 一次性批准。

@@ -132,7 +132,7 @@ pub fn specs() -> &'static [ActionSpec] {
         specs_napcat_file(&mut list);
         specs_napcat_profile(&mut list);
         specs_agent(&mut list);
-        specs_media_local_no_napcat(&mut list);
+        specs_image(&mut list);
         specs_api(&mut list);
         list
     })
@@ -572,56 +572,60 @@ fn specs_agent(list: &mut Vec<ActionSpec>) {
     }
 }
 
-fn specs_media_local_no_napcat(list: &mut Vec<ActionSpec>) {
-    // ---- media (local, no NapCat) ----
+fn specs_image(list: &mut Vec<ActionSpec>) {
     for (action, summary, params, example) in [
         (
-            "media.image_info",
+            "image.info",
             "Inspect an image in the VFS (dimensions, format, bytes).",
             json!({"path": {"type": "string"}}),
             r#"{"path":"/tmp/a.png"}"#,
         ),
         (
-            "media.image_resize",
-            "Resize an image into the VFS to exactly width x height.",
-            json!({"path": {"type": "string"}, "out": {"type": "string"}, "width": {"type": "number"}, "height": {"type": "number"}}),
-            r#"{"path":"/tmp/a.jpg","out":"/tmp/a-small.jpg","width":640,"height":640}"#,
+            "image.transform",
+            "Crop, rotate by any angle, and/or resize an image in one pass.",
+            json!({
+                "path": {"type": "string"},
+                "out": {"type": "string"},
+                "crop": {"type": "object", "properties": {
+                    "x": {"type": "number"}, "y": {"type": "number"},
+                    "width": {"type": "number"}, "height": {"type": "number"}
+                }},
+                "rotate": {"type": "number"},
+                "width": {"type": "number"},
+                "height": {"type": "number"},
+                "max_width": {"type": "number"},
+                "max_height": {"type": "number"},
+                "quality": {"type": "number"}
+            }),
+            r#"{"path":"/tmp/a.jpg","out":"/tmp/a.png","crop":{"x":0,"y":0,"width":640,"height":640},"rotate":15,"max_width":800,"max_height":800}"#,
         ),
         (
-            "media.image_crop",
-            "Crop an image into the VFS.",
-            json!({"path": {"type": "string"}, "out": {"type": "string"}, "x": {"type": "number"}, "y": {"type": "number"}, "width": {"type": "number"}, "height": {"type": "number"}}),
-            r#"{"path":"/tmp/a.jpg","out":"/tmp/face.jpg","x":100,"y":50,"width":512,"height":512}"#,
-        ),
-        (
-            "media.image_watermark",
-            "Draw a text watermark near the bottom-right corner; font8x8 covers Latin/Greek/Hiragana, not CJK.",
-            json!({"path": {"type": "string"}, "out": {"type": "string"}, "text": {"type": "string"}}),
-            r#"{"path":"/tmp/a.jpg","out":"/tmp/wm.jpg","text":"sbot"}"#,
-        ),
-        (
-            "media.image_rotate",
-            "Rotate an image clockwise by 90/180/270 degrees.",
-            json!({"path": {"type": "string"}, "out": {"type": "string"}, "degrees": {"type": "number"}}),
-            r#"{"path":"/tmp/a.jpg","out":"/tmp/a-rot.jpg","degrees":90}"#,
-        ),
-        (
-            "media.image_thumbnail",
-            "Fit an image inside max_width x max_height, preserving aspect ratio.",
-            json!({"path": {"type": "string"}, "out": {"type": "string"}, "max_width": {"type": "number"}, "max_height": {"type": "number"}}),
-            r#"{"path":"/tmp/a.jpg","out":"/tmp/thumb.jpg","max_width":512,"max_height":512}"#,
-        ),
-        (
-            "media.image_compress",
-            "Re-encode as JPEG, PNG or WebP based on the output extension; quality (1-100) applies to JPEG.",
+            "image.convert",
+            "Re-encode as PNG, JPEG or WebP based on the output extension; quality applies to JPEG.",
             json!({"path": {"type": "string"}, "out": {"type": "string"}, "quality": {"type": "number"}}),
             r#"{"path":"/tmp/a.png","out":"/tmp/a.jpg","quality":80}"#,
         ),
         (
-            "media.image_convert",
-            "Convert an image (png/jpeg/webp) into the VFS.",
-            json!({"path": {"type": "string"}, "out": {"type": "string"}}),
-            r#"{"path":"/tmp/a.webp","out":"/tmp/a.png"}"#,
+            "image.text",
+            "Draw text on an image at any position with font, size, color and opacity.",
+            json!({
+                "path": {"type": "string"},
+                "out": {"type": "string"},
+                "text": {"type": "string"},
+                "font": {"type": "string"},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "size": {"type": "number"},
+                "color": {"type": "string"},
+                "opacity": {"type": "number"}
+            }),
+            r##"{"path":"/tmp/a.jpg","out":"/tmp/a-wm.jpg","text":"hello","font":"DejaVu Sans","x":24,"y":24,"size":48,"color":"#ffffff","opacity":0.8}"##,
+        ),
+        (
+            "image.fonts",
+            "List installed font families (paths included when available).",
+            json!({"query": {"type": "string"}, "limit": {"type": "number"}}),
+            r#"{"query":"sans","limit":20}"#,
         ),
     ] {
         list.push(ActionSpec {

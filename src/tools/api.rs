@@ -29,7 +29,7 @@ use crate::transcript::ToolResult;
 use super::{Permission, Tool, ToolContext, arg_str, object_schema};
 use crate::actions::{ActionSpec, Category, qq_number, specs};
 
-mod media;
+mod image_ops;
 mod policy;
 
 /// NapCat 网关抽象；真实实现是 [`QqClient`]，测试用 fake。
@@ -282,7 +282,7 @@ impl Tool for ApiTool {
 
         match spec.namespace() {
             "agent" => self.run_agent(spec, &params, ctx).await,
-            "media" => self.run_media(spec, &params, ctx).await,
+            "image" => self.run_image(spec, &params, ctx),
             // napcat 的策略链顺序集中在本模块的 `policy` 子模块里。
             "napcat" => self.run_napcat(spec, params, ctx).await,
             _ => ToolResult::error(format!("Unsupported namespace in {}", spec.action)),
@@ -637,7 +637,7 @@ mod tests {
         image::load_from_memory(&vfs.read_bytes(&path).unwrap()).unwrap()
     }
 
-    async fn run_media(
+    async fn run_image(
         tool: &ApiTool,
         ctx: &ToolContext,
         action: &str,
@@ -1177,252 +1177,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn media_image_info_and_resize_work() {
-        let vfs = Arc::new(
-            crate::vfs::sqlite::VfsStore::open(
-                Arc::new(crate::storage::Database::open_in_memory().unwrap()),
-                Arc::new(crate::storage::crypto::MasterKey::from_bytes([3u8; 32])),
-                tempfile::tempdir().unwrap().keep(),
-                crate::vfs::quota::Limits::default(),
-            )
-            .unwrap(),
-        );
-        let image = image::DynamicImage::new_rgb8(4, 2);
-        let mut png = std::io::Cursor::new(Vec::new());
-        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
-        let input = crate::vfs::path::VfsPath::parse("/tmp/a.png").unwrap();
-        vfs.write_binary(&input, &png.into_inner(), crate::vfs::NodeKind::Image)
-            .unwrap();
-
-        let tool = tool(None, None);
-        let ctx = ToolContext::new(Arc::clone(&vfs), None);
-        let result = tool
-            .execute(
-                &ctx,
-                json!({"action": "media.image_info", "params": {"path": "/tmp/a.png"}}),
-            )
-            .await;
-        assert!(!result.is_error, "{}", result.content);
-        let info: Value = serde_json::from_str(&result.content).unwrap();
-        assert_eq!(info["width"], 4);
-        assert_eq!(info["height"], 2);
-
-        let result = tool
-            .execute(
-                &ctx,
-                json!({
-                    "action": "media.image_resize",
-                    "params": {"path": "/tmp/a.png", "out": "/tmp/b.png", "width": 2, "height": 1}
-                }),
-            )
-            .await;
-        assert!(!result.is_error, "{}", result.content);
-        let out = crate::vfs::path::VfsPath::parse("/tmp/b.png").unwrap();
-        assert!(vfs.stat(&out).is_ok());
-
-        let result = tool
-            .execute(
-                &ctx,
-                json!({
-                    "action": "media.image_watermark",
-                    "params": {"path": "/tmp/a.png", "out": "/tmp/wm.png", "text": "sbot"}
-                }),
-            )
-            .await;
-        assert!(!result.is_error, "{}", result.content);
-        assert!(
-            vfs.stat(&crate::vfs::path::VfsPath::parse("/tmp/wm.png").unwrap())
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn media_image_compress_honors_output_extension() {
-        let vfs = media_vfs();
-        seed_image(&vfs, "/tmp/src.png", 5, 4);
-        let tool = tool(None, None);
-        let ctx = ToolContext::new(Arc::clone(&vfs), None);
-
-        for (out, expected) in [
-            ("/tmp/out.jpg", image::ImageFormat::Jpeg),
-            ("/tmp/out.jpeg", image::ImageFormat::Jpeg),
-            ("/tmp/out.png", image::ImageFormat::Png),
-            ("/tmp/out.webp", image::ImageFormat::WebP),
-        ] {
-            let result = run_media(
-                &tool,
-                &ctx,
-                "media.image_compress",
-                json!({"path": "/tmp/src.png", "out": out, "quality": 55}),
-            )
-            .await;
-            assert!(!result.is_error, "{out}: {}", result.content);
-            let value: Value = serde_json::from_str(&result.content).unwrap();
-            assert_eq!(value["quality"], 55);
-
-            let path = crate::vfs::path::VfsPath::parse(out).unwrap();
-            let bytes = vfs.read_bytes(&path).unwrap();
-            assert_eq!(value["bytes"].as_u64(), Some(bytes.len() as u64));
-            assert_eq!(image::guess_format(&bytes).unwrap(), expected, "{out}");
-            assert_eq!(image::ImageFormat::from_path(out).unwrap(), expected);
-            let decoded = image::load_from_memory(&bytes).unwrap();
-            assert_eq!((decoded.width(), decoded.height()), (5, 4), "{out}");
-        }
-    }
-
-    #[tokio::test]
-    async fn media_image_compress_rejects_unknown_output_extension() {
-        let vfs = media_vfs();
-        seed_image(&vfs, "/tmp/src.png", 2, 2);
-        let tool = tool(None, None);
-        let ctx = ToolContext::new(Arc::clone(&vfs), None);
-
-        for out in ["/tmp/out.gif", "/tmp/out.bmp", "/tmp/out.txt", "/tmp/out"] {
-            let result = run_media(
-                &tool,
-                &ctx,
-                "media.image_compress",
-                json!({"path": "/tmp/src.png", "out": out, "quality": 80}),
-            )
-            .await;
-            assert!(
-                result.is_error,
-                "{out} should be rejected: {}",
-                result.content
-            );
-            assert!(
-                result.content.contains(".png") && result.content.contains(".webp"),
-                "unclear error for {out}: {}",
-                result.content
-            );
-            let path = crate::vfs::path::VfsPath::parse(out).unwrap();
-            assert!(vfs.stat(&path).is_err(), "{out} should not be written");
-        }
-    }
-
-    #[tokio::test]
-    async fn media_tools_transform_images() {
+    async fn image_info_and_transform_work() {
         let vfs = media_vfs();
         seed_image(&vfs, "/tmp/src.png", 16, 10);
         let tool = tool(None, None);
         let ctx = ToolContext::new(Arc::clone(&vfs), None);
 
-        let result = run_media(
+        let info = run_image(&tool, &ctx, "image.info", json!({"path": "/tmp/src.png"})).await;
+        assert!(!info.is_error, "{}", info.content);
+        let value: Value = serde_json::from_str(&info.content).unwrap();
+        assert_eq!(value["width"], 16);
+        assert_eq!(value["height"], 10);
+
+        let result = run_image(
             &tool,
             &ctx,
-            "media.image_resize",
+            "image.transform",
+            json!({
+                "path": "/tmp/src.png",
+                "out": "/tmp/rotated.png",
+                "crop": {"x": 2, "y": 1, "width": 10, "height": 8},
+                "rotate": 45.0,
+                "max_width": 20,
+                "max_height": 20
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        let rotated = load_output(&vfs, "/tmp/rotated.png");
+        assert!(rotated.width() > 0 && rotated.height() > 0);
+
+        let result = run_image(
+            &tool,
+            &ctx,
+            "image.transform",
             json!({"path": "/tmp/src.png", "out": "/tmp/resized.png", "width": 8, "height": 5}),
         )
         .await;
         assert!(!result.is_error, "{}", result.content);
         assert_eq!(load_output(&vfs, "/tmp/resized.png").dimensions(), (8, 5));
 
-        let result = run_media(
+        let empty = run_image(
             &tool,
             &ctx,
-            "media.image_crop",
-            json!({
-                "path": "/tmp/src.png", "out": "/tmp/cropped.png",
-                "x": 2, "y": 1, "width": 4, "height": 4
-            }),
+            "image.transform",
+            json!({"path": "/tmp/src.png", "out": "/tmp/noop.png"}),
         )
         .await;
-        assert!(!result.is_error, "{}", result.content);
-        assert_eq!(load_output(&vfs, "/tmp/cropped.png").dimensions(), (4, 4));
-
-        let result = run_media(
-            &tool,
-            &ctx,
-            "media.image_rotate",
-            json!({"path": "/tmp/src.png", "out": "/tmp/rotated.png", "degrees": 90}),
-        )
-        .await;
-        assert!(!result.is_error, "{}", result.content);
-        assert_eq!(load_output(&vfs, "/tmp/rotated.png").dimensions(), (10, 16));
-
-        let result = run_media(
-            &tool,
-            &ctx,
-            "media.image_thumbnail",
-            json!({
-                "path": "/tmp/src.png", "out": "/tmp/thumb.png",
-                "max_width": 4, "max_height": 4
-            }),
-        )
-        .await;
-        assert!(!result.is_error, "{}", result.content);
-        assert_eq!(load_output(&vfs, "/tmp/thumb.png").dimensions(), (4, 3));
-
-        let result = run_media(
-            &tool,
-            &ctx,
-            "media.image_convert",
-            json!({"path": "/tmp/src.png", "out": "/tmp/converted.jpg"}),
-        )
-        .await;
-        assert!(!result.is_error, "{}", result.content);
-        assert_eq!(
-            load_output(&vfs, "/tmp/converted.jpg").dimensions(),
-            (16, 10)
-        );
-        let converted = crate::vfs::path::VfsPath::parse("/tmp/converted.jpg").unwrap();
-        assert_eq!(
-            image::guess_format(&vfs.read_bytes(&converted).unwrap()).unwrap(),
-            image::ImageFormat::Jpeg
-        );
-
-        let result = run_media(
-            &tool,
-            &ctx,
-            "media.image_watermark",
-            json!({"path": "/tmp/src.png", "out": "/tmp/watermarked.png", "text": "sbot"}),
-        )
-        .await;
-        assert!(!result.is_error, "{}", result.content);
-        let watermarked = load_output(&vfs, "/tmp/watermarked.png");
-        assert_eq!(watermarked.dimensions(), (16, 10));
-        let source = load_output(&vfs, "/tmp/src.png").to_rgba8();
-        let watermarked = watermarked.to_rgba8();
-        assert!(
-            source
-                .pixels()
-                .zip(watermarked.pixels())
-                .any(|(before, after)| before != after),
-            "watermark did not change any pixel"
-        );
+        assert!(empty.is_error);
+        assert!(empty.content.contains("no transform"), "{}", empty.content);
     }
 
     #[tokio::test]
-    async fn watermark_renders_unicode_and_rejects_unknown_glyphs() {
+    async fn image_convert_honors_output_extension() {
         let vfs = media_vfs();
-        seed_image(&vfs, "/tmp/src.png", 40, 16);
+        seed_image(&vfs, "/tmp/src.png", 6, 4);
+        let tool = tool(None, None);
+        let ctx = ToolContext::new(Arc::clone(&vfs), None);
+        for (out, expected) in [
+            ("/tmp/out.png", image::ImageFormat::Png),
+            ("/tmp/out.jpg", image::ImageFormat::Jpeg),
+            ("/tmp/out.webp", image::ImageFormat::WebP),
+        ] {
+            let result = run_image(
+                &tool,
+                &ctx,
+                "image.convert",
+                json!({"path": "/tmp/src.png", "out": out, "quality": 70}),
+            )
+            .await;
+            assert!(!result.is_error, "{}", result.content);
+            let path = crate::vfs::path::VfsPath::parse(out).unwrap();
+            let bytes = vfs.read_bytes(&path).unwrap();
+            assert_eq!(image::guess_format(&bytes).unwrap(), expected, "{out}");
+        }
+        let bad = run_image(
+            &tool,
+            &ctx,
+            "image.convert",
+            json!({"path": "/tmp/src.png", "out": "/tmp/out.gif"}),
+        )
+        .await;
+        assert!(bad.is_error);
+        assert!(bad.content.contains(".png"), "{}", bad.content);
+    }
+
+    #[tokio::test]
+    async fn image_text_and_fonts_work() {
+        let vfs = media_vfs();
+        seed_image(&vfs, "/tmp/src.png", 48, 24);
         let tool = tool(None, None);
         let ctx = ToolContext::new(Arc::clone(&vfs), None);
 
-        let result = run_media(
-            &tool,
-            &ctx,
-            "media.image_watermark",
-            json!({"path": "/tmp/src.png", "out": "/tmp/unicode.png", "text": "café α"}),
-        )
-        .await;
-        assert!(!result.is_error, "{}", result.content);
-        let source = load_output(&vfs, "/tmp/src.png").to_rgba8();
-        let marked = load_output(&vfs, "/tmp/unicode.png").to_rgba8();
-        assert!(
-            source.pixels().zip(marked.pixels()).any(|(a, b)| a != b),
-            "unicode watermark did not change any pixel"
-        );
+        let fonts = run_image(&tool, &ctx, "image.fonts", json!({"limit": 5})).await;
+        assert!(!fonts.is_error, "{}", fonts.content);
+        let value: Value = serde_json::from_str(&fonts.content).unwrap();
+        let count = value["count"].as_u64().unwrap_or(0);
 
-        let result = run_media(
+        if count > 0 {
+            let family = value["fonts"][0]["family"].as_str().unwrap().to_owned();
+            let result = run_image(
+                &tool,
+                &ctx,
+                "image.text",
+                json!({
+                    "path": "/tmp/src.png", "out": "/tmp/text.png", "text": "Hi 42",
+                    "font": family, "x": 2, "y": 2, "size": 14,
+                    "color": "#ff0000", "opacity": 0.8
+                }),
+            )
+            .await;
+            assert!(!result.is_error, "{}", result.content);
+            let source = load_output(&vfs, "/tmp/src.png").to_rgba8();
+            let marked = load_output(&vfs, "/tmp/text.png").to_rgba8();
+            assert!(
+                source.pixels().zip(marked.pixels()).any(|(a, b)| a != b),
+                "text did not change any pixel"
+            );
+        } else {
+            let result = run_image(
+                &tool,
+                &ctx,
+                "image.text",
+                json!({"path": "/tmp/src.png", "out": "/tmp/text.png", "text": "Hi"}),
+            )
+            .await;
+            assert!(result.is_error);
+            assert!(result.content.contains("font"), "{}", result.content);
+        }
+
+        let bad = run_image(
             &tool,
             &ctx,
-            "media.image_watermark",
-            json!({"path": "/tmp/src.png", "out": "/tmp/cjk.png", "text": "你好"}),
+            "image.text",
+            json!({"path": "/tmp/src.png", "out": "/tmp/text.png", "text": "x", "color": "red"}),
         )
         .await;
-        assert!(result.is_error);
-        assert!(result.content.contains("font8x8"), "{}", result.content);
+        assert!(bad.is_error);
+        assert!(bad.content.contains("RRGGBB"), "{}", bad.content);
     }
 
     #[tokio::test]

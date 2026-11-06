@@ -26,7 +26,7 @@
 - 连续 tool 结果合并为一个 user 消息，图片排在全部 tool_result 之后。
 - 补 GIF/BMP 解码；MCP image-only 结果不再把 base64 复制进正文。
 - `get_image` 支持返回 base64；API 响应中的 base64/image 自动转图片附件。
-- `media.image_compress` 按输出扩展名编码为 JPEG/PNG/WebP，未知扩展名报错；WebP 为无损编码，quality 只作用于 JPEG。
+- `image.convert` 按输出扩展名编码为 JPEG/PNG/WebP，未知扩展名报错；WebP 为无损编码，quality 只作用于 JPEG。
 - 回合 early-return 前排空 local SteeringQueue；关闭 receiver 让晚到消息回填 ChatQueue。
 - API base64/image 响应重新接入图片附件；User 图片计入 token 估算与裁剪。
 - 自动入站图片按模型 `input`/`vision` 门控。
@@ -36,18 +36,18 @@
 ### 重构与结构
 
 - 单会话化：删除 `[session].scope`、`SessionScope`、`ScopeCache` 与 `SessionStore.scope`；运行时只有一条 transcript，由单个 `turn_lock` 串行。
-- `app.rs` 拆为 `app/{mod,assembly,events,bootstrap}.rs`；`config/sections.rs` 拆为 19 个 section；`runner.rs` 拆出 `scope/compaction/review/injected/images/evidence/ops`；`MessageStore` 拆出 `codec/index/outbox/retention`；`ApiTool` 拆出 `policy/media`；`VfsStore` 拆出 `codec/tree`。
+- `app.rs` 拆为 `app/{mod,assembly,events,bootstrap}.rs`；`config/sections.rs` 拆为 19 个 section；`runner.rs` 拆出 `scope/compaction/review/injected/images/evidence/ops`；`MessageStore` 拆出 `codec/index/outbox/retention`；`ApiTool` 拆出 `policy/image_ops`；`VfsStore` 拆出 `codec/tree`。
 - 模块 2-循环清零：`ExecutionMode`/`ToolExecutor` 归 `tools`，消息与证据归 `transcript`，`ProviderSlot` 归 `providers`，action 元数据归 crate 根 `actions`。
 - `Runner` 字段 25→15（`RunnerDeps`）；`run_turn` 拆为 `drive_turn`/`commit_turn`。
 - provider 外壳合并为 `HttpProviderCore` + 泛型 `pump`；5 份单轮补全合并为 `providers::complete_text`。
 - `hold` 只拒绝 QQ 操作（`napcat.*`）；MCP、下载、Web 与本地工具不再受 hold 影响。
 - 公开面收缩：7 个内部模块改 `pub(crate)`，全仓 `pub fn` 381→246。
 - `actions` 注册表按 namespace 拆为 9 个 helper，`Box::leak` 清零。
-- 水印支持 font8x8 的 Unicode 字库（拉丁/希腊/平假名等）；CJK 仍无字形。
+- 图片工具收敛为 `image.*`：`info`、`transform`（裁剪/任意角度旋转/缩放/缩略）、`convert`、`text`、`fonts`；文字/字体来自系统字体库（fontdb + imageproc），不内置字体。
 
 ### 测试
 
-- `cargo test --all-targets`：379 项通过（367 lib + 12 integration），2 ignored；`cargo fmt --check`、`clippy -D warnings` 通过。
+- `cargo test --all-targets`：377 项通过（365 lib + 12 integration），2 ignored；`cargo fmt --check`、`clippy -D warnings` 通过。
 
 ## [0.2.0-alpha.34] - 2026-11-04
 

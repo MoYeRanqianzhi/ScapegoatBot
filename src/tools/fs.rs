@@ -116,7 +116,7 @@ impl Tool for ReadTool {
                 "image/png" | "image/jpeg" | "image/gif" | "image/webp"
             ) {
                 return ToolResult::ok(format!(
-                    "Image {} ({} bytes, {mime}); unsupported for vision. Convert it with media.image_convert first.",
+                    "Image {} ({} bytes, {mime}); unsupported for vision. Convert it with image.convert first.",
                     target.path,
                     bytes.len()
                 ));

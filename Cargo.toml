@@ -64,6 +64,9 @@ base64 = "0.22"
 hex = "0.4"
 # VFS 路径的 Unicode NFC 规范化（设计 §6.3）。
 unicode-normalization = "0.1"
+imageproc = "0.27.0"
+fontdb = "0.24.0"
+ab_glyph = "0.2.32"
 # Unix 域套接字权限、Windows 管道 DACL 需要平台 API。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
