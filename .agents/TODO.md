@@ -1,79 +1,78 @@
 # TODO
 
-剩余问题；已完成项删除（git 有记录）。
+剩余问题；已完成项删除（git 有记录）。当前交接计划见
+`plan/2026-11-06-image-tools-and-review-handoff.md`。
 
 ## 构建规则
 
 - 子代理禁止运行任何 `cargo` 命令；构建只在主 checkout 用默认 `target/` 统一执行。
 - 不使用 C: 盘放构建产物；G: 空间不足时先清 worktree target / incremental，再报告。
+- 本机 cargo 访问 crates.io 的 TLS/schannel 失败；需要拉依赖时用交接计划 §5 的 rsproxy
+  `--config` 命令，不要把镜像配置提交进仓库。
 
-## P1
+## 当前基线
 
-- [x] `execute` 前置早退丢 steering 消息：外层 close + 排空 + 落库，已加回归测试（c0fc680）。
-- [x] 并发只作用于子代理（`[swarm].max_concurrency`）；主代理不加全局并发上限，
-      已回滚共享 turn limiter（13aaebf），主代理回合仍由 session turn_lock 串行。
-- [x] `control_slots` 已删除（runner-ops 重构），控制通道只保留 `ai_enabled` 检查。
-- [x] per_chat 已彻底删除：`[session]` 配置、`SessionScope`、`ScopeCache`、`SessionStore.scope`/`for_scope`（2f2948c）。
+- HEAD `48fe69f`；`cargo test --locked --all-targets` = 377 passed（365 lib + 12 integration），
+  2 ignored；clippy/fmt 通过。
+- 本地 tag `v0.2.0-alpha.35` 落后 HEAD 3 个提交；尚未 push/release/deploy。
+- 服务器 `hw1` 的 `sbot.service` 仍停止；NapCat 未登录（QR 登录失败）。
 
-## transcript
+## 待用户确认
 
-- [x] AAD 行号恢复上限 4096 已去掉，改为按文件行数扫描（279eedc）；位置完整性仍待签名/链式方案。
-- [x] 已补 >4096 偏移恢复、并发 append/read/rotate、wrong-key 测试。
+- [ ] 审核新的 `image.*` 5 个 action（`info`/`transform`/`convert`/`text`/`fonts`）的命名与参数；
+      确认前不要继续扩展图片 API。完整表见交接计划 §2。
+- [ ] 是否授权 `git push origin main --tags`、GitHub release、部署 hw1。
 
 ## 图片
 
-- [ ] 真实 `get_image` 契约未实测：2026-11-06 直连验证时发现 NapCat 已退出登录（11-05 05:22 起持续 QR 登录失败），WS 握手被 reset；需用户扫码登录后重试。
-- [x] 转发/回复引用图片自动解析（get_msg/get_forward_msg；每批最多 4 次引用查询，JSON 递归深度上限 16；47e4260、bdfb59d）。
-- [x] control/monitor 注入回合本身没有图片片段，图片注入不适用（非缺陷）。
-- [x] `media.image_watermark` 支持 font8x8 的 Unicode 字库（拉丁/希腊/平假名等）；CJK 仍无字形（需字体文件）。
-- [x] `media.image_compress` 支持 JPEG/PNG/WebP（14f6a31）；WebP 仅无损，quality 只作用于 JPEG。
-- [x] 已补 media 各动作测试；provider `image_url` 序列化已有覆盖。
-- [x] MCP 图片压缩已补端到端测试（`call_tool` → `ToolResult.images`，373 测试）。
-- [x] inbound resolver 的 URL 白名单/mime helper、User image estimate/prune 已有测试（949ec46）。
-- [ ] `inbound_image_prompts` 的真实 HTTP 下载（QQ CDN）仍未测；需 NapCat 登录后的图片消息。
+- [ ] 真实 `get_image` 契约未实测：NapCat 从 2026-11-05 05:22 起退出登录，WS 握手 reset；
+      需用户扫码登录后重试。
+- [ ] `inbound_image_prompts` 的真实 HTTP 下载（QQ CDN）未测；需登录后的图片消息。
+- [ ] `image.text`/`image.fonts` 只在 Windows（有系统字体）上验证过；Linux 服务器无字体，
+      需在安装字体后再验证，或接受“返回空列表/明确错误”的行为。
+- [ ] 不在仓库内置字体，也不引入字体资产；`image.text` 只使用系统字体（用户明确要求）。
 
-## 结构
+## 结构（按交接计划 §3.1/§3.2 执行）
 
-- [x] `src/app.rs` 拆为 `src/app/{mod,assembly,events,bootstrap}.rs`（45155bd）。
-- [x] `src/agent/runner.rs` 已拆为 `runner/{scope,compaction,review,injected,images,evidence}.rs`（7de8177），
-      `runner.rs` 从 3229 行降到 2295 行。
-- [x] `src/config/sections.rs` 已拆为 `src/config/sections/` 19 个 section 文件（e0a4121）。
+- [ ] `app/assembly.rs`（1017 生产行）拆分：`open_stores`、`assemble_tools`、`build_agent`、
+      hot reload；拆前先补装配层测试。
+- [ ] `agent/runner.rs`：`loop_config`/`run_subagent` 重复、预算跳过图片持久化重复、
+      跳过检查与 `injected.rs` 重复、重复 `debug!("turn completed")`、`commit_turn` 参数对象化。
+- [ ] `agent/loop.rs`：`run_with_steering`（244 行）提取预算/输入闸/请求/输出闸/终止分支；
+      stream/render 逻辑移出。
+- [ ] `monitor/mod.rs`：拆 predicate/cron/delivery/config；`Monitor` 23 字段分组。
+- [ ] `vfs/sqlite.rs`：`edit_text`/`read` 委托、usage SQL、`write_blob_tx`、
+      `copy_node` staging 漂移。
+- [ ] `tools/api/policy.rs`：`run_napcat` 223 行按顺序拆 guard 阶段，保留顺序测试。
+- [ ] 冗余：Monitor spec 解析（约 110–130 行）、图片 mime/压缩/附件 helper（45–55 行）、
+      provider `finish`（25–30 行）、session/messages 信封与写模式（50–60 行）、
+      `complete_text` 错误映射、`self_message_from_params`/`parse_segment`、
+      at/timer 解析、config JSON 读取。
+- [ ] 断裂空格错误串：`policy.rs:92/112/125/231`、`action_gate.rs:663/680/706`、
+      `web.rs:345/351`、`assembly.rs:416`；加 grep 级检查。
+- [ ] 8 个零引用 `pub fn` 删除或补文档；`prompt/mod.rs:37` 的 `Box::leak` 视情况改 `OnceLock`。
 
-## P2 / 发布
+## 文档
 
-- [x] `queue.cap_batches` 已删除（d807e4c）。
-- [x] `agent.compact` 支持可选 `chat` 参数（2608061）。
-- [x] 本地 tag `v0.2.0-alpha.35` 已创建；CHANGELOG 更新到 372 测试；本地 `cargo build --release` 通过（12 MB，`sbot --version` 正确）。
-- [x] `RUSTDOCFLAGS=-D warnings cargo doc --no-deps` 通过（修复 3 处 intra-doc 链接，86ad96d）。
+- [ ] `docs/development/prompt-maintenance.md:59` 与 `docs/guide/tools-and-vfs.md:82` 的
+      “来源门控/唯一写入口”承诺未实现；删除承诺或实现 `/MEMORY.md` 写保护与 source 过滤。
+- [ ] `sbot status` 文档按实际 JSON 重写（`README.md:109`、`docs/guide/usage.md:12/30-34`）。
+- [ ] 默认值/热更新：`configuration.md:44`（max_steps 64）、`:48`（retry_max_ms 30000）、
+      `usage.md:106` 与 `configuration.md:82`（filter+queue）统一。
+- [ ] `security.md:211` 与 `limits.md:21` 的周期检查前缀描述统一为“复用 system 前缀”。
+- [ ] `docs/development/README.md:30` v1–v12、`:47` 删除 ScopeCache 先例、`:41` 补 `stream`；
+      `README.md:183` 目录树改 `app/`。
+- [ ] `config.example.toml:45` compaction_model 说明改为“非空时用于压缩摘要”；
+      `docs/guide/README.md:18` 工具数、`:64-65` 残缺句子。
+- [ ] 源码注释：`tools/mod.rs:8-9` Permission、`swarm/mod.rs:9` 单层、`hooks.rs:3-5`、
+      `prompt/mod.rs:31`、`config/mod.rs:112`、`tools/api.rs:5/220` 命名空间数量、
+      `agent.compact chat` 语义、`runner.rs:158`、`turn_buffer.rs:65-66`。
+- [ ] `.agents/plan/refactor-2.md` 标记 superseded（tag/per_chat/resync/control_slots 已过期）。
+
+## 发布 / 外部
+
 - [ ] push tag / GitHub release / 服务器部署需用户确认；服务器 `sbot.service` 仍停止。
+- [ ] 发布前重指 `v0.2.0-alpha.35` 到最终 HEAD，重跑 release build；
+      release build 上次验证早于 image 依赖与 `48fe69f`。
 - [ ] 历史重写后其他 clone 必须重新 clone 或
       `git fetch --all --prune --tags --force && git reset --hard origin/main`；旧 SHA 失效。
-
-## 架构审查（ba81e80）
-
-- [x] ActionGate note_send 只保留 120s，导致 1h/10min 规则失效；改为保留 3600s（已修）。
-- [x] TurnBuffer `Committing` 恢复：open_turns 纳入 committing，按已写前缀去重后补写（ce5971d）。
-- [x] MessageStore 读路径：按文件批量解码，load_indexed/rebuild_index 不再逐行重读（本次）。
-- [x] transcript 恢复上界改用 message_count；扫描候选改为物理位置 ±64 优先、每行上限 128（本次）。
-- [x] steering 早退落库只写 transcript，由 pending_history 注入一次（8f92843）。
-- [x] provider `HttpProviderCore`/`pump` 外壳合并；5 份 `complete_text`/`truncate_chars` 合并（e41f5a8）。
-- [x] monitor lookup/rate_limit/system_delivery 三组复制已收敛（5b4ca65）。
-- [x] session/messages 加密信封已抽 `storage/envelope.rs`（6d48111）。
-- [x] `build_agent` 18 参改 `AgentInputs`；`MonitorManager::add` 16 参改 `MonitorSpec`（16e97b8/44e7f6e）。
-- [x] providers→agent 循环依赖已解：`Usage/StopReason/RefusalDetails` 移到 `src/llm/types.rs`（2a0f851）。
-- [x] 已解：providers→agent、session→agent、security→agent、swarm→agent（消息模型/证据移到 `src/transcript.rs`）。
-- [x] 已解：agent↔tools（`ExecutionMode`/`ToolExecutor` 移到 `tools`，`hooks` 移到 crate 根）。
-- [x] 已解：agent↔memory（`ProviderSlot` 移到 `providers`，memory 用 `QueueActivity` 注入队列活跃度）。
-- [x] 已解：security↔tools（action 元数据移到 crate 根 `actions`，`chat_of`/`qq_number` 随迁）。
-- [x] 所有模块 2-循环已清零。
-- [x] ApiTool `execute` 拆出 `api/policy.rs`、媒体拆出 `api/media.rs`；VfsStore 拆出 `sqlite/{codec,tree}.rs`（2608061/1f0106d）。
-- [x] `actions.rs` 已按 namespace 拆成 9 个 helper；Box::leak 清零（15757a1、7026425）。
-- [x] `run_turn` 已拆为 `drive_turn`/`commit_turn`（155+83 行）。
-- [x] MessageStore 已拆为 `messages/{codec,index,outbox,retention}.rs`（960 行主文件）。
-- [x] Runner 的 9 个存储/运行时字段收进 `RunnerDeps`，字段数 25→15（22ea723）。
-- [x] 内部模块 `ipc/mcp/monitor/paths/prompt/transcript/llm` 改为 `pub(crate)`（ed88080）。
-- [x] storage/session 的 `pub fn` 已降为 `pub(crate)`，全仓 `pub fn` 381→332（48ed2b2）。
-- [x] agent/security 方法已降为 `pub(crate)`，只为外部测试保留 `ActionGate/ApprovalQueue/JevJudge` 构造器；全仓 `pub fn` 332→287（0eedbca）。
-- [x] `tools` 方法已降为 `pub(crate)`，只为集成测试保留 `ApiTool::new/with_action_gate`、`ToolContext::new`；全仓 `pub fn` 287→246（5ce2684）。
-- [x] `#[allow(dead_code)]` 清零（10→0），删除 `Secret::raw` 与 `SbotPaths` 四个未用路径 helper（6b3ed9c）。
-- [x] hold 语义修正：只拒绝 QQ 操作（`napcat.*`），MCP/下载/Web 不再被 hold 拦截（d21eed4）。
