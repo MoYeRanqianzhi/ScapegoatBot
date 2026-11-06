@@ -5,10 +5,10 @@ Worktree: `G:/ClaudeProjects/ScapegoatBot/ScapegoatBot` (main checkout; do not b
 
 ## 1. Current state (verified)
 
-- HEAD: `48fe69f feat: replace media tools with image transform text and fonts`.
+- HEAD: `9f52e00`（交接文档；图片功能代码在 `48fe69f`）。
 - Tests: `cargo test --locked --all-targets` = **377 passed** (365 lib + 12 integration), 2 ignored, 0 failed.
 - `cargo clippy --locked --all-targets -- -D warnings` and `cargo fmt --all` pass at this commit.
-- Tag `v0.2.0-alpha.35` exists but is **behind HEAD** (`git describe` = `v0.2.0-alpha.35-3-g48fe69f`). Do not publish it as-is; re-point after the next accepted change.
+- Tag `v0.2.0-alpha.35` exists but is **behind HEAD** (`git describe` = `v0.2.0-alpha.35-4-g9f52e00`). Do not publish it as-is; re-point after the next accepted change.
 - Release build was last verified **before** the image tool rewrite and before the new `imageproc/fontdb/ab_glyph` dependencies; the current HEAD has not had `cargo build --release`.
 - Server `hw1` `sbot.service` is stopped. Nothing has been pushed, tagged remotely, released, or deployed.
 - NapCat is **logged out** (QR login loop since 2026-11-05 05:22, `Login Error ErrType:1 ErrCode:3`). `get_image`, QQ CDN download, `get_msg`/`get_forward_msg` live paths remain unverified.

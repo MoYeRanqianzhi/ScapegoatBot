@@ -8,12 +8,12 @@ metadata:
   last_verified: 2026-11-06
 ---
 
-当前版本：`0.2.0-alpha.35`（`main`，HEAD `48fe69f`）。数据库迁移到 v12；
+当前版本：`0.2.0-alpha.35`（`main`，HEAD `9f52e00`，图片功能代码 `48fe69f`）。数据库迁移到 v12；
 `cargo test --locked --all-targets` = 377 passed（365 lib + 12 integration），2 ignored；
 clippy/fmt 通过。CI 已接入 GitHub Actions。
 
-发布状态：本地 annotated tag `v0.2.0-alpha.35` 存在，但落后 HEAD 3 个提交
-（`git describe` = `v0.2.0-alpha.35-3-g48fe69f`）；尚未 push/release/deploy。
+发布状态：本地 annotated tag `v0.2.0-alpha.35` 存在，但落后 HEAD 4 个提交
+（`git describe` = `v0.2.0-alpha.35-4-g9f52e00`）；尚未 push/release/deploy。
 release build 上次验证在 image 依赖与新图片工具之前，当前 HEAD 未重跑
 `cargo build --release`。服务器 `hw1` 的 `sbot.service` 已停止。
 
