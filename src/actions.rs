@@ -595,7 +595,7 @@ fn specs_media_local_no_napcat(list: &mut Vec<ActionSpec>) {
         ),
         (
             "media.image_watermark",
-            "Draw an ASCII text watermark near the bottom-right corner.",
+            "Draw a text watermark near the bottom-right corner; font8x8 covers Latin/Greek/Hiragana, not CJK.",
             json!({"path": {"type": "string"}, "out": {"type": "string"}, "text": {"type": "string"}}),
             r#"{"path":"/tmp/a.jpg","out":"/tmp/wm.jpg","text":"sbot"}"#,
         ),
