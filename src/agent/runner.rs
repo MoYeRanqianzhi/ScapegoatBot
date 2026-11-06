@@ -18,7 +18,7 @@ use anyhow::Result;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, warn};
 
-use crate::agent::queue::{TurnHandler, TurnInput};
+use crate::agent::queue::{TurnHandler, TurnInput, TurnReport};
 use crate::agent::{
     AgentEvent, AgentLoop, AgentMessage, FallbackProvider, LoopConfig, LoopOutcome, SteeringQueue,
     TurnEvidence,
@@ -496,35 +496,35 @@ impl Runner {
         &self,
         input: TurnInput,
         mut steering_rx: mpsc::UnboundedReceiver<AgentMessage>,
-    ) -> Result<()> {
-        let chat = input.chat;
-        let result = self.run_turn(input, &mut steering_rx).await;
+    ) -> TurnReport {
+        let mut unanswered = 0usize;
+        let result = self
+            .run_turn(input, &mut steering_rx, &mut unanswered)
+            .await;
 
-        // 先关闭再排空：关闭后 `send` 会失败，`ChatQueue::ingest` 据此把消息回填
-        // pending；已缓冲的消息仍可从 receiver 取出。排空用 `recv().await` 而不是
-        // `try_recv()`：tokio 保证 `close()` 后 `recv()` 返回 `None` 时所有被接受的
-        // 发送都已落进缓冲，`try_recv()` 则可能撞上尚未完成的 `send`。
+        // 关闭后 `send` 会失败，`ChatQueue::ingest` 据此把之后的消息留在 pending。
+        // 正常结束时 `drive_turn` 已经关闭并排空过；这里兜底的是回合被跳过（开关、
+        // 急停、暂停、预算）或提前出错的路径。剩下的消息都没有得到回应，交还队列。
+        // 排空用 `recv().await`：tokio 保证 `close()` 后 `recv()` 返回 `None` 时，
+        // 所有被接受的发送都已落进缓冲。
         steering_rx.close();
-        let mut leftover = Vec::new();
-        while let Some(message) = steering_rx.recv().await {
-            leftover.push(message);
+        while steering_rx.recv().await.is_some() {
+            unanswered += 1;
         }
-        if !leftover.is_empty() {
-            let turn_lock = self.turn_lock_for(chat).await;
-            let _turn_guard = turn_lock.lock().await;
-            let sessions = self.session_for(chat).await;
-            // 只写 transcript：下一回合的 pending_history 会把“上次回复以来”的消息
-            // 作为上下文注入，若这里同时写 history，同一文本会出现两遍。
-            sessions.append(&leftover)?;
+        TurnReport {
+            error: result.err(),
+            unanswered,
         }
-        result
     }
 
     /// 回合主体：前置检查、模型循环与提交都在这里。
+    ///
+    /// `unanswered` 返回经 steering 送进来、但本回合没有回应的消息条数。
     async fn run_turn(
         &self,
         input: TurnInput,
         steering_rx: &mut mpsc::UnboundedReceiver<AgentMessage>,
+        unanswered: &mut usize,
     ) -> Result<()> {
         // `sbot ai stop` 与 `ESTOP` 都只暂停新回合；消息已经入库，下一回合可见。
         if !self
@@ -664,9 +664,10 @@ impl Runner {
         prompts.extend(image_prompts);
 
         let prompt_tokens = crate::session::compaction::estimate_messages(&prompts);
-        let outcome = self
+        let (outcome, not_answered) = self
             .drive_turn(chat, &mut working, prompts, evidence, steering_rx)
             .await;
+        *unanswered = not_answered;
         self.commit_turn(
             chat,
             &turn_id,
@@ -680,7 +681,9 @@ impl Runner {
         )
         .await
     }
-    /// 跑模型循环，并把本回合产生的新块与 steering 消息并入 `working`。
+    /// 跑模型循环，把本回合产生的新块并入 `working`。
+    ///
+    /// 返回循环结果与“经 steering 送进来、但没有回应”的消息条数。
     async fn drive_turn(
         &self,
         chat: ChatId,
@@ -688,7 +691,7 @@ impl Runner {
         prompts: Vec<AgentMessage>,
         evidence: TurnEvidence,
         steering_rx: &mut mpsc::UnboundedReceiver<AgentMessage>,
-    ) -> LoopOutcome {
+    ) -> (LoopOutcome, usize) {
         // 4) 运行循环。工具执行器带上本回合证据。
         let slot = self.provider_snapshot();
         let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {
@@ -726,6 +729,20 @@ impl Runner {
                 &events_tx,
             )
             .await;
+
+        // 模型循环一结束就关闭 steering。之后的 Stop hook、提交、周期审查与已读标记
+        // 可能要好几秒；这期间到达的消息 `send` 会失败，由队列留在 pending、回合结束后
+        // 再开一轮，而不是“送进来了却没人回”。
+        steering_rx.close();
+        let mut unanswered = 0usize;
+        while steering_rx.recv().await.is_some() {
+            unanswered += 1;
+        }
+        // 提前结束（出错、超限、被闸拦下）时，循环已经取出、但还没进入上下文的消息也
+        // 没有回应。两部分都是最后送进来的一段：不写进本回合，交还队列重新排队，
+        // 下一轮按正常输入处理（带它自己的证据）。
+        unanswered += steering.drain().len();
+
         drop(events_tx);
         let _ = logger.await;
         if let Some(budget) = &self.config.budget {
@@ -744,22 +761,10 @@ impl Runner {
             crate::agent::hooks::injected(&self.config.event_hooks, crate::config::HookEvent::Stop)
         {
             working.push(AgentMessage::System {
-                text: format!(
-                    "[hook context | Stop]
-{text}"
-                ),
+                text: format!("[hook context | Stop]\n{text}"),
             });
         }
-
-        // 把 local SteeringQueue（early return 时已取出的消息）与 channel 已到达的
-        // 消息一并并入本回合；receiver 由外层关闭并排空，这里不关闭，避免重复处理。
-        for message in steering.drain() {
-            working.push(message);
-        }
-        while let Ok(message) = steering_rx.try_recv() {
-            working.push(message);
-        }
-        outcome
+        (outcome, unanswered)
     }
 
     /// 提交本回合新块：buffer → transcript → 共享历史，并跑周期检查。
@@ -821,7 +826,7 @@ impl TurnHandler for Runner {
         &self,
         input: TurnInput,
         steering: mpsc::UnboundedReceiver<AgentMessage>,
-    ) -> Result<()> {
+    ) -> TurnReport {
         self.execute(input, steering).await
     }
 }
@@ -1221,7 +1226,7 @@ mod tests {
                 rx,
             )
             .await
-            .unwrap();
+            .expect_ok();
 
         // 工具真的调用了网关。锁必须在一个块里释放，后面还有 await。
         {
@@ -1384,7 +1389,7 @@ mod tests {
                 rx,
             )
             .await
-            .unwrap();
+            .expect_ok();
         // 回合被跳过：没有 assistant 块。
         let current = runner.deps.sessions.current().unwrap();
         let transcript = runner.deps.sessions.read_segment(&current.file).unwrap();
@@ -1398,7 +1403,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paused_turn_keeps_steering_messages() {
+    async fn paused_turn_returns_steering_messages_to_the_queue() {
         let (runner, gate, _dir) = runner_with(None, Vec::new(), 120_000, 20_000).await;
         gate.pause_agent("test pause");
         assert!(gate.agent_paused());
@@ -1407,7 +1412,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         tx.send(AgentMessage::user("[Alice] steering survives"))
             .unwrap();
-        runner
+        let unanswered = runner
             .handle(
                 TurnInput {
                     chat,
@@ -1417,21 +1422,20 @@ mod tests {
                 rx,
             )
             .await
-            .unwrap();
+            .expect_ok();
 
+        // 被跳过的回合不回应 steering 消息：交还队列重新排队，自己什么都不写。
+        assert_eq!(unanswered, 1);
         let sessions = runner.session_for(chat).await;
         let current = sessions.current().unwrap();
         let transcript = sessions.read_segment(&current.file).unwrap();
         assert!(
-            transcript.iter().any(|message| matches!(
+            !transcript.iter().any(|message| matches!(
                 message,
                 AgentMessage::User { text, .. } if text.contains("steering survives")
             )),
-            "steering message missing from transcript: {transcript:?}"
+            "a skipped turn must not write the steering message: {transcript:?}"
         );
-
-        // 只落 transcript；下一回合由 pending_history 注入，避免同一文本在
-        // history 与 [chat history since your last reply] 里出现两遍。
         let history = runner.history_for(chat).await;
         let history = history.lock().await;
         assert!(
@@ -1439,7 +1443,94 @@ mod tests {
                 message,
                 AgentMessage::User { text, .. } if text.contains("steering survives")
             )),
-            "steering message must not be duplicated into history: {history:?}"
+            "a skipped turn must not add the steering message to history: {history:?}"
+        );
+    }
+
+    /// 回合正常结束后才到的 steering 消息不能被“收下却不回应”：
+    /// 模型循环一结束 steering 就关闭，之后的发送失败、留在队列里。
+    #[tokio::test]
+    async fn steering_closes_as_soon_as_the_model_loop_ends() {
+        let (runner, _gate, _dir) = runner_with(
+            None,
+            vec![vec![
+                ProviderEvent::TextDelta("ok".to_owned()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    refusal: None,
+                },
+            ]],
+            120_000,
+            20_000,
+        )
+        .await;
+        let chat = ChatId::Group(1);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let unanswered = runner
+            .handle(
+                TurnInput {
+                    chat,
+                    messages: vec![inbound(chat, 1, "hi")],
+                    dropped: 0,
+                },
+                rx,
+            )
+            .await
+            .expect_ok();
+        assert_eq!(unanswered, 0);
+        // 回合结束后发送一定失败：队列据此把消息留在 pending。
+        assert!(tx.send(AgentMessage::user("too late")).is_err());
+    }
+
+    /// 回合提前结束时，循环已经取出、但还没进入上下文的 steering 消息交还队列。
+    #[tokio::test]
+    async fn early_exit_returns_waiting_steering_messages() {
+        let (runner, _gate, _dir) = runner_with(
+            None,
+            vec![vec![
+                ProviderEvent::ToolCallStart {
+                    index: 0,
+                    id: "c1".to_owned(),
+                    name: "Read".to_owned(),
+                },
+                ProviderEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    delta: "{\"path\":".to_owned(),
+                },
+                // 参数被截断：循环不执行工具、直接结束本回合。
+                ProviderEvent::Stop {
+                    reason: StopReason::MaxTokens,
+                    refusal: None,
+                },
+            ]],
+            120_000,
+            20_000,
+        )
+        .await;
+        let chat = ChatId::Group(1);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(AgentMessage::user("[Alice] are you there?"))
+            .unwrap();
+        let unanswered = runner
+            .handle(
+                TurnInput {
+                    chat,
+                    messages: vec![inbound(chat, 1, "hi")],
+                    dropped: 0,
+                },
+                rx,
+            )
+            .await
+            .expect_ok();
+        assert_eq!(unanswered, 1);
+        let history = runner.history_for(chat).await;
+        let history = history.lock().await;
+        assert!(
+            !history.iter().any(|message| matches!(
+                message,
+                AgentMessage::User { text, .. } if text.contains("are you there")
+            )),
+            "an unanswered steering message is re-queued, not appended: {history:?}"
         );
     }
 
@@ -1735,7 +1826,7 @@ mod tests {
                 rx,
             )
             .await
-            .unwrap();
+            .expect_ok();
 
         let committed = history.lock().await.clone();
         // 压缩后历史从摘要块开始，且本回合的回复被提交（不会因 base 错位而 panic/丢块）。
@@ -1918,7 +2009,7 @@ mod tests {
                 rx,
             )
             .await
-            .unwrap();
+            .expect_ok();
     }
 
     #[tokio::test]
@@ -1981,7 +2072,7 @@ mod tests {
                     rx,
                 )
                 .await
-                .unwrap();
+                .expect_ok();
         }
         let history_handle = runner.history();
         let history = history_handle.lock().await;

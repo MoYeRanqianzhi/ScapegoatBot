@@ -6,7 +6,9 @@
 //! - 同一 chat 的连发在 `debounce_ms` 窗口内合并成一个回合；不同 chat 各自计时。
 //! - 回合运行期间到达的消息：`steer` 直接进入 steering 队列；`followup` / `collect`
 //!   留在下一条待处理里，回合结束后再开新回合。
-//! - 每 chat 同时限制消息条数与批次上限；溢出按 `summarize | old | new` 处理，
+//! - steer 进去的消息若回合没有回应（回合提前结束、或被跳过），回合结束时按原顺序
+//!   放回待处理队首，再开一轮；一条消息不会“送进去了却没人回”。
+//! - 每 chat 限制待处理消息条数；溢出按 `summarize | old | new` 处理，
 //!   `summarize` 只保留一个“丢弃了多少条”的计数，由回合提示语转述。
 //! - 全局并发由 `max_concurrent` 控制。
 //!
@@ -16,7 +18,6 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::Result;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, warn};
 
@@ -34,15 +35,41 @@ pub struct TurnInput {
     pub dropped: u64,
 }
 
+/// 一个回合的收尾结果。
+#[derive(Debug, Default)]
+pub struct TurnReport {
+    /// 回合执行错误；`None` 表示正常结束（包括按开关、预算跳过）。
+    pub error: Option<anyhow::Error>,
+    /// 经 steering 送进本回合、但没有得到回应的消息条数。
+    ///
+    /// steering 按到达顺序消费，没回应的一定是最后送进来的那几条；队列把它们按原
+    /// 顺序放回待处理队首，回合结束后再开一轮。
+    pub unanswered: usize,
+}
+
+#[cfg(test)]
+impl TurnReport {
+    /// 测试用：回合出错时 panic，否则返回没回应的 steering 消息条数。
+    pub(crate) fn expect_ok(self) -> usize {
+        if let Some(error) = self.error {
+            panic!("turn failed: {error:#}");
+        }
+        self.unanswered
+    }
+}
+
 /// 回合执行器。
 #[async_trait::async_trait]
 pub trait TurnHandler: Send + Sync {
     /// 执行一个回合；`steering` 在回合运行期间持续接收同 chat 的新消息。
+    ///
+    /// 执行器负责在收尾时关闭 `steering`：关闭之后的 `send` 会失败，队列据此把
+    /// 消息留在待处理里。
     async fn handle(
         &self,
         input: TurnInput,
         steering: mpsc::UnboundedReceiver<AgentMessage>,
-    ) -> Result<()>;
+    ) -> TurnReport;
 }
 
 /// 每个 chat 的状态。
@@ -52,6 +79,8 @@ struct ChatState {
     dropped: u64,
     /// 当前回合的 steering 发送端；`None` 表示空闲。
     active: Option<mpsc::UnboundedSender<AgentMessage>>,
+    /// 本回合已经 steer 进去的消息（按到达顺序）；回合没回应的部分会放回 `pending`。
+    steered: Vec<QqMessage>,
     /// 去抖令牌：只有最新一次计时有效。
     token: u64,
     /// 已排队（含运行中）的批次数。
@@ -101,14 +130,18 @@ impl ChatQueue {
         let state = states.entry(chat).or_default();
 
         // 回合进行中：steer 模式直接注入。
-        if let Some(steering) = &state.active
-            && config.mode == QueueMode::Steer
+        if config.mode == QueueMode::Steer
+            && let Some(steering) = &state.active
         {
-            if steering
+            let sent = steering
                 .send(AgentMessage::user(render_inbound(&message)))
-                .is_err()
-            {
-                // handler 已收尾但 active 尚未清空：放回 pending，finish 会补开一轮。
+                .is_ok();
+            if sent {
+                // 记下已送进回合的消息：回合若没有回应它们，结束时放回 pending。
+                state.steered.push(message);
+            } else {
+                // handler 已关闭 steering 但 active 尚未清空：放回 pending，
+                // 回合结束时会补开一轮。
                 self.push_with_caps(state, message);
             }
             return;
@@ -204,6 +237,10 @@ impl ChatQueue {
                 if let Some(state) = states.get_mut(&chat) {
                     state.active = None;
                     state.pending_batches = state.pending_batches.saturating_sub(1);
+                    // 回合没跑：等待期间 steer 进去的消息原样放回队首。
+                    for message in std::mem::take(&mut state.steered).into_iter().rev() {
+                        state.pending.push_front(message);
+                    }
                 }
                 return;
             }
@@ -211,12 +248,11 @@ impl ChatQueue {
         let handler = Arc::clone(&self.handler);
         let queue = Arc::clone(self);
         tokio::spawn(async move {
-            let input_for_log = batch.clone();
-            match handler.handle(batch, steering_rx).await {
-                Ok(()) => {
-                    debug!(chat = %chat, messages = input_for_log.messages.len(), "turn finished")
-                }
-                Err(error) => warn!(%error, chat = %chat, "turn failed"),
+            let messages = batch.messages.len();
+            let report = handler.handle(batch, steering_rx).await;
+            match &report.error {
+                None => debug!(chat = %chat, messages, "turn finished"),
+                Some(error) => warn!(%error, chat = %chat, "turn failed"),
             }
             drop(permit);
             drop(steering_tx);
@@ -226,6 +262,13 @@ impl ChatQueue {
             if let Some(state) = states.get_mut(&chat) {
                 state.active = None;
                 state.pending_batches = state.pending_batches.saturating_sub(1);
+                // 没得到回应的 steering 消息是最后送进去的几条；按原顺序放回队首——
+                // 它们比收尾期间回填进 pending 的消息更早。
+                let steered = std::mem::take(&mut state.steered);
+                let unanswered = report.unanswered.min(steered.len());
+                for message in steered.into_iter().rev().take(unanswered) {
+                    state.pending.push_front(message);
+                }
                 if !state.pending.is_empty() {
                     state.token = queue.counter.fetch_add(1, Ordering::Relaxed) + 1;
                     let token = state.token;
@@ -298,7 +341,7 @@ mod tests {
             &self,
             input: TurnInput,
             mut steering: mpsc::UnboundedReceiver<AgentMessage>,
-        ) -> Result<()> {
+        ) -> TurnReport {
             self.calls.lock().unwrap().push(input.clone());
             if self.delay_ms > 0 {
                 let deadline =
@@ -317,7 +360,7 @@ mod tests {
                     self.steer.lock().unwrap().push(message);
                 }
             }
-            Ok(())
+            TurnReport::default()
         }
     }
 
@@ -499,7 +542,7 @@ mod tests {
             &self,
             input: TurnInput,
             mut steering: mpsc::UnboundedReceiver<AgentMessage>,
-        ) -> Result<()> {
+        ) -> TurnReport {
             self.calls.lock().unwrap().push(input);
             if self.calls.lock().unwrap().len() == 1 {
                 // 模拟 Runner::execute 收尾：先 close，让后续 send 立即失败。
@@ -507,7 +550,7 @@ mod tests {
                 self.closed.notify_one();
                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
             }
-            Ok(())
+            TurnReport::default()
         }
     }
 
@@ -537,5 +580,88 @@ mod tests {
             "the requeued message should open a second turn"
         );
         assert_eq!(calls[1].messages[0].message_id, 2);
+    }
+
+    /// 回合收到 steering 消息但没有回应（比如提前结束）时报告条数；
+    /// 队列把这几条按原顺序放回，排在收尾期间回填的消息前面，再开一轮。
+    struct UnansweredHandler {
+        calls: StdMutex<Vec<TurnInput>>,
+        steered: tokio::sync::Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnHandler for UnansweredHandler {
+        async fn handle(
+            &self,
+            input: TurnInput,
+            mut steering: mpsc::UnboundedReceiver<AgentMessage>,
+        ) -> TurnReport {
+            let first = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(input);
+                calls.len() == 1
+            };
+            if !first {
+                return TurnReport::default();
+            }
+            // 等两条 steering 消息到达，然后像提前结束的回合一样收尾：关闭、排空、
+            // 只回应第一条。
+            let mut received = 0;
+            while received < 2 {
+                if steering.recv().await.is_some() {
+                    received += 1;
+                }
+            }
+            steering.close();
+            self.steered.notify_one();
+            // 关闭之后到达的消息走 pending。
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            TurnReport {
+                error: None,
+                unanswered: 1,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unanswered_steering_messages_open_a_follow_up_turn_in_order() {
+        let handler = Arc::new(UnansweredHandler {
+            calls: StdMutex::new(Vec::new()),
+            steered: tokio::sync::Notify::new(),
+        });
+        let mut cfg = config();
+        cfg.debounce_ms = 20;
+        cfg.mode = QueueMode::Steer;
+        let queue = ChatQueue::new(cfg, handler.clone());
+        let chat = ChatId::Group(1);
+
+        queue.ingest(msg(chat, 1)).await;
+        // 等第一回合开始，再 steer 两条进去。
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        queue.ingest(msg(chat, 2)).await;
+        queue.ingest(msg(chat, 3)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handler.steered.notified(),
+        )
+        .await
+        .expect("the first turn should receive both steering messages");
+        // steering 已关闭：这条进 pending。
+        queue.ingest(msg(chat, 4)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let calls = handler.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            2,
+            "unanswered messages must open a second turn"
+        );
+        let ids: Vec<i64> = calls[1]
+            .messages
+            .iter()
+            .map(|message| message.message_id)
+            .collect();
+        // 2 已回应；3 没回应，排在关闭后才到的 4 前面。
+        assert_eq!(ids, vec![3, 4]);
     }
 }
