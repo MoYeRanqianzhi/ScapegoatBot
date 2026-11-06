@@ -146,7 +146,7 @@ fn specs_napcat_message(list: &mut Vec<ActionSpec>) {
         "group_id",
         json!({
             "group_id": {"type": "number"},
-            "message": {"description": "Message segment array or plain string."}
+            "message": {"description": "Message segment array or plain string. Media segments (image/record/video/file) take `file`: a VFS path, a public http(s) URL, or base64:// data."}
         }),
         &[r#"{"group_id":123,"message":[{"type":"text","data":{"text":"hello"}}]}"#],
     ));
@@ -156,21 +156,24 @@ fn specs_napcat_message(list: &mut Vec<ActionSpec>) {
         "user_id",
         json!({
             "user_id": {"type": "number"},
-            "message": {"description": "Message segment array or plain string."}
+            "message": {"description": "Message segment array or plain string. Media segments (image/record/video/file) take `file`: a VFS path, a public http(s) URL, or base64:// data."}
         }),
         &[r#"{"user_id":10001,"message":"hello"}"#],
     ));
+    // `send_msg` 的目标由 `chat_of` 的专门分支解析（group_id 或 user_id 二选一）；
+    // 这里的 `user_id` 只决定 owner/master 保护读取哪个字段。
     list.push(send_spec(
         "napcat.send_msg",
-        "Send a message by message_type/chat target.",
+        "Send a message by message_type/chat target. Give exactly one of group_id \
+         (message_type \"group\") or user_id (message_type \"private\").",
         "user_id",
         json!({
-            "message_type": {"type": "string"},
+            "message_type": {"type": "string", "description": "\"group\" or \"private\"; may be omitted."},
             "user_id": {"type": "number"},
             "group_id": {"type": "number"},
-            "message": {"description": "Message segment array or plain string."}
+            "message": {"description": "Message segment array or plain string. Media segments (image/record/video/file) take `file`: a VFS path, a public http(s) URL, or base64:// data."}
         }),
-        &[],
+        &[r#"{"message_type":"group","group_id":123,"message":"hello"}"#],
     ));
 
     list.push(ActionSpec {
@@ -435,13 +438,13 @@ fn specs_napcat_file(list: &mut Vec<ActionSpec>) {
         (
             "napcat.upload_group_file",
             "Upload a file to a group.",
-            json!({"group_id": {"type": "number"}, "file": {"type": "string"}, "name": {"type": "string"}}),
+            json!({"group_id": {"type": "number"}, "file": {"type": "string", "description": "A VFS path, a public http(s) URL, or base64:// data."}, "name": {"type": "string"}}),
             r#"{"group_id":123,"file":"/data/x.bin","name":"x.bin"}"#,
         ),
         (
             "napcat.upload_private_file",
             "Upload a file to a friend.",
-            json!({"user_id": {"type": "number"}, "file": {"type": "string"}, "name": {"type": "string"}}),
+            json!({"user_id": {"type": "number"}, "file": {"type": "string", "description": "A VFS path, a public http(s) URL, or base64:// data."}, "name": {"type": "string"}}),
             r#"{"user_id":10001,"file":"/data/x.bin","name":"x.bin"}"#,
         ),
         (
@@ -463,9 +466,16 @@ fn specs_napcat_file(list: &mut Vec<ActionSpec>) {
             r#"{"group_id":123,"file_id":"abc"}"#,
         ),
     ] {
+        // 取下载链接与查看空间只是读取：归 Query，受 receive_scopes 约束，
+        // approve 模式也不需要主人确认。上传与删除才会改变群文件。
+        let read_only = action.starts_with("napcat.get_");
         list.push(ActionSpec {
             action,
-            category: Category::File,
+            category: if read_only {
+                Category::Query
+            } else {
+                Category::File
+            },
             summary,
             params,
             returns: "OneBot response.",
@@ -504,7 +514,7 @@ fn specs_napcat_profile(list: &mut Vec<ActionSpec>) {
         (
             "napcat.set_qq_avatar",
             "Change the avatar.",
-            json!({"file": {"type": "string"}}),
+            json!({"file": {"type": "string", "description": "A VFS path, a public http(s) URL, or base64:// data."}}),
             r#"{"file":"/data/a.png"}"#,
         ),
     ] {
@@ -688,37 +698,46 @@ pub(crate) fn qq_number(value: &serde_json::Value) -> Option<u64> {
     }
 }
 
-/// 从 action 参数推导目标会话（发送范围与跨群规则用）。
+/// 从 action 参数推导目标会话（发送范围、owner intent 与跨群规则用）。
+///
+/// 返回 `None` 表示没有目标或目标有歧义；有作用域字段的动作此时会被拒绝。
 pub(crate) fn chat_of(
     spec: &ActionSpec,
     params: &serde_json::Value,
 ) -> Option<crate::qq::event::ChatId> {
-    if spec.action == "napcat.send_msg" {
-        let message_type = params
-            .get("message_type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        if message_type == "group" || (message_type.is_empty() && params.get("group_id").is_some())
-        {
-            return params
-                .get("group_id")
-                .and_then(qq_number)
-                .map(crate::qq::event::ChatId::Group);
+    use crate::qq::event::ChatId;
+    // 读取一个 id 字段；0 不是合法的群号或 QQ 号。
+    let id = |field: &str| params.get(field).and_then(qq_number).filter(|id| *id != 0);
+    match spec.action {
+        // NapCat `SendMsg` 的 `createContext`：私聊模式下 user_id 查不到且带了
+        // group_id 时会改发到群里；不指定 message_type 时 group_id 优先。
+        // 这里只认“恰好一个目标字段”的写法，NapCat 的选择与本函数不可能不一致。
+        "napcat.send_msg" => {
+            let message_type = params
+                .get("message_type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            match (message_type, id("group_id"), id("user_id")) {
+                ("group" | "", Some(group), None) => Some(ChatId::Group(group)),
+                ("private" | "", None, Some(user)) => Some(ChatId::Private(user)),
+                _ => None,
+            }
         }
-        return params
-            .get("user_id")
-            .and_then(qq_number)
-            .map(crate::qq::event::ChatId::Private);
+        // 带 group_id 的戳一戳发生在群里，作用于那个群。
+        "napcat.send_poke" => id("group_id")
+            .map(ChatId::Group)
+            .or_else(|| id("user_id").map(ChatId::Private)),
+        _ => match spec.scope_field {
+            Some("group_id") => id("group_id").map(ChatId::Group),
+            Some("user_id") => id("user_id").map(ChatId::Private),
+            _ => None,
+        },
     }
-    match spec.scope_field {
-        Some("group_id") => params
-            .get("group_id")
-            .and_then(qq_number)
-            .map(crate::qq::event::ChatId::Group),
-        Some("user_id") => params
-            .get("user_id")
-            .and_then(qq_number)
-            .map(crate::qq::event::ChatId::Private),
-        _ => None,
-    }
+}
+
+/// 该 action 是否携带 `message`（真正把内容发进 chat 的发送）。
+///
+/// 只有这类发送成功后才写一条 `self` 消息进归档；戳一戳、召回、表情回应不是消息。
+pub(crate) fn carries_message(spec: &ActionSpec) -> bool {
+    spec.params.get("message").is_some()
 }

@@ -299,27 +299,46 @@ pub fn normalize(name: &str, data: &Value) -> QqEvent {
 }
 
 fn parse_message(data: &Value, sent_event: bool) -> Option<QqMessage> {
+    // 消息 id 是去重键的一部分；没有 id 的事件不按消息处理。
     let message_id = data.get("message_id").and_then(Value::as_i64)?;
+    // 本账号 QQ；缺失时记 0，后面的“是否自己发的”判断会把 0 排除在外。
     let self_id = data.get("self_id").and_then(Value::as_u64).unwrap_or(0);
+    // OneBot 的 `user_id` 永远是发送者，不是会话对象。
     let user_id = data.get("user_id").and_then(Value::as_u64);
+    // 自己发出的消息：`message_sent` 回声，或发送者就是本账号。
+    let from_self = sent_event || (self_id != 0 && user_id == Some(self_id));
+    // 私聊的会话对象。别人发来的私聊，对象就是发送者；自己发出的私聊，
+    // `user_id` 是本账号，对象在 `target_id`（NapCat 对私聊统一填 peerUin，
+    // 见 NapCatQQ `packages/napcat-onebot/index.ts` 的 `target_id` 赋值）。
+    // 缺 `target_id` 的实现只能退回本账号，即记成“自己和自己的会话”。
+    let private_peer = if from_self {
+        data.get("target_id")
+            .and_then(Value::as_u64)
+            .filter(|id| *id != 0)
+            .or(user_id)
+    } else {
+        user_id
+    };
 
     let chat = match data.get("message_type").and_then(Value::as_str) {
         Some("group") => ChatId::Group(data.get("group_id").and_then(Value::as_u64)?),
-        Some("private") => ChatId::Private(user_id?),
+        // 临时会话也是 `private`（同时带来源群 `group_id`），按私聊对象归档。
+        Some("private") => ChatId::Private(private_peer?),
         // `message_sent` 可能没有 message_type；用 group_id 判断。
         _ => match data.get("group_id").and_then(Value::as_u64) {
             Some(group) if group != 0 => ChatId::Group(group),
-            _ => ChatId::Private(user_id?),
+            _ => ChatId::Private(private_peer?),
         },
     };
 
     let sender = data.get("sender").cloned().unwrap_or(Value::Null);
-    let sender_qq = user_id.filter(|id| *id != self_id);
     let sender = Sender {
-        qq: if sent_event || sender_qq.is_none() {
+        // 自己发出的消息统一记为 `self`（`None`），不暴露本账号 QQ 号，
+        // 也就不会被误认成 owner_qq（stand_in 模式下二者相同）。
+        qq: if from_self {
             None
         } else {
-            sender_qq
+            user_id.filter(|id| *id != 0)
         },
         nickname: sender
             .get("nickname")
@@ -357,7 +376,7 @@ fn parse_message(data: &Value, sent_event: bool) -> Option<QqMessage> {
         time,
         segments,
         reply_to,
-        is_self: sent_event || user_id == Some(self_id),
+        is_self: from_self,
         backfilled: false,
         raw: data.clone(),
     })
@@ -378,17 +397,18 @@ fn parse_segments(message: Option<&Value>) -> Vec<Segment> {
     items.iter().map(parse_segment).collect()
 }
 
-fn parse_segment(value: &Value) -> Segment {
+/// 解析一个 OneBot 消息段；入站消息与自己发出的消息共用这一份规则。
+pub(crate) fn parse_segment(value: &Value) -> Segment {
     let kind = value
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let data = value.get("data").cloned().unwrap_or(Value::Null);
-    let text = |key: &str| {
-        data.get(key)
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned()
+    // 字段取字符串；id 一类字段有的实现（和模型）写成数字，按十进制文本保留。
+    let text = |key: &str| match data.get(key) {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Number(number)) => number.to_string(),
+        _ => String::new(),
     };
     match kind {
         "text" => Segment::Text { text: text("text") },
@@ -570,7 +590,8 @@ pub fn unknown_to_inbox_message(name: &str, data: &Value) -> Option<QqMessage> {
     })
 }
 
-fn synthetic_event_id() -> i64 {
+/// 本地合成的消息 id：负数，避免与 NapCat 分配的 id 冲突（按微秒取值）。
+pub(crate) fn synthetic_event_id() -> i64 {
     -(Utc::now().timestamp_micros().unsigned_abs() as i64).max(1)
 }
 
@@ -663,6 +684,48 @@ mod tests {
             panic!("expected message");
         };
         assert_eq!(message.chat, ChatId::Private(456));
+    }
+
+    /// NapCat 对自己发出的私聊：`user_id` 是本账号，对方在 `target_id`。
+    /// 以前按 `user_id` 归档，所有私聊回复都落进了 `private:<本账号>`。
+    #[test]
+    fn private_self_echo_is_filed_under_the_peer() {
+        let data = json!({
+            "post_type": "message_sent",
+            "message_type": "private",
+            "self_id": 10000,
+            "user_id": 10000,
+            "target_id": 456,
+            "message_id": 2,
+            "time": 1793304000,
+            "sender": {"user_id": 10000, "nickname": "Me"},
+            "message": [{"type": "text", "data": {"text": "hello"}}]
+        });
+        let QqEvent::Message(message) = normalize("message_sent.private.friend", &data) else {
+            panic!("expected message");
+        };
+        assert_eq!(message.chat, ChatId::Private(456));
+        assert!(message.is_self);
+        assert_eq!(message.sender.qq, None);
+    }
+
+    /// 没有 `target_id` 的实现无法知道对方是谁，只能记成本账号自己的会话。
+    #[test]
+    fn private_self_echo_without_target_falls_back_to_the_account() {
+        let data = json!({
+            "post_type": "message_sent",
+            "message_type": "private",
+            "self_id": 10000,
+            "user_id": 10000,
+            "message_id": 3,
+            "time": 1793304000,
+            "message": [{"type": "text", "data": {"text": "note to self"}}]
+        });
+        let QqEvent::Message(message) = normalize("message_sent.private.friend", &data) else {
+            panic!("expected message");
+        };
+        assert_eq!(message.chat, ChatId::Private(10000));
+        assert!(message.is_self);
     }
 
     #[test]

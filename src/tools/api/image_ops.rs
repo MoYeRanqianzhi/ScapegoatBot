@@ -115,7 +115,10 @@ fn image_transform(params: &Value, ctx: &ToolContext) -> ToolResult {
         if !degrees.is_finite() {
             return ToolResult::error("rotate must be a finite number of degrees");
         }
-        rgba = rotate_rgba(rgba, degrees as f32);
+        rgba = match rotate_rgba(rgba, degrees as f32) {
+            Ok(rotated) => rotated,
+            Err(error) => return ToolResult::error(error),
+        };
         changed = true;
     }
 
@@ -190,6 +193,10 @@ fn image_text(params: &Value, ctx: &ToolContext) -> ToolResult {
     let text = params.get("text").and_then(Value::as_str).unwrap_or("");
     if text.is_empty() {
         return ToolResult::error("text must not be empty");
+    }
+    // 光栅化开销随字数 × 字号² 增长；画布外的字形同样会被光栅化。
+    if text.chars().count() > MAX_TEXT_CHARS {
+        return ToolResult::error(format!("text must be at most {MAX_TEXT_CHARS} characters"));
     }
     let size = params.get("size").and_then(Value::as_f64).unwrap_or(32.0);
     if !(1.0..=512.0).contains(&size) {
@@ -310,9 +317,30 @@ fn read_image(
         .vfs
         .read_bytes(&path)
         .map_err(|error| error.to_string())?;
-    let image =
-        image::load_from_memory(&bytes).map_err(|error| format!("cannot decode image: {error}"))?;
+    let image = decode_limited(&bytes)?;
     Ok((input.to_owned(), image, bytes))
+}
+
+/// 图片单边上限，与 crop/resize 参数的上限一致；8192² 的 RGBA 约 268 MB。
+const MAX_IMAGE_SIDE: u32 = 8192;
+/// `image.text` 一次最多绘制的字符数。
+const MAX_TEXT_CHARS: usize = 1000;
+
+/// 按尺寸上限解码：文件可能很小、但声明的尺寸巨大（解压炸弹）。
+///
+/// `image` 默认只限制 512 MiB 的“分配估算”、不限宽高，1×100000 的细图能通过它，
+/// 转个角度却要几十 GB。宽高限制是严格的，超限在分配之前就报错。
+fn decode_limited(bytes: &[u8]) -> Result<DynamicImage, String> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| format!("cannot read image: {error}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_SIDE);
+    limits.max_image_height = Some(MAX_IMAGE_SIDE);
+    reader.limits(limits);
+    reader
+        .decode()
+        .map_err(|error| format!("cannot decode image: {error}"))
 }
 
 fn output_path(params: &Value) -> Result<(String, crate::vfs::VfsPath, String), String> {
@@ -392,26 +420,40 @@ fn encode_image(image: &DynamicImage, ext: &str, quality: u8) -> Result<Vec<u8>,
         .map_err(|error| format!("cannot encode {format:?}: {error}"))
 }
 
-fn rotate_rgba(image: RgbaImage, degrees: f32) -> RgbaImage {
+fn rotate_rgba(image: RgbaImage, degrees: f32) -> Result<RgbaImage, String> {
     let normalized = degrees.rem_euclid(360.0);
     if normalized.abs() < f32::EPSILON {
-        return image;
+        return Ok(image);
     }
     if (normalized - 90.0).abs() < 0.01 {
-        return image::imageops::rotate90(&image);
+        return Ok(image::imageops::rotate90(&image));
     }
     if (normalized - 180.0).abs() < 0.01 {
-        return image::imageops::rotate180(&image);
+        return Ok(image::imageops::rotate180(&image));
     }
     if (normalized - 270.0).abs() < 0.01 {
-        return image::imageops::rotate270(&image);
+        return Ok(image::imageops::rotate270(&image));
     }
-    rotate_about_center_no_crop(
+    // 任意角度会扩画布，宽高都可能超过输入（8192×8192 转 45° 约 11586²）。
+    // 先按 imageproc `rotate_about_center_no_crop` 的同一公式算出画布，超限就拒绝。
+    let (width, height) = image.dimensions();
+    let (sin, cos) = normalized.to_radians().sin_cos();
+    let (sin, cos) = (f64::from(sin.abs()), f64::from(cos.abs()));
+    let out_width = (f64::from(height) * sin + f64::from(width) * cos).ceil();
+    let out_height = (f64::from(height) * cos + f64::from(width) * sin).ceil();
+    if out_width > f64::from(MAX_IMAGE_SIDE) || out_height > f64::from(MAX_IMAGE_SIDE) {
+        return Err(format!(
+            "rotating a {width}x{height} image by {degrees} degrees needs a \
+             {out_width}x{out_height} canvas; the limit is {MAX_IMAGE_SIDE} per side. \
+             Crop or shrink it first."
+        ));
+    }
+    Ok(rotate_about_center_no_crop(
         &image,
         normalized.to_radians(),
         Interpolation::Bilinear,
         Border::Constant(Rgba([0, 0, 0, 0])),
-    )
+    ))
 }
 
 fn fit_within(image: RgbaImage, max_width: u32, max_height: u32) -> RgbaImage {
@@ -465,4 +507,27 @@ fn load_font(family: Option<&str>) -> Result<FontVec, String> {
         .ok_or_else(|| "cannot read the selected font data".to_owned())?;
     FontVec::try_from_vec_and_index(data, index)
         .map_err(|error| format!("cannot parse the selected font: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 任意角度旋转先算画布再分配：超过单边上限时报错，不尝试分配。
+    #[test]
+    fn rotation_refuses_canvases_beyond_the_side_limit() {
+        // 8192×1024 本身合法；转 10° 时宽为
+        // ceil(1024·sin10° + 8192·cos10°) = ceil(177.8 + 8067.5) = 8246 > 8192。
+        let wide = RgbaImage::new(MAX_IMAGE_SIDE, 1024);
+        let error = rotate_rgba(wide, 10.0).unwrap_err();
+        assert!(error.contains("8246x"), "{error}");
+        // 90° 的倍数只交换宽高，不扩画布。
+        let wide = RgbaImage::new(MAX_IMAGE_SIDE, 1024);
+        let rotated = rotate_rgba(wide, 90.0).unwrap();
+        assert_eq!(rotated.dimensions(), (1024, MAX_IMAGE_SIDE));
+        // 小图任意角度照常可用，画布按公式扩大。
+        let small = RgbaImage::new(100, 50);
+        let rotated = rotate_rgba(small, 30.0).unwrap();
+        assert_eq!(rotated.dimensions(), (112, 94));
+    }
 }

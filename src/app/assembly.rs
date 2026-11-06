@@ -151,6 +151,8 @@ struct ToolAssembly<'a> {
     monitors: Arc<MonitorManager>,
     ops: Arc<RuntimeOps>,
     qq: Option<Arc<QqClient>>,
+    /// 本账号 QQ（NapCat 登录信息）；0 = 未连接。
+    account_qq: u64,
     owner_qq: u64,
     master_qq: u64,
     provider: Arc<dyn crate::providers::Provider>,
@@ -182,6 +184,7 @@ async fn assemble_tools(
         monitors,
         ops,
         qq,
+        account_qq,
         owner_qq,
         master_qq,
         provider,
@@ -381,6 +384,7 @@ async fn assemble_tools(
             config.agent.send_scopes.clone(),
             Some(Arc::clone(&messages)),
         )
+        .with_account(account_qq)
         .with_action_gate(Arc::clone(&action_gate))
         .with_receive_scopes(config.agent.receive_scopes.clone())
         .with_event_hooks(config.hooks.events.clone()),
@@ -656,6 +660,7 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
         monitors: Arc::clone(&monitors),
         ops: Arc::clone(&ops),
         qq: qq.clone(),
+        account_qq: self_id,
         owner_qq,
         master_qq,
         provider: Arc::clone(&provider),

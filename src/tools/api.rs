@@ -2,17 +2,20 @@
 //!
 //! 设计依据：设计 §5.2 / §5.6 / §5.10。
 //!
-//! 三个命名空间：
-//! - `napcat.*`：转发 OneBot action（全部 QQ 操作）；
+//! 四个命名空间：
+//! - `napcat.*`：转发 OneBot action（全部 QQ 操作），策略链见 `policy` 子模块；
 //! - `agent.*`：对 agent 自己的操作（status / resume / quarantine / compact /
-//!   clear_context），不产生对外影响；`agent.compact` 可用 `chat` 指定会话。
+//!   clear_context），不产生对外影响；
+//! - `image.*`：VFS 图片处理（`image_ops` 子模块），不访问 QQ；
 //! - `api.*`：对注册表本身的查询（list / help）。
 //!
 //! 安全边界：
 //! - `hold` 期间 **所有** `napcat.*` 返回 `Disabled during hold`，包括拉黑、禁言、
-//!   踢人；`agent.*` 与 `api.*` 照常可用。
+//!   踢人；`agent.*`、`image.*` 与 `api.*` 照常可用。
 //! - 目标为 `owner_qq` / `master_qq` 的 admin/destructive action 在任何模式下都拒绝。
-//! - 发送受 `[agent].send_scopes` 限制（fail-closed）。
+//! - 对外动作受 `[agent].send_scopes` 限制（fail-closed）。
+//! - NapCat 只会收到 `base64://` 形式的文件内容（`outbound` 子模块），
+//!   宿主机路径与内网 URL 永远不会交给它。
 
 use std::sync::Arc;
 
@@ -20,16 +23,18 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::ExecutionMode;
-use crate::qq::event::{QqMessage, Segment, Sender};
+use crate::qq::event::{QqMessage, Sender};
 use crate::qq::{ChatId, QqClient, format};
 use crate::security::Gate;
 use crate::storage::messages::MessageStore;
+use crate::tools::net::NetPolicy;
 use crate::transcript::ToolResult;
 
 use super::{Permission, Tool, ToolContext, arg_str, object_schema};
 use crate::actions::{ActionSpec, Category, qq_number, specs};
 
 mod image_ops;
+mod outbound;
 mod policy;
 
 /// NapCat 网关抽象；真实实现是 [`QqClient`]，测试用 fake。
@@ -64,8 +69,11 @@ pub struct ApiTool {
     agent_ops: Option<Arc<dyn AgentOps>>,
     owner_qq: u64,
     master_qq: u64,
+    /// 本账号 QQ；0 表示未知（未连接 NapCat 或测试）。用来判断主人能否在
+    /// `master_qq` 私聊里回复确认码：通知账号就是本账号时不能。
+    account_qq: u64,
     gate: Option<Arc<Gate>>,
-    /// 允许发送的 scope 列表；空表示拒绝一切发送。
+    /// 允许产生对外影响的 chat 列表；空表示拒绝一切对外动作。
     send_scopes: Vec<String>,
     /// 发送成功后写入 `sender = self`；没有存储时只返回结果。
     messages: Option<Arc<MessageStore>>,
@@ -79,6 +87,8 @@ pub struct ApiTool {
     receive_scopes: Option<Vec<String>>,
     /// `[hooks.events]` 的 BeforeSend hook。
     event_hooks: Vec<crate::config::EventHookConfig>,
+    /// 发送前下载 http(s) 媒体用的网络策略（只连公网）。
+    media_net: NetPolicy,
 }
 
 impl ApiTool {
@@ -96,6 +106,7 @@ impl ApiTool {
             agent_ops,
             owner_qq,
             master_qq,
+            account_qq: 0,
             gate,
             send_scopes,
             messages,
@@ -104,7 +115,21 @@ impl ApiTool {
             action_gate: None,
             receive_scopes: None,
             event_hooks: Vec::new(),
+            media_net: outbound::media_net_policy(),
         }
+    }
+
+    /// 告诉工具本账号 QQ（NapCat 登录信息）。
+    pub(crate) fn with_account(mut self, account_qq: u64) -> Self {
+        self.account_qq = account_qq;
+        self
+    }
+
+    /// 测试用：替换媒体下载策略（例如允许连本地测试服务器）。
+    #[cfg(test)]
+    pub(crate) fn with_media_net(mut self, policy: NetPolicy) -> Self {
+        self.media_net = policy;
+        self
     }
 
     /// 接入 `[gate]`；测试不接时按 trusted 处理。
@@ -418,76 +443,24 @@ fn suggestions(action: &str) -> Vec<String> {
 // 注册表
 // ---------------------------------------------------------------------------
 
-/// 把发送参数还原成一条 `self` 消息，供 transcript/收件箱去重使用。
-fn self_message_from_params(chat: ChatId, params: &Value) -> QqMessage {
-    let segments = match params.get("message") {
-        Some(Value::String(text)) => vec![Segment::Text { text: text.clone() }],
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|item| {
-                let kind = item
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                let data = item.get("data").cloned().unwrap_or(Value::Null);
-                match kind {
-                    "text" => Segment::Text {
-                        text: data
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    },
-                    "at" => Segment::At {
-                        qq: data
-                            .get("qq")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    },
-                    "reply" => Segment::Reply {
-                        id: data
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    },
-                    "face" => Segment::Face {
-                        id: data
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    },
-                    "image" => Segment::Image {
-                        url: data
-                            .get("url")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        file: data
-                            .get("file")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                        path: data
-                            .get("path")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_owned(),
-                    },
-                    other => Segment::Other {
-                        kind: other.to_owned(),
-                        data,
-                    },
-                }
-            })
-            .collect(),
+/// 把发送参数还原成一条 `self` 消息，写进消息归档。
+///
+/// 段的解析与入站消息共用 [`crate::qq::event::parse_segment`]。`message_id` 是
+/// NapCat 返回的真实 id；有它时 `message_sent` 回声会按 `(chat, message_id)` 去重，
+/// 同一条消息不会存两份。没有时用负数占位 id，避免与 NapCat 的 id 冲突。
+fn self_message_from_params(chat: ChatId, params: &Value, message_id: Option<i64>) -> QqMessage {
+    let segments: Vec<crate::qq::event::Segment> = match params.get("message") {
+        Some(Value::String(text)) => vec![crate::qq::event::Segment::Text { text: text.clone() }],
+        Some(Value::Array(items)) => items.iter().map(crate::qq::event::parse_segment).collect(),
         _ => Vec::new(),
     };
+    // 回复段决定 `reply_to`，与入站消息的解析规则一致。
+    let reply_to = segments.iter().find_map(|segment| match segment {
+        crate::qq::event::Segment::Reply { id } => id.parse().ok(),
+        _ => None,
+    });
     QqMessage {
-        // 本地占位 id；真实 message_id 在账本里。负数避免与 NapCat id 冲突。
-        message_id: -chrono::Utc::now().timestamp_millis(),
+        message_id: message_id.unwrap_or_else(crate::qq::event::synthetic_event_id),
         chat,
         sender: Sender {
             qq: None,
@@ -497,7 +470,7 @@ fn self_message_from_params(chat: ChatId, params: &Value) -> QqMessage {
         },
         time: chrono::Utc::now(),
         segments,
-        reply_to: None,
+        reply_to,
         is_self: true,
         backfilled: false,
         raw: Value::Null,
@@ -686,10 +659,20 @@ mod tests {
         let tool = tool(Some(gateway.clone()), Some(gate));
 
         // 连查询与拉黑都被拒绝：设计 §5.10 明确“全部拒绝”。
-        for action in ["napcat.get_login_info", "napcat.set_group_kick"] {
-            let result = call(&tool, action, json!({"group_id": 1, "user_id": 2})).await;
+        for (action, params) in [
+            ("napcat.get_login_info", json!({})),
+            (
+                "napcat.set_group_kick",
+                json!({"group_id": 1, "user_id": 2}),
+            ),
+        ] {
+            let result = call(&tool, action, params).await;
             assert!(result.is_error);
-            assert!(result.content.contains(crate::tools::HOLD_DISABLED));
+            assert!(
+                result.content.contains(crate::tools::HOLD_DISABLED),
+                "{action}: {}",
+                result.content
+            );
         }
         assert!(gateway.calls.lock().unwrap().is_empty());
 
@@ -1228,6 +1211,23 @@ mod tests {
         assert!(empty.content.contains("no transform"), "{}", empty.content);
     }
 
+    /// 解压炸弹：文件很小、声明尺寸巨大的图在解码阶段就被拒绝，不分配像素。
+    #[tokio::test]
+    async fn images_beyond_the_side_limit_are_not_decoded() {
+        let vfs = media_vfs();
+        // 8193×1 的 PNG 只有几十 KB，但宽度超过 8192 的上限。
+        seed_image(&vfs, "/tmp/wide.png", 8193, 1);
+        let tool = tool(None, None);
+        let ctx = ToolContext::new(Arc::clone(&vfs), None);
+        let result = run_image(&tool, &ctx, "image.info", json!({"path": "/tmp/wide.png"})).await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("cannot decode"),
+            "{}",
+            result.content
+        );
+    }
+
     #[tokio::test]
     async fn image_convert_honors_output_extension() {
         let vfs = media_vfs();
@@ -1365,5 +1365,268 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].mime, "image/png");
         assert_eq!(images[0].data_base64, "aGVsbG8=");
+    }
+
+    /// 测试用消息库（不加密）。
+    fn message_store() -> (Arc<MessageStore>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MessageStore::open(
+            Arc::new(crate::storage::Database::open_in_memory().unwrap()),
+            Arc::new(crate::storage::crypto::MasterKey::from_bytes([22u8; 32])),
+            dir.path().to_path_buf(),
+            0,
+            crate::config::EncryptionMode::None,
+        )
+        .unwrap();
+        (Arc::new(store), dir)
+    }
+
+    /// 一个只回一次固定内容的 HTTP 服务器，返回它的地址。
+    async fn one_shot_http(body: &'static [u8]) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+        });
+        address
+    }
+
+    /// 发出去的媒体只能是 base64：VFS 路径由本进程读出，http 由本进程下载。
+    #[tokio::test]
+    async fn outbound_media_reaches_napcat_only_as_base64() {
+        use base64::Engine;
+        let address = one_shot_http(b"remote-bytes").await;
+        let gateway = Arc::new(FakeGateway::default());
+        let vfs = media_vfs();
+        seed_image(&vfs, "/tmp/a.png", 4, 4);
+        let local = crate::vfs::Vfs::read_bytes(
+            vfs.as_ref(),
+            &crate::vfs::path::VfsPath::parse("/tmp/a.png").unwrap(),
+        )
+        .unwrap();
+        let tool = tool(Some(gateway.clone()), None).with_media_net(NetPolicy {
+            allow_private: true,
+            ..outbound::media_net_policy()
+        });
+        let ctx = ToolContext::new(Arc::clone(&vfs), None)
+            .with_evidence(crate::transcript::TurnEvidence::owner("test"));
+        let result = tool
+            .execute(
+                &ctx,
+                json!({"action": "napcat.send_group_msg", "params": {"group_id": 1, "message": [
+                    {"type": "image", "data": {"file": "/tmp/a.png"}},
+                    {"type": "image", "data": {"url": format!("http://{address}/x.png"),
+                                               "file": "ignored-name.png"}}
+                ]}}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let calls = gateway.calls.lock().unwrap();
+        let (action, params) = &calls[0];
+        assert_eq!(action, "send_group_msg");
+        let encode = |bytes: &[u8]| {
+            format!(
+                "base64://{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        };
+        assert_eq!(
+            params["message"][0]["data"],
+            json!({"file": encode(&local)})
+        );
+        assert_eq!(
+            params["message"][1]["data"],
+            json!({"file": encode(b"remote-bytes")})
+        );
+    }
+
+    /// 宿主机路径永远到不了 NapCat。
+    #[tokio::test]
+    async fn host_file_references_never_reach_napcat() {
+        let gateway = Arc::new(FakeGateway::default());
+        let tool = tool(Some(gateway.clone()), None);
+        let result = tool
+            .execute(
+                &intent_ctx("group:1"),
+                json!({"action": "napcat.send_group_msg", "params": {"group_id": 1, "message": [
+                    {"type": "file", "data": {"file": "file:///root/.sbot/auth.json"}}
+                ]}}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(gateway.calls.lock().unwrap().is_empty());
+    }
+
+    /// 未声明的参数（这里是 NapCat 会当作文件读取的 `image`）在任何检查之前被拒绝。
+    #[tokio::test]
+    async fn undeclared_params_are_rejected_before_napcat() {
+        let gateway = Arc::new(FakeGateway::default());
+        let tool = tool(Some(gateway.clone()), None);
+        let result = tool
+            .execute(
+                &intent_ctx("group:1"),
+                json!({"action": "napcat.send_group_notice",
+                       "params": {"group_id": 1, "content": "hi", "image": "/root/.sbot/key"}}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("does not accept"),
+            "{}",
+            result.content
+        );
+        assert!(gateway.calls.lock().unwrap().is_empty());
+    }
+
+    /// approve 模式的门禁（测试共用）。
+    fn approve_gate() -> (
+        Arc<crate::security::action_gate::ActionGate>,
+        Arc<crate::security::action_gate::ApprovalQueue>,
+    ) {
+        let approvals = crate::security::action_gate::ApprovalQueue::new();
+        let gate = Arc::new(crate::security::action_gate::ActionGate::new(
+            &crate::config::GateConfig {
+                mode: crate::config::GateMode::Approve,
+                max_per_minute: 60,
+                llm_review: false,
+            },
+            Arc::clone(&approvals),
+        ));
+        (gate, approvals)
+    }
+
+    /// 发送范围检查先于门禁：越界请求不会生成待确认项，也不会私聊主人。
+    #[tokio::test]
+    async fn send_scope_is_checked_before_the_approval_gate() {
+        let gateway = Arc::new(FakeGateway::default());
+        let (gate, approvals) = approve_gate();
+        let tool = ApiTool::new(
+            Some(gateway.clone()),
+            None,
+            10000,
+            20000,
+            None,
+            vec!["group:1".to_owned()],
+            None,
+        )
+        .with_action_gate(gate);
+        let result = tool
+            .execute(
+                &intent_ctx("group:2"),
+                json!({"action": "napcat.send_group_msg",
+                       "params": {"group_id": 2, "message": "hi"}}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("send_scopes"), "{}", result.content);
+        assert!(approvals.pending().is_empty());
+        assert!(gateway.calls.lock().unwrap().is_empty());
+    }
+
+    /// 通知账号就是本账号时，确认码回复无法批准，通知里不放确认码。
+    #[tokio::test]
+    async fn approval_notice_omits_the_code_when_master_is_this_account() {
+        let gateway = Arc::new(FakeGateway::default());
+        let (gate, approvals) = approve_gate();
+        let tool = tool(Some(gateway.clone()), None)
+            .with_account(10000)
+            .with_action_gate(gate);
+        let result = tool
+            .execute(
+                &intent_ctx("group:1"),
+                json!({"action": "napcat.send_group_msg",
+                       "params": {"group_id": 1, "message": "hi"}}),
+            )
+            .await;
+        assert!(
+            result.content.contains("approval_required"),
+            "{}",
+            result.content
+        );
+        let id = approvals.pending()[0]["id"].as_str().unwrap().to_owned();
+        let nonce = approvals.nonce_for(&id).unwrap();
+        let calls = gateway.calls.lock().unwrap();
+        let notice = calls
+            .iter()
+            .find(|(action, _)| action == "send_private_msg")
+            .expect("the owner is still notified");
+        let text = notice.1["message"].as_str().unwrap();
+        assert!(!text.contains(&nonce), "{text}");
+        assert!(text.contains("sbot gate approve"), "{text}");
+    }
+
+    /// 只有带 `message` 的发送进归档，并使用 NapCat 返回的真实 message_id；
+    /// 戳一戳不是消息，带 group_id 时作用于那个群。
+    #[tokio::test]
+    async fn only_real_messages_are_archived_with_their_napcat_id() {
+        let (messages, _dir) = message_store();
+        let gateway = Arc::new(FakeGateway::default());
+        let tool = tool(Some(gateway.clone()), None).with_messages(Arc::clone(&messages));
+        let sent = tool
+            .execute(
+                &intent_ctx("group:1"),
+                json!({"action": "napcat.send_group_msg",
+                       "params": {"group_id": 1, "message": "hi"}}),
+            )
+            .await;
+        assert!(!sent.is_error, "{}", sent.content);
+        // FakeGateway 返回 data.message_id = 42。
+        assert_eq!(
+            messages.chat_for_message(42).unwrap(),
+            Some(crate::qq::event::ChatId::Group(1))
+        );
+
+        let poke = tool
+            .execute(
+                &intent_ctx("group:1"),
+                json!({"action": "napcat.send_poke",
+                       "params": {"group_id": 1, "user_id": 30000}}),
+            )
+            .await;
+        assert!(!poke.is_error, "{}", poke.content);
+        // 戳一戳没有生成归档消息，也不会被记到 `private:30000`。
+        let group = messages
+            .recent(crate::qq::event::ChatId::Group(1), 10)
+            .unwrap();
+        assert_eq!(group.len(), 1, "{group:?}");
+        assert!(
+            messages
+                .recent(crate::qq::event::ChatId::Private(30000), 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `send_msg` 只接受恰好一个与 message_type 匹配的目标。
+    #[test]
+    fn send_msg_targets_must_be_unambiguous() {
+        let spec = ApiTool::spec("napcat.send_msg").unwrap();
+        let chat = |params: Value| crate::actions::chat_of(spec, &params);
+        assert_eq!(
+            chat(json!({"message_type": "group", "group_id": 1})),
+            Some(ChatId::Group(1))
+        );
+        assert_eq!(
+            chat(json!({"message_type": "private", "user_id": 2})),
+            Some(ChatId::Private(2))
+        );
+        assert_eq!(chat(json!({"group_id": 1})), Some(ChatId::Group(1)));
+        // NapCat 在私聊对象查不到时会改发到 group_id：两者同时出现一律不认。
+        assert_eq!(
+            chat(json!({"message_type": "private", "user_id": 2, "group_id": 1})),
+            None
+        );
+        assert_eq!(chat(json!({"user_id": 2, "group_id": 1})), None);
+        assert_eq!(chat(json!({"message_type": "x", "group_id": 1})), None);
     }
 }

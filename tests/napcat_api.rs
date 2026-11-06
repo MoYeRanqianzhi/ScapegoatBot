@@ -364,7 +364,7 @@ async fn approve_mode_nonce_round_trip_over_napcat() {
     );
 }
 
-/// 依据 action 注册表的 JSON Schema 生成最小参数。
+/// 依据 action 注册表的 JSON Schema 生成最小的**合法**参数。
 fn params_for(spec: &scapegoat_bot::tools::actions::ActionSpec) -> Value {
     let mut params = serde_json::Map::new();
     if let Some(properties) = spec.params.as_object() {
@@ -377,6 +377,8 @@ fn params_for(spec: &scapegoat_bot::tools::actions::ActionSpec) -> Value {
                 _ => match key.as_str() {
                     "message_type" => json!("group"),
                     "message" | "text" => json!("hi"),
+                    // 文件引用只接受 VFS 路径、公网 URL 或 base64；这里给内联内容。
+                    "file" => json!("base64://aGk="),
                     _ => json!("x"),
                 },
             };
@@ -385,6 +387,10 @@ fn params_for(spec: &scapegoat_bot::tools::actions::ActionSpec) -> Value {
     }
     if let Some(field) = spec.scope_field {
         params.entry(field).or_insert(json!(1));
+    }
+    // `send_msg` 必须恰好有一个与 message_type 匹配的目标（与 NapCat 的选择一致）。
+    if spec.action == "napcat.send_msg" {
+        params.remove("user_id");
     }
     Value::Object(params)
 }

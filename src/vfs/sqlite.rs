@@ -568,6 +568,10 @@ impl Vfs for VfsStore {
         if !meta.kind.is_file() {
             return Err(VfsError::IsADirectory(path.to_string()));
         }
+        // 文本节点的内容在 `content_enc` 列里，没有 blob 分块；按 UTF-8 字节返回。
+        if meta.kind == NodeKind::Text {
+            return self.read_text_unrecorded(path).map(String::into_bytes);
+        }
         let chunks = meta.size.div_ceil(1024 * 1024);
         let mut out = Vec::with_capacity(meta.size as usize);
         for index in 0..chunks {

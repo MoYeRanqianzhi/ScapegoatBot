@@ -156,7 +156,6 @@ pub(super) fn spawn_qq_pipeline(
                                 &messages,
                                 &data.name,
                                 &data.data,
-                                info.user_id,
                             )
                             .await;
                         }
@@ -177,33 +176,30 @@ async fn handle_qq_event(
     messages: &MessageStore,
     name: &str,
     data: &serde_json::Value,
-    _self_id: u64,
 ) {
     let event = crate::qq::event::normalize(name, data);
 
-    // 主人/通知账号在私聊里回复 nonce：批准对应 gate 请求，不进入 agent 回合。
+    // 主人/通知账号在私聊里回复确认码：批准对应 gate 请求，不进入 agent 回合，
+    // 也不入库（确认码不应留在模型能读到的归档里）。
     if let QqEvent::Message(message) = &event
-        && !message.is_self
-        && !message.backfilled
-        && message.chat == crate::qq::event::ChatId::Private(agent.self_id)
-        && message
-            .sender
-            .qq
-            .is_some_and(|qq| qq == agent.owner_qq || qq == agent.master_qq)
+        && let Some(sender) =
+            approval_reply_sender(message, agent.self_id, agent.owner_qq, agent.master_qq)
         && let Some(approved) = agent.approvals.approve_by_nonce(&message.plain_text())
     {
         let id = approved["approved"].as_str().unwrap_or_default();
         let action = approved["action"].as_str().unwrap_or_default();
-        let ack = format!("gate approval {id} for {action} accepted; retry the action within 120s");
-        if let Some(qq) = message.sender.qq
-            && let Err(error) = client
-                .call(
-                    "send_private_msg",
-                    serde_json::json!({"user_id": qq, "message": ack}),
-                )
-                .await
+        let ack = format!(
+            "Approved {id} ({action}). The agent may use it once within the next 120s; \
+             ask it to retry if it does not."
+        );
+        if let Err(error) = client
+            .call(
+                "send_private_msg",
+                serde_json::json!({"user_id": sender, "message": ack}),
+            )
+            .await
         {
-            warn!(%error, "cannot acknowledge a gate nonce");
+            warn!(%error, "cannot acknowledge a gate approval");
         }
         return;
     }
@@ -281,5 +277,100 @@ async fn handle_qq_event(
             }
             debug!(name, "unknown QQ event");
         }
+    }
+}
+
+/// 这条消息能否作为 gate 确认码的回复；能则返回回复者的 QQ。
+///
+/// 只接受“另一个账号发来的私聊”，且该账号是 owner 或 master：
+/// - 私聊会话对象必须就是发送者（群消息、转发、引用都不算）；
+/// - 本账号自己发出的消息（`is_self`，包括 stand_in 下主人在手机上手动发的）
+///   一律不算：它们与模型通过 API 发出的消息无法区分，而模型可能从归档里
+///   读到确认码，接受它们就等于允许模型自我批准；
+/// - 发送者等于本账号的消息同理。
+fn approval_reply_sender(
+    message: &crate::qq::event::QqMessage,
+    account_qq: u64,
+    owner_qq: u64,
+    master_qq: u64,
+) -> Option<u64> {
+    if message.is_self {
+        return None;
+    }
+    let crate::qq::event::ChatId::Private(peer) = message.chat else {
+        return None;
+    };
+    let sender = message.sender.qq?;
+    if sender != peer || sender == account_qq || sender == 0 {
+        return None;
+    }
+    (sender == owner_qq || sender == master_qq).then_some(sender)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::approval_reply_sender;
+    use crate::qq::event::{QqEvent, normalize};
+    use serde_json::json;
+
+    /// 用 NapCat 的事件形状构造一条消息。
+    fn message(data: serde_json::Value) -> crate::qq::event::QqMessage {
+        match normalize("message", &data) {
+            QqEvent::Message(message) => message,
+            other => panic!("expected a message, got {other:?}"),
+        }
+    }
+
+    /// companion 模式：主人（20000）从自己的账号私聊 bot（10000）回复确认码。
+    #[test]
+    fn owner_private_reply_from_another_account_is_accepted() {
+        let reply = message(json!({
+            "post_type": "message", "message_type": "private", "self_id": 10000,
+            "user_id": 20000, "message_id": 1, "time": 1793304000,
+            "message": [{"type": "text", "data": {"text": "123456"}}]
+        }));
+        assert_eq!(
+            approval_reply_sender(&reply, 10000, 20000, 10000),
+            Some(20000)
+        );
+        // 独立的通知账号（30000）同样可以。
+        let reply = message(json!({
+            "post_type": "message", "message_type": "private", "self_id": 10000,
+            "user_id": 30000, "message_id": 2, "time": 1793304000,
+            "message": [{"type": "text", "data": {"text": "123456"}}]
+        }));
+        assert_eq!(
+            approval_reply_sender(&reply, 10000, 10000, 30000),
+            Some(30000)
+        );
+    }
+
+    /// stand_in 默认配置：owner = master = 本账号。主人在手机上发的消息是
+    /// `message_sent` 回声，与模型发出的消息无法区分，不能用来批准。
+    #[test]
+    fn messages_from_the_account_itself_never_approve() {
+        let echo = message(json!({
+            "post_type": "message_sent", "message_type": "private", "self_id": 10000,
+            "user_id": 10000, "target_id": 10000, "message_id": 3, "time": 1793304000,
+            "message": [{"type": "text", "data": {"text": "123456"}}]
+        }));
+        assert_eq!(approval_reply_sender(&echo, 10000, 10000, 10000), None);
+    }
+
+    /// 群里、陌生人私聊发确认码都不算。
+    #[test]
+    fn group_messages_and_strangers_never_approve() {
+        let group = message(json!({
+            "post_type": "message", "message_type": "group", "self_id": 10000,
+            "group_id": 42, "user_id": 20000, "message_id": 4, "time": 1793304000,
+            "message": [{"type": "text", "data": {"text": "123456"}}]
+        }));
+        assert_eq!(approval_reply_sender(&group, 10000, 20000, 20000), None);
+        let stranger = message(json!({
+            "post_type": "message", "message_type": "private", "self_id": 10000,
+            "user_id": 40000, "message_id": 5, "time": 1793304000,
+            "message": [{"type": "text", "data": {"text": "123456"}}]
+        }));
+        assert_eq!(approval_reply_sender(&stranger, 10000, 20000, 20000), None);
     }
 }
