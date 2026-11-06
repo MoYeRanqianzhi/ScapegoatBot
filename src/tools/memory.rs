@@ -1,6 +1,6 @@
 //! `Memory` 工具：`/USER.md`、`/memory/<slug>.md` 与 `/MEMORY.md` 索引的唯一写入口。
 //!
-//! 设计依据：设计 §8.5 / `.agents/plan/2026-10-29-claude-memory-format.md`。
+//! 设计依据：设计 §8.5（索引 + 单条记忆文件的格式参考 Claude Code 的 memdir）。
 //!
 //! 规则：
 //! - `/USER.md` 写“主人希望被如何对待”（祈使句）；单条记忆写事实（陈述句）。

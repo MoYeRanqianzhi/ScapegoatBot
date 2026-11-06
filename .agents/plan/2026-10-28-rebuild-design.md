@@ -1,6 +1,10 @@
 # ScapegoatBot 彻底重构设计
 
-> 状态：设计草案（未实现）
+> 状态：0.2 已按本设计实现；本文是设计依据与取舍理由，**与代码冲突时以代码为准**。
+> 已知偏离（截至 2026-11-07）：单会话化（无 `[session].scope` / per_chat）；hold 只拒绝
+> `napcat.*`；图片工具为 `image.*`；断线补消息已删除。评审原文（prompt review、v3 提案、
+> Hermes 对照、设计复审二、子代理审查、Claude Code 记忆格式）已于 2026-11-07 从 `.agents/plan/`
+> 删除，结论已并入本文，原文用 `git log --all -- '.agents/plan/2026-10-29-*'` 查看。
 > 日期：2026-10-28
 > 参考：`.ref/pi`（agent loop）、`.ref/claude-code`（流程）、`.ref/claude-code-system-prompts`（提示词）
 
@@ -925,7 +929,7 @@ lifecycle = { max_events = 100, expires = "1h" }
 - **缓存策略**：Anthropic 用 `cache_control` 标记静态块结束与 skills 块结束（最多 4 个断点，留余量）；OpenAI/chat 依赖前缀缓存，因此静态前缀不得插入时间戳或会话相关字段。工具定义顺序稳定。
 - **Token 预算**：四块分别计量——静态前缀 ≤ 10,000 tokens；动态注入（owner context + USER + memory + STYLE + 技能索引 + runtime）≤ 30,000 tokens；工具 schema ≤ 12,000 tokens；单条工具结果 ≤ 32 KB。预算宽裕不等于可以回填工具细节：参数与返回格式仍留在工具 description。当前 v4 静态约 3,802–4,278 tokens。
 - **记忆是声明式事实**：写入记忆的条目用陈述句（“主人喜欢短回复”），不用命令句（“总是简短回复”）；命令式笔记会在后续会话被重新读成指令，覆盖当下的真实需求。参考 Hermes `build_memory_guidance`。
-- **参考来源（长期运行）**：Hermes Agent 的分层提示词、记忆/技能学习回路、后台复盘与压缩连续性设计；详细对照见 `.agents/plan/2026-10-29-hermes-review.md`。
+- **参考来源（长期运行）**：Hermes Agent 的分层提示词、记忆/技能学习回路、后台复盘与压缩连续性设计；详细对照已归档（见文首状态说明）。
 - **工具描述与系统提示分工**：参数、action 列表、返回格式放工具 description；系统提示只写何时用、边界与组合策略。
 - **版本化与测试**：提示词带 `prompt_version`；快照测试 section 顺序、边界与动态字段；lint 测试确保内置模型面文本不含 CJK（动态值例外）。
 - **Prompt 清单**：system prompt、tool description、压缩、子代理、门禁、错误/提示统一见 `.agents/plan/2026-10-29-prompt-catalog.md`；本节 7.3 是 system prompt 本体。
@@ -1942,7 +1946,7 @@ src/
 - 系统提示词以 `You are ScapegoatBot` 开头，全英文（所有模型面文本一律英文）；静态前缀与 `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` 动态上下文分离；动态段顺序为 owner context → USER → memory → STYLE → skills；runtime 每轮作为独立上下文消息注入；会话稳定部分只构建一次，压缩后重建；QQ 回复跟随会话语言，默认纯文本（话题需要或主人人设明显使用 Markdown 时跟随）；不用 Unicode emoji、用 QQ 表情；不单独设“是不是机器人”策略，跟随主人自己的人设；owner 通知走 master QQ 私聊；工具细节下沉到 description；指令优先级：内置 > owner context > skill > QQ/网络数据。当前版本 v4，静态约 3,802–4,278 tokens（预算上限 10k）。
 - 长期运行参考 Hermes Agent：分层提示词与一次构建；记忆用声明式陈述句、有字符预算、满了合并；agent 记忆使用独立 `<memory_context>` 标签，永不作为 owner guidance；技能承载“这类任务怎么做”，用户纠正是写入技能的一等信号；后台复盘默认空闲触发；技能 curator 只归档不删除；压缩摘要记录用户纠正并写成带日期的过去式；`~/.sbot/ESTOP` 提供暂停/恢复；内部注入标签在发送前与流式输出中剥离。对照见 `.agents/plan/2026-10-29-hermes-review.md`。
 - **会话上下文保持 shared（2026-10-29 决定）**：整个 QQ 号一份全局 transcript；A、B 的消息必须结合才能拼出完整信息。风险由回合绑定 `origin_chat`、按 chat 去抖、跨 chat 发送的 n-gram 门禁与提示词控制；`[session].scope = "per_chat"` 作为强隔离逃生口。README 如实写明 shared 的隐私边界。
-- 长期运行运维参考 OpenClaw / Grok Build（见 `.agents/plan/2026-10-29-design-review-2.md`）：断线重连按最后 `message_id` 补齐并去重；每 chat 队列有上限与 `summarize/old/new` 丢弃策略；provider 重试 + `Retry-After` + 回退链，失败不重放已完成工具；崩溃恢复写 marker、不自动重放；IPC 带版本、请求 id 与幂等键；`sbot backup` / `sbot doctor`。
+- 长期运行运维参考 OpenClaw / Grok Build（设计复审二，已归档）：断线重连按最后 `message_id` 补齐并去重；每 chat 队列有上限与 `summarize/old/new` 丢弃策略；provider 重试 + `Retry-After` + 回退链，失败不重放已完成工具；崩溃恢复写 marker、不自动重放；IPC 带版本、请求 id 与幂等键；`sbot backup` / `sbot doctor`。
 - 记忆参考 OpenClaw 的来源模型：`owner` / `agent` / `untrusted` / `system` 由写入代码判定；只有 `owner` / `agent` 自动注入；untagged 不自动注入；召回内容不回流；非交互会话不产生候选。记忆分 `/USER.md`（偏好祈使句）与 `/MEMORY.md`（事实陈述句），详细材料放 `/memory/topics/`，压缩前 flush、压缩后检索。
 - 周期安全检查：每 `check_every_tokens`（默认 256K）新增上下文触发一次独立模型检查；共享主请求前缀缓存，底部追加检查指令，响应不写入主 transcript；命中写 `~/.sbot/SECURITY_HOLD`，解除与 5.10 共用同一套恢复方式。
 - Inbox 忽略（2026-10-30）：`RM` 是唯一入口，把条目标为 `dismissed` 并从默认视图移除，但**不算读过**；`RM /inbox/<chat>.md` 忽略整个来源、`RM /inbox?filter=...` 批量忽略且必须带 `filter`；消息本体不删除，审计保留，`?filter=state:dismissed` 可回看。三种状态 `unread` / `read` / `dismissed` 分明。

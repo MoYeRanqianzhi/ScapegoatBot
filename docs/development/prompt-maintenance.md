@@ -1,6 +1,6 @@
 # 提示词维护指南
 
-本文说明 ScapegoatBot 的模型面文本如何组织、哪些地方不能改、改完怎么验证。设计依据见 `.agents/plan/2026-10-28-rebuild-design.md` §7 与 `.agents/plan/2026-10-29-hermes-review.md`。
+本文说明 ScapegoatBot 的模型面文本如何组织、哪些地方不能改、改完怎么验证。设计依据见 `.agents/plan/2026-10-28-rebuild-design.md` §7。
 
 ## 1. 哪些文本属于模型面
 
