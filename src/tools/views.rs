@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use crate::config::models::ModelsFile;
 use crate::config::{LoadedConfig, SbotConfig};
 use crate::qq::event::{ChatId, QqMessage};
-use crate::qq::{QqClient, format};
+use crate::qq::format;
 use crate::security::gate::Gate;
 use crate::session::SessionStore;
 use crate::storage::Database;
@@ -63,7 +63,8 @@ pub struct Views {
     vfs: Arc<VfsStore>,
     messages: Arc<MessageStore>,
     sessions: Arc<SessionStore>,
-    client: Option<Arc<QqClient>>,
+    /// NapCat 网关（生产是 `QqClient`）；`/friends`、`/groups` 用它实时查询。
+    client: Option<Arc<dyn crate::tools::api::NapcatGateway>>,
     /// `/config` 与 `/system` 使用的运行时快照；未接入时为 `None`。
     context: ViewContext,
     /// 配置写入后的热更新回调（filter/queue 等内存副本）。
@@ -107,7 +108,7 @@ impl Views {
         vfs: Arc<VfsStore>,
         messages: Arc<MessageStore>,
         sessions: Arc<SessionStore>,
-        client: Option<Arc<QqClient>>,
+        client: Option<Arc<dyn crate::tools::api::NapcatGateway>>,
     ) -> Self {
         Self {
             vfs,
@@ -133,6 +134,16 @@ impl Views {
     }
 
     /// 接入 `/config` 与 `/system` 所需的运行时句柄。
+    /// 换一个 NapCat 网关（测试用假网关）。
+    #[cfg(test)]
+    pub(crate) fn with_gateway(
+        mut self,
+        client: Arc<dyn crate::tools::api::NapcatGateway>,
+    ) -> Self {
+        self.client = Some(client);
+        self
+    }
+
     pub(crate) fn with_context(mut self, context: ViewContext) -> Self {
         self.context = context;
         self
@@ -160,17 +171,13 @@ impl Views {
             [root] if root == "sessions" => self.list_sessions_root(),
             [root] if root == "friends" => self.list_friends().await,
             [root] if root == "groups" => self.list_groups().await,
+            [root, group] if root == "groups" => self.list_group_members(group).await,
             [root, scope] if root == "messages" => self.list_message_scope(scope),
             [root, scope, peer] if root == "messages" => self.list_message_peer(scope, peer),
             [root, scope, peer, month] if root == "messages" => {
                 self.list_message_month(scope, peer, month)
             }
             [root, chat] if root == "inbox" => self.list_inbox_chat(chat),
-            [root, scope, peer] if root == "friends" => self.list_friend(scope, peer).await,
-            [root, group] if root == "groups" => self.list_group(group).await,
-            [root, group, members] if root == "groups" && members == "members" => {
-                self.list_group_members(group).await
-            }
             [root] if root == "config" => Ok(self.list_config_root()),
             [root, section] if root == "config" => Ok(self.list_config_section(section)),
             [root, _, _] if root == "config" => Ok(Vec::new()),
@@ -239,12 +246,9 @@ impl Views {
                     self.read_session(file)
                 }
             }
-            [root, scope, peer] if root == "friends" => self.read_friend_file(scope, peer).await,
-            [root, group, member] if root == "groups" && member.ends_with(".md") => {
-                self.read_group_member(group, member.trim_end_matches(".md"))
-                    .await
-            }
-            [root, group, file] if root == "groups" => self.read_group_file(group, file).await,
+            [root, file] if root == "friends" => self.read_friend(file).await,
+            [root, file] if root == "groups" => self.read_group(file).await,
+            [root, group, file] if root == "groups" => self.read_group_member(group, file).await,
             [root] if root == "config.toml" => self.read_config_toml(),
             [root] if root == "config" => self.read_config_digest(),
             [root, file] if root == "config" && file == "models.json" => self.read_models_json(),
@@ -624,6 +628,11 @@ mod tests {
     use crate::config::SbotConfig;
     use crate::storage::crypto::MasterKey;
     use crate::vfs::quota::Limits;
+
+    /// 子模块测试共用的最小 `Views`（离线、无配置）。
+    pub(super) fn views_for_tests() -> (Views, tempfile::TempDir) {
+        views()
+    }
 
     fn views() -> (Views, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

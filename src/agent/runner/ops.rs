@@ -106,7 +106,8 @@ impl crate::tools::api::AgentOps for RuntimeOps {
         let text = params
             .get("text")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "agent.quarantine requires \"text\"".to_owned())?;
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| "agent.quarantine requires a non-empty \"text\"".to_owned())?;
         let reason = params
             .get("reason")
             .and_then(serde_json::Value::as_str)
@@ -117,20 +118,15 @@ impl crate::tools::api::AgentOps for RuntimeOps {
             std::process::id()
         );
         let path = crate::vfs::VfsPath::parse(&name).map_err(|error| error.to_string())?;
-        let body = format!("# Quarantined content\n\nreason: {reason}\n\n---\n\n{text}\n");
         self.vfs
-            .write_text(&path, &body, None)
+            .write_text(&path, &quarantine_body(reason, text), None)
             .map_err(|error| error.to_string())?;
         // 把同一段原文从已提交的上下文里换成占位符：下一回合与 `agent.resume`
-        // 看到的就是清理后的上下文。只改内存里的历史；磁盘上的 transcript 分段
-        // 保持原样，作为审计记录（重启后会重新读入，必要时需再隔离一次）。
-        let placeholder = format!("[quarantined: {path}]");
+        // 看到的就是清理后的上下文。磁盘上的 transcript 分段保持原样作为审计记录；
+        // 重启恢复上下文时由 [`reapply_quarantine`] 按 `/quarantine/` 再替换一次。
         let removed: usize = {
             let mut history = self.history.lock().await;
-            history
-                .iter_mut()
-                .map(|message| message.redact(text, &placeholder))
-                .sum()
+            redact_all(&mut history, text, &placeholder(&path))
         };
         Ok(serde_json::json!({
             "quarantined": path.to_string(),
@@ -162,6 +158,60 @@ impl crate::tools::api::AgentOps for RuntimeOps {
     }
 }
 
+/// 隔离文件里原因与原文之间的分隔；分隔之后（去掉末尾换行）就是原文。
+const QUARANTINE_SEPARATOR: &str = "\n\n---\n\n";
+
+/// 隔离文件正文。原因压成一行，保证分隔符只出现在它该在的位置。
+fn quarantine_body(reason: &str, text: &str) -> String {
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("# Quarantined content\n\nreason: {reason}{QUARANTINE_SEPARATOR}{text}\n")
+}
+
+/// 上下文里替换原文的占位符。
+fn placeholder(path: &crate::vfs::VfsPath) -> String {
+    format!("[quarantined: {path}]")
+}
+
+/// 在整段历史里替换一段原文，返回替换次数。
+fn redact_all(history: &mut [AgentMessage], text: &str, placeholder: &str) -> usize {
+    history
+        .iter_mut()
+        .map(|message| message.redact(text, placeholder))
+        .sum()
+}
+
+/// 重启恢复上下文后调用：按 `/quarantine/` 里的每份隔离文件再替换一次。
+///
+/// transcript 分段是只追加的审计记录，隔离时不改写；不在这里重放，隔离过的
+/// 原文会在每次重启后回到上下文，`agent.resume` 的复核又会被它挡住。
+/// 返回替换次数；读不到的文件跳过（隔离区不存在是常态）。
+pub(super) fn reapply_quarantine(vfs: &VfsStore, history: &mut [AgentMessage]) -> usize {
+    let Ok(root) = crate::vfs::VfsPath::parse("/quarantine") else {
+        return 0;
+    };
+    let Ok(entries) = vfs.list(&root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries {
+        if entry.kind != crate::vfs::NodeKind::Text {
+            continue;
+        }
+        let Ok(body) = vfs.read_text_unrecorded(&entry.path) else {
+            continue;
+        };
+        let Some((_, text)) = body.split_once(QUARANTINE_SEPARATOR) else {
+            continue;
+        };
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        if text.trim().is_empty() {
+            continue;
+        }
+        removed += redact_all(history, text, &placeholder(&entry.path));
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,7 +221,7 @@ mod tests {
     use crate::vfs::quota::Limits;
 
     /// 只含 resume/quarantine 需要的部件；runner 留空（compact/clear_context 不在这里测）。
-    fn ops(dir: &std::path::Path, history: Vec<AgentMessage>) -> RuntimeOps {
+    pub(super) fn ops_for(dir: &std::path::Path, history: Vec<AgentMessage>) -> RuntimeOps {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let key = Arc::new(MasterKey::from_bytes([4u8; 32]));
         let data = dir.join("data");
@@ -237,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn the_agent_can_lift_an_output_hold_by_itself() {
         let dir = tempfile::tempdir().unwrap();
-        let ops = ops(dir.path(), vec![AgentMessage::user("hi")]);
+        let ops = ops_for(dir.path(), vec![AgentMessage::user("hi")]);
         assert!(
             !ops.gate
                 .check(
@@ -261,7 +311,7 @@ mod tests {
     async fn a_poisoned_context_must_be_quarantined_before_resuming() {
         let dir = tempfile::tempdir().unwrap();
         let poison = "token sk-abcdefghijklmnopqrstuvwx";
-        let ops = ops(
+        let ops = ops_for(
             dir.path(),
             vec![AgentMessage::user(format!("look: {poison}"))],
         );
@@ -290,5 +340,36 @@ mod tests {
 
         assert_eq!(ops.resume().await.unwrap()["hold"], false);
         assert!(!ops.gate.hold_active());
+    }
+}
+
+#[cfg(test)]
+mod quarantine_tests {
+    use super::*;
+    use crate::tools::api::AgentOps;
+
+    /// 重启后从 transcript 恢复的上下文仍然看不到隔离过的原文。
+    #[tokio::test]
+    async fn quarantine_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let poison = "token sk-abcdefghijklmnopqrstuvwx";
+        let ops = tests::ops_for(dir.path(), vec![AgentMessage::user(format!("a {poison}"))]);
+        ops.quarantine(&serde_json::json!({"text": poison, "reason": "multi\n\n---\n\nline"}))
+            .await
+            .unwrap();
+        assert!(
+            ops.quarantine(&serde_json::json!({"text": "  "}))
+                .await
+                .is_err()
+        );
+
+        // 模拟重启：从磁盘读回的是未改写的原文。
+        let mut recovered = vec![AgentMessage::user(format!("a {poison}"))];
+        assert_eq!(reapply_quarantine(&ops.vfs, &mut recovered), 1);
+        let AgentMessage::User { text, .. } = &recovered[0] else {
+            unreachable!()
+        };
+        assert!(!text.contains(poison), "{text}");
+        assert!(text.contains("[quarantined: /quarantine/"));
     }
 }

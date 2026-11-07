@@ -124,7 +124,7 @@ impl MonitorEvent {
     }
 }
 
-/// 谓词求值；错误由调用方转成系统通知，绝不静默失败。
+/// 谓词求值。表达式在 [`validate_when`] 里已经校验过；这里的错误只是防御。
 pub fn matches(when: Option<&str>, event: &MonitorEvent) -> Result<bool, String> {
     let Some(when) = when else {
         return Ok(true);
@@ -139,6 +139,35 @@ pub fn matches(when: Option<&str>, event: &MonitorEvent) -> Result<bool, String>
         }
     }
     Ok(true)
+}
+
+/// 校验 `when` 表达式：每一项都必须是受支持的谓词。
+///
+/// 必须逐项检查：`matches` 遇到第一个为假的项就短路，后面写错的项可能永远不被求值，
+/// 直到某个事件恰好让前面的项都为真才暴露。
+pub fn validate_when(when: &str) -> Result<(), String> {
+    let probe = MonitorEvent {
+        kind: String::new(),
+        chat: String::new(),
+        sender: None,
+        text: String::new(),
+        mentions_self: false,
+        owner_intent: false,
+        message: None,
+    };
+    let mut terms = 0;
+    for term in when.split(" and ") {
+        let term = term.trim();
+        if term.is_empty() {
+            return Err(format!("empty term in `when` expression {when:?}"));
+        }
+        match_term(term, &probe)?;
+        terms += 1;
+    }
+    if terms == 0 {
+        return Err("`when` expression is empty".to_owned());
+    }
+    Ok(())
 }
 
 fn match_term(term: &str, event: &MonitorEvent) -> Result<bool, String> {
@@ -342,6 +371,9 @@ impl MonitorManager {
             cc,
             on_missing,
         } = spec;
+        if let Some(when) = &when {
+            validate_when(when).map_err(|error| anyhow::anyhow!("monitor {name:?}: {error}"))?;
+        }
         // 过期时刻先算出来：参数来自模型与配置，时长再大也只能报错，不能让
         // `DateTime + Duration` 溢出 panic（release 是 panic = "abort"，会带走整个进程）。
         let expires_at = match expires {
@@ -509,17 +541,22 @@ impl MonitorManager {
             match matches(monitor.when.as_deref(), &view) {
                 Ok(true) => self.enqueue(&monitor, &view).await,
                 Ok(false) => {}
+                // `add` 已校验表达式，这里不应发生。真发生了就停掉这个 monitor 并只通知一次：
+                // 否则每个 QQ 事件都会投递一条系统通知（每条都是一个回合）。
                 Err(error) => {
                     warn!(%error, monitor = %monitor.name, "monitor predicate failed");
-                    self.sink
-                        .deliver(monitor.system_delivery(
-                            "internal",
-                            format!(
-                                "system: monitor {:?} has an invalid `when` expression: {error}",
-                                monitor.name
-                            ),
-                        ))
-                        .await;
+                    if self.remove(&monitor.name).await {
+                        self.sink
+                            .deliver(monitor.system_delivery(
+                                "internal",
+                                format!(
+                                    "system: monitor {:?} was removed: its `when` expression \
+                                     failed ({error})",
+                                    monitor.name
+                                ),
+                            ))
+                            .await;
+                    }
                 }
             }
         }
@@ -1021,18 +1058,15 @@ pub async fn load_config_monitors(
         if wants_backlog && let Some(messages) = messages {
             let mut lines = Vec::new();
             for message in messages.unread(None).unwrap_or_default() {
-                let event = MonitorEvent {
-                    kind: "message".to_owned(),
-                    chat: message.chat.to_string(),
-                    sender: message.sender.qq,
-                    text: message.plain_text(),
-                    mentions_self: message
-                        .segments
-                        .iter()
-                        .any(|segment| matches!(segment, crate::qq::event::Segment::At { .. })),
-                    owner_intent: false,
-                    message: None,
+                // 与实时事件同一套视图（`@` 判定、主人消息），补投与实时投递结果一致。
+                let Some(mut event) = MonitorEvent::from_qq(
+                    &QqEvent::Message(message.clone()),
+                    manager.self_id.load(Ordering::Relaxed),
+                ) else {
+                    continue;
                 };
+                let owner_qq = manager.owner_qq.load(Ordering::Relaxed);
+                event.owner_intent = owner_qq != 0 && event.sender == Some(owner_qq);
                 if !matches(monitor.when.as_deref(), &event).unwrap_or(false) {
                     continue;
                 }
@@ -1525,6 +1559,43 @@ mod tests {
         let deliveries = sink.deliveries.lock().unwrap();
         assert_eq!(deliveries.len(), 1);
         assert!(deliveries[0].owner_intent);
+    }
+
+    /// 写错的表达式在创建时就被拒绝：短路求值会让后面的错项长期潜伏。
+    #[tokio::test]
+    async fn invalid_when_expressions_are_rejected_when_added() {
+        assert!(validate_when("event.mentions_self and not event.text contains 'x'").is_ok());
+        assert!(validate_when("event.type == 'notice' and event.bogus").is_err());
+        assert!(validate_when("event.mentions_self and ").is_err());
+
+        let sink = Arc::new(RecordingSink::default());
+        let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+        let error = manager
+            .add(MonitorSpec {
+                name: "broken".to_owned(),
+                source: "qq".to_owned(),
+                timer: None,
+                when: Some("event.type == 'message' and event.sender = '1'".to_owned()),
+                prompt: None,
+                as_prompt: false,
+                max_events: 10,
+                expires: None,
+                one_shot: false,
+                min_interval: Duration::ZERO,
+                idle_only: false,
+                batch_window: Duration::ZERO,
+                target: None,
+                catch_up: CatchUp::Coalesce,
+                cc: false,
+                on_missing: crate::config::OnMissing::Queue,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unsupported predicate"),
+            "{error}"
+        );
+        assert!(manager.monitors.read().await.is_empty());
     }
 
     #[test]

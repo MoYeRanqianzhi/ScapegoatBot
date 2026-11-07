@@ -7,6 +7,29 @@
 
 ## [Unreleased]
 
+## [0.2.0-alpha.39] - 2026-11-08
+
+运行时正确性（审查 P0）。
+
+### 修复
+
+- 回合块实时写入 turn buffer：模型循环每并入一块就发 `AgentEvent::Appended`，runner 立刻
+  落盘（`agent/runner/journal.rs`）。以前只在回合结束前一次性写入，进程中途退出会丢掉整个
+  回合，包括已经执行过的工具调用。
+- 消息日文件的行号改为文件里的物理位置（带长度校验的缓存，末尾残行先补换行）。以前按索引
+  条数计算，文件写成功、索引事务丢失一次，之后同一天的行号全部错位，重建也修不好。
+- `/friends`、`/groups` 视图重写：按文档的 `/friends/<qq>.md`、`/groups/<gid>.md`、
+  `/groups/<gid>/<qq>.md` 路由；以前对已解包的结果再取 `data`，列表永远为空，读文件的路由也对不上。
+  视图改用 `NapcatGateway`，有了离线单测。
+- monitor 的 `when` 在创建时（含配置文件）逐项校验，写错直接报错；以前短路求值让错项潜伏，
+  一旦触发就每个 QQ 事件投递一条系统通知（每条一个回合）。运行时若仍出错，移除该 monitor 并只通知一次。
+  `backlog = "inbox"` 补投的 `@` 判定与实时事件一致（以前任意 `@` 都算 `mentions_self`）。
+- 子代理：`sbot ai stop` 与 ESTOP 也停下子代理；`Agent message` 用调用方这一回合的证据续聊，
+  不再沿用 spawn 时的 owner intent；spawn 带 owner intent 的运行中实例不接受没有 owner intent 的引导；
+  运行收尾时送来的消息等收尾完成再续聊（以前立刻重启，上一轮的最终回答被丢弃），收件通道关闭前
+  送进来的消息会再跑一轮回应。
+- `agent.quarantine` 在重启后仍然生效：恢复上下文时按 `/quarantine/` 重放替换；空 `text` 被拒绝。
+
 ## [0.2.0-alpha.38] - 2026-11-08
 
 主人的消息不再走特权通道。

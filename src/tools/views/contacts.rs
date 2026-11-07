@@ -1,213 +1,252 @@
-//! `Views` 的 contacts 部分。
+//! `Views` 的联系人部分：`/friends` 与 `/groups`，实时查询 NapCat。
 //!
-//! 由 `views/mod.rs` 的 `list` / `read` 路由调用。
+//! 路由（与 `docs/guide/tools-and-vfs.md` 一致）：
+//!
+//! | 路径 | 列目录 | 读文件 |
+//! |------|--------|--------|
+//! | `/friends` | 每个好友一个 `<qq>.md` | — |
+//! | `/friends/<qq>.md` | — | 好友资料 |
+//! | `/groups` | 每个群一个 `<gid>.md` 与一个 `<gid>/` | — |
+//! | `/groups/<gid>.md` | — | 群资料 |
+//! | `/groups/<gid>` | 每个成员一个 `<qq>.md` | — |
+//! | `/groups/<gid>/<qq>.md` | — | 群成员资料 |
+//!
+//! 所有路径都受 `receive_scopes` 约束；不在范围内的好友/群既不列出也不能读。
+//! `QqClient::call` 返回的已经是 OneBot 响应的 `data`，这里不再解一层。
+
+use serde_json::{Value, json};
 
 use super::*;
 
 impl Views {
-    pub(super) async fn list_friends(&self) -> Result<Vec<ViewEntry>, VfsError> {
+    /// 调一次 NapCat；没有连接或调用失败都是 `Offline`。
+    async fn contacts_query(&self, action: &str, params: Value) -> Result<Value, VfsError> {
         let Some(client) = &self.client else {
-            // 离线：仍然列出 VFS 里已有的 notes 目录。
-            return self.vfs_list_fallback(&VfsPath::parse("/friends").expect("valid"));
+            return Err(VfsError::Offline(format!(
+                "{action}: NapCat is not connected"
+            )));
         };
-        let response = client
-            .friend_list()
-            .await
-            .map_err(|error| VfsError::Offline(error.to_string()))?;
-        let list = response
-            .get("data")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Ok(list
+        client.call(action, params).await.map_err(VfsError::Offline)
+    }
+
+    /// 列表类查询的结果数组。
+    async fn contacts_list(&self, action: &str, params: Value) -> Result<Vec<Value>, VfsError> {
+        match self.contacts_query(action, params).await? {
+            Value::Array(items) => Ok(items),
+            other => Err(VfsError::Storage(format!(
+                "{action} returned {} instead of a list",
+                kind_of(&other)
+            ))),
+        }
+    }
+
+    pub(super) async fn list_friends(&self) -> Result<Vec<ViewEntry>, VfsError> {
+        let friends = self.contacts_list("get_friend_list", json!({})).await?;
+        Ok(friends
             .iter()
-            .filter_map(|friend| friend.get("user_id").and_then(serde_json::Value::as_u64))
+            .filter_map(|friend| id_field(friend, "user_id"))
             .filter(|qq| self.receive_allows(ChatId::Private(*qq)))
-            .map(|qq| dir_entry(&format!("/friends/{qq}")))
+            .map(|qq| text_entry(&format!("/friends/{qq}.md")))
             .collect())
     }
 
     pub(super) async fn list_groups(&self) -> Result<Vec<ViewEntry>, VfsError> {
-        let Some(client) = &self.client else {
-            return self.vfs_list_fallback(&VfsPath::parse("/groups").expect("valid"));
-        };
-        let response = client
-            .group_list()
-            .await
-            .map_err(|error| VfsError::Offline(error.to_string()))?;
-        let list = response
-            .get("data")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Ok(list
+        let groups = self.contacts_list("get_group_list", json!({})).await?;
+        Ok(groups
             .iter()
-            .filter_map(|group| group.get("group_id").and_then(serde_json::Value::as_u64))
+            .filter_map(|group| id_field(group, "group_id"))
             .filter(|gid| self.receive_allows(ChatId::Group(*gid)))
-            .map(|gid| dir_entry(&format!("/groups/{gid}")))
+            .flat_map(|gid| {
+                [
+                    text_entry(&format!("/groups/{gid}.md")),
+                    dir_entry(&format!("/groups/{gid}")),
+                ]
+            })
             .collect())
-    }
-
-    pub(super) async fn list_friend(
-        &self,
-        _scope: &str,
-        peer: &str,
-    ) -> Result<Vec<ViewEntry>, VfsError> {
-        let qq: u64 = peer
-            .parse()
-            .map_err(|_| VfsError::NotFound(format!("/friends/{peer}")))?;
-        self.ensure_receive(ChatId::Private(qq))?;
-        Ok(vec![
-            text_entry(&format!("/friends/{peer}/profile.md")),
-            text_entry(&format!("/friends/{peer}/info.json")),
-            text_entry(&format!("/friends/{peer}/notes.md")),
-        ])
-    }
-
-    pub(super) async fn list_group(&self, group: &str) -> Result<Vec<ViewEntry>, VfsError> {
-        let gid: u64 = group
-            .parse()
-            .map_err(|_| VfsError::NotFound(format!("/groups/{group}")))?;
-        self.ensure_receive(ChatId::Group(gid))?;
-        Ok(vec![
-            text_entry(&format!("/groups/{group}/profile.md")),
-            text_entry(&format!("/groups/{group}/info.json")),
-            dir_entry(&format!("/groups/{group}/members")),
-            text_entry(&format!("/groups/{group}/notes.md")),
-        ])
     }
 
     pub(super) async fn list_group_members(&self, group: &str) -> Result<Vec<ViewEntry>, VfsError> {
-        let gid: u64 = group
-            .parse()
-            .map_err(|_| VfsError::NotFound(format!("/groups/{group}")))?;
+        let gid = parse_id(group, "/groups")?;
         self.ensure_receive(ChatId::Group(gid))?;
-        let Some(client) = &self.client else {
-            return Err(VfsError::Offline("/groups members".to_owned()));
-        };
-        let response = client
-            .call(
-                "get_group_member_list",
-                serde_json::json!({"group_id": group.parse::<u64>().unwrap_or(0)}),
-            )
-            .await
-            .map_err(|error| VfsError::Offline(error.to_string()))?;
-        let list = response
-            .get("data")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Ok(list
+        let members = self
+            .contacts_list("get_group_member_list", json!({"group_id": gid}))
+            .await?;
+        Ok(members
             .iter()
-            .filter_map(|member| member.get("user_id").and_then(serde_json::Value::as_u64))
-            .map(|qq| text_entry(&format!("/groups/{group}/members/{qq}.md")))
+            .filter_map(|member| id_field(member, "user_id"))
+            .map(|qq| text_entry(&format!("/groups/{gid}/{qq}.md")))
             .collect())
     }
 
-    pub(super) async fn read_friend_file(
-        &self,
-        _scope: &str,
-        peer: &str,
-    ) -> Result<ViewRead, VfsError> {
-        let path = VfsPath::parse(&format!("/friends/{peer}"))?;
-        let qq: u64 = peer
-            .parse()
-            .map_err(|_| VfsError::NotFound(path.to_string()))?;
+    /// `/friends/<qq>.md`：好友列表里的那一项。
+    pub(super) async fn read_friend(&self, file: &str) -> Result<ViewRead, VfsError> {
+        let qq = parse_md_id(file, "/friends")?;
         self.ensure_receive(ChatId::Private(qq))?;
-        let Some(client) = &self.client else {
-            return Err(VfsError::Offline(format!("/friends/{peer}")));
-        };
-        let response = client
-            .friend_list()
-            .await
-            .map_err(|error| VfsError::Offline(error.to_string()))?;
-        let list = response
-            .get("data")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let friend = list
+        let friends = self.contacts_list("get_friend_list", json!({})).await?;
+        let friend = friends
             .iter()
-            .find(|item| {
-                item.get("user_id")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(|id| id.to_string())
-                    .as_deref()
-                    == Some(peer)
-            })
-            .ok_or_else(|| VfsError::NotFound(path.to_string()))?;
-        Ok(ViewRead::Text(format!(
-            "# Friend {peer}\n\n```json\n{}\n```\n",
-            serde_json::to_string_pretty(friend).unwrap_or_default()
-        )))
+            .find(|friend| id_field(friend, "user_id") == Some(qq))
+            .ok_or_else(|| VfsError::NotFound(format!("/friends/{file}")))?;
+        Ok(profile(&format!("Friend {qq}"), friend))
     }
 
-    pub(super) async fn read_group_file(
+    /// `/groups/<gid>.md`：群资料。
+    pub(super) async fn read_group(&self, file: &str) -> Result<ViewRead, VfsError> {
+        let gid = parse_md_id(file, "/groups")?;
+        self.ensure_receive(ChatId::Group(gid))?;
+        let info = self
+            .contacts_query("get_group_info", json!({"group_id": gid}))
+            .await?;
+        Ok(profile(&format!("Group {gid}"), &info))
+    }
+
+    /// `/groups/<gid>/<qq>.md`：群成员资料。
+    pub(super) async fn read_group_member(
         &self,
         group: &str,
         file: &str,
     ) -> Result<ViewRead, VfsError> {
-        let _ = file;
-        let gid: u64 = group
-            .parse()
-            .map_err(|_| VfsError::NotFound(format!("/groups/{group}")))?;
+        let gid = parse_id(group, "/groups")?;
         self.ensure_receive(ChatId::Group(gid))?;
-        let Some(client) = &self.client else {
-            return Err(VfsError::Offline(format!("/groups/{group}")));
-        };
-        let response = client
-            .group_list()
-            .await
-            .map_err(|error| VfsError::Offline(error.to_string()))?;
-        let list = response
-            .get("data")
-            .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let found = list.iter().find(|item| {
-            item.get("group_id")
-                .and_then(serde_json::Value::as_u64)
-                .map(|id| id.to_string())
-                .as_deref()
-                == Some(group)
-        });
-        let group = found.ok_or_else(|| VfsError::NotFound(format!("/groups/{group}")))?;
-        Ok(ViewRead::Text(format!(
-            "# Group {group}\n\n```json\n{}\n```\n",
-            serde_json::to_string_pretty(group).unwrap_or_default()
-        )))
-    }
-
-    pub(super) async fn read_group_member(
-        &self,
-        group: &str,
-        member: &str,
-    ) -> Result<ViewRead, VfsError> {
-        let gid: u64 = group
-            .parse()
-            .map_err(|_| VfsError::NotFound(format!("/groups/{group}")))?;
-        self.ensure_receive(ChatId::Group(gid))?;
-        let Some(client) = &self.client else {
-            return Err(VfsError::Offline(format!("/groups/{group}/members")));
-        };
-        let response = client
-            .call(
+        let qq = parse_md_id(file, &format!("/groups/{gid}"))?;
+        let info = self
+            .contacts_query(
                 "get_group_member_info",
-                serde_json::json!({
-                    "group_id": group.parse::<u64>().unwrap_or(0),
-                    "user_id": member.parse::<u64>().unwrap_or(0),
-                }),
+                json!({"group_id": gid, "user_id": qq}),
             )
-            .await
-            .map_err(|error| VfsError::Offline(error.to_string()))?;
-        Ok(ViewRead::Text(format!(
-            "# Member {member} of {group}\n\n```json\n{}\n```\n",
-            serde_json::to_string_pretty(response.get("data").unwrap_or(&response))
-                .unwrap_or_default()
-        )))
+            .await?;
+        Ok(profile(&format!("Member {qq} of group {gid}"), &info))
+    }
+}
+
+/// 资料文件：标题 + 原始 JSON。
+fn profile(title: &str, value: &Value) -> ViewRead {
+    ViewRead::Text(format!(
+        "# {title}\n\n```json\n{}\n```\n",
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    ))
+}
+
+/// 数字 id 字段；NapCat 有时把 id 写成字符串。
+fn id_field(value: &Value, key: &str) -> Option<u64> {
+    match value.get(key)? {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+/// 路径段是一个非零 QQ/群号。
+fn parse_id(segment: &str, parent: &str) -> Result<u64, VfsError> {
+    segment
+        .parse()
+        .ok()
+        .filter(|id| *id != 0)
+        .ok_or_else(|| VfsError::NotFound(format!("{parent}/{segment}")))
+}
+
+/// `<id>.md` 形式的文件名。
+fn parse_md_id(file: &str, parent: &str) -> Result<u64, VfsError> {
+    let stem = file
+        .strip_suffix(".md")
+        .ok_or_else(|| VfsError::NotFound(format!("{parent}/{file}")))?;
+    parse_id(stem, parent)
+}
+
+/// 错误信息里用的 JSON 类型名。
+fn kind_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "an object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::api::NapcatGateway;
+
+    /// 按 action 返回固定数据的假网关（形状与 `QqClient::call` 一致：已解包的 `data`）。
+    struct FakeNapcat;
+
+    #[async_trait::async_trait]
+    impl NapcatGateway for FakeNapcat {
+        async fn call(&self, action: &str, params: Value) -> Result<Value, String> {
+            Ok(match action {
+                "get_friend_list" => {
+                    json!([{"user_id": 1001, "nickname": "A"}, {"user_id": "1002"}])
+                }
+                "get_group_list" => json!([{"group_id": 77}, {"group_id": 88}]),
+                "get_group_member_list" => json!([{"user_id": 1001}]),
+                "get_group_info" => json!({"group_id": params["group_id"], "group_name": "G"}),
+                "get_group_member_info" => json!({"user_id": params["user_id"], "card": "c"}),
+                other => return Err(format!("unexpected {other}")),
+            })
+        }
     }
 
-    // ---------------------------------------------------------------------
-    // /config /system
-    // ---------------------------------------------------------------------
+    fn views(scopes: &[&str]) -> (Views, tempfile::TempDir) {
+        let (views, dir) = super::super::tests::views_for_tests();
+        let views = views.with_gateway(Arc::new(FakeNapcat));
+        let views = views.with_context(ViewContext {
+            receive_scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+            ..ViewContext::default()
+        });
+        (views, dir)
+    }
+
+    fn paths(entries: Vec<ViewEntry>) -> Vec<String> {
+        entries.into_iter().map(|entry| entry.path).collect()
+    }
+
+    #[tokio::test]
+    async fn contacts_list_and_read_through_the_documented_paths() {
+        let (views, _dir) = views(&["*"]);
+        assert_eq!(
+            paths(views.list_friends().await.unwrap()),
+            vec!["/friends/1001.md", "/friends/1002.md"]
+        );
+        assert_eq!(
+            paths(views.list_groups().await.unwrap()),
+            vec!["/groups/77.md", "/groups/77", "/groups/88.md", "/groups/88"]
+        );
+        assert_eq!(
+            paths(views.list_group_members("77").await.unwrap()),
+            vec!["/groups/77/1001.md"]
+        );
+        let ViewRead::Text(friend) = views.read_friend("1001.md").await.unwrap() else {
+            panic!("expected text");
+        };
+        assert!(friend.contains("\"nickname\": \"A\""));
+        let ViewRead::Text(group) = views.read_group("77.md").await.unwrap() else {
+            panic!("expected text");
+        };
+        assert!(group.contains("\"group_name\": \"G\""));
+        let ViewRead::Text(member) = views.read_group_member("77", "1001.md").await.unwrap() else {
+            panic!("expected text");
+        };
+        assert!(member.contains("\"card\": \"c\""));
+        assert!(views.read_friend("9.md").await.is_err());
+        assert!(views.read_friend("1001").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn contacts_respect_receive_scopes() {
+        let (views, _dir) = views(&["group:77", "private:1002"]);
+        assert_eq!(
+            paths(views.list_friends().await.unwrap()),
+            vec!["/friends/1002.md"]
+        );
+        assert_eq!(
+            paths(views.list_groups().await.unwrap()),
+            vec!["/groups/77.md", "/groups/77"]
+        );
+        assert!(views.read_group("88.md").await.is_err());
+        assert!(views.list_group_members("88").await.is_err());
+        assert!(views.read_friend("1001.md").await.is_err());
+    }
 }

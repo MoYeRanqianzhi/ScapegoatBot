@@ -39,6 +39,7 @@ mod compaction;
 mod evidence;
 mod images;
 mod injected;
+mod journal;
 mod ops;
 mod review;
 mod scope;
@@ -257,7 +258,12 @@ impl Runner {
             );
         }
         let current = sessions.current()?;
-        let recovered_history = sessions.read_segment(&current.file)?;
+        let mut recovered_history = sessions.read_segment(&current.file)?;
+        // transcript 不改写；隔离过的原文在恢复时重新替换成占位符。
+        let redacted = ops::reapply_quarantine(&vfs, &mut recovered_history);
+        if redacted > 0 {
+            debug!(redacted, "re-applied quarantine to the recovered context");
+        }
         {
             let mut shared = history.lock().await;
             // 只在此处初始化一次；重复构造会重置内存历史。
@@ -664,26 +670,33 @@ impl Runner {
         prompts.extend(image_prompts);
 
         let prompt_tokens = crate::session::compaction::estimate_messages(&prompts);
-        let (outcome, not_answered) = self
-            .drive_turn(chat, &mut working, prompts, evidence, steering_rx)
+        let journal =
+            journal::TurnJournal::new(Arc::clone(&self.deps.turn_buffer), turn_id, runtime_blocks);
+        let (outcome, not_answered, journal) = self
+            .drive_turn(chat, &mut working, prompts, evidence, steering_rx, journal)
             .await;
         *unanswered = not_answered;
         self.commit_turn(
             chat,
-            &turn_id,
+            journal,
             &sessions,
             &history,
-            &working,
-            base,
-            runtime_blocks,
+            &working[base + runtime_blocks..],
             prompt_tokens,
-            &outcome,
         )
-        .await
+        .await?;
+        debug!(
+            chat = %chat,
+            stop = ?outcome.stop_reason,
+            turns = outcome.turns,
+            "turn completed"
+        );
+        Ok(())
     }
     /// 跑模型循环，把本回合产生的新块并入 `working`。
     ///
-    /// 返回循环结果与“经 steering 送进来、但没有回应”的消息条数。
+    /// 返回循环结果、“经 steering 送进来、但没有回应”的消息条数，以及本回合日志
+    /// （循环期间并入上下文的块已经实时写进 turn buffer）。
     async fn drive_turn(
         &self,
         chat: ChatId,
@@ -691,7 +704,8 @@ impl Runner {
         prompts: Vec<AgentMessage>,
         evidence: TurnEvidence,
         steering_rx: &mut mpsc::UnboundedReceiver<AgentMessage>,
-    ) -> (LoopOutcome, usize) {
+        mut journal: journal::TurnJournal,
+    ) -> (LoopOutcome, usize, journal::TurnJournal) {
         // 4) 运行循环。工具执行器带上本回合证据。
         let slot = self.provider_snapshot();
         let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {
@@ -705,10 +719,12 @@ impl Runner {
             Arc::clone(&self.deps.gate),
             self.loop_config(),
         );
+        let turn_id = journal.turn_id().to_owned();
         let (events_tx, mut events_rx) = mpsc::channel(256);
         let logger = tokio::spawn(async move {
             while let Some(event) = events_rx.recv().await {
                 match event {
+                    AgentEvent::Appended { message } => journal.record(&message),
                     AgentEvent::Security {
                         checkpoint,
                         allowed: false,
@@ -718,6 +734,7 @@ impl Runner {
                     _ => {}
                 }
             }
+            journal
         });
         let mut steering = SteeringQueue::default();
         let outcome = loop_
@@ -744,7 +761,14 @@ impl Runner {
         unanswered += steering.drain().len();
 
         drop(events_tx);
-        let _ = logger.await;
+        let journal = match logger.await {
+            Ok(journal) => journal,
+            // 事件任务 panic：用同一个 turn id 重建日志，提交时按 seq 覆盖重写，不会重复。
+            Err(error) => {
+                warn!(%error, "the turn event task failed");
+                journal::TurnJournal::new(Arc::clone(&self.deps.turn_buffer), turn_id, 0)
+            }
+        };
         if let Some(budget) = &self.config.budget {
             budget
                 .record_usage(outcome.usage.input_tokens, outcome.usage.output_tokens)
@@ -764,38 +788,28 @@ impl Runner {
                 text: format!("[hook context | Stop]\n{text}"),
             });
         }
-        (outcome, unanswered)
+        (outcome, unanswered, journal)
     }
 
     /// 提交本回合新块：buffer → transcript → 共享历史，并跑周期检查。
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// `new_blocks` 是本回合要落盘的块（不含 runtime / pending 提示）。
     async fn commit_turn(
         &self,
         chat: ChatId,
-        turn_id: &str,
+        journal: journal::TurnJournal,
         sessions: &Arc<SessionStore>,
         history: &Arc<Mutex<Vec<AgentMessage>>>,
-        working: &[AgentMessage],
-        base: usize,
-        runtime_blocks: usize,
+        new_blocks: &[AgentMessage],
         prompt_tokens: usize,
-        outcome: &LoopOutcome,
     ) -> Result<()> {
         // 5) 提交新块：buffer -> transcript -> 共享历史。
-        let new_blocks: Vec<AgentMessage> = working[base + runtime_blocks..].to_vec();
+        journal.commit(sessions, new_blocks).await?;
         if !new_blocks.is_empty() {
-            let scope = "shared".to_owned();
-            for (seq, message) in new_blocks.iter().enumerate() {
-                self.deps
-                    .turn_buffer
-                    .append(turn_id, seq as u64, &scope, message)?;
-            }
-            self.deps.turn_buffer.commit(sessions, turn_id).await?;
-            let mut shared = history.lock().await;
-            shared.extend(new_blocks.clone());
+            history.lock().await.extend(new_blocks.iter().cloned());
         }
         self.accumulate_review_tokens(
-            prompt_tokens + crate::session::compaction::estimate_messages(&new_blocks),
+            prompt_tokens + crate::session::compaction::estimate_messages(new_blocks),
         );
         self.maybe_security_review(history).await;
 
@@ -803,19 +817,6 @@ impl Runner {
         if let Some(qq) = &self.deps.qq {
             let _ = qq.mark_read(chat).await;
         }
-
-        debug!(
-            chat = %chat,
-            stop = ?outcome.stop_reason,
-            turns = outcome.turns,
-            "turn completed"
-        );
-        debug!(
-            chat = %chat,
-            stop = ?outcome.stop_reason,
-            turns = outcome.turns,
-            "turn completed"
-        );
         Ok(())
     }
 }
@@ -840,6 +841,17 @@ impl crate::swarm::SubagentRunner for Runner {
     /// - 有自己的历史，不写 transcript / turn buffer；
     /// - 不注入 owner context / USER / memory / skills。
     async fn run_subagent(&self, request: crate::swarm::SubagentRequest) -> Result<String> {
+        // 与主回合同样的开关：`sbot ai stop` 与 ESTOP 也停下子代理。
+        if !self
+            .deps
+            .ai_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            anyhow::bail!("AI calls are stopped; the subagent did not run");
+        }
+        if self.deps.estop_file.exists() {
+            anyhow::bail!("ESTOP is active; the subagent did not run");
+        }
         let mut incoming = request.incoming;
         let shared_history = request.shared_history.clone();
         let slot = self.provider_snapshot();
@@ -903,7 +915,7 @@ impl crate::swarm::SubagentRunner for Runner {
         let (tx, mut rx) = mpsc::channel(256);
         let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let mut steering = SteeringQueue::default();
-        let outcome = loop_
+        let mut outcome = loop_
             .run_with_steering(
                 &mut history,
                 Vec::new(),
@@ -912,10 +924,31 @@ impl crate::swarm::SubagentRunner for Runner {
                 &tx,
             )
             .await;
-        // 收尾：最后一轮之后到达的消息仍进入历史，避免下一轮丢失。
+        // 收尾：先关闭收件通道，之后的 `Agent message` 会等这次运行写回再续聊
+        // （见 `AgentHub::message`）；关闭前已经送进来、还没回应的消息再跑一轮回应，
+        // 不能“送达”之后没人理。
+        let mut leftovers = steering.drain();
         if let Some(receiver) = &mut incoming {
+            receiver.close();
             while let Ok(message) = receiver.try_recv() {
-                history.push(message);
+                leftovers.push(message);
+            }
+        }
+        if !leftovers.is_empty() {
+            if outcome.stop_reason == crate::agent::StopReason::EndTurn {
+                outcome = loop_
+                    .run_with_steering(
+                        &mut history,
+                        leftovers,
+                        &mut SteeringQueue::default(),
+                        None,
+                        &tx,
+                    )
+                    .await;
+            } else {
+                // 提前结束（出错、超限、被闸拦下）：不再请求模型，消息留在历史里，
+                // 下一次续聊时可见。
+                history.extend(leftovers);
             }
         }
         if let Some(shared) = shared_history {

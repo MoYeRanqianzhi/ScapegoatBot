@@ -268,7 +268,7 @@ pub struct AgentInstance {
     tools: Vec<&'static str>,
     /// 该实例的 `API` 是否是只读视图；续聊时保持一致。
     read_only: bool,
-    /// spawn 时继承的回合证据；续聊沿用。
+    /// spawn 时继承的回合证据。续聊（重启）用的是续聊那一回合的证据，不沿用这里。
     evidence: crate::transcript::TurnEvidence,
     max_steps: u32,
     depth: u32,
@@ -281,6 +281,8 @@ pub struct AgentInstance {
     generation: std::sync::atomic::AtomicU64,
     /// 串行化 message/restart，避免两个调用同时把实例重启。
     dispatch_lock: tokio::sync::Mutex<()>,
+    /// 一次运行收尾完成（结果与历史已写回）时通知。
+    finished: tokio::sync::Notify,
 }
 
 /// 子代理管理器。
@@ -460,6 +462,7 @@ impl AgentHub {
             result: Mutex::new(None),
             generation: std::sync::atomic::AtomicU64::new(0),
             dispatch_lock: tokio::sync::Mutex::new(()),
+            finished: tokio::sync::Notify::new(),
         });
         self.instances
             .write()
@@ -497,7 +500,17 @@ impl AgentHub {
     }
 
     /// 给子代理追加消息；已完成/失败的实例会带历史重新启动。
-    pub async fn message(&self, id: &str, text: String) -> Result<serde_json::Value> {
+    ///
+    /// `evidence` 是调用方这一回合的证据：
+    /// - 送进正在运行的实例时，实例仍按 spawn 时的证据执行；所以 spawn 带着 owner intent、
+    ///   调用方却没有时拒绝，否则任何后来的回合都能借它的 owner intent 行事；
+    /// - 重启已结束的实例时，按调用方的证据运行。
+    pub async fn message(
+        &self,
+        id: &str,
+        text: String,
+        evidence: crate::transcript::TurnEvidence,
+    ) -> Result<serde_json::Value> {
         if text.trim().is_empty() {
             anyhow::bail!("message must not be empty");
         }
@@ -508,30 +521,32 @@ impl AgentHub {
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("unknown subagent {id:?}"))?;
-        let _dispatch = instance.dispatch_lock.lock().await;
-        let status = instance.status.lock().await.clone();
-        if status == InstanceStatus::Running {
+        let dispatch = loop {
+            // 先登记通知再检查：检查与等待之间收尾的运行不会漏掉唤醒。
+            let finished = instance.finished.notified();
+            let dispatch = instance.dispatch_lock.lock().await;
+            if *instance.status.lock().await != InstanceStatus::Running {
+                break dispatch;
+            }
+            if instance.evidence.owner_intent && !evidence.owner_intent {
+                anyhow::bail!(
+                    "subagent {id:?} is running with the owner intent of the turn that spawned \
+                     it; this turn has none, so it cannot steer it. Wait for it to finish, then \
+                     message it again."
+                );
+            }
             let sender = instance.incoming.lock().await.clone();
             if let Some(sender) = sender
                 && sender.send(AgentMessage::user(&text)).is_ok()
             {
                 return Ok(serde_json::json!({"id": id, "delivered": true}));
             }
-            // receiver 已关闭但 status 还是 Running：交给下面重启，旧 runner
-            // 的 completion 会被 generation 检查丢弃。
-            *instance.status.lock().await = InstanceStatus::Done;
-        }
-
-        // 已结束：锁已持有，重新检查状态。
-        let status = instance.status.lock().await.clone();
-        if status == InstanceStatus::Running {
-            let sender = instance.incoming.lock().await.clone();
-            if let Some(sender) = sender
-                && sender.send(AgentMessage::user(&text)).is_ok()
-            {
-                return Ok(serde_json::json!({"id": id, "delivered": true}));
-            }
-        }
+            // 运行已经关闭了收件通道、正在收尾：等它把结果与历史写回再续聊。
+            // 立刻重启会丢掉这一轮的最终回答（旧结果会被 generation 检查丢弃）。
+            drop(dispatch);
+            finished.await;
+        };
+        let _dispatch = dispatch;
         instance
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -557,7 +572,7 @@ impl AgentHub {
             depth: instance.depth,
             max_depth: self.config.max_depth,
             read_only: instance.read_only,
-            evidence: instance.evidence.clone(),
+            evidence,
             incoming: Some(incoming_rx),
             shared_history: Some(Arc::clone(&instance.history)),
         };
@@ -585,7 +600,9 @@ impl AgentHub {
         } else {
             target.to_owned()
         };
-        self.message(&id, text).await.map(|_| ())
+        self.message(&id, text, crate::transcript::TurnEvidence::monitor())
+            .await
+            .map(|_| ())
     }
 
     /// 查询一个或全部实例。
@@ -690,6 +707,7 @@ async fn run_instance(
         .load(std::sync::atomic::Ordering::SeqCst)
         != generation
     {
+        instance.finished.notify_waiters();
         return;
     }
     *instance.incoming.lock().await = None;
@@ -707,6 +725,8 @@ async fn run_instance(
             *instance.status.lock().await = InstanceStatus::Failed(message);
         }
     }
+    drop(history);
+    instance.finished.notify_waiters();
     // 任务文本已在首轮历史里；`task` 只用于日志级别的可追溯性。
     let _ = task;
 }
@@ -927,9 +947,93 @@ mod tests {
             .unwrap();
         let id = started["id"].as_str().unwrap().to_owned();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let response = hub.message(&id, "interrupt now".to_owned()).await.unwrap();
+        let response = hub
+            .message(
+                &id,
+                "interrupt now".to_owned(),
+                crate::transcript::TurnEvidence::monitor(),
+            )
+            .await
+            .unwrap();
         assert_eq!(response["delivered"], true);
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(runner.seen.lock().await.as_slice(), ["interrupt now"]);
+    }
+
+    /// spawn 时带着 owner intent 的子代理，不能被没有 owner intent 的回合引导。
+    #[tokio::test]
+    async fn a_turn_without_owner_intent_cannot_steer_an_owner_spawned_subagent() {
+        let runner = Arc::new(InterruptRunner {
+            seen: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let hub = hub(Arc::clone(&runner) as Arc<dyn SubagentRunner>);
+        let started = hub
+            .spawn(
+                None,
+                None,
+                "start".to_owned(),
+                0,
+                crate::transcript::TurnEvidence::owner("control"),
+            )
+            .await
+            .unwrap();
+        let id = started["id"].as_str().unwrap().to_owned();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let error = hub
+            .message(
+                &id,
+                "do more".to_owned(),
+                crate::transcript::TurnEvidence::monitor(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("owner intent"), "{error}");
+        let response = hub
+            .message(
+                &id,
+                "owner says go".to_owned(),
+                crate::transcript::TurnEvidence::owner("control"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["delivered"], true);
+    }
+
+    /// 运行已经关闭收件通道、正在收尾时送来的消息：等收尾完成再续聊，结果不丢。
+    #[tokio::test]
+    async fn a_message_during_wrap_up_waits_for_the_run_to_finish() {
+        struct ClosingRunner;
+        #[async_trait]
+        impl SubagentRunner for ClosingRunner {
+            async fn run_subagent(&self, request: SubagentRequest) -> Result<String> {
+                if let Some(mut receiver) = request.incoming {
+                    receiver.close();
+                }
+                // 收尾需要一点时间。
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok(format!("answered: {}", request.task))
+            }
+        }
+        let hub = hub(Arc::new(ClosingRunner) as Arc<dyn SubagentRunner>);
+        let started = hub
+            .spawn(None, None, "first".to_owned(), 0, Default::default())
+            .await
+            .unwrap();
+        let id = started["id"].as_str().unwrap().to_owned();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        hub.message(&id, "second".to_owned(), Default::default())
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let instance = hub.instances.read().await.get(&id).cloned().unwrap();
+        let history = instance.history.lock().await.clone();
+        let texts: Vec<String> = history
+            .iter()
+            .filter_map(|message| match message {
+                AgentMessage::Assistant(assistant) => Some(assistant.text()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["answered: first", "answered: second"]);
     }
 }

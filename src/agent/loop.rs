@@ -241,7 +241,7 @@ impl AgentLoop {
         'outer: loop {
             for message in pending.drain(..) {
                 input_delta.push_str(&render_message(&message));
-                history.push(message);
+                append(history, events, message).await;
             }
 
             loop {
@@ -383,16 +383,18 @@ impl AgentLoop {
                         .force_hold("provider returned stop_reason=refusal");
                     let calls: Vec<ToolCall> =
                         assistant.tool_calls().into_iter().cloned().collect();
-                    history.push(AgentMessage::Assistant(assistant));
-                    append_interrupted(history, &calls, "the provider refused the turn");
+                    append(history, events, AgentMessage::Assistant(assistant)).await;
+                    append_interrupted(history, events, &calls, "the provider refused the turn")
+                        .await;
                     return conclude(events, total_usage, turns, StopReason::Refusal).await;
                 }
 
                 if stop_reason == StopReason::Error {
                     let calls: Vec<ToolCall> =
                         assistant.tool_calls().into_iter().cloned().collect();
-                    history.push(AgentMessage::Assistant(assistant));
-                    append_interrupted(history, &calls, "the provider returned an error");
+                    append(history, events, AgentMessage::Assistant(assistant)).await;
+                    append_interrupted(history, events, &calls, "the provider returned an error")
+                        .await;
                     return conclude(events, total_usage, turns, StopReason::Error).await;
                 }
 
@@ -400,7 +402,7 @@ impl AgentLoop {
                     // 工具参数可能被截断，全部调用都不执行。
                     let calls: Vec<ToolCall> =
                         assistant.tool_calls().into_iter().cloned().collect();
-                    history.push(AgentMessage::Assistant(assistant));
+                    append(history, events, AgentMessage::Assistant(assistant)).await;
                     for call in calls {
                         let result = ToolResultMessage {
                             tool_call_id: call.id,
@@ -412,14 +414,14 @@ impl AgentLoop {
                             images: Vec::new(),
                         };
                         input_delta.push_str(&render_message(&AgentMessage::Tool(result.clone())));
-                        history.push(AgentMessage::Tool(result));
+                        append(history, events, AgentMessage::Tool(result)).await;
                     }
                     return conclude(events, total_usage, turns, StopReason::MaxTokens).await;
                 }
 
                 let calls: Vec<ToolCall> = assistant.tool_calls().into_iter().cloned().collect();
                 let server_pause = stop_reason == StopReason::PauseTurn;
-                history.push(AgentMessage::Assistant(assistant));
+                append(history, events, AgentMessage::Assistant(assistant)).await;
 
                 // 服务端工具暂停：追加响应内容后继续请求，不结束回合。
                 if server_pause && calls.is_empty() {
@@ -440,14 +442,14 @@ impl AgentLoop {
                 let results = self.execute_tools(&calls, events).await;
                 for result in results {
                     input_delta.push_str(&render_message(&AgentMessage::Tool(result.clone())));
-                    history.push(AgentMessage::Tool(result));
+                    append(history, events, AgentMessage::Tool(result)).await;
                 }
 
                 // 工具之后注入 steering，下一次请求前生效。
                 drain_incoming(steering, &mut incoming);
                 for message in steering.drain() {
                     input_delta.push_str(&render_message(&message));
-                    history.push(message);
+                    append(history, events, message).await;
                 }
             }
 
@@ -1045,19 +1047,44 @@ async fn send(events: &mpsc::Sender<AgentEvent>, event: AgentEvent) {
     let _ = events.send(event).await;
 }
 
+/// 把一条消息并入上下文，并发 [`AgentEvent::Appended`]。
+///
+/// 循环里所有进入 `history` 的消息都走这里：runner 据此把本回合的块实时写进
+/// turn buffer，进程在回合中途退出也能恢复已经发生的部分（包括已执行的工具调用）。
+async fn append(
+    history: &mut Vec<AgentMessage>,
+    events: &mpsc::Sender<AgentEvent>,
+    message: AgentMessage,
+) {
+    send(
+        events,
+        AgentEvent::Appended {
+            message: message.clone(),
+        },
+    )
+    .await;
+    history.push(message);
+}
+
 /// 把没有执行的工具调用补成错误结果，保持 `tool_use` / `tool_result` 成对。
 ///
 /// Error / Refusal 可能发生在流已经产出 tool_use 之后；直接结束回合会把
 /// 半对消息提交进 transcript，下一次请求就会被 provider 拒绝。
-fn append_interrupted(history: &mut Vec<AgentMessage>, calls: &[ToolCall], reason: &str) {
+async fn append_interrupted(
+    history: &mut Vec<AgentMessage>,
+    events: &mpsc::Sender<AgentEvent>,
+    calls: &[ToolCall],
+    reason: &str,
+) {
     for call in calls {
-        history.push(AgentMessage::Tool(ToolResultMessage {
+        let result = AgentMessage::Tool(ToolResultMessage {
             tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
             content: format!("Tool call was not executed: {reason}."),
             is_error: true,
             images: Vec::new(),
-        }));
+        });
+        append(history, events, result).await;
     }
 }
 

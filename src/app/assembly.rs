@@ -618,7 +618,8 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
             Arc::clone(&vfs),
             Arc::clone(&messages),
             Arc::clone(&sessions),
-            qq.clone(),
+            qq.clone()
+                .map(|client| client as Arc<dyn crate::tools::api::NapcatGateway>),
         )
         .with_context(ViewContext {
             config: Some(Arc::clone(&config_handle)),

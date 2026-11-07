@@ -71,10 +71,10 @@ sbot gate reject g3        # 拒绝
 | 开关 | 影响 | 恢复 |
 |------|------|------|
 | `sbot ai stop` | 不发起新的模型请求；消息照收照存 | `sbot ai start` |
-| `sbot pause`（ESTOP） | 不开始新回合；消息照收照存 | `sbot resume` |
+| `sbot pause`（ESTOP） | 不开始新的 QQ / monitor 回合与子代理；消息照收照存；宿主机上的 `sbot chat` 仍可用 | `sbot resume` |
 | hold | 拒绝所有 QQ 动作（`napcat.*`）；回合照常运行 | agent 隔离可疑内容后自己调用 `agent.resume`；宿主机上的 `sbot security resume` 走同一条路径 |
 
-`ai stop` 与 ESTOP 都只挡“新回合”，不会中断已经在跑的回合。
+`ai stop` 与 ESTOP 都只挡“新回合”（`ai stop` 连 `sbot chat` 也挡），不会中断已经在跑的回合。
 
 ## 消息进来之后
 

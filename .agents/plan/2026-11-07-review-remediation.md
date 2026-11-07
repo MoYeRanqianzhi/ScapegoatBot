@@ -46,6 +46,19 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 | v4 提示词多处与代码不符；技能索引从未填充；边界后模板文本死代码；`static_prefix` 忽略 mode 且 `Box::leak`（已核实） | v5 提示词；`prompt::context` 固定注入 AGENTS/USER/MEMORY/STYLE/技能索引 + agent 自管 `/hooks/context.toml`；删除 `[[hooks.context]]` | `prompt::tests::*`、`prompt::context::tests::*`、`config::tests::retired_context_hooks_fail_with_a_migration_hint` |
 | `agent.status` / `agent.quarantine` 描述承诺不存在的能力；`quarantine.message_id` 未使用 | 描述与实现一致；删参数 | 现有测试 |
 
+## 2c. 0.2.0-alpha.39 已修（2026-11-08，P0）
+
+| 问题 | 修法 | 测试 |
+|------|------|------|
+| P0-2 子代理带着 spawn 时的 owner intent、不检查 ai stop / ESTOP（已核实） | `run_subagent` 检查开关；`AgentHub::message` 用调用方证据，拒绝无 owner intent 的回合引导 owner 实例 | `swarm::tests::a_turn_without_owner_intent_cannot_steer_an_owner_spawned_subagent` |
+| P0-3 子代理收尾时的消息报 delivered 后丢失 / 重启丢上一轮回答（已核实） | 收尾先关通道、补跑一轮；`message` 等 `finished` 通知再续聊 | `swarm::tests::a_message_during_wrap_up_waits_for_the_run_to_finish` |
+| P0-4 非法 `when`（已核实：短路求值 + 每事件一条系统通知） | 创建/配置时逐项校验；运行时出错移除并只通知一次 | `monitor::tests::invalid_when_expressions_are_rejected_when_added` |
+| P0-5 turn buffer 只在提交时写（已核实） | `AgentEvent::Appended` + `runner/journal.rs` 实时落盘 | `journal::tests::*` |
+| P0-6 消息行号按索引条数（已核实） | 物理行号 + 长度校验缓存 + 残行隔离 | `storage::messages::tests::{a_lost_index_commit_does_not_shift_later_line_numbers, a_torn_last_line_is_isolated_before_the_next_append}` |
+| P0-7 联系人视图为空、路由不存在（已核实） | 重写 `views/contacts.rs`，按文档路由，改用 `NapcatGateway` | `views::contacts::tests::*` |
+| `run_injected` 不检查 ESTOP（核实：monitor 回合检查；控制通道有意不受 ESTOP 限制，只受 `ai stop`） | 文档写明 | — |
+| `agent.quarantine` 重启失效 | 恢复上下文时按 `/quarantine/` 重放 | `runner::ops::quarantine_tests::quarantine_survives_a_restart` |
+
 ## 3. 待修（按优先级）
 
 ### P0 / 高

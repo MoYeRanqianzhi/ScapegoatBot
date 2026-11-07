@@ -306,13 +306,15 @@ pub(in crate::config) fn validate_monitors(
             ));
         }
 
-        if let Some(when) = &monitor.when
-            && when.trim().is_empty()
-        {
-            errors.push(ConfigError::new(
-                format!("{field}.when"),
-                "must not be empty; omit the field to match everything",
-            ));
+        if let Some(when) = &monitor.when {
+            if when.trim().is_empty() {
+                errors.push(ConfigError::new(
+                    format!("{field}.when"),
+                    "must not be empty; omit the field to match everything",
+                ));
+            } else if let Err(error) = crate::monitor::validate_when(when) {
+                errors.push(ConfigError::new(format!("{field}.when"), error));
+            }
         }
 
         non_empty(errors, format!("{field}.deliver.to"), &monitor.deliver.to);

@@ -92,11 +92,46 @@ pub struct MessageStore {
     max_bytes: u64,
     /// 与 `[storage].encryption` 一致；`none` 只用于调试。
     encryption: EncryptionMode,
-    /// 串行化写入：行号 = 已提交行数，取号与写入必须在同一个临界区，
-    /// 否则两个并发 append 会拿到同一个行号（AAD 相同，读到错误的消息）。
-    append_lock: Mutex<()>,
+    /// 串行化写入，同时缓存每个日文件的 `(字节长度, 下一行的物理行号)`。
+    ///
+    /// 行号进入每行的 AAD，必须等于它在文件里的物理位置。以前行号按索引里的
+    /// 已提交条数计算：文件写成功、索引事务失败一次，之后同一天的行号就全部错位，
+    /// 连重建索引都修不好。现在行号只看文件本身；缓存的长度与磁盘不一致时重新数。
+    append_lock: Mutex<HashMap<PathBuf, (u64, usize)>>,
     /// 按年龄清理旧月份；0 = 只按配额。
     retention_days: u32,
+}
+
+/// 日文件下一条消息的物理行号，以及当时的文件长度。
+///
+/// 缓存的长度与磁盘一致时直接用缓存；否则数一遍换行。文件末尾没有换行说明上次写到
+/// 一半，先补一个换行让残行自成一行，新消息才不会粘在它后面。
+fn next_line(cache: &mut HashMap<PathBuf, (u64, usize)>, path: &Path) -> Result<(u64, usize)> {
+    let length = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    if let Some(&(cached, next)) = cache.get(path)
+        && cached == length
+    {
+        return Ok((length, next));
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let mut count = bytes.iter().filter(|byte| **byte == b'\n').count();
+    let mut length = bytes.len() as u64;
+    if bytes.last().is_some_and(|byte| *byte != b'\n') {
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        count += 1;
+        length += 1;
+    }
+    cache.insert(path.to_path_buf(), (length, count));
+    Ok((length, count))
 }
 
 impl MessageStore {
@@ -116,7 +151,7 @@ impl MessageStore {
             root,
             max_bytes,
             encryption,
-            append_lock: Mutex::new(()),
+            append_lock: Mutex::new(HashMap::new()),
             retention_days: 0,
         })
     }
@@ -131,7 +166,7 @@ impl MessageStore {
     ///
     /// 返回 `true` 表示新写入，调用方才应触发去抖与回合。
     pub(crate) fn append(&self, message: &QqMessage) -> Result<bool> {
-        let _guard = self
+        let mut lines = self
             .append_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -164,29 +199,28 @@ impl MessageStore {
         }
 
         let file_id = self.ensure_header(&path, scope, peer, &date)?;
-        let line_no: i64 = {
-            let conn = self.db.lock();
-            // 文件头占第 0 行，消息从第 1 行开始。
-            1 + conn
-                .query_row(
-                    "SELECT COALESCE(SUM(count), 0) FROM message_files WHERE path = ?1",
-                    params![relative],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap_or(0)
-        };
-
-        let line = self.encode_line(message, scope, peer, &file_id, line_no as usize)?;
-
-        {
+        // 文件头占第 0 行，消息从第 1 行开始；行号就是写入前文件里的行数。
+        let (length, line_no) = next_line(&mut lines, &path)?;
+        let line = self.encode_line(message, scope, peer, &file_id, line_no)?;
+        let written = {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&path)
                 .with_context(|| format!("cannot open {}", path.display()))?;
-            file.write_all(line.as_bytes())?;
-            file.flush()?;
+            file.write_all(line.as_bytes()).and_then(|()| file.flush())
+        };
+        match written {
+            Ok(()) => {
+                lines.insert(path.clone(), (length + line.len() as u64, line_no + 1));
+            }
+            Err(error) => {
+                // 可能写了一半：丢掉缓存，下次按磁盘重新数（并修复残行）。
+                lines.remove(&path);
+                return Err(error.into());
+            }
         }
+        let line_no = line_no as i64;
 
         // 索引写入放在文件之后：即使进程在两者之间崩溃，`rebuild_index` 能补回来。
         let now = Utc::now().to_rfc3339();
@@ -698,6 +732,69 @@ mod tests {
         let repaired = store.rebuild_index().unwrap();
         assert_eq!(repaired, 2);
         assert_eq!(store.recent(chat, 10).unwrap().len(), 2);
+    }
+
+    /// 文件写成功、索引事务丢失一次（崩溃在两者之间）：之后的行号仍然等于物理位置，
+    /// 新消息照常可读，重建能把丢失的那条补回来。
+    #[test]
+    fn a_lost_index_commit_does_not_shift_later_line_numbers() {
+        let (store, _dir) = store();
+        let chat = ChatId::Group(123);
+        store.append(&message(chat, 1, "a")).unwrap();
+        store.append(&message(chat, 2, "b")).unwrap();
+        {
+            let conn = store.db.lock();
+            conn.execute("DELETE FROM messages WHERE message_id = 2", [])
+                .unwrap();
+            conn.execute("UPDATE message_files SET count = count - 1", [])
+                .unwrap();
+        }
+        store.append(&message(chat, 3, "c")).unwrap();
+        let texts: Vec<String> = store
+            .recent(chat, 10)
+            .unwrap()
+            .iter()
+            .map(QqMessage::plain_text)
+            .collect();
+        assert_eq!(texts, vec!["a", "c"]);
+        assert_eq!(store.rebuild_index().unwrap(), 1);
+        assert_eq!(store.recent(chat, 10).unwrap().len(), 3);
+    }
+
+    /// 上次写到一半的残行不会和下一条消息粘在一起。
+    #[test]
+    fn a_torn_last_line_is_isolated_before_the_next_append() {
+        let (store, dir) = store();
+        let chat = ChatId::Group(123);
+        store.append(&message(chat, 1, "a")).unwrap();
+        let file = walk(dir.path())
+            .into_iter()
+            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .unwrap();
+        {
+            use std::io::Write;
+            let mut handle = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&file)
+                .unwrap();
+            handle.write_all(b"{\"v\":1,\"kind\":\"mess").unwrap();
+        }
+        store.append(&message(chat, 2, "b")).unwrap();
+        assert_eq!(store.recent(chat, 10).unwrap().len(), 2);
+    }
+
+    /// 递归列出目录下的文件。
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
     }
 
     #[test]

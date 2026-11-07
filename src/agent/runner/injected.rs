@@ -106,20 +106,36 @@ impl Runner {
             Arc::clone(&self.deps.gate),
             self.loop_config(),
         );
+        let turn_id = new_turn_id();
+        let mut journal = super::journal::TurnJournal::new(
+            Arc::clone(&self.deps.turn_buffer),
+            turn_id.clone(),
+            runtime_blocks,
+        );
         let (tx, mut rx) = mpsc::channel(256);
         let logger = tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                if let AgentEvent::Error { message } = event {
-                    warn!(%message, "agent error");
+                match event {
+                    AgentEvent::Appended { message } => journal.record(&message),
+                    AgentEvent::Error { message } => warn!(%message, "agent error"),
+                    _ => {}
                 }
             }
+            journal
         });
         let mut steering = SteeringQueue::default();
         let outcome = loop_
             .run_with_steering(&mut working, prompts, &mut steering, None, &tx)
             .await;
         drop(tx);
-        let _ = logger.await;
+        let journal = match logger.await {
+            Ok(journal) => journal,
+            // 同一个 turn id 重建：提交时按 seq 覆盖重写，不会重复。
+            Err(error) => {
+                warn!(%error, "the turn event task failed");
+                super::journal::TurnJournal::new(Arc::clone(&self.deps.turn_buffer), turn_id, 0)
+            }
+        };
         if let Some(budget) = &self.config.budget {
             budget
                 .record_usage(outcome.usage.input_tokens, outcome.usage.output_tokens)
@@ -130,15 +146,8 @@ impl Runner {
             working.push(message);
         }
         let new_blocks: Vec<AgentMessage> = working[base + runtime_blocks..].to_vec();
+        journal.commit(&sessions, &new_blocks).await?;
         if !new_blocks.is_empty() {
-            let turn_id = new_turn_id();
-            let scope = "shared".to_owned();
-            for (seq, message) in new_blocks.iter().enumerate() {
-                self.deps
-                    .turn_buffer
-                    .append(&turn_id, seq as u64, &scope, message)?;
-            }
-            self.deps.turn_buffer.commit(&sessions, &turn_id).await?;
             history.lock().await.extend(new_blocks.clone());
         }
         self.accumulate_review_tokens(

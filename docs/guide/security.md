@@ -114,7 +114,7 @@ agent 调用 `API` 的 `agent.resume`（宿主机上的 `sbot security resume` �
    或用 `agent.clear_context` 重新开始，再调用 `agent.resume`。
 
 `agent.quarantine` 把原文另存到 `/quarantine/`，只替换内存中的上下文；磁盘上的 transcript
-分段保留原样作为审计记录（重启后会重新读入，必要时需再隔离一次）。
+分段保留原样作为审计记录；重启恢复上下文时按 `/quarantine/` 里的文件再替换一次，隔离不会因重启失效。
 
 不复核当初被判危险的那段原文：它永远是危险的，拿它复核等于 hold 永远解不开。
 

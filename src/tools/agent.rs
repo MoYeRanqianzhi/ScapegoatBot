@@ -265,7 +265,7 @@ impl Tool for AgentTool {
                     Ok(text) => text.to_owned(),
                     Err(error) => return error,
                 };
-                match hub.message(id, text).await {
+                match hub.message(id, text, ctx.evidence.clone()).await {
                     Ok(value) => ToolResult::ok(value.to_string()),
                     Err(error) => ToolResult::error(error.to_string()),
                 }

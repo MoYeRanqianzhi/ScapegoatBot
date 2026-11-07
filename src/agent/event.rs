@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::message::{AssistantMessage, StopReason, Usage};
+use super::message::{AgentMessage, AssistantMessage, StopReason, Usage};
 
 /// 一个 agent 事件。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,6 +23,9 @@ pub enum AgentEvent {
     MessageUpdate { kind: DeltaKind, delta: String },
     /// 一条完整的助手消息。
     MessageEnd { message: AssistantMessage },
+    /// 一条消息并入了本回合上下文（提示、助手消息、工具结果、steering）。
+    /// runner 据此把块实时写进 turn buffer。
+    Appended { message: AgentMessage },
     /// 工具开始执行。
     ToolExecutionStart { id: String, name: String },
     /// 工具结束。
