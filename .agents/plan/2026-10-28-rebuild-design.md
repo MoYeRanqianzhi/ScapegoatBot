@@ -1,7 +1,7 @@
 # ScapegoatBot 彻底重构设计
 
 > 状态：0.2 已按本设计实现；本文是设计依据与取舍理由，**与代码冲突时以代码为准**。
-> 已知偏离（截至 2026-11-07）：单会话化（无 `[session].scope` / per_chat）；hold 只拒绝
+> 已知偏离（截至 2026-11-07）：`/AGENTS.md` agent 可写、存在即由程序注入，`/SOUL.md` 不预置、不由程序注入（用户纠正，见 `memory/design-decisions.md`，本文 §5/§6/§7 里“仅主人可写”的说法作废）；单会话化（无 `[session].scope` / per_chat）；hold 只拒绝
 > `napcat.*`；图片工具为 `image.*`；断线补消息已删除。评审原文（prompt review、v3 提案、
 > Hermes 对照、设计复审二、子代理审查、Claude Code 记忆格式）已于 2026-11-07 从 `.agents/plan/`
 > 删除，结论已并入本文，原文用 `git log --all -- '.agents/plan/2026-10-29-*'` 查看。

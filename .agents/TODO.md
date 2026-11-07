@@ -13,15 +13,11 @@
 ## 当前基线
 
 - `cargo test --locked --all-targets` = 404 passed（391 lib + 13 integration），2 ignored；
-  clippy / fmt 通过。改动记在 `CHANGELOG.md` 的 Unreleased 段，尚未打 tag。
-- 本地 tag `v0.2.0-alpha.35` 未指向 HEAD；尚未 push/release/deploy。
+  clippy / fmt 通过。当前 `0.2.0-alpha.36`（本地 tag）；每批升版本、打 tag，未验证前不 push。
 - 服务器 `hw1` 的 `sbot.service` 仍停止；NapCat 未登录（2026-11-05 起 QR 登录失败）。
 
 ## 待用户确认
 
-- [ ] hold 是否只允许控制通道解除（计划 §3 P0-1，改变原设计）。
-- [ ] `image.*` 5 个 action（`info`/`transform`/`convert`/`text`/`fonts`）的命名与参数；
-      确认前不要继续扩展图片 API。
 - [ ] 是否授权 `git push origin main --tags`、GitHub release、部署 hw1。
 
 ## 修复（按计划 §3 / §6 的顺序）
@@ -42,7 +38,6 @@
 
 ## 发布
 
-- [ ] 发布前重指 tag 到最终 HEAD（或开 alpha.36），重跑 `cargo build --release`；
-      上次 release 构建早于图片依赖。
+- [ ] 发布前重跑 `cargo build --release`；上次 release 构建早于图片依赖。
 - [ ] 历史重写后其他 clone 必须重新 clone 或
       `git fetch --all --prune --tags --force && git reset --hard origin/main`。

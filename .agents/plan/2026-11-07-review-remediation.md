@@ -40,10 +40,10 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 
 ### P0 / 高
 
-1. `已核实` **模型可以自己解除 hold**：`agent.resume` 无证据检查；`force_hold`
-   （周期审查、refusal）不记录被判内容，复核只看历史尾部；默认 shadow + 无分类器时
-   只有规则层。**原设计就是“agent 自己调 resume、runtime 复核”**，是否改成只允许控制
-   通道需要用户决定（设计决定，见 [[design-decisions]]）。
+1. `已核实` hold 的复核偏弱：`force_hold`（周期审查、refusal）不记录被判内容，复核只看
+   历史尾部；默认 shadow + 无分类器时只有规则层。**用户 2026-11-07 决定：hold 必须由 agent
+   自主解除**（无人值守，见 [[design-decisions]]）。所以只加强复核输入（记录触发 hold 的内容），
+   不收走解除权。
 2. `未核实` 子代理带着 spawn 时的 owner intent 一直运行，且不检查 `ai_enabled` /
    ESTOP / `agent_paused`；`/agents/*.md` 模型可写，能给自定义子代理开 `allow_send`
    （swarm/mod.rs:346-363、454、560、576；runner.rs:837-859）。
@@ -110,9 +110,7 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 
 ## 4. 需要用户决定
 
-- §3 P0-1：hold 是否只允许控制通道解除（改变原设计）。
-- `image.*` 五个 action 的命名与参数（11-06 起待确认，见 [[image-tools]]）。
-- 是否 push / release / 部署 hw1；本地 tag `v0.2.0-alpha.35` 未指向 HEAD。
+- 是否 push / release / 部署 hw1（tag 本地自动打，见 [[release-workflow]]）。
 
 ## 5. 文档与命名漂移（2026-11-07 审查，均为 `未核实`，除非另注）
 

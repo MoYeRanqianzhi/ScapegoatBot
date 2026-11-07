@@ -1,6 +1,8 @@
 # 项目记忆索引
 
-- [设计决定](memory/design-decisions.md) -- 用户拍板的架构取舍（单会话、本地 IPC、明文 auth.json、hold 只拦 QQ 等），改架构前先读
+- [设计决定](memory/design-decisions.md) -- 无人值守（hold 必须自主解除）、AGENTS.md 可写、单会话、命名分层等用户拍板的取舍，改架构前先读
+- [提示词风格](memory/prompt-style.md) -- 参考 Claude Code 的哲学感写法与比喻；常用 API 写进 system prompt；声明必须与代码一致
+- [版本与发布](memory/release-workflow.md) -- 每批升版本号并自动打 tag；未验证前不 push
 - [安全闸语义](memory/security-gate-semantics.md) -- shadow/enforce、fail-closed、llm 后端装入、hold 只拦 napcat.*、resume 复核
 - [存储不变量](memory/storage-invariants.md) -- append 串行、(chat, message_id) 去重、索引校验、文件头加密、迁移 v12
 - [图片工具 image.*](memory/image-tools.md) -- 5 个 action、系统字体约束、依赖与模块命名坑

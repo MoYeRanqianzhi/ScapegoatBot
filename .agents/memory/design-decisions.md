@@ -14,6 +14,23 @@ metadata:
 
 ## 用户决定
 
+- **无人值守是第一前提**（用户 2026-11-07 强调，之前多次说过但没记下）：启动后理想情况下
+  不再有任何人工干预，**主人只通过 QQ 与 agent 交互**，不会去敲 CLI。凡是“必须主人在
+  主机上执行命令才能恢复”的设计都等于永远卡死。由此推出：
+  - **hold 必须能由 agent 自己解除**（`agent.resume`，由 runtime 用同一套闸复核）。
+    不要改成“只允许控制通道解除”；要加强的是复核本身，不是收走解除权。
+  - CLI（`sbot gate approve`、`sbot security resume` 等）只是补充通道，不能是唯一出路。
+- **`/AGENTS.md` agent 可以写**（用户 2026-11-07 纠正）。原设计与 v4 提示词里
+  “`/AGENTS.md`、`/SOUL.md` 只有主人能写”是错的，不要再实现写保护。
+- **上下文注入的分工**（用户 2026-11-07）：
+  - `/AGENTS.md` 是业界统一的 agent 约定：**存在就由程序自动注入**，不存在也没关系。
+    这是程序行为，不是可被配置删掉的普通 hook。
+  - `/SOUL.md` 不是必需品，只是借鉴 OpenClaw 记录角色设定的一种做法。程序不预置、不指定注入；
+    agent 可以在 `/AGENTS.md` 里写“去读 /SOUL.md”，也可以给自己加一条 hook 自动注入——
+    这是 agent 自己的行为与决定。其他文件同理：agent 自己读，或自己设置 hook。
+  - 因此 agent 必须能管理自己的上下文 hook（增删），程序只硬编码 AGENTS.md。
+  - 记忆系统自身的文件（`/MEMORY.md` 索引、`/USER.md`）随记忆功能注入，属于记忆功能的设计，
+    不是“程序指定的人设文件”（主代理的理解，未与用户逐字确认）。
 - **单会话、全局 transcript**：整个 QQ 号一条上下文，不按群/私聊拆分（替身需要把 A、B 的消息结合起来）。
   2026-11-06 起连 `per_chat` 逃生口也已删除；跨 chat 风险由 `origin_chat` 回合绑定、按 chat 去抖、
   跨 chat 发送门禁控制。
@@ -31,14 +48,21 @@ metadata:
 - **默认值**：模型 `anthropic/claude-opus-5-5` + `high`；swarm 默认开启；`[gate].mode = auto`、
   `llm_review = false`；`[memory].review = idle`；配额 VFS/消息 10 GB、transcript 2 GB；
   压缩 `reserve_tokens = 16384`、`keep_recent_tokens = 20000`。
+- **工具命名分层**：`API` 的 action 名要体现完整归属。图片处理是“本地工具 → 媒体 → 图片”，
+  所以是 `local.media.image.*`，不能直接 `image.*` 开头（用户 2026-11-07：“漏了前缀”）。
+  新增 action 时先想清楚它在哪一层。
 - **图片与字体**：见 [[image-tools]] 与 [[feature-scope-correction]]（禁止内置字体）。
+- **提示词风格**：见 [[prompt-style]]。
+- **版本与发布**：见 [[release-workflow]]。
 
 ## 仍待用户决定
 
 - `[gate].llm_review` 的默认值（当前 `false`）。
 
 **Evidence:** 设计文档 §1–§14；`src/config/sections/{agent,gate,memory,storage,compaction,swarm}.rs`
-的 `Default` 实现（2026-11-07 核对）；单会话化提交 `2f2948c`；hold 范围提交 `d21eed4`。
+的 `Default` 实现（2026-11-07 核对）；单会话化提交 `2f2948c`；hold 范围提交 `d21eed4`；
+用户 2026-11-07 原话：“这是个自主运行的agent，理想情况下启动后就不会干预，主人只会通过qq进行交互，
+所以必须自主解除”“AGENTS.md可以写”“AGENTS.md是程序决定的是一定要注入的（如果存在），其他文件靠agent自己读或者自己设置hook注入”“这是本地工具类下属的媒体类的图片处理工具……不能直接image.开头”。
 
 **Recheck when:** 用户改变上述任一决定，或默认值被修改。
 
