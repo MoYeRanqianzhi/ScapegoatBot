@@ -177,7 +177,18 @@ async fn handle_qq_event(
     name: &str,
     data: &serde_json::Value,
 ) {
-    let event = crate::qq::event::normalize(name, data);
+    let mut event = crate::qq::event::normalize(name, data);
+
+    // 本账号发出的消息：只有本进程发出的才是 agent 自己的话（`self`）。
+    // 其余的是有人在这个账号上手打的——stand_in 下就是主人——它们和别人的消息
+    // 一样进 inbox，由 monitor 决定是否唤醒（见 `crate::qq::ledger`）。
+    if let QqEvent::Message(message) = &mut event
+        && message.is_self
+        && agent.self_id != 0
+        && !client.ledger().claim(message).await
+    {
+        message.mark_typed_by_hand(agent.self_id);
+    }
 
     // 主人/通知账号在私聊里回复确认码：批准对应 gate 请求，不进入 agent 回合，
     // 也不入库（确认码不应留在模型能读到的归档里）。
@@ -205,15 +216,7 @@ async fn handle_qq_event(
     }
     // 准入过滤必须在 monitor 之前：被拒消息既不应入库，也不应通过 monitor
     // 进入上下文（否则过滤只剩“不写 JSONL”，挡不住注入）。
-    // 主人之声不过滤：过滤是挡外部噪声的，主人只能通过 QQ 与 agent 交互，
-    // 一条误配的 `ignore_patterns` 不能把主人关在门外。
-    let principals = crate::principals::Principals {
-        account_qq: agent.self_id,
-        owner_qq: agent.owner_qq,
-        master_qq: agent.master_qq,
-    };
     if let QqEvent::Message(message) = &event
-        && !principals.is_owner_voice(message)
         && !agent.filter_and_count(message)
     {
         debug!(chat = %message.chat, "message rejected by the admission filter");

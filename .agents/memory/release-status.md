@@ -20,7 +20,7 @@ metadata:
 
 - 发给 NapCat 的文件引用一律是 `base64://`（VFS 路径本进程读出，URL 本进程下载）。
 - 私聊 `message_sent` 回声按 `target_id` 归到对方会话（依据 NapCatQQ 源码）。
-- 主人通过 `master_qq` 私线私聊唤醒 agent 并带 owner intent（`src/principals.rs`，单测覆盖）。
+- 发送账本认领 `message_sent` 回声，stand_in 下主人手打的消息进 inbox 并由 `wake-on-owner` 唤醒（`src/qq/ledger.rs` 单测覆盖；需要 `reportSelfMessage`，未在真实 NapCat 上测）。
 - `approve` 的私聊确认码只接受 owner/master 从另一个账号的回复；队列持久化在
   `gate_approvals`，重启后未过期的请求与批准仍有效。
 

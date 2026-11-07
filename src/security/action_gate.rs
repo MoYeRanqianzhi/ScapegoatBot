@@ -640,7 +640,7 @@ impl ActionGate {
         targets.dedup();
         if targets.len() >= MASS_TARGETS && !evidence.owner_intent {
             return Err(format!(
-                "the same content is being sent to {} different chats within 2 minutes; \\
+                "the same content is being sent to {} different chats within 2 minutes; \
                  mass sending requires owner intent",
                 targets.len()
             ));

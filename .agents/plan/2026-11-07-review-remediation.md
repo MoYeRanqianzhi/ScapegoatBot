@@ -40,7 +40,7 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 
 | 问题 | 修法 | 测试 |
 |------|------|------|
-| stand_in 下主人的消息全是 `is_self`，主人没有任何 QQ 渠道；owner 判定散落在 runner/monitor/预设三处（已核实） | `src/principals.rs` 统一“主人之声”：`owner_qq` 非 self，或 `master_qq` 私线私聊；`[agent].master` 新增/默认 `"owner"`；主人之声免过滤；doctor 警告 | `principals::tests::*`、`monitor::tests::owner_message_delivery_carries_owner_intent` |
+| stand_in 下主人的消息全是 `is_self`，主人没有任何 QQ 渠道（已核实） | alpha.37 的“主人之声/私线”被用户否决；alpha.38 改为发送账本 `src/qq/ledger.rs`：认领不到的本账号消息是手打的，进 inbox、由 `wake-on-owner` 唤醒 | `qq::ledger::tests::*` |
 | `agent.resume` 复核当初的危险原文，输出闸触发的 hold 永远解不开（已核实） | 复核当前已提交上下文尾部；不再保存危险原文；`agent.quarantine` 同时替换上下文里的原文 | `runner::ops::tests::{the_agent_can_lift_an_output_hold_by_itself, a_poisoned_context_must_be_quarantined_before_resuming}`、`gate::tests::hold_records_the_reason_but_never_the_flagged_text`、`transcript::tests::redaction_*` |
 | `critical` 周期检查暂停所有非控制回合，无人值守时永久停机（已核实） | hold + 下一回合前丢弃上下文（`discard_context`）；删除 `agent_paused` | `runner::tests::critical_risk_holds_and_discards_the_context_before_the_next_turn` |
 | v4 提示词多处与代码不符；技能索引从未填充；边界后模板文本死代码；`static_prefix` 忽略 mode 且 `Box::leak`（已核实） | v5 提示词；`prompt::context` 固定注入 AGENTS/USER/MEMORY/STYLE/技能索引 + agent 自管 `/hooks/context.toml`；删除 `[[hooks.context]]` | `prompt::tests::*`、`prompt::context::tests::*`、`config::tests::retired_context_hooks_fail_with_a_migration_hint` |

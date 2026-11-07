@@ -5,7 +5,7 @@
 //! 只做三件事：
 //! - 建立 WebSocket 连接并暴露事件订阅；
 //! - 提供统一的 action 调用（`API` 工具直接复用）；
-//! - 把发送结果解析成消息 id，供发送账本与去重使用。
+//! - 把发送结果解析成消息 id，并在发送账本里登记（见 [`super::ledger`]）。
 //!
 //! 断线重连由 NapCatLink 内置的退避策略负责。
 
@@ -14,6 +14,7 @@ use napcat_link::{EventSubscription, MessageSegment, NapLink};
 use serde_json::Value;
 
 use super::event::ChatId;
+use super::ledger::{OutboundLedger, produces_message};
 
 /// 登录信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,8 @@ pub struct LoginInfo {
 /// NapCat 客户端。
 pub struct QqClient {
     link: NapLink,
+    /// 本进程发出的消息；`message_sent` 回声据此区分 agent 的话与手打的消息。
+    ledger: OutboundLedger,
 }
 
 impl QqClient {
@@ -37,7 +40,10 @@ impl QqClient {
             builder = builder.token(token);
         }
         let link = builder.build().context("cannot build the NapCat client")?;
-        Ok(Self { link })
+        Ok(Self {
+            link,
+            ledger: OutboundLedger::default(),
+        })
     }
 
     /// 建立连接。
@@ -53,15 +59,34 @@ impl QqClient {
         self.link.subscribe()
     }
 
-    /// 原始 action 调用（`API` 工具与内部查询共用）。
+    /// 发送账本。
+    pub fn ledger(&self) -> &OutboundLedger {
+        &self.ledger
+    }
+
+    /// 原始 action 调用（`API` 工具、运行时通知与内部查询共用）。
     ///
     /// NapCatLink 返回的是 OneBot 响应中的 `data` 字段（错误已由库转成 `Err`），
     /// 因此这里直接返回 `data`，不再二次解包。
+    ///
+    /// 会产生消息的 action 在调用前登记进账本、返回后补记 id：本进程的每一条
+    /// 发送都经过这里，回声才能被认出来。
     pub async fn call(&self, action: &str, params: Value) -> Result<Value> {
-        self.link
+        // 守卫保证登记一定会结束：调用方的超时会直接丢弃这个 future，
+        // 永远“在途”的登记会让该 chat 后续的手打消息都被当成 agent 的话。
+        let mut guard = produces_message(action).then(|| SendGuard {
+            ledger: &self.ledger,
+            ticket: self.ledger.begin(action, &params),
+        });
+        let result = self
+            .link
             .call_api(action, params)
             .await
-            .map_err(|error| anyhow::anyhow!("NapCat action {action} failed: {error}"))
+            .map_err(|error| anyhow::anyhow!("NapCat action {action} failed: {error}"));
+        if let Some(guard) = guard.take() {
+            guard.finish(result.as_ref().ok());
+        }
+        result
     }
 
     /// 查询登录账号。
@@ -142,5 +167,25 @@ impl QqClient {
 
     pub async fn friend_list(&self) -> Result<Value> {
         self.call("get_friend_list", Value::Null).await
+    }
+}
+
+/// 在途发送的守卫：正常返回时带响应结束；被丢弃时按“没有响应”结束。
+struct SendGuard<'a> {
+    ledger: &'a OutboundLedger,
+    ticket: u64,
+}
+
+impl SendGuard<'_> {
+    fn finish(self, response: Option<&Value>) {
+        self.ledger.finish(self.ticket, response);
+        // 已经结束，不再让 Drop 重复结束。
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for SendGuard<'_> {
+    fn drop(&mut self) {
+        self.ledger.finish(self.ticket, None);
     }
 }

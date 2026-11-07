@@ -125,7 +125,7 @@ agent 调用 `API` 的 `agent.resume`（宿主机上的 `sbot security resume` �
 owner intent 由 runtime 核实，不接受模型自报或聊天里的“主人同意了”：
 
 - **control**：`sbot chat` 通过本地 IPC 触发，恒为 true；
-- **owner_message**：触发批次里有主人之声——`owner_qq` 的非 self 消息，或 `master_qq` 私线的私聊（判定见 `src/principals.rs` 与 [配置说明](configuration.md)）；文件与记忆里的文字永远不算；
+- **owner_message**：触发批次里有 `owner_qq` 的非 `self` 消息（stand_in 下包括主人在本账号上手打、经发送账本确认不是本进程发出的消息，见 [配置说明](configuration.md#主人的消息)）；文件与记忆里的文字永远不算；
 - 子代理继承 spawn 时的证据。
 
 `API` 对扩张动作（发消息、加好友、处理请求、改资料、上传文件、改群名片/群名/
@@ -155,7 +155,7 @@ owner intent 由 runtime 核实，不接受模型自报或聊天里的“主人�
 
 `approve`：变更类动作返回 `approval_required` 和请求 id（60 秒内有效）。机器人同时
 私聊 `master_qq` 一条通知。只有 `master_qq` 与机器人登录账号不同时，通知才带 6 位
-确认码、主人在那个私聊里回复确认码即批准；`master_qq` 就是本账号时（stand_in 且未配置私线），
+确认码、主人在那个私聊里回复确认码即批准；`master_qq` 就是本账号时（stand_in 默认），
 本账号发出的消息与 agent 自己发的无法区分，私聊回复一律不算，只能用控制通道：
 
 ```bash

@@ -4,8 +4,9 @@
 //!
 //! 结构：`{source, when?, deliver, lifecycle?}`。
 //! - source：`qq` / `timer` / `internal`；`stream` 只允许写在配置文件里；
-//! - when：谓词子集（`event.mentions_self`、`event.from_owner`、`event.type == 'message'`、
-//!   `event.chat == 'group:123'`、`event.text contains 'x'`，前缀 `not` 取反，用 `and` 组合）；
+//! - when：谓词子集（`event.mentions_self`、`event.type == 'message'`、
+//!   `event.chat == 'group:123'`、`event.sender == '10001'` / `!=`、`event.text contains 'x'`，
+//!   前缀 `not` 取反，用 `and` 组合）；
 //! - deliver：投递给主代理，以 `event` 或 `prompt` 形式；
 //! - lifecycle：`max_events`、`expires`、`one_shot`、`min_interval_secs`。
 //!
@@ -147,10 +148,6 @@ fn match_term(term: &str, event: &MonitorEvent) -> Result<bool, String> {
     }
     if term == "event.mentions_self" {
         return Ok(event.mentions_self);
-    }
-    // 主人之声：主人本人，或主人私线的私聊（见 `crate::principals`）。
-    if term == "event.from_owner" {
-        return Ok(event.owner_intent);
     }
     if let Some(value) = term.strip_prefix("event.type == ") {
         return Ok(event.kind == unquote(value));
@@ -295,8 +292,8 @@ pub struct MonitorManager {
     monitors: RwLock<HashMap<String, Arc<Monitor>>>,
     sink: Arc<dyn MonitorSink>,
     db: std::sync::RwLock<Option<Arc<Database>>>,
-    /// 账号 / 主人 / 私线；`@` 判定与“主人之声”都用它。
-    principals: std::sync::RwLock<crate::principals::Principals>,
+    self_id: AtomicU64,
+    owner_qq: AtomicU64,
 }
 
 impl MonitorManager {
@@ -305,23 +302,19 @@ impl MonitorManager {
             monitors: RwLock::new(HashMap::new()),
             sink,
             db: std::sync::RwLock::new(None),
-            principals: std::sync::RwLock::new(crate::principals::Principals::default()),
+            self_id: AtomicU64::new(0),
+            owner_qq: AtomicU64::new(0),
         })
     }
 
-    /// 身份三元组：账号用于 `@` 判定；主人之声触发的投递拥有 owner 证据。
-    pub fn set_principals(&self, principals: crate::principals::Principals) {
-        *self
-            .principals
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = principals;
+    /// 登录账号；用于 `@` 判定。
+    pub fn set_self_id(&self, self_id: u64) {
+        self.self_id.store(self_id, Ordering::Relaxed);
     }
 
-    fn principals(&self) -> crate::principals::Principals {
-        *self
-            .principals
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// 主人 QQ；主人消息触发的 monitor 投递拥有 owner 证据。
+    pub fn set_owner_qq(&self, owner_qq: u64) {
+        self.owner_qq.store(owner_qq, Ordering::Relaxed);
     }
 
     /// 接入数据库：定时源把上次触发时间写进 `meta`，重启后可补投。
@@ -497,14 +490,13 @@ impl MonitorManager {
 
     /// 喂入 QQ 事件；匹配的 monitor 各投递一次。
     pub async fn on_qq_event(&self, event: &QqEvent) {
-        let principals = self.principals();
-        let Some(mut view) = MonitorEvent::from_qq(event, principals.account_qq) else {
+        let Some(mut view) = MonitorEvent::from_qq(event, self.self_id.load(Ordering::Relaxed))
+        else {
             return;
         };
-        view.owner_intent = match event {
-            QqEvent::Message(message) => principals.is_owner_voice(message),
-            _ => false,
-        };
+        let owner_qq = self.owner_qq.load(Ordering::Relaxed);
+        view.owner_intent =
+            view.kind == "message" && owner_qq != 0 && view.sender == Some(owner_qq);
         let monitors: Vec<Arc<Monitor>> = {
             let monitors = self.monitors.read().await;
             monitors
@@ -1204,10 +1196,7 @@ mod tests {
     async fn qq_monitor_delivers_matching_events_only() {
         let sink = Arc::new(RecordingSink::default());
         let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
-        manager.set_principals(crate::principals::Principals {
-            account_qq: 1,
-            ..Default::default()
-        });
+        manager.set_self_id(1);
         manager
             .add(MonitorSpec {
                 name: "at-me".to_owned(),
@@ -1499,17 +1488,13 @@ mod tests {
     async fn owner_message_delivery_carries_owner_intent() {
         let sink = Arc::new(RecordingSink::default());
         let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
-        manager.set_principals(crate::principals::Principals {
-            account_qq: 1,
-            owner_qq: 1,
-            master_qq: 322,
-        });
+        manager.set_owner_qq(322);
         manager
             .add(MonitorSpec {
                 name: "owner".to_owned(),
                 source: "qq".to_owned(),
                 timer: None,
-                when: Some("event.type == 'message' and event.from_owner".to_owned()),
+                when: Some("event.sender == '322'".to_owned()),
                 prompt: None,
                 as_prompt: false,
                 max_events: 10,
@@ -1554,7 +1539,10 @@ mod tests {
             message: None,
         };
         assert_eq!(
-            matches(Some("event.mentions_self and not event.from_owner"), &event),
+            matches(
+                Some("event.mentions_self and not event.sender == '7'"),
+                &event
+            ),
             Ok(true)
         );
         assert_eq!(matches(Some("not event.mentions_self"), &event), Ok(false));

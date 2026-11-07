@@ -42,7 +42,7 @@ SBOT__NAPCAT__URL=ws://127.0.0.1:3002
 | `compaction_model` | 空 | 摘要模型；空 = 主模型 |
 | `max_output_tokens` | 8192 | 单次回复上限 |
 | `max_steps` | 48 | 单回合工具循环上限 |
-| `master` | `owner` | 主人的私线：`owner`（= `owner_qq`）、`self`（登录账号）或 QQ 号。报告与审批通知发到这里；它是另一个账号时，它发来的私聊也算主人在对 agent 说话（见下方“主人怎么和 agent 说话”） |
+| `master` | `self` | 报告与审批通知的目标：`self`（登录账号）或 QQ 号 |
 | `receive_scopes` | `["*"]` | 允许读的 chat 列表 |
 | `send_scopes` | `["*"]` | 允许发的 chat 列表；空 = 禁止一切发送 |
 | `retry_attempts` / `retry_base_ms` / `retry_max_ms` | 3 / 400 / 8000 | provider 重试次数、基础间隔、上限 |
@@ -50,24 +50,18 @@ SBOT__NAPCAT__URL=ws://127.0.0.1:3002
 
 `mode` 启动时固定，修改需重启。
 
-#### 主人怎么和 agent 说话
+#### 主人的消息
 
-这个 agent 设计为无人值守运行，主人只通过 QQ 和它交互。运行时用一条规则判断
-“这条消息是不是主人在对 agent 说话”（代码：`src/principals.rs`）：
+主人只通过 QQ 与这个无人值守的 agent 交互，但主人的消息没有特权通道：
 
-- 登录账号自己发出的消息永远不算——它们与 agent 通过 API 发出的消息无法区分；
-- 来自 `owner_qq` 的消息算（任何会话）；
-- 来自 `master_qq` 的**私聊**算（`master_qq` 必须是另一个账号）。
-
-命中的消息会唤醒 agent（`wake-on-owner`）、带上 owner intent，并且不受 `[filter]` 拦截。
-
-| 模式 | 推荐配置 | 主人的 QQ 渠道 |
-|------|----------|----------------|
-| `companion` | `owner_qq = 主人`，`master = "owner"` | 主人在任何会话里说话都能被听到 |
-| `stand_in` | `master = 主人的另一个账号` | 主人用那个账号私聊登录账号 |
-| `stand_in` | `master = "owner"` 或 `"self"` | **没有**：主人手机上手打的消息是 `self`，agent 会让开；只剩宿主机上的 `sbot chat` |
-
-`sbot doctor` 会对最后一种情况给出警告。
+- 本进程发出的消息才是 agent 自己的话（`self`）。每次发送都在发送账本里登记，NapCat 的
+  `message_sent` 回声据此认领（`src/qq/ledger.rs`）；对不上时宁可当成 agent 的话。
+- 其余消息——包括 stand_in 下主人在手机上用**同一个账号**手打的——都和别人的消息一样
+  进 inbox，发送者记为本账号的 QQ（stand_in 下就是 `owner_qq`）。这需要 NapCat 打开
+  `reportSelfMessage`。
+- 是否因此醒来由 monitor 决定。默认装有 `wake-on-owner`，agent 可以修改或删除它；
+  不想看主人的消息也是 agent 自己的选择。
+- `owner_qq` 的非 `self` 消息带 owner intent；控制通道（`sbot chat`）同样带。
 
 ### `[napcat]`
 
@@ -176,16 +170,16 @@ lifecycle = { idle_only = false, max_events = 1000 }
 `cron`（5 字段）。运行时也能通过 `Monitor` 工具增删，但重启即消失；配置文件里的才是常驻。
 
 `when` 是用 `and` 连接的谓词：`event.type == '…'`、`event.chat == '…'`、
-`event.sender == '…'` / `!=`、`event.text contains '…'`、`event.mentions_self`、
-`event.from_owner`（主人之声），任一项前加 `not` 取反。写错的表达式会作为系统通知投递，不会静默失效。
+`event.sender == '…'` / `!=`、`event.text contains '…'`、`event.mentions_self`，
+任一项前加 `not` 取反。写错的表达式会作为系统通知投递，不会静默失效。
 
 默认所有 QQ 消息只写入 `/inbox` / transcript，**不逐条唤醒 agent**。内置两个可删除的
 唤醒预设：
 
 | 名称 | 条件 | 行为 |
 |------|------|------|
-| `wake-on-mention` | `@` 本账号、且不是主人之声的消息 | 唤醒主代理处理 |
-| `wake-on-owner` | 主人之声（见上文“主人怎么和 agent 说话”）；主人没有 QQ 渠道时不安装 | 唤醒主代理处理 |
+| `wake-on-mention` | 非主人的 `@` 消息 | 唤醒主代理处理 |
+| `wake-on-owner` | `owner_qq` 的消息（含 stand_in 下主人手打的，见上文“主人的消息”） | 唤醒主代理处理 |
 
 拍一拍、撤回等 QQ notice，以及好友/群请求、带 `group_id`/`user_id` 的未知事件，
 都会以 `[poke]` / `[recall]` / `[request]` / `[unknown]` 伪消息写入 inbox；

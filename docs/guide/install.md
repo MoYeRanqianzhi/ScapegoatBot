@@ -28,8 +28,8 @@ cargo build --release
    “WebSocket 客户端”（反向 WS）连不上 sbot。示例：
    - 地址：`ws://127.0.0.1:3001`（填到 `sbot.toml` 的 `[napcat].url`）；
    - `messagePostFormat` 保持默认的 `array`；
-   - 想让 agent 看到自己（以及 stand_in 下主人在手机上）发出的消息，打开
-     `reportSelfMessage`；
+   - 打开 `reportSelfMessage`：stand_in 下主人在手机上手打的消息只能这样被 agent 看到；
+     agent 自己发的消息会被发送账本认出来，不会被当成主人的话；
    - 若设置了 `token`，填到 `~/.sbot/auth.json` 的 `napcat.access_token`。
 3. 确认 NapCat 与 QQ 都处于登录状态。
 

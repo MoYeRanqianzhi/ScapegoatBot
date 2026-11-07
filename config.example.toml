@@ -32,11 +32,8 @@ fallback_models = []
 thinking_level = "high"
 max_output_tokens = 8192
 max_steps = 48
-# 主人的私线：主人用它给 agent 发指令、接收报告与审批通知。
-# "owner"（默认）= owner_qq；"self" = 登录账号；或填一个 QQ 号。
-# stand_in 下主人就是登录账号，它发出的消息无法与 agent 自己发的区分，
-# 所以主人要通过 QQ 指挥 agent，必须在这里填主人的另一个账号。
-master = "owner"
+# owner 通知目标：self 或 QQ 号。
+master = "self"
 # 允许读/发的 chat：group:<gid> / private:<qq> / *；空 = 禁止。
 receive_scopes = ["*"]
 send_scopes = ["*"]

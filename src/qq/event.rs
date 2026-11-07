@@ -153,7 +153,10 @@ pub struct QqMessage {
     pub time: DateTime<Utc>,
     pub segments: Vec<Segment>,
     pub reply_to: Option<i64>,
-    /// 是否为 agent 自己发出的（`message_sent` echo 或 `self_id` 匹配）。
+    /// 是否为 agent 自己发出的。
+    ///
+    /// 解析时凡是本账号的消息（`message_sent` 回声或 `self_id` 匹配）都先记为 `true`；
+    /// 事件循环再用发送账本复核，不是本进程发出的改成手打（[`Self::mark_typed_by_hand`]）。
     pub is_self: bool,
     /// 历史字段：断线补消息已删除，生产路径恒为 false；仅为旧记录兼容保留。
     pub backfilled: bool,
@@ -162,6 +165,15 @@ pub struct QqMessage {
 }
 
 impl QqMessage {
+    /// 本账号的消息不是本进程发出的：有人在这个账号上手打。
+    ///
+    /// 它不再是 agent 自己的话：`is_self` 清掉，发送者记成本账号的 QQ。
+    /// stand_in 下本账号就是 `owner_qq`，于是这条消息自然就是主人的消息。
+    pub fn mark_typed_by_hand(&mut self, account_qq: u64) {
+        self.is_self = false;
+        self.sender.qq = Some(account_qq);
+    }
+
     /// 纯文本拼接（图片等以占位符出现）。
     pub fn plain_text(&self) -> String {
         let mut out = String::new();
@@ -333,8 +345,8 @@ fn parse_message(data: &Value, sent_event: bool) -> Option<QqMessage> {
 
     let sender = data.get("sender").cloned().unwrap_or(Value::Null);
     let sender = Sender {
-        // 自己发出的消息统一记为 `self`（`None`），不暴露本账号 QQ 号，
-        // 也就不会被误认成 owner_qq（stand_in 模式下二者相同）。
+        // 本账号的消息先统一记为 `self`（`None`）：在发送账本确认它不是本进程发的
+        // 之前，绝不能让它被认成 owner_qq（stand_in 模式下二者相同）。
         qq: if from_self {
             None
         } else {
@@ -382,7 +394,7 @@ fn parse_message(data: &Value, sent_event: bool) -> Option<QqMessage> {
     })
 }
 
-fn parse_segments(message: Option<&Value>) -> Vec<Segment> {
+pub(crate) fn parse_segments(message: Option<&Value>) -> Vec<Segment> {
     let Some(Value::Array(items)) = message else {
         // 字符串形式（`messagePostFormat = "string"`）降级为纯文本；配置要求 array，
         // 但这里仍要能解析，不能因为 NapCat 配置错误就整个事件丢失。
@@ -666,6 +678,20 @@ mod tests {
         assert!(message.is_self);
         assert_eq!(message.sender.qq, None);
         assert_eq!(message.sender.label(), "self");
+    }
+
+    /// 发送账本认领不到的本账号消息是手打的：不再是 `self`，发送者是本账号。
+    #[test]
+    fn a_hand_typed_echo_carries_the_account_as_sender() {
+        let mut data = group_message();
+        data["post_type"] = json!("message_sent");
+        let QqEvent::Message(mut message) = normalize("message_sent", &data) else {
+            panic!("expected message");
+        };
+        message.mark_typed_by_hand(10000);
+        assert!(!message.is_self);
+        assert_eq!(message.sender.qq, Some(10000));
+        assert_eq!(message.sender.label(), "10000");
     }
 
     #[test]

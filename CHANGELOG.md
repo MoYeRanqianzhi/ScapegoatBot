@@ -7,6 +7,30 @@
 
 ## [Unreleased]
 
+## [0.2.0-alpha.38] - 2026-11-08
+
+主人的消息不再走特权通道。
+
+### 变更
+
+- 撤回 0.2.0-alpha.37 的“主人之声”与 `[agent].master = "owner"`：`src/principals.rs`、
+  `event.from_owner`、主人消息免过滤、doctor 的私线警告全部删除，`master` 恢复为
+  `"self"` 或 QQ 号（默认 `"self"`），只是报告与审批通知的目标。
+- 新增发送账本（`src/qq/ledger.rs`）：本进程每次发消息前登记 chat 与内容指纹、返回后补记
+  `message_id`，`message_sent` 回声据此认领。认领到的是 agent 自己的话（`self`）；认领不到的
+  是有人在本账号上手打的——stand_in 下就是主人——它们和别人的消息一样进 inbox，发送者记为
+  本账号 QQ（即 `owner_qq`），由默认的 `wake-on-owner` monitor 唤醒，带 owner intent。
+  monitor 是 agent 可以改写或删除的普通 monitor；不看主人消息也是 agent 自己的选择。
+  误判只偏向“是 agent 发的”：同一 chat 有发送在途时等它返回（最多 10 秒），调用失败或超时、
+  无法预知回声内容的发送匹配该 chat 的下一条回声。需要 NapCat 打开 `reportSelfMessage`。
+- 唤醒预设的提示词修正：原来缺少行尾 `\`，模型看到的是一段断开的缩进文本。
+
+### 修复
+
+- `ActionGate` 的群发拒绝信息里多了一个字面反斜杠和断开的缩进。
+- `tests/source_hygiene.rs` 新增跨行扫描：普通字符串里没有 `\` 的换行后接缩进即报错
+  （SQL 除外；CRLF checkout 先归一化）。原来的单行正则看不到开引号在上一行的字面量。
+
 ## [0.2.0-alpha.37] - 2026-11-08
 
 自主运行第一批：主人只能通过 QQ 交互、hold 必须由 agent 自己解除，以及 v5 系统提示词。

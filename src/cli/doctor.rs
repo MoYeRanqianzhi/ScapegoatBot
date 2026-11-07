@@ -261,19 +261,15 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
     } else if loaded.config.agent.owner_qq == 0 {
         report.warn("agent.owner_qq is 0: owner-only rules fall back to the login account");
     }
-    // 主人的 QQ 渠道：这个 agent 无人值守，主人只通过 QQ 与它交互。
-    // stand_in 下主人就是本账号，本账号发出的消息无法与 agent 自己发的区分，
-    // 所以主人必须有一个“私线”账号（`[agent].master = <QQ>`），否则只剩宿主机上的控制通道。
-    // （`master` 的取值格式由配置校验负责，这里不重复。）
-    let agent = &loaded.config.agent;
-    if agent.mode == crate::config::AgentMode::StandIn
-        && agent.owner_qq == 0
-        && matches!(agent.master.as_str(), "owner" | "self")
+    if loaded.config.agent.master != "self"
+        && loaded
+            .config
+            .agent
+            .master
+            .parse::<u64>()
+            .map_or(true, |qq| qq == 0)
     {
-        report.warn(
-            "agent.master: in stand_in mode the owner can only reach the agent from a second QQ \
-             account; set [agent].master to that account's QQ number",
-        );
+        report.error("agent.master: must be \"self\" or a non-zero QQ number");
     }
 
     // 路径边界：允许显式放在根目录之外，但必须提醒迁移时要一起复制。

@@ -53,7 +53,7 @@ approval_required: napcat.send_group_msg is pending as g3. ...
 - 机器人会私聊 `master_qq` 一条确认通知。如果 `master_qq` 是**另一个账号**
   （companion 模式，或 stand_in 下把 `[agent].master` 设成主人的小号），通知里带
   6 位确认码，主人从那个账号直接回复确认码即批准；
-- 如果 `master_qq` 就是机器人登录的账号（stand_in 且没有配置私线），
+- 如果 `master_qq` 就是机器人登录的账号（stand_in 的默认 `master = "self"`），
   私聊回复无法批准：本账号发出的消息与 agent 自己发的分不开，接受它们等于让 agent
   自我批准。此时通知里不带确认码，只能用控制通道：
 

@@ -49,10 +49,7 @@ pub struct AgentConfig {
     pub retry_max_ms: u64,
     /// `stepped`（默认，阶梯退避）或 `fixed`（固定间隔）。
     pub retry_mode: RetryMode,
-    /// 主人的私线：`owner`（默认，等于 `owner_qq`）、`self`（本账号）或 QQ 号。
-    ///
-    /// 报告与审批通知发到这里；另一个账号时，它发来的私聊也算主人在说话
-    /// （见 `crate::principals`）。
+    /// owner 通知目标：`self` 或 QQ 号。
     pub master: String,
     pub receive_scopes: Vec<String>,
     pub send_scopes: Vec<String>,
@@ -81,7 +78,7 @@ impl Default for AgentConfig {
             retry_base_ms: 400,
             retry_max_ms: 30_000,
             retry_mode: RetryMode::Stepped,
-            master: "owner".to_owned(),
+            master: "self".to_owned(),
             receive_scopes: vec!["*".to_owned()],
             send_scopes: vec!["*".to_owned()],
             max_steps: 64,
@@ -98,12 +95,10 @@ impl AgentConfig {
                 "must be at most 64 characters",
             ));
         }
-        if !matches!(self.master.as_str(), "owner" | "self")
-            && self.master.parse::<u64>().map_or(true, |qq| qq == 0)
-        {
+        if self.master != "self" && self.master.parse::<u64>().map_or(true, |qq| qq == 0) {
             errors.push(ConfigError::new(
                 "agent.master",
-                "must be \"owner\", \"self\" or a non-zero QQ number",
+                "must be \"self\" or a non-zero QQ number",
             ));
         }
         if self.available_models.is_empty() {

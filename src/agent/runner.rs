@@ -107,17 +107,6 @@ pub struct RunnerConfig {
     pub event_hooks: Vec<crate::config::EventHookConfig>,
 }
 
-impl RunnerConfig {
-    /// 身份三元组；“主人之声”的判定统一走 `Principals`。
-    pub fn principals(&self) -> crate::principals::Principals {
-        crate::principals::Principals {
-            account_qq: self.account_qq,
-            owner_qq: self.owner_qq,
-            master_qq: self.master_qq,
-        }
-    }
-}
-
 /// 摘要用的独立 provider 与模型 id。
 pub struct CompactionModel {
     pub provider: Arc<dyn Provider>,

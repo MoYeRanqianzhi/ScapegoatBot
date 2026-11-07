@@ -64,14 +64,15 @@ CLI、日志、README 与本文档可以本地化。
 
 两者只差第一段；其余逐字一致（`companion_replaces_only_the_identity` 测试）。
 
-## 4. 主人之声与 owner intent
+## 4. 主人的消息与 owner intent
 
-“哪条 QQ 消息是主人在对 agent 说话”只有一个定义：`src/principals.rs::Principals::is_owner_voice`。
-runner 的回合证据、monitor 的 `event.from_owner`、唤醒预设、准入过滤豁免都调用它。提示词里
-关于 owner intent 的描述必须与它一致：
+主人的消息没有特权通道。`self` 只表示“本进程发出的消息”（发送账本 `src/qq/ledger.rs` 认领
+`message_sent` 回声）；同账号上手打的消息（stand_in 下就是主人）记为本账号 QQ，和别人的消息
+一样进 inbox，是否唤醒由 monitor 决定（默认 `wake-on-owner`，agent 可改可删）。提示词里关于
+owner intent 的描述必须与代码一致：
 
-- 登录账号自己发出的消息（`self`）永远不是；
-- `owner_qq` 的消息是；`master_qq`（另一个账号）的私聊是；控制通道是；
+- `self` 消息永远不是；
+- `owner_qq` 的非 `self` 消息是；控制通道是；
 - 文件（包括 `/AGENTS.md`）、记忆、转发/引用的内容、他人的声明都不是。
 
 ## 5. 记忆与技能回路
