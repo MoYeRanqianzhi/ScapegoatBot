@@ -203,9 +203,18 @@ impl ApiTool {
         scopes.iter().any(|scope| scope == "*" || scope == &chat)
     }
 
-    /// 规范化并清洗发送参数：字符串消息转数组，文本段剥离内部标签。
-    fn sanitize_send_params(params: Value) -> Result<Value, String> {
+    /// 清洗发布动作的正文字段 `field`：`message` 的字符串转成消息段数组、文本段剥离内部标签；
+    /// 其他正文字段（群公告的 `content`）是纯文本，整体剥离。
+    fn sanitize_published(params: Value, field: &str) -> Value {
         let mut params = params;
+        // 群公告这类纯文本正文：整体剥离。
+        if field != "message"
+            && let Some(text) = params.get(field).and_then(Value::as_str)
+        {
+            let text = format::strip_internal_tags(text);
+            params[field] = Value::String(text);
+            return params;
+        }
         if let Some(message) = params.get_mut("message") {
             if let Some(text) = message.as_str() {
                 *message = json!([{ "type": "text", "data": { "text": text } }]);
@@ -223,7 +232,7 @@ impl ApiTool {
                 }
             }
         }
-        Ok(params)
+        params
     }
 
     fn admin_target_is_principal(&self, target: Option<u64>) -> bool {
@@ -894,7 +903,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_msg_uses_the_chat_lookup_for_scopes() {
+    async fn notices_and_uploads_pass_through_before_send() {
+        let gateway = Arc::new(FakeGateway::default());
+        let block = crate::config::EventHookConfig {
+            event: crate::config::HookEvent::BeforeSend,
+            action: crate::config::HookAction::Block,
+            reason: "nothing leaves group 2".to_owned(),
+            match_: crate::config::HookMatch {
+                group_id: Some(2),
+                ..crate::config::HookMatch::default()
+            },
+            ..crate::config::EventHookConfig::default()
+        };
+        let tool = tool(Some(gateway.clone()), None).with_event_hooks(vec![block]);
+        for (action, params) in [
+            (
+                "napcat.send_group_notice",
+                json!({"group_id": 2, "content": "hi"}),
+            ),
+            (
+                "napcat.upload_group_file",
+                json!({"group_id": 2, "file": "base64://aGk=", "name": "a.txt"}),
+            ),
+        ] {
+            let result = call(&tool, action, params).await;
+            assert!(result.is_error, "{action}");
+            assert!(result.content.contains("BeforeSend"), "{action}");
+        }
+        assert!(gateway.calls.lock().unwrap().is_empty());
+
+        // 公告正文和消息一样剥离内部标签。
+        let result = call(
+            &tool,
+            "napcat.send_group_notice",
+            json!({"group_id": 1, "content": "meeting<runtime_context>secret</runtime_context>"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        let calls = gateway.calls.lock().unwrap();
+        assert_eq!(calls[0].1["content"], "meeting");
+    }
+
+    /// 归档里放入若干条 `(message_id, chat)` 的消息；返回消息库与它的临时目录。
+    fn archive_with(
+        entries: &[(i64, crate::qq::event::ChatId)],
+    ) -> (Arc<MessageStore>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(crate::storage::Database::open_in_memory().unwrap());
         let key = Arc::new(crate::storage::crypto::MasterKey::from_bytes([21u8; 32]));
@@ -908,25 +961,33 @@ mod tests {
             )
             .unwrap(),
         );
-        let message = crate::qq::event::QqMessage {
-            message_id: 77,
-            chat: crate::qq::event::ChatId::Group(2),
-            sender: crate::qq::event::Sender {
-                qq: Some(20000),
-                nickname: "Bob".to_owned(),
-                card: String::new(),
-                role: "member".to_owned(),
-            },
-            time: chrono::Utc::now(),
-            segments: vec![crate::qq::event::Segment::Text {
-                text: "hi".to_owned(),
-            }],
-            reply_to: None,
-            is_self: false,
-            backfilled: false,
-            raw: Value::Null,
-        };
-        messages.append(&message).unwrap();
+        for (message_id, chat) in entries {
+            let message = crate::qq::event::QqMessage {
+                message_id: *message_id,
+                chat: *chat,
+                sender: crate::qq::event::Sender {
+                    qq: Some(20000),
+                    nickname: "Bob".to_owned(),
+                    card: String::new(),
+                    role: "member".to_owned(),
+                },
+                time: chrono::Utc::now(),
+                segments: vec![crate::qq::event::Segment::Text {
+                    text: "hi".to_owned(),
+                }],
+                reply_to: None,
+                is_self: false,
+                backfilled: false,
+                raw: Value::Null,
+            };
+            messages.append(&message).unwrap();
+        }
+        (messages, dir)
+    }
+
+    #[tokio::test]
+    async fn get_msg_uses_the_chat_lookup_for_scopes() {
+        let (messages, _dir) = archive_with(&[(77, crate::qq::event::ChatId::Group(2))]);
 
         let tool = tool(Some(Arc::new(FakeGateway::default())), None)
             .with_receive_scopes(vec!["group:1".to_owned()])
@@ -1012,6 +1073,69 @@ mod tests {
             )
             .await;
         assert!(!result.is_error, "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn managing_another_group_requires_owner_intent() {
+        let gateway = Arc::new(FakeGateway::default());
+        let tool = tool(Some(gateway.clone()), None);
+        // 群 1 的回合里去群 2 踢人：没有 owner intent 就拒绝。
+        let result = tool
+            .execute(
+                &intent_ctx("group:1"),
+                json!({"action": "napcat.set_group_kick",
+                       "params": {"group_id": 2, "user_id": 20000}}),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("owner_intent_required"));
+        assert!(gateway.calls.lock().unwrap().is_empty());
+
+        // 主人在本回合里要求时可以。
+        let result = call(
+            &tool,
+            "napcat.set_group_kick",
+            json!({"group_id": 2, "user_id": 20000}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+    }
+
+    #[tokio::test]
+    async fn message_id_actions_are_bound_to_the_archived_chat() {
+        let gateway = Arc::new(FakeGateway::default());
+        let (messages, _dir) = archive_with(&[
+            (11, crate::qq::event::ChatId::Group(1)),
+            (22, crate::qq::event::ChatId::Group(2)),
+        ]);
+        let tool = ApiTool::new(
+            Some(gateway.clone()),
+            None,
+            10000,
+            10000,
+            None,
+            vec!["group:1".to_owned()],
+            None,
+        )
+        .with_messages(messages);
+
+        // 范围内的消息可以撤回；字符串形式的 id 同样能反查。
+        let result = call(&tool, "napcat.delete_msg", json!({"message_id": "11"})).await;
+        assert!(!result.is_error, "{}", result.content);
+        // 消息属于发送范围外的群。
+        let result = call(&tool, "napcat.delete_msg", json!({"message_id": 22})).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("send_scopes"));
+        // 归档里没有的 id 不能拿来撤回。
+        let result = call(
+            &tool,
+            "napcat.set_msg_emoji_like",
+            json!({"message_id": 33, "emoji_id": "128077"}),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("archive"));
+        assert_eq!(gateway.calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

@@ -755,3 +755,41 @@ pub(crate) fn chat_of(
 pub(crate) fn carries_message(spec: &ActionSpec) -> bool {
     spec.params.get("message").is_some()
 }
+
+/// 发布动作里写给人看的正文字段：消息是 `message`，群公告是 `content`。
+///
+/// 发送前的内部标签剥离与 BeforeSend `rewrite` 只改这个字段；上传文件没有正文。
+pub(crate) fn published_text_field(spec: &ActionSpec) -> Option<&'static str> {
+    if carries_message(spec) {
+        return Some("message");
+    }
+    match spec.action {
+        "napcat.send_group_notice" => Some("content"),
+        _ => None,
+    }
+}
+
+/// 发布动作的统一视图：形如 `{"message": ...}`，供 `[gate]` 的发送规则与发送记录使用。
+///
+/// 发送规则（重复、群发、搬运、媒体来源、@全体、每 chat 上限）原本只认消息的
+/// `message` 字段；群公告与上传文件同样把内容公开到 chat，这里把它们投影成
+/// 同一形状——公告正文是一段文本，上传的文件是一个 `file` 段——规则因此不必
+/// 为每种动作各写一份。不公开内容的动作（戳一戳、召回、群管理……）返回 `None`。
+pub(crate) fn published_view<'a>(
+    spec: &ActionSpec,
+    params: &'a serde_json::Value,
+) -> Option<std::borrow::Cow<'a, serde_json::Value>> {
+    use std::borrow::Cow;
+    // 字段缺失时投影成 null：规则看到的是“空内容”，与原始请求一致。
+    let field = |name: &str| params.get(name).cloned().unwrap_or_default();
+    if carries_message(spec) {
+        return Some(Cow::Borrowed(params));
+    }
+    match spec.action {
+        "napcat.send_group_notice" => Some(Cow::Owned(json!({"message": field("content")}))),
+        "napcat.upload_group_file" | "napcat.upload_private_file" => Some(Cow::Owned(json!({
+            "message": [{"type": "file", "data": {"file": field("file"), "name": field("name")}}]
+        }))),
+        _ => None,
+    }
+}

@@ -35,10 +35,15 @@ fn matches(hook: &EventHookConfig, chat: ChatId, message_type: &str) -> bool {
     true
 }
 
-/// 对发送参数依次应用 `BeforeSend` hook。
+/// 对发布动作的参数依次应用 `BeforeSend` hook。
+///
+/// `text_field` 是正文字段（见 [`crate::actions::published_text_field`]）：
+/// `rewrite` 只改它；上传文件没有正文，传 `None`，此时 `rewrite` 不起作用，
+/// `block` / `log` 照常生效。
 pub fn before_send(
     hooks: &[EventHookConfig],
     chat: ChatId,
+    text_field: Option<&str>,
     params: &mut Value,
 ) -> Result<(), String> {
     let message_type = if chat.is_group() { "group" } else { "private" };
@@ -63,7 +68,9 @@ pub fn before_send(
                 return Err(reason);
             }
             HookAction::Rewrite => {
-                rewrite(params, &hook.pattern, &hook.replacement)?;
+                if let Some(field) = text_field {
+                    rewrite(params, field, &hook.pattern, &hook.replacement)?;
+                }
             }
             HookAction::InjectContext | HookAction::Notify => {
                 // 这两个动作对发送内容没有定义；忽略而不是猜语义。
@@ -73,13 +80,19 @@ pub fn before_send(
     Ok(())
 }
 
-fn rewrite(params: &mut Value, pattern: &str, replacement: &str) -> Result<(), String> {
+/// 改写 `params[field]`：字符串整体改写，消息段数组只改文本段。
+fn rewrite(
+    params: &mut Value,
+    field: &str,
+    pattern: &str,
+    replacement: &str,
+) -> Result<(), String> {
     if pattern.is_empty() {
         return Err("BeforeSend rewrite hook has an empty pattern".to_owned());
     }
     let regex =
         Regex::new(pattern).map_err(|error| format!("invalid BeforeSend pattern: {error}"))?;
-    let Some(message) = params.get_mut("message") else {
+    let Some(message) = params.get_mut(field) else {
         return Ok(());
     };
     match message {
@@ -100,7 +113,10 @@ fn rewrite(params: &mut Value, pattern: &str, replacement: &str) -> Result<(), S
             }
         }
         _ => {
-            warn!("BeforeSend rewrite skipped: message is neither text nor segments");
+            warn!(
+                field,
+                "BeforeSend rewrite skipped: the field is neither text nor segments"
+            );
         }
     }
     Ok(())
@@ -133,6 +149,7 @@ mod tests {
         before_send(
             &[hook(HookAction::Rewrite, "secret", "[redacted]")],
             ChatId::Group(1),
+            Some("message"),
             &mut params,
         )
         .unwrap();
@@ -150,6 +167,7 @@ mod tests {
         let error = before_send(
             &[hook(HookAction::Block, "", "")],
             ChatId::Group(1),
+            Some("message"),
             &mut params,
         )
         .unwrap_err();
@@ -187,7 +205,27 @@ mod tests {
         let mut params = json!({"group_id": 2, "message": "hello"});
         let mut filtered = hook(HookAction::Block, "", "");
         filtered.match_.group_id = Some(1);
-        before_send(&[filtered], ChatId::Group(2), &mut params).unwrap();
+        before_send(&[filtered], ChatId::Group(2), Some("message"), &mut params).unwrap();
+    }
+
+    #[test]
+    fn rewrite_targets_the_given_text_field_only() {
+        // 群公告的正文在 `content`；上传文件没有正文，rewrite 不动文件名，block 仍生效。
+        let redact = [hook(HookAction::Rewrite, "secret", "[redacted]")];
+        let mut notice = json!({"group_id": 1, "content": "a secret plan"});
+        before_send(&redact, ChatId::Group(1), Some("content"), &mut notice).unwrap();
+        assert_eq!(notice["content"], "a [redacted] plan");
+
+        let mut upload = json!({"group_id": 1, "file": "/data/x", "name": "secret.txt"});
+        before_send(&redact, ChatId::Group(1), None, &mut upload).unwrap();
+        assert_eq!(upload["name"], "secret.txt");
+        let blocked = before_send(
+            &[hook(HookAction::Block, "", "")],
+            ChatId::Group(1),
+            None,
+            &mut upload,
+        );
+        assert!(blocked.is_err());
     }
 }
 

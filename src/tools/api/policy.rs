@@ -8,8 +8,9 @@
 //! 2. [`ApiTool::check_target`]：admin/destructive 动作的目标若是 owner/master，恒拒绝；
 //! 3. hold：所有 QQ 动作拒绝；
 //! 4. [`ApiTool::check_receive_scope`]：查询只能读 `receive_scopes` 内的 chat；
-//! 5. [`ApiTool::check_owner_intent`]：扩张类动作需要本回合的运行时证据；
-//! 6. [`ApiTool::check_send_scope`]：对某个 chat 产生影响的动作必须在 `send_scopes` 内；
+//! 5. [`ApiTool::check_owner_intent`]：扩张类动作与跨 chat 的群管理需要本回合的运行时证据；
+//! 6. [`ApiTool::check_send_scope`]：对某个 chat 产生影响的动作必须在 `send_scopes` 内，
+//!    只带 `message_id` 的动作按归档反查 chat；
 //!    放在门禁之前，越界请求不会生成待确认项、也不会给主人发确认码；
 //! 7. [`ApiTool::check_action_gate`]：速率、发送规则与 approve 模式确认；
 //! 8. [`ApiTool::prepare_outbound`]：剥离内部标签、BeforeSend hook、文件引用内联；
@@ -136,12 +137,7 @@ impl ApiTool {
             && self.receive_scopes.is_some()
             && let Some(store) = &self.messages
         {
-            let id = params.get("message_id").and_then(|value| {
-                value
-                    .as_i64()
-                    .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-            });
-            let chat = id.and_then(|id| store.chat_for_message(id).ok().flatten());
+            let chat = Self::archived_chat(store, params);
             if !chat.is_some_and(|chat| self.receive_allows(chat)) {
                 return Err("receive scope does not allow reading this message".to_owned());
             }
@@ -152,17 +148,33 @@ impl ApiTool {
     /// owner intent 只消费 runtime 证据：控制通道，或触发批次里主人本人的消息。
     ///
     /// 回复触发本回合的 chat 有明确理由，不需要额外证据；给 `master_qq` 的私聊
-    /// 是主人通知通道，同样不需要。跨 chat 发送、加好友、改资料等扩张动作必须有证据。
+    /// 是主人通知通道，同样不需要。跨 chat 发送、加好友、改资料等扩张动作必须有证据；
+    /// 群管理只在触发本回合的那个群里免证据。
     fn check_owner_intent(
         &self,
         spec: &ActionSpec,
         params: &Value,
         ctx: &ToolContext,
     ) -> Result<(), String> {
-        if !spec.requires_owner_intent || ctx.evidence.owner_intent {
+        if ctx.evidence.owner_intent {
             return Ok(());
         }
         let target = crate::actions::chat_of(spec, params);
+        // 群管理（踢人、禁言、改名片……）本身不需要 owner intent，但只能管触发本回合的
+        // 那个群：在 A 群的回合里去 B 群踢人，是把 A 群的内容变成对 B 群的动作。
+        if spec.category == Category::Admin
+            && let (Some(chat), Some(origin)) = (target, ctx.evidence.origin_chat.as_deref())
+            && chat.to_string() != origin
+        {
+            return Err(format!(
+                "owner_intent_required: {} targets {chat}, but this turn belongs to {origin}. \
+                 Managing another chat needs the owner's request in this turn.",
+                spec.action
+            ));
+        }
+        if !spec.requires_owner_intent {
+            return Ok(());
+        }
         let same_chat = spec.category == Category::Message
             && target.is_some_and(|chat| {
                 ctx.evidence.origin_chat.as_deref() == Some(chat.to_string().as_str())
@@ -182,10 +194,28 @@ impl ApiTool {
     /// 会对某个 chat 产生影响的动作（发送、群管理、上传、改群资料）必须在
     /// `send_scopes` 内；有作用域字段却解析不出 chat 时拒绝（fail-closed）。
     ///
-    /// 召回、表情回应只有 message_id，没有作用域字段，不在这里判断。
+    /// 召回、表情回应、设精华这类只有 `message_id` 的动作，按归档反查消息所属的
+    /// chat 再判断；归档里查不到的 id 拒绝——否则任何 id 都能拿来召回。
     fn check_send_scope(&self, spec: &ActionSpec, params: &Value) -> Result<(), String> {
         if !spec.category.is_outbound() {
             return Ok(());
+        }
+        if spec.scope_field.is_none()
+            && params.get("message_id").is_some()
+            && let Some(store) = &self.messages
+        {
+            return match Self::archived_chat(store, params) {
+                Some(chat) if self.scope_allowed(chat) => Ok(()),
+                Some(chat) => Err(format!(
+                    "message {} belongs to {chat}, which is outside [agent].send_scopes.",
+                    params["message_id"]
+                )),
+                None => Err(format!(
+                    "{}: message {} is not in this account's archive; only messages this \
+                     account has seen can be acted on.",
+                    spec.action, params["message_id"]
+                )),
+            };
         }
         match crate::actions::chat_of(spec, params) {
             Some(chat) if self.scope_allowed(chat) => Ok(()),
@@ -199,6 +229,16 @@ impl ApiTool {
             )),
             None => Ok(()),
         }
+    }
+
+    /// 按归档反查 `params.message_id` 所属的 chat；id 不是数字、归档里没有、
+    /// 或查询失败都返回 `None`，由调用方按拒绝处理。
+    fn archived_chat(store: &MessageStore, params: &Value) -> Option<ChatId> {
+        let id = params.get("message_id")?;
+        let id = id
+            .as_i64()
+            .or_else(|| id.as_str().and_then(|text| text.trim().parse().ok()))?;
+        store.chat_for_message(id).ok().flatten()
     }
 
     /// `[gate]`：放行、拦截，或在 approve 模式下登记待确认并通知主人。
@@ -276,15 +316,16 @@ impl ApiTool {
         params: Value,
         ctx: &ToolContext,
     ) -> Result<(Value, Value), String> {
-        let mut params = if spec.category == Category::Message {
-            Self::sanitize_send_params(params)?
-        } else {
-            params
+        // 消息、群公告、上传文件都把内容公开到 chat：剥离内部标签并过 BeforeSend。
+        let text_field = crate::actions::published_text_field(spec);
+        let mut params = match text_field {
+            Some(field) => Self::sanitize_published(params, field),
+            None => params,
         };
-        if spec.category == Category::Message
+        if crate::actions::published_view(spec, &params).is_some()
             && let Some(chat) = crate::actions::chat_of(spec, &params)
         {
-            crate::hooks::before_send(&self.event_hooks, chat, &mut params)
+            crate::hooks::before_send(&self.event_hooks, chat, text_field, &mut params)
                 .map_err(|error| format!("BeforeSend hook blocked the send: {error}"))?;
         }
         let wire =
@@ -320,10 +361,12 @@ impl ApiTool {
         match gateway.call(napcat_action, wire).await {
             Ok(response) => {
                 // 只有成功才计入重复/跨群规则；失败重试不被自己的记录挡住。
-                if let (Some(action_gate), Some(chat)) = (&self.action_gate, chat)
-                    && spec.category == Category::Message
-                {
-                    action_gate.note_send(&params, &chat.to_string());
+                if let (Some(action_gate), Some(chat), Some(view)) = (
+                    &self.action_gate,
+                    chat,
+                    crate::actions::published_view(spec, &params),
+                ) {
+                    action_gate.note_send(&view, &chat.to_string());
                 }
                 let message_id = response
                     .get("message_id")

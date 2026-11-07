@@ -71,7 +71,7 @@ pub(super) async fn inline_references(
     let mut wire = params.clone();
     // 需要内联的字段，以 JSON Pointer 记录，第二步统一改写。
     let mut pointers = Vec::new();
-    // 消息段：可能是数组，也可能已被 `sanitize_send_params` 规范成数组。
+    // 消息段：可能是数组，也可能已被 `ApiTool::sanitize_published` 规范成数组。
     if let Some(message) = wire.get_mut("message") {
         collect_segment_references(message, "/message", 0, &mut pointers)?;
     }

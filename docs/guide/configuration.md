@@ -271,6 +271,8 @@ key 放 `auth.json`：
   其余文件由 agent 自己列在 VFS 的 `/hooks/context.toml`（见 [人设、记忆与技能](persona-memory.md)）。
 - `[hooks.events]`：所有事件都会触发 `log` / `block` / `inject_context` / `notify`；
   `rewrite` 只在 `BeforeSend` 生效，`scope` 支持 `model`（默认）与 `all`。
+  `BeforeSend` 作用于消息、群公告与上传文件；`rewrite` 改写消息文本段与公告正文，
+  上传文件没有正文，只受 `block` / `log` 影响。
   `inject_context` 的落点：SessionStart → system，MessageReceived → 回合内提示，
   Pre/PostCompact → 摘要输入/新分段；`notify` 只支持 `owner`/`master`。
 

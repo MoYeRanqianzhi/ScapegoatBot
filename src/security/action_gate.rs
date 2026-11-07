@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::actions::{ActionSpec, Category};
+use crate::actions::ActionSpec;
 use crate::config::{GateConfig, GateMode};
 use crate::providers::{CompletionError, Provider, SystemBlock, complete_text, truncate_chars};
 use crate::storage::Database;
@@ -764,9 +764,10 @@ impl ActionGate {
             };
         }
 
-        if spec.category == Category::Message
+        // 发送规则作用于所有公开内容的动作（消息、群公告、上传文件），统一看投影后的视图。
+        if let Some(view) = crate::actions::published_view(spec, params)
             && let Some(chat) = crate::actions::chat_of(spec, params)
-            && let Err(reason) = self.send_rule(params, evidence, &chat.to_string())
+            && let Err(reason) = self.send_rule(&view, evidence, &chat.to_string())
         {
             self.record_audit(spec.action, false, &reason);
             return ActionDecision::Block(reason);
@@ -907,6 +908,46 @@ mod tests {
             .await,
             ActionDecision::Block(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn notices_and_uploads_follow_the_send_rules() {
+        let gate = auto_gate();
+        // 公告与上传本身要求 owner intent；有了 intent，重复规则依然适用。
+        let evidence = TurnEvidence::owner("test");
+        for (action, params) in [
+            (
+                "napcat.send_group_notice",
+                json!({"group_id": 1, "content": "the weekly meeting moves to friday"}),
+            ),
+            (
+                "napcat.upload_group_file",
+                json!({"group_id": 1, "file": "/data/report.pdf", "name": "report.pdf"}),
+            ),
+        ] {
+            let spec = spec(action);
+            assert!(
+                gate.check(spec, &params, &evidence).await.is_allowed(),
+                "{action}"
+            );
+            let view = crate::actions::published_view(spec, &params).unwrap();
+            gate.note_send(&view, "group:1");
+            assert!(
+                matches!(
+                    gate.check(spec, &params, &evidence).await,
+                    ActionDecision::Block(reason) if reason.contains("already sent")
+                ),
+                "{action} should be caught by the duplicate rule"
+            );
+        }
+        // 不公开内容的动作没有发布视图。
+        assert!(
+            crate::actions::published_view(
+                spec("napcat.set_group_kick"),
+                &json!({"group_id": 1, "user_id": 2})
+            )
+            .is_none()
+        );
     }
 
     #[tokio::test]
