@@ -53,7 +53,7 @@ approval_required: napcat.send_group_msg is pending as g3. ...
 - 机器人会私聊 `master_qq` 一条确认通知。如果 `master_qq` 是**另一个账号**
   （companion 模式，或 stand_in 下把 `[agent].master` 设成主人的小号），通知里带
   6 位确认码，主人从那个账号直接回复确认码即批准；
-- 如果 `master_qq` 就是机器人登录的账号（stand_in 的默认 `master = "self"`），
+- 如果 `master_qq` 就是机器人登录的账号（stand_in 且没有配置私线），
   私聊回复无法批准：本账号发出的消息与 agent 自己发的分不开，接受它们等于让 agent
   自我批准。此时通知里不带确认码，只能用控制通道：
 
@@ -72,8 +72,7 @@ sbot gate reject g3        # 拒绝
 |------|------|------|
 | `sbot ai stop` | 不发起新的模型请求；消息照收照存 | `sbot ai start` |
 | `sbot pause`（ESTOP） | 不开始新回合；消息照收照存 | `sbot resume` |
-| hold | 拒绝所有 QQ 动作（`napcat.*`） | 过闸后 `sbot security resume` 或 `agent.resume` |
-| `agent_paused` | 安全审查 `critical` 后连新回合也暂停 | 同上；控制通道 `chat` 仍可用 |
+| hold | 拒绝所有 QQ 动作（`napcat.*`）；回合照常运行 | agent 隔离可疑内容后自己调用 `agent.resume`；宿主机上的 `sbot security resume` 走同一条路径 |
 
 `ai stop` 与 ESTOP 都只挡“新回合”，不会中断已经在跑的回合。
 

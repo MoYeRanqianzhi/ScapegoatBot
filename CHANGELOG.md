@@ -7,8 +7,44 @@
 
 ## [Unreleased]
 
+## [0.2.0-alpha.37] - 2026-11-08
+
+自主运行第一批：主人只能通过 QQ 交互、hold 必须由 agent 自己解除，以及 v5 系统提示词。
+
+### 破坏性变更
+
+- 移除 `[[hooks.context]]`。`/AGENTS.md`（存在即注入，主人和 agent 都可以写）、`/USER.md`、
+  `/MEMORY.md`、风格档案与技能索引由程序固定注入；其余文件（例如人设 `/SOUL.md`）由 agent
+  自己列在 VFS 的 `/hooks/context.toml`。旧配置里的 `[[hooks.context]]` 会让启动失败并给出迁移提示。
+- `[agent].master` 默认值从 `"self"` 改为 `"owner"`（= `owner_qq`），并新增 `"owner"` 取值。
+  stand_in 的默认结果不变（仍是登录账号）；companion 的报告与审批通知现在默认发给主人。
+- 安全周期检查的 `critical` 不再“暂停所有新回合”（只有宿主机控制通道能解开，无人值守时等于
+  永久停机）：改为 hold，并在下一回合开始前丢弃当前上下文（换到新分段，旧分段留档）。
+  `agent_paused` 状态随之删除。
+
+### 新增
+
+- 主人之声：`src/principals.rs` 统一判定“这条 QQ 消息是不是主人在对 agent 说话”——`owner_qq`
+  的非 self 消息，或 `master_qq`（另一个账号）的私聊。此前 stand_in 下主人的消息全是 `self`，
+  主人没有任何 QQ 渠道；现在把 `[agent].master` 设成主人的另一个账号即可。命中的消息唤醒 agent、
+  带 owner intent，并且不受 `[filter]` 拦截。`sbot doctor` 对“主人没有 QQ 渠道”给出警告。
+- monitor 谓词新增 `event.from_owner` 与前缀 `not`；内置唤醒预设改用它们。
+- 技能索引真正进入上下文（此前模板里有占位符，但从未填充）。
+- `agent.quarantine` 把原文另存 `/quarantine/` 的同时，把上下文里的同一段文字换成占位符，
+  返回替换次数；`agent.status` 返回 `hold_reason`。
+
 ### 变更
 
+- 系统提示词重写为 v5（`assets/system_prompt_v5.txt`），参考 Claude Code 的写法：讲理由、用比喻
+  （白板、照片、断路器、闹钟、新同事），并直接写入发消息的 API、消息段与示例、门禁与 hold 的
+  自恢复流程。去掉了与代码不符的说法（“不能写 /AGENTS.md”“/AGENTS.md 或 /SOUL.md 里的常驻
+  指令算 owner intent”“下一条消息一定会唤醒你”等）。v4 模板与 `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`
+  机制删除。
+- `agent.resume` 复核**当前已提交上下文**的尾部，不再复核当初被判危险的原文（那段原文永远危险，
+  输出闸触发的 hold 因此永远解不开）。被判危险的原文不再留在内存里。
+- `Agent` 工具描述改为“刚走进房间、什么都不知道的新同事”的交接写法，并如实说明只有
+  `allow_send: true` 的自定义定义能发送。
+- `agent.quarantine` 删除从未生效的 `message_id` 参数；`agent.status` 的摘要与实际返回一致。
 - 图片工具改名为 `local.media.image.*`（`info`、`transform`、`convert`、`text`、`fonts`），
   归属“本地工具 → 媒体 → 图片”；旧名 `image.*` 不再可用。`api.list` 的 `namespace`
   改为层级前缀匹配（`local`、`local.media`、`local.media.image`）。

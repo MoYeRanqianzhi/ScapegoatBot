@@ -140,11 +140,26 @@ actor: {}
                 config.gate.mode, config.agent.receive_scopes, config.agent.send_scopes
             ),
             "hooks" => {
-                let mut out = String::from("# Context hooks\n");
-                for hook in &config.hooks.context {
+                // 注入规则见 `crate::prompt::context`：固定注入 + agent 自管的清单。
+                let mut out = String::from(
+                    "# Context injection\n\nAlways injected when present: /AGENTS.md, \
+                     /USER.md, /MEMORY.md",
+                );
+                if config.style.enabled {
+                    out.push_str(&format!(", {}", config.style.profile_path));
+                }
+                out.push_str(&format!(
+                    ", and the skill index.\nYour own list: {} (read at session start).\n\n\
+                     # Event hooks\n",
+                    crate::prompt::context::HOOKS_PATH
+                ));
+                if config.hooks.events.is_empty() {
+                    out.push_str("(none)\n");
+                }
+                for hook in &config.hooks.events {
                     out.push_str(&format!(
-                        "- {} path={} kind={:?} inject={:?} enabled={}\n",
-                        hook.name, hook.path, hook.kind, hook.inject, hook.enabled
+                        "- {:?} -> {:?} enabled={}\n",
+                        hook.event, hook.action, hook.enabled
                     ));
                 }
                 out

@@ -34,7 +34,17 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 | monitor `expires` 过大时 `DateTime + Duration` 溢出 panic | `checked_add_signed` | `monitor::tests::absurd_expiry_is_an_error_not_a_panic` |
 | `get_group_file_url` / `get_group_file_system_info` 被当成变更 | 归 Query | 现有测试 |
 | 模型可见错误串里的断裂空白（policy/action_gate/web） | 修正 + 源码扫描 | `tests/source_hygiene.rs` |
-| steer 进回合的消息在循环最后一次排空之后到达时“收下却不回应”，队列也不补开回合（已核实 runner/queue 代码） | 循环结束立刻关闭 steering；没回应的条数随 `TurnReport` 交还队列，按原顺序放回队首再开一轮 | `queue::tests::unanswered_steering_messages_open_a_follow_up_turn_in_order`、`runner::tests::{steering_closes_as_soon_as_the_model_loop_ends, early_exit_returns_waiting_steering_messages, paused_turn_returns_steering_messages_to_the_queue}` |
+| steer 进回合的消息在循环最后一次排空之后到达时“收下却不回应”，队列也不补开回合（已核实 runner/queue 代码） | 循环结束立刻关闭 steering；没回应的条数随 `TurnReport` 交还队列，按原顺序放回队首再开一轮 | `queue::tests::unanswered_steering_messages_open_a_follow_up_turn_in_order`、`runner::tests::{steering_closes_as_soon_as_the_model_loop_ends, early_exit_returns_waiting_steering_messages, skipped_turn_returns_steering_messages_to_the_queue}` |
+
+## 2b. 0.2.0-alpha.37 已修（2026-11-08，自主运行）
+
+| 问题 | 修法 | 测试 |
+|------|------|------|
+| stand_in 下主人的消息全是 `is_self`，主人没有任何 QQ 渠道；owner 判定散落在 runner/monitor/预设三处（已核实） | `src/principals.rs` 统一“主人之声”：`owner_qq` 非 self，或 `master_qq` 私线私聊；`[agent].master` 新增/默认 `"owner"`；主人之声免过滤；doctor 警告 | `principals::tests::*`、`monitor::tests::owner_message_delivery_carries_owner_intent` |
+| `agent.resume` 复核当初的危险原文，输出闸触发的 hold 永远解不开（已核实） | 复核当前已提交上下文尾部；不再保存危险原文；`agent.quarantine` 同时替换上下文里的原文 | `runner::ops::tests::{the_agent_can_lift_an_output_hold_by_itself, a_poisoned_context_must_be_quarantined_before_resuming}`、`gate::tests::hold_records_the_reason_but_never_the_flagged_text`、`transcript::tests::redaction_*` |
+| `critical` 周期检查暂停所有非控制回合，无人值守时永久停机（已核实） | hold + 下一回合前丢弃上下文（`discard_context`）；删除 `agent_paused` | `runner::tests::critical_risk_holds_and_discards_the_context_before_the_next_turn` |
+| v4 提示词多处与代码不符；技能索引从未填充；边界后模板文本死代码；`static_prefix` 忽略 mode 且 `Box::leak`（已核实） | v5 提示词；`prompt::context` 固定注入 AGENTS/USER/MEMORY/STYLE/技能索引 + agent 自管 `/hooks/context.toml`；删除 `[[hooks.context]]` | `prompt::tests::*`、`prompt::context::tests::*`、`config::tests::retired_context_hooks_fail_with_a_migration_hint` |
+| `agent.status` / `agent.quarantine` 描述承诺不存在的能力；`quarantine.message_id` 未使用 | 描述与实现一致；删参数 | 现有测试 |
 
 ## 3. 待修（按优先级）
 
@@ -120,14 +130,10 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 
 **模型可见文本（优先，模型会照着做）**
 
-- `assets/system_prompt_v4.template.txt`：`:79` “You cannot write /AGENTS.md” 没有任何
-  强制，而 `/AGENTS.md` 作为可信 owner_context 注入（**安全**）；`:53` 把 AGENTS/SOUL
-  里的长期指示算作 owner intent，代码只认运行时证据，`/SOUL.md` 不存在；`:88` 技能索引
-  从未填充；`:41` “下一条消息会唤醒你”只对 @ 与主人成立；`:28` API 描述并不列出动作；
-  `:120-172` 边界之后的文本不被使用，`session_scope` 不再输出。
+- ~~`assets/system_prompt_v4.template.txt` 的各项~~：0.2.0-alpha.37 已由 v5 取代（见 §2b）。
 - 工具描述：`fs.rs:63` 示例过滤语法 `contains("...")` 不存在；`fs.rs:973` 承诺 mount 与
   权限；`actions.rs:541/549` 承诺预算用量、“标记不可执行”；`tools/monitor.rs:46/54`
-  `internal` 源与 `catch_up` 参数无效；`swarm/mod.rs:98/228` 说 general 子代理不能改
+  `internal` 源与 `catch_up` 参数无效（`actions.rs` 的 agent.* 摘要已在 alpha.37 修正）；`swarm/mod.rs:98/228` 说 general 子代理不能改
   `/MEMORY.md`、不能删数据，但它有 Write/Edit/RM；`api.rs:244` 仍说三个命名空间。
 
 **用户文档**
@@ -154,20 +160,22 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 - `QqMessage::backfilled`（功能已删，保留 DB 列）、`Permission`/`permissions()`（无消费者）、
   `DynamicProvider`（只有测试实现）、`Category::Media`（只有 image.*）、
   `ClientConfig.name: IpcConfig`。
-- 忽略参数的函数：`prompt::static_prefix(mode)`、`turn_lock_for/session_for/history_for(chat)`、
+- 忽略参数的函数：~~`prompt::static_prefix(mode)`~~（alpha.37 删除）、`turn_lock_for/session_for/history_for(chat)`、
   `compact_chat`、`turn_buffer::append(scope)`、`mentions_self`（含 @全体）、
   `gate::record_event`（固定 Input）。
 - CLI：`Chat.scope`、`AiCommand::Restart`（同 Start）、`model/effort list`。
 - `wake-on-` 名字前缀决定投递路径（隐藏行为）→ 显式字段。
 - 不起作用的配置键：`[memory].review_model/topics`、`[skills].shared_dir`、
   `[[monitors]].jitter_secs`、`source = stream|internal`、`[[hooks.events]].when/inject`、
-  `[[hooks.context]].path/scope`、`[queue].mode = collect`、默认保留下的 `max_session_bytes`。
+  ~~`[[hooks.context]].path/scope`~~（alpha.37 整段删除）、`[queue].mode = collect`、默认保留下的 `max_session_bytes`。
 
 ## 6. 下一步
 
 1. 核实并修 P0-2、P0-4 ~ P0-7（P0-4/5 影响计费与崩溃恢复）。
-2. 模型可见文本的漂移（§5 第一组），尤其 `/AGENTS.md` 写保护——提示词承诺了，代码没做。
-3. 用户文档与命名（§5 其余），配置键“实现或删除”需逐个问用户。
+2. 模型可见文本的漂移（§5 第一组剩余的工具描述项）。`/AGENTS.md` **不加**写保护（用户 2026-11-07 决定 agent 可写）。
+3. 配置重构（用户 2026-11-07 授权：“不起作用的配置项可能是旧代码残留……需要实现的进行实现”）：
+   逐个盘点 §5 列出的键，实现或删除，并同步 `config.example.toml`、文档与 CHANGELOG 破坏性说明。
+   然后是用户文档与命名（§5 其余）。
 4. P1 安全项（chat 绑定、`/config` 写保护与密钥暴露、配额）。
 5. P2 结构拆分（先测试后拆）。
 6. 每批：`cargo test --locked --all-targets`、`cargo clippy --locked --all-targets -- -D warnings`、

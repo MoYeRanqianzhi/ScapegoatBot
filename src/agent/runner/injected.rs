@@ -51,17 +51,10 @@ impl Runner {
         message: AgentMessage,
         owner_intent: bool,
     ) -> Result<LoopOutcome> {
-        if origin != "control" && self.deps.gate.agent_paused() {
-            debug!(%origin, "agent is paused by the security review; skipping this event");
-            return Ok(LoopOutcome {
-                stop_reason: crate::agent::StopReason::Aborted,
-                usage: Default::default(),
-                turns: 0,
-            });
-        }
         let chat = ChatId::Private(self.config.owner_qq);
         let turn_lock = self.turn_lock_for(chat).await;
         let _turn_guard = turn_lock.lock().await;
+        self.discard_context_if_flagged().await;
         self.active_turns
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let _active = ActiveTurnGuard(&self.active_turns);

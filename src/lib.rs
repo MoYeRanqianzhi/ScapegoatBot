@@ -22,6 +22,8 @@ pub(crate) mod mcp;
 pub mod memory;
 pub(crate) mod monitor;
 pub(crate) mod paths;
+// 身份三元组（账号 / 主人 / 私线）与“主人之声”的唯一判定。
+pub mod principals;
 // 提示词：静态前缀 + 动态 hooks + 每回合 runtime 上下文。
 pub(crate) mod prompt;
 // Provider：Anthropic Messages、OpenAI Responses、Chat Completions 与 SSE。

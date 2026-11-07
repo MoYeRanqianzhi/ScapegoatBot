@@ -498,19 +498,16 @@ deliver = { to = "main", as = "prompt" }
     }
 
     #[test]
-    fn default_hooks_cover_owner_memory_style() {
-        let hooks = HooksConfig::default();
-        let kinds: Vec<_> = hooks.context.iter().map(|h| h.kind).collect();
-        assert_eq!(
-            kinds,
-            vec![
-                ContextKind::Owner,
-                ContextKind::User,
-                ContextKind::Memory,
-                ContextKind::Style
-            ]
+    fn retired_context_hooks_fail_with_a_migration_hint() {
+        let config: SbotConfig =
+            toml::from_str("[[hooks.context]]\nname = \"soul\"\npath = \"/SOUL.md\"\n").unwrap();
+        let errors = config.validate_shape().unwrap_err();
+        assert!(
+            errors
+                .0
+                .iter()
+                .any(|error| error.field == "hooks.context" && error.message.contains("removed"))
         );
-        hooks.validate(&mut Vec::new());
     }
 
     #[test]

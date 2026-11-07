@@ -1,66 +1,10 @@
-use std::collections::HashSet;
-
 use serde::{Deserialize, Serialize};
 
-use super::{ConfigError, non_empty};
+use super::ConfigError;
 
 // ---------------------------------------------------------------------------
 // [hooks]
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HookTrigger {
-    SessionStart,
-    PostCompact,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextKind {
-    Owner,
-    User,
-    Memory,
-    Style,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InjectMode {
-    System,
-    UserPrefix,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ContextHookConfig {
-    pub name: String,
-    /// VFS 路径或合法 glob。
-    pub path: String,
-    pub kind: ContextKind,
-    pub when: Vec<HookTrigger>,
-    pub inject: InjectMode,
-    /// 可选字节上限；缺省按 kind 的默认预算。
-    pub max_bytes: Option<u64>,
-    /// 可选字符上限；与 `max_bytes` 同时存在时取先触发者。
-    pub max_chars: Option<u32>,
-    pub enabled: bool,
-}
-
-impl Default for ContextHookConfig {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            path: String::new(),
-            kind: ContextKind::Owner,
-            when: vec![HookTrigger::SessionStart, HookTrigger::PostCompact],
-            inject: InjectMode::System,
-            max_bytes: None,
-            max_chars: None,
-            enabled: true,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,84 +79,29 @@ impl Default for EventHookConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `[hooks]`：运维写给运行时的事件规则。
+///
+/// 上下文注入不在这里配置：`/AGENTS.md`、记忆与风格档案由程序固定注入，其余文件由
+/// agent 自己在 VFS 的 `/hooks/context.toml` 里决定（见 `crate::prompt::context`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HooksConfig {
-    pub context: Vec<ContextHookConfig>,
     pub events: Vec<EventHookConfig>,
-}
-
-impl Default for HooksConfig {
-    fn default() -> Self {
-        // 设计 §7.4 的默认 hook：AGENTS / USER / MEMORY / STYLE 各一条。
-        Self {
-            context: vec![
-                ContextHookConfig {
-                    name: "agents".to_owned(),
-                    path: "/AGENTS.md".to_owned(),
-                    kind: ContextKind::Owner,
-                    max_bytes: Some(65_536),
-                    ..ContextHookConfig::default()
-                },
-                ContextHookConfig {
-                    name: "user".to_owned(),
-                    path: "/USER.md".to_owned(),
-                    kind: ContextKind::User,
-                    max_chars: Some(4_000),
-                    ..ContextHookConfig::default()
-                },
-                ContextHookConfig {
-                    name: "memory".to_owned(),
-                    path: "/MEMORY.md".to_owned(),
-                    kind: ContextKind::Memory,
-                    max_bytes: Some(25_000),
-                    ..ContextHookConfig::default()
-                },
-                ContextHookConfig {
-                    name: "style".to_owned(),
-                    path: "/STYLE.md".to_owned(),
-                    kind: ContextKind::Style,
-                    max_chars: Some(2_000),
-                    ..ContextHookConfig::default()
-                },
-            ],
-            events: Vec::new(),
-        }
-    }
+    /// 已移除的 `[[hooks.context]]`；只为给出明确的迁移提示而保留解析。
+    #[serde(skip_serializing)]
+    context: Option<toml::Value>,
 }
 
 impl HooksConfig {
     pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
-        let mut names = HashSet::new();
-        for (index, hook) in self.context.iter().enumerate() {
-            let field = format!("hooks.context[{index}]");
-            non_empty(errors, format!("{field}.name"), &hook.name);
-            if !hook.name.trim().is_empty() && !names.insert(hook.name.as_str()) {
-                errors.push(ConfigError::new(
-                    format!("{field}.name"),
-                    format!("duplicate hook name {:?}", hook.name),
-                ));
-            }
-            if !hook.path.starts_with('/') {
-                errors.push(ConfigError::new(
-                    format!("{field}.path"),
-                    "must be an absolute VFS path or glob",
-                ));
-            }
-            if hook.when.is_empty() {
-                errors.push(ConfigError::new(
-                    format!("{field}.when"),
-                    "must list at least one trigger",
-                ));
-            }
-            if hook.max_bytes == Some(0) || hook.max_chars == Some(0) {
-                errors.push(ConfigError::new(
-                    format!("{field}.max_bytes / {field}.max_chars"),
-                    "must be greater than zero when set",
-                ));
-            }
+        if self.context.is_some() {
+            errors.push(ConfigError::new(
+                "hooks.context",
+                "was removed in 0.2.0-alpha.37: /AGENTS.md, /USER.md, /MEMORY.md and the style \
+                 profile are always injected, and the agent lists any other files in \
+                 /hooks/context.toml inside its VFS; delete this section",
+            ));
         }
-
         // 同一事件最多 16 条；动作参数必须齐全。
         let mut per_event = std::collections::HashMap::new();
         for (index, hook) in self.events.iter().enumerate() {

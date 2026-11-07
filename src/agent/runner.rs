@@ -65,8 +65,8 @@ pub struct RunnerConfig {
     pub retry: crate::agent::agent_loop::RetryPolicy,
     /// 注入“上次回复以来的群消息”时最多取多少条。
     pub chat_history_limit: u32,
-    /// context hooks（AGENTS/USER/MEMORY/STYLE 或自定义）。
-    pub hooks: Vec<crate::config::ContextHookConfig>,
+    /// 会话级注入的预算（`/USER.md`、`/MEMORY.md`、风格档案）；见 `prompt::context`。
+    pub context_budget: prompt::context::ContextBudget,
     /// 交给 provider 执行的服务端工具。
     pub server_tools: Vec<crate::providers::ServerToolKind>,
     /// 单回合工作集上限；超过则先压缩。
@@ -105,6 +105,17 @@ pub struct RunnerConfig {
     pub max_state_chars: usize,
     /// `[hooks.events]`；BeforeSend 在 API 里执行，其余事件由 Runner 触发。
     pub event_hooks: Vec<crate::config::EventHookConfig>,
+}
+
+impl RunnerConfig {
+    /// 身份三元组；“主人之声”的判定统一走 `Principals`。
+    pub fn principals(&self) -> crate::principals::Principals {
+        crate::principals::Principals {
+            account_qq: self.account_qq,
+            owner_qq: self.owner_qq,
+            master_qq: self.master_qq,
+        }
+    }
 }
 
 /// 摘要用的独立 provider 与模型 id。
@@ -153,6 +164,8 @@ pub struct Runner {
     unchecked_tokens: std::sync::atomic::AtomicU64,
     /// 周期检查连续失败次数。
     review_failures: std::sync::atomic::AtomicU32,
+    /// `critical` 周期检查后置位：下一个回合开始前丢弃当前上下文（见 `review`）。
+    discard_context: std::sync::atomic::AtomicBool,
     /// 周期检查互斥。
     review_lock: Mutex<()>,
     /// 每个 transcript scope 一个回合锁；shared 模式天然只有一个锁。
@@ -264,7 +277,7 @@ impl Runner {
             }
         }
 
-        let dynamic = prompt::load_hooks(&vfs, &config.hooks);
+        let dynamic = prompt::context::load(&vfs, &config.context_budget);
 
         let mut system = vec![SystemBlock {
             text: prompt::render_static(config.mode),
@@ -310,6 +323,7 @@ impl Runner {
             turn_times: Mutex::new(HashMap::new()),
             unchecked_tokens: std::sync::atomic::AtomicU64::new(0),
             review_failures: std::sync::atomic::AtomicU32::new(0),
+            discard_context: std::sync::atomic::AtomicBool::new(false),
             review_lock: Mutex::new(()),
             active_turns: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -369,7 +383,7 @@ impl Runner {
             text: prompt::render_static(self.config.mode),
             cache: true,
         }];
-        for block in prompt::load_hooks(&self.deps.vfs, &self.config.hooks).render() {
+        for block in prompt::context::load(&self.deps.vfs, &self.config.context_budget).render() {
             system.push(SystemBlock {
                 text: block,
                 cache: false,
@@ -539,13 +553,10 @@ impl Runner {
             debug!(chat = %input.chat, "ESTOP is active; skipping this turn");
             return Ok(());
         }
-        if self.deps.gate.agent_paused() {
-            debug!(chat = %input.chat, "agent is paused by the security review; skipping this turn");
-            return Ok(());
-        }
         let chat = input.chat;
         let turn_lock = self.turn_lock_for(chat).await;
         let _turn_guard = turn_lock.lock().await;
+        self.discard_context_if_flagged().await;
         let inbound_messages = input.messages.clone();
         let sessions = self.session_for(chat).await;
         let history = self.history_for(chat).await;
@@ -1182,7 +1193,7 @@ mod tests {
                 max_steps: 8,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
                 chat_history_limit: 10,
-                hooks: crate::config::HooksConfig::default().context,
+                context_budget: prompt::context::ContextBudget::default(),
                 server_tools: Vec::new(),
                 turn_context_budget: 120_000,
                 keep_recent_tokens: 20_000,
@@ -1348,7 +1359,7 @@ mod tests {
                 max_steps: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
                 chat_history_limit: 10,
-                hooks: crate::config::HooksConfig::default().context,
+                context_budget: prompt::context::ContextBudget::default(),
                 server_tools: Vec::new(),
                 turn_context_budget: 120_000,
                 keep_recent_tokens: 20_000,
@@ -1403,10 +1414,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paused_turn_returns_steering_messages_to_the_queue() {
-        let (runner, gate, _dir) = runner_with(None, Vec::new(), 120_000, 20_000).await;
-        gate.pause_agent("test pause");
-        assert!(gate.agent_paused());
+    async fn skipped_turn_returns_steering_messages_to_the_queue() {
+        let (runner, _gate, dir) = runner_with(None, Vec::new(), 120_000, 20_000).await;
+        // ESTOP 让回合在开始前就被跳过。
+        std::fs::write(dir.path().join("ESTOP"), b"").unwrap();
 
         let chat = ChatId::Group(1);
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1624,7 +1635,7 @@ mod tests {
                 max_steps: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
                 chat_history_limit: 10,
-                hooks: crate::config::HooksConfig::default().context,
+                context_budget: prompt::context::ContextBudget::default(),
                 server_tools: Vec::new(),
                 turn_context_budget: 120_000,
                 keep_recent_tokens: 5,
@@ -1782,7 +1793,7 @@ mod tests {
                 max_steps: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
                 chat_history_limit: 10,
-                hooks: crate::config::HooksConfig::default().context,
+                context_budget: prompt::context::ContextBudget::default(),
                 server_tools: Vec::new(),
                 // 故意压到很小：任何真实上下文都会触发自动压缩。
                 turn_context_budget: 2,
@@ -1962,7 +1973,7 @@ mod tests {
                 max_steps: 4,
                 retry: crate::agent::agent_loop::RetryPolicy::default(),
                 chat_history_limit: 10,
-                hooks: crate::config::HooksConfig::default().context,
+                context_budget: prompt::context::ContextBudget::default(),
                 server_tools: Vec::new(),
                 turn_context_budget,
                 keep_recent_tokens,
@@ -2023,11 +2034,12 @@ mod tests {
         .await;
         one_turn(&runner, ChatId::Group(1)).await;
         assert!(gate.hold_active());
-        assert!(!gate.agent_paused());
     }
 
+    /// 无人值守：`critical` 不能把 agent 永久停住。hold 关掉 QQ 出口，被污染的上下文在
+    /// 下一回合开始前丢弃；回合照常运行，agent 醒来后可以自己复核并解除 hold。
     #[tokio::test]
-    async fn critical_risk_pauses_new_turns() {
+    async fn critical_risk_holds_and_discards_the_context_before_the_next_turn() {
         let (runner, gate, _dir) = runner_with_review(crate::security::review::ReviewOutcome {
             risk: crate::security::review::Risk::Critical,
             complied: false,
@@ -2037,12 +2049,31 @@ mod tests {
         .await;
         one_turn(&runner, ChatId::Group(1)).await;
         assert!(gate.hold_active());
-        assert!(gate.agent_paused());
+        let poisoned = runner.deps.sessions.current().unwrap().file;
+        assert!(!runner.history().lock().await.is_empty());
 
-        // 暂停后新的 QQ 回合被跳过；控制通道仍可工作（这里只验证 QQ 回合）。
-        let before = runner.history().lock().await.len();
+        // 下一回合照常运行，但先换到新分段；旧分段留档。
         one_turn(&runner, ChatId::Group(1)).await;
-        assert_eq!(runner.history().lock().await.len(), before);
+        let fresh = runner.deps.sessions.current().unwrap().file;
+        assert_ne!(poisoned, fresh);
+        assert!(
+            !runner
+                .deps
+                .sessions
+                .read_segment(&poisoned)
+                .unwrap()
+                .is_empty()
+        );
+        let history = runner.history();
+        let history = history.lock().await;
+        assert!(
+            !history
+                .iter()
+                .any(|message| matches!(message, AgentMessage::Assistant(a) if a.text() == "ok")),
+            "the first turn's reply must not survive the discard: {history:?}"
+        );
+        // hold 仍在：解除是 agent 自己的事（`agent.resume`）。
+        assert!(gate.hold_active());
     }
 
     #[tokio::test]

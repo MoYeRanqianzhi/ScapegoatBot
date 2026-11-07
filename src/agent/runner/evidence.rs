@@ -1,17 +1,16 @@
 use super::*;
 
 impl Runner {
-    /// 触发批次里是否有主人本人的消息（转发/引用不算）。
+    /// 触发批次里是否有主人之声（主人本人，或主人私线的私聊；转发/引用不算）。
     pub(super) fn evidence_for_batch(
         &self,
         chat: ChatId,
         messages: &[crate::qq::event::QqMessage],
     ) -> TurnEvidence {
-        let owner = self.config.owner_qq;
-        let owner_intent = owner != 0
-            && messages
-                .iter()
-                .any(|message| !message.is_self && message.sender.qq == Some(owner));
+        let principals = self.config.principals();
+        let owner_intent = messages
+            .iter()
+            .any(|message| principals.is_owner_voice(message));
         let evidence = TurnEvidence {
             owner_intent,
             origin_chat: Some(chat.to_string()),

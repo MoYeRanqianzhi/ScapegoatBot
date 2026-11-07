@@ -205,7 +205,15 @@ async fn handle_qq_event(
     }
     // 准入过滤必须在 monitor 之前：被拒消息既不应入库，也不应通过 monitor
     // 进入上下文（否则过滤只剩“不写 JSONL”，挡不住注入）。
+    // 主人之声不过滤：过滤是挡外部噪声的，主人只能通过 QQ 与 agent 交互，
+    // 一条误配的 `ignore_patterns` 不能把主人关在门外。
+    let principals = crate::principals::Principals {
+        account_qq: agent.self_id,
+        owner_qq: agent.owner_qq,
+        master_qq: agent.master_qq,
+    };
     if let QqEvent::Message(message) = &event
+        && !principals.is_owner_voice(message)
         && !agent.filter_and_count(message)
     {
         debug!(chat = %message.chat, "message rejected by the admission filter");

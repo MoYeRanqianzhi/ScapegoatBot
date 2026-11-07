@@ -550,15 +550,17 @@ fn specs_agent(list: &mut Vec<ActionSpec>) {
     for (action, summary) in [
         (
             "agent.status",
-            "Hold state, recent verdicts, budget usage and scopes.",
+            "Hold state and its reason, recent security events, model, scopes and VFS usage.",
         ),
         (
             "agent.resume",
-            "Re-check the current context; clears the hold when it passes.",
+            "Re-check your current context and lift the hold if it is clean. If it refuses, \
+             quarantine the offending excerpt (or clear the context) and call it again.",
         ),
         (
             "agent.quarantine",
-            "Move a suspicious excerpt into /quarantine/ and mark it non-executable.",
+            "Copy a suspicious excerpt (`text`, verbatim) into /quarantine/ and replace it in \
+             your context with a placeholder.",
         ),
         (
             "agent.compact",
@@ -575,7 +577,6 @@ fn specs_agent(list: &mut Vec<ActionSpec>) {
             summary,
             params: match action {
                 "agent.quarantine" => json!({
-                    "message_id": {"type": "number"},
                     "text": {"type": "string"},
                     "reason": {"type": "string"}
                 }),

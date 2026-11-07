@@ -3,7 +3,7 @@ name: prompt-style
 description: 用户对模型面文本（system prompt、工具描述、子代理提示）的写法要求；写或改任何提示词前先读
 metadata:
   type: feedback
-  scope: assets/system_prompt_*.template.txt、src 里所有模型可见文本
+  scope: assets/system_prompt_v5.txt、src 里所有模型可见文本
   status: active
   last_verified: 2026-11-07
 ---
@@ -18,6 +18,8 @@ metadata:
   模型去 `api.help` 查。取舍原则：高频且出错代价高的写进提示词，长尾参数留给 `api.help`。
 - 提示词里的每一句“能/不能”都必须和代码一致；写之前核对实现（v4 曾写“不能写 /AGENTS.md”，
   代码并没有、用户也不要这条限制）。
+- 当前版本 v5（0.2.0-alpha.37）用到的比喻：思考气泡、白板、照片不是窗户、断路器、
+  锁上的门、闹钟和门铃、新同事。维护规则与相关测试见 `docs/development/prompt-maintenance.md`。
 - 模型面文本一律英文；参考原文在 `.ref/claude-code-system-prompts/`、`.ref/CL4R1T4S/ANTHROPIC/`。
 
 **Evidence:** 用户 2026-11-07 原话：“提示词要求是参考claude code，模仿其中哲学感写法，还有其中的比喻……

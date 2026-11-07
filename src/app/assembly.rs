@@ -13,7 +13,7 @@ use tracing::{info, warn};
 
 use crate::agent::queue::ChatQueue;
 use crate::agent::runner::{Runner, RunnerConfig, RuntimeOps};
-use crate::config::{AgentMode, AuthFile, EncryptionMode, LoadedConfig, ModelsFile, SbotConfig};
+use crate::config::{AuthFile, EncryptionMode, LoadedConfig, ModelsFile, SbotConfig};
 use crate::mcp::{McpManager, McpTool};
 use crate::monitor::{MonitorManager, MonitorSink, MonitorSpec};
 use crate::paths::SbotPaths;
@@ -408,28 +408,33 @@ async fn assemble_tools(
     (tools, server_tools, hub_handle, approvals)
 }
 
-/// 内置唤醒预设：只对 @ 与主人消息唤醒；删除后会记录到 meta，重启不再恢复。
-async fn install_wake_presets(monitors: &Arc<MonitorManager>, db: &Arc<Database>, owner_qq: u64) {
+/// 内置唤醒预设：只对 `@` 与主人之声唤醒；删除后会记录到 meta，重启不再恢复。
+///
+/// 预设命中时并不使用这里的 prompt：`RunnerSink` 会把原始消息交给 ChatQueue，
+/// 按普通 chat 回合处理（见 `app::events`）。prompt 只在消息缺失时兜底。
+async fn install_wake_presets(
+    monitors: &Arc<MonitorManager>,
+    db: &Arc<Database>,
+    principals: crate::principals::Principals,
+) {
     let presets = [
         (
             "wake-on-mention",
-            format!(
-                "event.type == 'message' and event.mentions_self and event.sender != '{owner_qq}'"
-            ),
-            "You were mentioned in {{event.chat}}. Message: {{event.text}}
-             Read /inbox if you need the surrounding conversation. Reply only if appropriate;              otherwise end the turn."
-                .to_owned(),
+            "event.type == 'message' and event.mentions_self and not event.from_owner",
+            "You were mentioned in {{event.chat}}: {{event.text}}\n\
+             Read /inbox if you need the surrounding conversation. Reply only if appropriate; \
+             otherwise end the turn.",
         ),
         (
             "wake-on-owner",
-            format!("event.type == 'message' and event.sender == '{owner_qq}'"),
-            "The owner wrote in {{event.chat}}: {{event.text}}
-             Read /inbox if needed, then respond."
-                .to_owned(),
+            "event.type == 'message' and event.from_owner",
+            "The owner wrote in {{event.chat}}: {{event.text}}\n\
+             Read /inbox if needed, then respond.",
         ),
     ];
     for (name, when, prompt) in presets {
-        if name == "wake-on-owner" && owner_qq == 0 {
+        // 主人没有任何 QQ 渠道（stand_in 且私线是本账号）时，这个预设永远不会命中。
+        if name == "wake-on-owner" && !principals.owner_can_reach_agent() {
             continue;
         }
         let key = format!("monitor.removed.{name}");
@@ -441,8 +446,8 @@ async fn install_wake_presets(monitors: &Arc<MonitorManager>, db: &Arc<Database>
                 name: name.to_owned(),
                 source: "qq".to_owned(),
                 timer: None,
-                when: Some(when),
-                prompt: Some(prompt),
+                when: Some(when.to_owned()),
+                prompt: Some(prompt.to_owned()),
                 as_prompt: true,
                 max_events: 1_000_000,
                 expires: None,
@@ -627,8 +632,12 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
     let sink = Arc::new(RunnerSink::default());
     let monitors = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
     monitors.set_db(Arc::clone(&db));
-    monitors.set_self_id(self_id);
-    monitors.set_owner_qq(owner_qq);
+    let principals = crate::principals::Principals {
+        account_qq: self_id,
+        owner_qq,
+        master_qq,
+    };
+    monitors.set_principals(principals);
 
     let guard_cost = match config.security.guard.backend {
         crate::config::GuardBackend::Off => 0.0,
@@ -739,7 +748,7 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
                 mode: config.agent.retry_mode,
             },
             chat_history_limit: 20,
-            hooks: config.hooks.context.clone(),
+            context_budget: crate::prompt::context::ContextBudget::from_config(config),
             server_tools,
             turn_context_budget: config.compaction.turn_context_budget,
             keep_recent_tokens: config.compaction.keep_recent_tokens,
@@ -787,7 +796,7 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
         }
     }
     crate::monitor::load_config_monitors(&monitors, &config.monitor, Some(&messages)).await?;
-    install_wake_presets(&monitors, &db, owner_qq).await;
+    install_wake_presets(&monitors, &db, principals).await;
 
     let filter = MessageFilter::from_config(&config.filter);
     let queue = ChatQueue::new(
@@ -925,38 +934,6 @@ pub(super) async fn connect_qq(
             None
         }
     }
-}
-
-/// 解析 owner/master。
-pub(super) fn resolve_principals(config: &SbotConfig, self_id: u64) -> Result<(u64, u64)> {
-    let agent = &config.agent;
-    let owner_qq = match agent.mode {
-        AgentMode::StandIn => {
-            if agent.owner_qq != 0 {
-                agent.owner_qq
-            } else {
-                self_id
-            }
-        }
-        AgentMode::Companion => {
-            if agent.owner_qq == 0 {
-                anyhow::bail!("companion mode requires a non-zero owner_qq");
-            }
-            if self_id != 0 && agent.owner_qq == self_id {
-                anyhow::bail!("companion mode requires owner_qq to differ from the account");
-            }
-            agent.owner_qq
-        }
-    };
-    let master_qq = if agent.master == "self" {
-        self_id
-    } else {
-        agent
-            .master
-            .parse()
-            .map_err(|_| anyhow::anyhow!("agent.master must be \"self\" or a QQ number"))?
-    };
-    Ok((owner_qq, master_qq))
 }
 
 /// 按 `[security]` 构造周期检查器；`review_model` 为空时用主模型。

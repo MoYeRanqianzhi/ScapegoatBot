@@ -40,9 +40,7 @@ use crate::tools::api::AgentOps;
 use crate::vfs::Vfs;
 use crate::vfs::sqlite::VfsStore;
 
-use self::assembly::{
-    AgentInputs, build_agent, connect_qq, load_models, open_stores, resolve_principals,
-};
+use self::assembly::{AgentInputs, build_agent, connect_qq, load_models, open_stores};
 use self::bootstrap::{
     InstanceLock, ensure_default_config, persist_agent_setting, remove_sentinel,
     report_missing_credentials, terminate_signal, write_sentinel,
@@ -175,7 +173,8 @@ impl Runtime {
             warn!("NapCat is not connected; QQ tools will fail until it is");
         }
 
-        let (owner_qq, master_qq) = resolve_principals(&loaded.config, self_id)?;
+        let principals = crate::principals::Principals::resolve(&loaded.config, self_id)?;
+        let (owner_qq, master_qq) = (principals.owner_qq, principals.master_qq);
         let config_handle = Arc::new(RwLock::new(loaded.clone()));
         let agent = build_agent(AgentInputs {
             loaded: &loaded,

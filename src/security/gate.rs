@@ -401,11 +401,6 @@ pub struct Gate {
     hold: AtomicBool,
     /// `enforce` 模式下是否必须有分类器；`backend = off` 是显式选择，不算缺失。
     classifier_required: bool,
-    /// 最近一次被判危险的原始增量；只留在内存，供 `agent.resume` 复核。
-    /// 不写磁盘：判定内容里可能就有凭据，hold 文件只记原因。
-    last_flagged: std::sync::Mutex<Option<String>>,
-    /// `critical` 安全事件触发的“暂停新回合”；解除 hold 时一起清掉。
-    agent_paused: AtomicBool,
     /// guard 花费预算；超过后跳过分类器、只跑规则层。
     budget: std::sync::OnceLock<Arc<crate::budget::Budget>>,
 }
@@ -475,8 +470,6 @@ impl Gate {
             hold_file,
             hold: AtomicBool::new(false),
             classifier_required: config.enabled && config.backend != GuardBackend::Off,
-            last_flagged: std::sync::Mutex::new(None),
-            agent_paused: AtomicBool::new(false),
             budget: std::sync::OnceLock::new(),
         }
     }
@@ -511,31 +504,15 @@ impl Gate {
         self.judge.get().is_some()
     }
 
-    /// `critical` 事件后是否暂停新回合。
-    pub(crate) fn agent_paused(&self) -> bool {
-        self.agent_paused.load(Ordering::SeqCst)
-    }
-
-    /// 暂停新回合（`critical` 安全检查或运维操作）。
-    pub(crate) fn pause_agent(&self, reason: &str) {
-        self.agent_paused.store(true, Ordering::SeqCst);
-        self.enter_hold(Checkpoint::Input, reason, "");
-    }
-
     /// 是否处于 `hold`。
     pub(crate) fn hold_active(&self) -> bool {
         self.hold.load(Ordering::SeqCst) || self.hold_file.exists()
     }
 
-    /// 最近一次被判危险的内容（只读内存）；恢复时用它重过闸。
-    pub(crate) fn flagged_content(&self) -> Option<String> {
-        self.last_flagged
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    /// 读出 hold 文件里的原因（恢复时要连同真实原因一起重过闸）。
+    /// 读出 hold 文件里的原因（`agent.status` 与 `agent.resume` 复核时使用）。
+    ///
+    /// 只有原因，没有被判危险的原文：原文里可能就有凭据，而且把它再放回上下文，
+    /// 复核只会再次命中。`agent.resume` 复核的是当前上下文（见 `RuntimeOps::resume`）。
     pub(crate) fn hold_reason(&self) -> Option<String> {
         std::fs::read_to_string(&self.hold_file)
             .ok()
@@ -547,22 +524,12 @@ impl Gate {
     pub(crate) fn restore_hold(&self) {
         if self.hold_file.exists() {
             self.hold.store(true, Ordering::SeqCst);
-            if let Some(reason) = self.hold_reason()
-                && reason.contains("critical")
-            {
-                self.agent_paused.store(true, Ordering::SeqCst);
-            }
         }
     }
 
     /// 解除 hold；调用方必须先让当前上下文再过一次闸。
     pub(crate) fn clear_hold(&self) -> std::io::Result<()> {
         self.hold.store(false, Ordering::SeqCst);
-        self.agent_paused.store(false, Ordering::SeqCst);
-        *self
-            .last_flagged
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         match std::fs::remove_file(&self.hold_file) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -572,24 +539,12 @@ impl Gate {
 
     /// 由外部事件（provider 拒绝）直接进入 hold。
     pub(crate) fn force_hold(&self, reason: &str) {
-        self.enter_hold(Checkpoint::Output, reason, "");
+        self.enter_hold(Checkpoint::Output, reason);
     }
 
     /// 进入 hold：写哨兵文件（重启后仍然有效），更新内存状态。
-    fn enter_hold(&self, checkpoint: Checkpoint, reason: &str, delta: &str) {
+    fn enter_hold(&self, checkpoint: Checkpoint, reason: &str) {
         self.hold.store(true, Ordering::SeqCst);
-        if !delta.is_empty() {
-            let mut flagged = self
-                .last_flagged
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // 只保留最近一次；限制长度，避免把整个上下文常驻内存。
-            let mut kept: String = delta.chars().take(32_000).collect();
-            if kept.len() < delta.len() {
-                kept.push_str("\n[truncated]");
-            }
-            *flagged = Some(kept);
-        }
         if let Err(error) = std::fs::write(
             &self.hold_file,
             format!(
@@ -624,7 +579,7 @@ impl Gate {
 
         let enforce = self.mode == GuardMode::Enforce;
         if verdict.dangerous && enforce {
-            self.enter_hold(checkpoint, &verdict.reason, delta);
+            self.enter_hold(checkpoint, &verdict.reason);
         }
 
         let allowed = !(verdict.dangerous && enforce);
@@ -853,22 +808,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_review_uses_the_flagged_content() {
+    async fn hold_records_the_reason_but_never_the_flagged_text() {
         let dir = tempfile::tempdir().unwrap();
         let gate = gate(GuardMode::Enforce, 0.9, dir.path());
         let secret = "sk-abcdefghijklmnopqrstuvwx";
         assert!(!gate.check(Checkpoint::Output, "", secret).await.allowed);
-        let flagged = gate.flagged_content().unwrap();
-        assert!(flagged.contains(secret));
+        assert!(gate.hold_active());
+        let reason = gate.hold_reason().unwrap();
+        assert!(
+            !reason.contains(secret),
+            "hold file leaked the flagged text"
+        );
 
-        // 复核同样的内容仍然危险；清掉 hold 后再换干净内容才应通过。
-        let verdict = gate.review("hold reason", &flagged).await;
-        assert!(verdict.dangerous);
-        let clean = gate.review("hold reason", "hello there").await;
-        assert!(!clean.dangerous);
+        // 复核按内容判断：仍含危险内容就不放行，干净的上下文才放行。
+        assert!(gate.review(&reason, secret).await.dangerous);
+        assert!(!gate.review(&reason, "hello there").await.dangerous);
 
         gate.clear_hold().unwrap();
-        assert!(gate.flagged_content().is_none());
+        assert!(!gate.hold_active());
+        assert!(gate.hold_reason().is_none());
     }
 
     #[test]

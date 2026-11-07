@@ -6,7 +6,7 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 ## 种子布局
 
 ```text
-/AGENTS.md        主人给 agent 的规则（owner context）
+/AGENTS.md        常驻说明（存在即注入；主人和 agent 都可以写）
 /USER.md          偏好（祈使句）
 /MEMORY.md        记忆索引
 /memory/topics/   记忆分类（可选）
@@ -16,6 +16,9 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 /trash/           回收站：RM 默认移到这里
 /tmp/             临时文件
 ```
+
+`/hooks/context.toml` 不是种子文件：agent 想让别的文件（例如 `/SOUL.md`）每个会话自动注入时
+自己创建，格式见 [人设、记忆与技能](persona-memory.md)。
 
 `/quarantine/` 由 agent 在可疑内容上创建。
 

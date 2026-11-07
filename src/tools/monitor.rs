@@ -46,7 +46,8 @@ impl Tool for MonitorTool {
          {\"internal\": \"security\" | \"budget\" | \"agent\" | \"storage\"} for runtime state \
          changes. A stream source is config-file only; add rejects it.\n\n\
          when — optional expression over event.*, e.g. event.mentions_self, \
-         event.text contains \"报名\", event.chat == \"group:123\". A broken expression is \
+         event.from_owner, event.text contains \"报名\", event.chat == \"group:123\"; join \
+         terms with and, negate one with not. A broken expression is \
          reported, never silently ignored.\n\n\
          deliver — {\"to\": \"main\", \"as\": \"event\" | \"prompt\", \"prompt\"?: \"...\"}. \
          as: prompt sends an instruction you write; {{event.text}} and {{count}} are substituted.\n\n\

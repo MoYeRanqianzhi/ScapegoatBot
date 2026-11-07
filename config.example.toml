@@ -32,8 +32,11 @@ fallback_models = []
 thinking_level = "high"
 max_output_tokens = 8192
 max_steps = 48
-# owner 通知目标：self 或 QQ 号。
-master = "self"
+# 主人的私线：主人用它给 agent 发指令、接收报告与审批通知。
+# "owner"（默认）= owner_qq；"self" = 登录账号；或填一个 QQ 号。
+# stand_in 下主人就是登录账号，它发出的消息无法与 agent 自己发的区分，
+# 所以主人要通过 QQ 指挥 agent，必须在这里填主人的另一个账号。
+master = "owner"
 # 允许读/发的 chat：group:<gid> / private:<qq> / *；空 = 禁止。
 receive_scopes = ["*"]
 send_scopes = ["*"]
@@ -200,15 +203,8 @@ prune = true
 prune_soft_limit = 4000
 prune_keep_turns = 3
 
-# 默认已注入 /AGENTS.md、/USER.md、/MEMORY.md、/STYLE.md；需要自定义时取消注释。
-# [[hooks.context]]
-# name = "soul"
-# path = "/SOUL.md"
-# kind = "owner"
-# when = ["SessionStart", "PostCompact"]
-# inject = "system"
-# max_bytes = 32768
-# enabled = true
+# 上下文注入不在配置里：/AGENTS.md、/USER.md、/MEMORY.md、风格档案与技能索引
+# 存在即注入；其余文件（例如人设 /SOUL.md）由 agent 自己列在 VFS 的 /hooks/context.toml。
 
 # [[hooks.events]]
 # event = "before_send"

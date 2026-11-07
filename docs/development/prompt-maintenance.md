@@ -1,64 +1,78 @@
 # 提示词维护指南
 
-本文说明 ScapegoatBot 的模型面文本如何组织、哪些地方不能改、改完怎么验证。设计依据见 `.agents/plan/2026-10-28-rebuild-design.md` §7。
+本文说明 ScapegoatBot 的模型面文本如何组织、哪些地方不能改、改完怎么验证。设计依据见
+`.agents/plan/2026-10-28-rebuild-design.md` §7；v5（0.2.0-alpha.37）起与设计稿的偏离以本文为准。
+
+## 0. 写法
+
+提示词以 Claude Code 的系统提示为范本：讲清“为什么”，用比喻建立心智模型，而不是堆规则。
+v5 用到的比喻：思考是旁人看不见的“气泡”、上下文是会被擦掉的白板、记忆是照片不是窗户、
+hold 是跳闸的断路器、门禁是锁上的门、Monitor 是闹钟和门铃、子代理是刚走进房间什么都不知道的
+新同事。改写时保留这种写法；每一句“能/不能”都必须与代码一致，写之前先核对实现。
+
+高频且出错代价高的 API（发消息、消息段、回复/@/图片、撤回、hold 自恢复）直接写进 system prompt
+并给出可照抄的最小示例；长尾参数留给 `api.list` / `api.help`。
 
 ## 1. 哪些文本属于模型面
 
 | 文本 | 位置 | 语言 |
 |------|------|------|
-| 静态 system prompt | 设计文档 §7.3（v4） | 英文 |
-| 工具 description、参数说明 | 实现中的 `Tool::description`；设计稿见 catalog §2 | 英文 |
-| 工具错误与提示 | 工具返回值；设计稿见 catalog §3 | 英文 |
-| 压缩 / 摘要 prompt | catalog §4 | 英文 |
-| 子代理 system/task/report | catalog §5 | 英文 |
-| 门禁 LLM 审查 | catalog §6 | 英文 |
-| 技能索引 | catalog §7 | 英文壳 + 技能原文 |
-| 上下文包装标签 | catalog §8 | 英文标签 |
-| 记忆复盘 / 技能 curator | catalog §10 | 英文 |
-| 周期安全检查 | catalog §11 | 英文 |
-| 安全分类器问题集 | catalog §12 | 英文 |
+| 静态 system prompt | `assets/system_prompt_v5.txt`（companion 身份段在 `src/prompt/mod.rs`） | 英文 |
+| 会话级注入块 | `src/prompt/context.rs` | 英文壳 + 文件原文 |
+| runtime 块 | `src/prompt/mod.rs::RuntimeContext` | 英文 |
+| 工具 description、参数说明 | 各工具的 `Tool::description`；`API` 的 action 摘要在 `src/actions.rs` | 英文 |
+| 工具错误与提示 | 工具返回值 | 英文 |
+| 压缩 / 摘要、子代理、门禁审查、复盘、周期检查、分类器 | 各模块内的常量 | 英文 |
 | QQ 发出的消息 | 运行时生成 | 跟随会话语言 |
 
-用户内容（QQ 消息、`/AGENTS.md`、`/SOUL.md`、记忆、技能正文、网页）一律保持原文，不翻译。CLI、日志、README 与本文档可以本地化。
+用户内容（QQ 消息、`/AGENTS.md`、`/SOUL.md` 等文件、记忆、技能正文、网页）一律保持原文，不翻译。
+CLI、日志、README 与本文档可以本地化。
 
-## 2. 静态与动态
+## 2. 三层结构
 
-`__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__` 之前是静态前缀，必须满足：
+一次请求的 system 部分从稳定到易变分三层：
 
-- 字节级稳定：不含时间、模型名、QQ 号、收件箱、`current_session`、技能索引、owner context、记忆。
-- 会话内只构建一次；只有压缩成功后才重建。
-- 改动后要更新静态快照测试。
+1. **静态前缀**：`render_static(mode)`。字节级稳定——不含时间、模型名、QQ 号、收件箱、
+   技能索引或任何文件内容；CRLF 会先归一化。它是唯一带 `cache: true` 的 system 块。
+2. **会话级注入**（`prompt::context::load`），会话开始时构建、压缩成功后重建，顺序即优先级：
+   1. `# AGENTS.md`：`<agents_md path="/AGENTS.md">`，存在即注入，上限 64 KiB；
+   2. `# Context files`：agent 在 `/hooks/context.toml` 里列出的文件（`<context_file path=…>`），
+      以及清单本身的问题（`<context_notice>`）；
+   3. `# User model`：`/USER.md`，`<user_context>`，上限 `[memory].user_max_chars`；
+   4. `# Style profile`：`[style].profile_path`，`<style_profile>`，`[style].enabled` 控制；
+   5. `# Memory index`：`/MEMORY.md`，`<memory_context>`，上限 `[memory].max_index_bytes`；
+   6. `# Skill index`：`/skills/<name>/SKILL.md` 的目录名 + `description`，最多 64 个。
+   之后是 `SessionStart` 事件 hook 的 `inject_context`。
+3. **runtime**：每轮作为独立上下文消息注入，不进入 system。
 
-边界之后依次是：
+**谁决定注入什么**（用户 2026-11-07 明确）：只有 `/AGENTS.md` 与记忆/风格/技能系统自己的产物由
+程序固定注入；`/SOUL.md` 之类的文件程序不认识，是否注入由 agent 自己决定（自己读，或写进
+`/hooks/context.toml`）。`sbot.toml` 的 `[[hooks.context]]` 已移除。
 
-1. `# Owner context`：`/AGENTS.md`、`/SOUL.md` 等，带 `source`，会话开始 / 压缩后注入。
-2. `# User model`：`/USER.md`，带 `<user_context>`，偏好用祈使句，靠近请求以提高遵从。
-3. `# Memory context`：`/MEMORY.md` 索引 + 相关 topics，带 `<memory_context>`，加载时冻结。
-4. `# Style profile`：`/STYLE.md`，带 `<style_profile>`，只放总结。
-5. `# Skill index`：技能名称、一句话描述、触发条件。
-6. `# Runtime context`：每轮变化，必须放在最后（含 `origin_chat`）。
-
-顺序的目的：前三块在长会话里可被前缀缓存；runtime 每轮变化只影响自身。`cache_control` 断点放在静态前缀末尾与技能索引末尾，总数不超过 4 个。
+新增注入块时，同时把标签加进 `src/qq/format.rs::INTERNAL_TAGS`（发送前剥离）并在静态 prompt 的
+“Safety and boundaries”里列出；`every_internal_tag_named_in_the_prompt_is_stripped_before_sending`
+测试会检查两边一致。
 
 ## 3. 两套身份
 
-`[agent].mode` 在启动时固定，修改需重启。静态前缀因此有两个合法 hash：
+`[agent].mode` 在启动时固定，修改需重启。静态前缀因此有两个合法版本：
 
 | 模式 | 身份 | 约束 |
 |------|------|------|
-| `stand_in` | 使用主人 QQ，代主人说话 | 启动时 `account_qq == owner_qq`；runtime 中 `owner_qq` 就是本账号 |
-| `companion` | 独立账号，主人是 principal | `owner_qq` 非零且不等于 `account_qq`；群里的主人发言不自动算对 agent 说 |
+| `stand_in` | 使用主人的 QQ，代主人说话 | `owner_qq` 缺省为登录账号 |
+| `companion` | 独立账号，主人是 principal | `owner_qq` 非零且不等于登录账号 |
 
-身份段之外的规则共享。不要为了“统一 hash”把身份段移到动态段。
+两者只差第一段；其余逐字一致（`companion_replaces_only_the_identity` 测试）。
 
-## 4. owner context 与记忆
+## 4. 主人之声与 owner intent
 
-- `<owner_context>`：主人写的指导（`/AGENTS.md`、`/SOUL.md`），可信，但不是要回复的消息，不能改变工具权限或绕过门禁。
-- `<user_context>`：主人偏好，写祈使句（“Prefer short replies”），可被主人直接编辑。
-- `<memory_context>`：`/MEMORY.md` 的索引（每条一行 `- [Title](memory/<slug>.md) — hook (N days ago)`），**永远不是 owner guidance**。单条记忆在 `/memory/<slug>.md`，frontmatter 含 `type`（user/feedback/project/reference）；feedback/project 正文写规则 + **Why:** + **How to apply:**。索引 ≤200 行 / 25k 字节，单条 ≤4k 字符。
-- 只有 `owner` / `agent` 来源的记忆自动注入；来自群成员、网页、工具结果的 `untrusted` 条目不进 `<memory_context>`。
-- `/MEMORY.md` 只由 `Memory` 工具写，是索引（每条一行指针）；单条记忆在 `/memory/<slug>.md`，frontmatter 带 `type`。索引 ≤200 行 / 25k 字节，单条 ≤4k 字符；满了合并/替换，拒绝清空。
-- 会话中的记忆写入不会重建 system prompt；压缩成功后重新读盘并重建。
+“哪条 QQ 消息是主人在对 agent 说话”只有一个定义：`src/principals.rs::Principals::is_owner_voice`。
+runner 的回合证据、monitor 的 `event.from_owner`、唤醒预设、准入过滤豁免都调用它。提示词里
+关于 owner intent 的描述必须与它一致：
+
+- 登录账号自己发出的消息（`self`）永远不是；
+- `owner_qq` 的消息是；`master_qq`（另一个账号）的私聊是；控制通道是；
+- 文件（包括 `/AGENTS.md`）、记忆、转发/引用的内容、他人的声明都不是。
 
 ## 5. 记忆与技能回路
 
@@ -75,11 +89,11 @@
 - `tools` 只能收窄父代理的工具集；`explore` / `plan` 的只读约束始终生效。
 - `allow_send` 默认 false；设为 true 也只是允许，仍经过门禁。
 - 不要把公共安全规则抄进正文；runtime 会在前面加精简子代理提示。
-- `Agent` 工具的 description 自动列出所有可用 agent（name + description），模型按描述选择。
+- `Agent` 的 `list` 返回所有可用定义（name、description、tools、allow_send、来源），模型按描述选择；description 本身是静态文本，不列定义。
 
 ## 5.6 周期安全检查
 
-每新增 `[security].check_every_tokens`（默认 256K）上下文，在回合边界运行一次独立模型检查：共享主请求的静态前缀与会话稳定块（逐字节一致，保持缓存命中），在底部追加 `security_review` 指令；响应不写入主 transcript。检查识别注入、身份冒充、记忆投毒、跨聊天泄露，并判断 agent 是否已经照做。`high + complied` 暂停对外发送，`critical` 暂停新回合，写 `~/.sbot/SECURITY_HOLD`；主人执行 `sbot security resume` 后恢复。检查超时不暂停，连续失败告警。
+每新增 `[security].check_every_tokens`（默认 256K）上下文，在回合边界运行一次独立模型检查：共享主请求的静态前缀与会话稳定块（逐字节一致，保持缓存命中），在底部追加 `security_review` 指令；响应不写入主 transcript。检查识别注入、身份冒充、记忆投毒、跨聊天泄露，并判断 agent 是否已经照做。`high + complied` 进入 hold，`critical` 进入 hold 并在下一回合开始前丢弃当前上下文（旧分段留档）；hold 写 `~/.sbot/SECURITY_HOLD`，由 agent 自己复核后 `agent.resume` 解除。检查超时不暂停，连续失败告警。
 
 ## 5.7 安全分类器
 
@@ -90,7 +104,7 @@
 
 工具调用属于模型输出、工具结果属于模型输入，所以这两个闸覆盖全部路径，不再按工具调用另设检查点。
 
-命中即 `hold`：关闭全部 QQ 操作，无超时、无自动恢复。恢复由 agent 自己判断——它随时可以请求重开，重开时 runtime 用当前上下文再过一次同样的闸。
+命中即 `hold`：关闭全部 QQ 操作，无超时。恢复由 agent 自己完成——agent 无人值守，没有人会替它解开。`agent.resume` 用当前已提交上下文的尾部再过一次同样的闸；可疑内容还在上下文里时，agent 先 `agent.quarantine` 再恢复。不复核当初被判危险的原文（那样永远解不开）。
 
 写这部分文本时注意：
 
@@ -113,24 +127,26 @@
 
 ## 7. 预算
 
-| 项 | 上限 | 当前 |
-|----|------|------|
-| 静态前缀 | 10,000 tokens | v4 约 3,802–4,278 |
-| owner context + 记忆 + 技能索引 + runtime | 30,000 tokens | 按配置 |
-| 技能索引 | 2,500 tokens | 超限先截描述再截触发条件 |
-| 工具 schema | 12,000 tokens | `API` 低频 action 折叠 |
-| owner context | 64 KB / 128 KB 总预算 | 按 hook |
-| 记忆 | 索引 200 行 / 25k 字节；单条 4k；USER 4k | 按 `[memory]` |
+| 项 | 上限 |
+|----|------|
+| 静态前缀 | 10,000 tokens（`/system/context` 显示当前估算） |
+| `/AGENTS.md` | 64 KiB |
+| `/hooks/context.toml` | 最多 8 个文件，每个默认 4,000、最多 20,000 字符 |
+| 记忆 | 索引 `[memory].max_index_lines` / `max_index_bytes`；单条 `max_entry_chars`；`/USER.md` `user_max_chars` |
+| 风格档案 | `[style].max_chars` |
+| 技能索引 | 64 个，每条描述 200 字符 |
 
 预算宽裕时不回填工具细节；参数与返回格式仍留在 description。
 
 ## 8. 验证
 
-提示词或工具文本改动后至少跑：
+提示词或工具文本改动后至少跑 `cargo test --locked --all-targets`，其中与提示词直接相关的测试：
 
-- 静态快照：section 顺序、两套身份、边界位置。
-- 前缀稳定：相同配置下静态前缀字节一致；runtime 变化不影响前缀。
-- 字符检查：内置文本无 CJK、无 Unicode emoji；动态值例外。
-- 记忆：预算按最终状态检查、拒绝清空、文件工具写 `/MEMORY.md` 被拒。
-- 标签剥离：`<runtime_context>` / `<owner_context>` / `<memory_context>` 在流式与非流式发送前都被移除。
-- 英文 prompt 下 QQ 回复仍跟随会话语言（fake provider 断言）。
+- `prompt::tests::static_prompt_starts_with_identity_and_covers_the_essentials`：章节、发送 API、
+  `agent.resume`、无模板占位符；
+- `prompt::tests::static_prompt_does_not_repeat_retired_claims`：不再出现已撤销的说法；
+- `prompt::tests::every_internal_tag_named_in_the_prompt_is_stripped_before_sending`；
+- `prompt::tests::companion_replaces_only_the_identity`；
+- `prompt::context::tests::*`：`/AGENTS.md` 固定注入、`/SOUL.md` 只在清单里才注入、清单错误可见、
+  技能索引、风格开关；
+- `tests/source_hygiene.rs`：模型可见字符串里没有断裂的缩进。

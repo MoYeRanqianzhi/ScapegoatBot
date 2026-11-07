@@ -47,9 +47,14 @@ pub fn render_batch(messages: &[QqMessage]) -> String {
 }
 
 /// 内部注入标签；发送前必须从模型输出里剥离（设计 §7.1 / §13）。
+///
+/// 与 `crate::prompt::context` 渲染的块、runtime 块一一对应；新增注入块时同步这里。
 const INTERNAL_TAGS: &[&str] = &[
     "runtime_context",
     "owner_context",
+    "agents_md",
+    "context_file",
+    "context_notice",
     "user_context",
     "memory_context",
     "style_profile",
@@ -57,7 +62,7 @@ const INTERNAL_TAGS: &[&str] = &[
     "system_prompt",
 ];
 
-/// 剥离内部标签与边界标记。
+/// 剥离内部标签。
 ///
 /// 只处理成对标签；未闭合的标签保留原文，避免误删正常文本。
 pub fn strip_internal_tags(text: &str) -> String {
@@ -79,7 +84,7 @@ pub fn strip_internal_tags(text: &str) -> String {
             cleaned.replace_range(start..close_end, "");
         }
     }
-    cleaned.replace("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__", "")
+    cleaned
 }
 
 /// 把模型输出转换成 NapCat 消息段。
@@ -196,10 +201,8 @@ mod tests {
             strip_internal_tags("<runtime_context>oops"),
             "<runtime_context>oops"
         );
-        assert_eq!(
-            strip_internal_tags("a__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__b"),
-            "ab"
-        );
+        let text = "<agents_md path=\"/AGENTS.md\">rules</agents_md>ok";
+        assert_eq!(strip_internal_tags(text), "ok");
     }
 
     #[test]

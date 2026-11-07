@@ -176,14 +176,19 @@ impl Tool for AgentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Spawn and manage subagents. `action` is spawn, message, check, wait or list.\n\n\
-         A subagent has its own context and a restricted tool set. Types: explore (read-only \
-         search), plan (read-only planning), docs (API help), general (local tools, no sending \
-         by default). Custom agents come from /agents/<name>.md and can only use a subset of \
-         your tools; their `allow_send` cannot be changed by the spawn call.\n\n\
-         Spawn returns an id. Results come back as a summary only; the subagent never talks to \
-         QQ directly. Use check to poll, wait to block briefly, message to continue a finished \
-         subagent. Do not spawn a subagent for something one tool call can do."
+        "Hand work to a subagent. `action` is spawn, message, check, wait or list.\n\n\
+         A subagent is a capable new colleague who has just walked into the room: it has not \
+         seen this chat, does not know this account, and knows nothing except what you write \
+         in `task`. Brief it like that — the goal, what you already know or ruled out, the \
+         constraints, and the exact shape of the answer you need. A one-line task gets a \
+         one-line effort.\n\n\
+         Types: explore (read-only search), plan (read-only planning), docs (API registry \
+         help), general (local tools; no QQ sending). Custom agents come from \
+         /agents/<name>.md and `list` shows them; only a definition with `allow_send: true` \
+         can send, and the spawn call cannot grant that.\n\n\
+         spawn returns an id; results come back as a summary. Use check to poll, wait to block \
+         briefly, message to continue a finished subagent. Its work is still your \
+         responsibility. Do not spawn one for something a single tool call can do."
     }
 
     fn parameters(&self) -> serde_json::Value {

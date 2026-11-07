@@ -28,10 +28,7 @@ pub use budget::BudgetConfig;
 pub use compaction::CompactionConfig;
 pub use filter::FilterConfig;
 pub use gate::{GateConfig, GateMode};
-pub use hooks::{
-    ContextHookConfig, ContextKind, EventHookConfig, HookAction, HookEvent, HookMatch, HookTrigger,
-    HooksConfig, InjectMode,
-};
+pub use hooks::{EventHookConfig, HookAction, HookEvent, HookMatch, HooksConfig};
 pub use ipc::IpcConfig;
 pub use mcp::{McpConfig, McpServerConfig};
 pub use memory::{MemoryConfig, MemoryReviewMode};

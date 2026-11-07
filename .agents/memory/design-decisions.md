@@ -5,7 +5,7 @@ metadata:
   type: project
   scope: 0.2 分支整体（2026-10-28 重构起）
   status: active
-  last_verified: 2026-11-07
+  last_verified: 2026-11-08
 ---
 
 0.2 是 2026-10-28 起的完全重写，完整设计与取舍理由在
@@ -17,8 +17,14 @@ metadata:
 - **无人值守是第一前提**（用户 2026-11-07 强调，之前多次说过但没记下）：启动后理想情况下
   不再有任何人工干预，**主人只通过 QQ 与 agent 交互**，不会去敲 CLI。凡是“必须主人在
   主机上执行命令才能恢复”的设计都等于永远卡死。由此推出：
-  - **hold 必须能由 agent 自己解除**（`agent.resume`，由 runtime 用同一套闸复核）。
-    不要改成“只允许控制通道解除”；要加强的是复核本身，不是收走解除权。
+  - **hold 必须能由 agent 自己解除**（`agent.resume`，由 runtime 用同一套闸复核当前上下文）。
+    不要改成“只允许控制通道解除”；要加强的是复核本身，不是收走解除权。0.2.0-alpha.37 起
+    复核对象是当前已提交上下文（不是当初的危险原文，那样永远解不开）；`critical` 不再暂停
+    新回合，而是 hold + 下一回合前丢弃上下文。
+  - **主人必须有 QQ 渠道**：`src/principals.rs` 的“主人之声”= `owner_qq` 的非 self 消息，或
+    `master_qq`（另一个账号）的私聊。stand_in 下主人就是本账号，本账号消息（`is_self`）
+    与 agent 自己发的无法区分，所以永远不算；主人要指挥 agent 就配置 `[agent].master`
+    为自己的另一个账号（默认 `"owner"`）。这是主代理的设计推论，用户未逐字确认。
   - CLI（`sbot gate approve`、`sbot security resume` 等）只是补充通道，不能是唯一出路。
 - **`/AGENTS.md` agent 可以写**（用户 2026-11-07 纠正）。原设计与 v4 提示词里
   “`/AGENTS.md`、`/SOUL.md` 只有主人能写”是错的，不要再实现写保护。
@@ -29,8 +35,10 @@ metadata:
     agent 可以在 `/AGENTS.md` 里写“去读 /SOUL.md”，也可以给自己加一条 hook 自动注入——
     这是 agent 自己的行为与决定。其他文件同理：agent 自己读，或自己设置 hook。
   - 因此 agent 必须能管理自己的上下文 hook（增删），程序只硬编码 AGENTS.md。
-  - 记忆系统自身的文件（`/MEMORY.md` 索引、`/USER.md`）随记忆功能注入，属于记忆功能的设计，
-    不是“程序指定的人设文件”（主代理的理解，未与用户逐字确认）。
+    实现（0.2.0-alpha.37）：`src/prompt/context.rs`；agent 自管清单是 VFS 的
+    `/hooks/context.toml`（`[[inject]] path/max_chars`），配置里的 `[[hooks.context]]` 已删除。
+  - 记忆系统自身的文件（`/MEMORY.md` 索引、`/USER.md`）与风格档案、技能索引随各自功能注入，
+    属于这些功能的设计，不是“程序指定的人设文件”（主代理的理解，未与用户逐字确认）。
 - **单会话、全局 transcript**：整个 QQ 号一条上下文，不按群/私聊拆分（替身需要把 A、B 的消息结合起来）。
   2026-11-06 起连 `per_chat` 逃生口也已删除；跨 chat 风险由 `origin_chat` 回合绑定、按 chat 去抖、
   跨 chat 发送门禁控制。

@@ -62,10 +62,10 @@ url = "ws://127.0.0.1:3001"
 ## 三个核心概念
 
 - **回合（turn）**：一条或多条 QQ 消息触发的一次模型对话。同一 chat 的连发会在
-  写入 inbox；只有 @ 与主人消息的唤醒预设会触发回合。
+  写入 inbox；只有 @ 与主人之声（主人本人或主人私线的私聊）的唤醒预设会触发回合。
 - **VFS**：agent 看到的文件系统。`/AGENTS.md`、`/USER.md`、`/MEMORY.md` 是文件，
   `/messages`、`/inbox`、`/sessions`、`/config`、`/system` 是运行时生成的动态视图。
-- **hold**：安全闸判定危险后进入的停机状态。此时所有 QQ 动作被拒绝，直到 agent
+- **hold**：安全闸判定危险后进入的熔断状态。此时所有 QQ 动作被拒绝，直到 agent 自己
   用当前上下文重新过闸（`agent.resume` 或 `sbot security resume`）。
 
 ## 一个可靠的部署顺序

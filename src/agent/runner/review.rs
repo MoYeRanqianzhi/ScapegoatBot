@@ -87,8 +87,14 @@ impl Runner {
                         warn!(%reason, "security review raised high risk")
                     }
                     crate::security::review::Risk::Critical => {
-                        warn!(%reason, "security review paused the agent");
-                        self.deps.gate.pause_agent(&reason);
+                        // 以前这里“暂停所有新回合”，只有宿主机上的控制通道能解开；
+                        // 这个 agent 无人值守，那等于永久停机。现在：hold 关掉 QQ 出口，
+                        // 被污染的上下文在下一回合开始前整体丢弃（旧分段留档）。agent
+                        // 醒来时上下文是干净的，自己复核后用 `agent.resume` 解除。
+                        warn!(%reason, "security review: critical; holding and discarding the context");
+                        self.deps.gate.force_hold(&reason);
+                        self.discard_context
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                 }
             }
@@ -119,4 +125,30 @@ fn render_review_window(history: &[AgentMessage], overlap_tokens: u64) -> String
         out.insert(0, '\n');
     }
     out
+}
+
+impl Runner {
+    /// 回合开始前调用：`critical` 检查留下的“丢弃上下文”标记在这里执行。
+    ///
+    /// 放在回合锁之内、构建工作副本之前，保证本回合看到的已经是新分段。
+    pub(super) async fn discard_context_if_flagged(&self) {
+        if !self
+            .discard_context
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        match self.clear_all_context().await {
+            Ok(result) => warn!(
+                previous = %result["previous_session"],
+                "discarded the context after a critical security review"
+            ),
+            Err(error) => {
+                // 清理失败就保留标记，下一回合再试；hold 仍然关着 QQ 出口。
+                warn!(%error, "cannot discard the context after a critical security review");
+                self.discard_context
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
 }

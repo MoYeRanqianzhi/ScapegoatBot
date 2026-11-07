@@ -85,8 +85,10 @@ timeout_ms = 800
 
 - `low`：记录；
 - `medium`：记录 + 告警；
-- `high` 且 `complied = true`：暂停外发（hold）；
-- `critical`：暂停新回合（`agent_paused`），重启后仍从 hold 文件恢复。
+- `high` 且 `complied = true`：hold（关闭 QQ 出口）；
+- `critical`：hold，并在下一回合开始前丢弃当前上下文（换到新的 transcript 分段，旧分段留档）。
+  以前这里会“暂停所有新回合”，只有宿主机上的控制通道能解开；agent 无人值守，那等于永久停机，
+  0.2.0-alpha.37 起改为现在的做法。
 
 检查超时/失败按放行处理；连续失败计数只告警。
 
@@ -94,25 +96,27 @@ timeout_ms = 800
 
 命中后：
 
-- 写 `~/.sbot/SECURITY_HOLD`（重启仍然有效）；
+- 写 `~/.sbot/SECURITY_HOLD`（重启仍然有效；只记原因，不记被判危险的原文）；
 - 所有 `napcat.*` 动作返回 `Disabled during hold`，包括拉黑、禁言、踢人；
 - 其余工具（文件、记忆、`WebSearch`、`WebFetch`、`MCP`、`Download`）不受影响；
-- `agent.*` 与 `api.*` 只读查询仍可用，agent 可以看状态、写记忆、自查；
-- `critical` 暂停的新回合在 `agent_paused` 置位后跳过；控制通道仍可 `chat`。
+- 回合照常运行：`agent.*` 与 `api.*` 仍可用，agent 可以看状态、隔离可疑内容、自查。
 
-hold **没有超时、没有自动恢复**。
+hold **没有超时**，但**由 agent 自己解除**：这个 agent 无人值守，不会有人来替它解开。
 
 ### 恢复
 
-```bash
-sbot security resume
-```
+agent 调用 `API` 的 `agent.resume`（宿主机上的 `sbot security resume` 走同一条路径）：
 
-或 agent 自己调用 `API` 的 `agent.resume`。恢复流程：
+1. 取**当前已提交上下文**的尾部，用同样的规则层/分类器复核；
+2. 干净就删除 `SECURITY_HOLD`，否则继续 hold，并提示 agent 先隔离；
+3. 输出闸命中时，危险输出从未进入上下文，通常可以直接恢复；输入闸命中时，可疑内容
+   已在上下文里，agent 要先用 `agent.quarantine`（传入原文）把它换成占位符，
+   或用 `agent.clear_context` 重新开始，再调用 `agent.resume`。
 
-1. 取最近一次被判危险的原始内容（内存里，不写磁盘）+ 当前历史尾部 + hold 原因；
-2. 用同样的规则层/分类器复核；
-3. 通过才删除 `SECURITY_HOLD` 并清掉 `agent_paused`，否则继续 hold。
+`agent.quarantine` 把原文另存到 `/quarantine/`，只替换内存中的上下文；磁盘上的 transcript
+分段保留原样作为审计记录（重启后会重新读入，必要时需再隔离一次）。
+
+不复核当初被判危险的那段原文：它永远是危险的，拿它复核等于 hold 永远解不开。
 
 `provider stop_reason = refusal` 会直接 `force_hold`，不重试、不换模型。
 
@@ -121,7 +125,7 @@ sbot security resume
 owner intent 由 runtime 核实，不接受模型自报或聊天里的“主人同意了”：
 
 - **control**：`sbot chat` 通过本地 IPC 触发，恒为 true；
-- **owner_message**：触发批次里有 `owner_qq` 的非 self 消息；
+- **owner_message**：触发批次里有主人之声——`owner_qq` 的非 self 消息，或 `master_qq` 私线的私聊（判定见 `src/principals.rs` 与 [配置说明](configuration.md)）；文件与记忆里的文字永远不算；
 - 子代理继承 spawn 时的证据。
 
 `API` 对扩张动作（发消息、加好友、处理请求、改资料、上传文件、改群名片/群名/
@@ -151,7 +155,7 @@ owner intent 由 runtime 核实，不接受模型自报或聊天里的“主人�
 
 `approve`：变更类动作返回 `approval_required` 和请求 id（60 秒内有效）。机器人同时
 私聊 `master_qq` 一条通知。只有 `master_qq` 与机器人登录账号不同时，通知才带 6 位
-确认码、主人在那个私聊里回复确认码即批准；`master_qq` 就是本账号时（stand_in 默认），
+确认码、主人在那个私聊里回复确认码即批准；`master_qq` 就是本账号时（stand_in 且未配置私线），
 本账号发出的消息与 agent 自己发的无法区分，私聊回复一律不算，只能用控制通道：
 
 ```bash

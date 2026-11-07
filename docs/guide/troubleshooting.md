@@ -55,14 +55,16 @@ NapCat connection timed out
 sbot security status
 ```
 
-事件里会写判定原因（规则命中还是分类器）。确认内容无害后：
+事件里会写判定原因（规则命中还是分类器）。agent 被设计为自己解除 hold：下一次被唤醒时它会
+读 `agent.status`、隔离可疑内容、调用 `agent.resume`。如果你在宿主机上，也可以手动触发同一次复核：
 
 ```bash
 sbot security resume
 ```
 
-如果提示 `The gate still blocks this context`，说明复核仍判定危险。处理方式：
-清理上下文里被标记的内容（`agent.quarantine`、修正文件），或确认分类器配置正确。
+如果提示 `The hold stays: your current context still looks unsafe`，说明当前上下文里仍有被判危险的
+内容。处理方式：用 `agent.quarantine` 把那段原文换成占位符，或 `agent.clear_context` 重新开始；
+也要确认分类器配置正确。
 
 **enforce 且没配分类器**时每个回合都会被 hold：启动日志与 `doctor` 会提示。
 要么配 `base_url` + key，要么显式 `backend = "off"`。
