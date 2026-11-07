@@ -28,7 +28,7 @@ metadata:
 
 - NapCat 未登录（2026-11-05 05:22 起 QR 失败）；`get_image`、QQ CDN 下载、
   `get_msg`/`get_forward_msg`、发出媒体都未实测。
-- 服务器无系统字体：`image.fonts` 为空、`image.text` 明确报错；不内置字体。
+- 服务器无系统字体：`local.media.image.fonts` 为空、`.text` 明确报错；不内置字体。
 - 审查发现的 P0（子代理权限、非法 monitor 谓词、turn buffer、
   消息索引错位、联系人视图）尚未核实与修复。
 - WebFetch 默认后端模式下内容在 final_url 复核前已被取走；`local = true` 才逐跳抓取。

@@ -87,15 +87,16 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 | `Agent` | 生成/续聊/查询/等待子代理 |
 | `MCP` | 调用已连接的 MCP 服务器工具（可选） |
 
-`API` 分四个命名空间：
+`API` 的 action 名是分层的，第一段说明效果落在哪里：
 
-- `napcat.*`：QQ 操作。hold 期间全部拒绝。
+- `napcat.*`：QQ 操作，唯一会被别人看到的动作。hold 期间全部拒绝。
+- `local.*`：只读写 VFS 的本地工具。目前是 `local.media.image.*`（本地工具 → 媒体 → 图片）：
+  `info`、`transform`（裁剪/任意角度旋转/缩放/缩略）、`convert`（PNG/JPEG/WebP，quality
+  只作用于 JPEG）、`text`（字体、位置、颜色、透明度）、`fonts`（列出系统字体）。不内置字体，
+  `text` 使用系统安装的字体；没有字体时 `fonts` 返回空列表，`text` 返回明确错误。
 - `agent.*`：`status`、`resume`、`quarantine`、`compact`、`clear_context`。
-- `image.*`：VFS 图片处理：`info`、`transform`（裁剪/任意角度旋转/缩放/缩略）、
-  `convert`（PNG/JPEG/WebP，quality 只作用于 JPEG）、`text`（字体、位置、颜色、透明度）、
-  `fonts`（列出系统字体）。不内置字体，`image.text` 使用系统安装的字体；
-  没有字体时 `image.fonts` 返回空列表，`image.text` 返回明确错误。
-- `api.*`：`list`（过滤/分页）、`help`（单个 action 的 schema）。
+- `api.*`：`list`（`namespace` 按层级前缀过滤，如 `local.media`；另有分类/关键词/分页）、
+  `help`（单个 action 的 schema）。
 
 `Read` 读取 VFS 图片时会把图片作为 tool result 的 image attachment 交给 provider；
 图片处理工具的输出同样适用；图片附件会随 transcript 持久化，重启后仍可恢复

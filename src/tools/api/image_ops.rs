@@ -1,4 +1,4 @@
-//! `API` 的 image 分支：VFS 内图片的检查、变换、编码与文字。
+//! `API` 的 `local.media.image.*` 分支：VFS 内图片的检查、变换、编码与文字。
 //!
 //! 只读写 VFS，不产生对外影响；字体来自系统字体库（`fontdb`），不内置字体。
 
@@ -20,11 +20,11 @@ impl ApiTool {
         ctx: &ToolContext,
     ) -> ToolResult {
         match spec.action {
-            "image.info" => image_info(params, ctx),
-            "image.transform" => image_transform(params, ctx),
-            "image.convert" => image_convert(params, ctx),
-            "image.text" => image_text(params, ctx),
-            "image.fonts" => image_fonts(params),
+            "local.media.image.info" => image_info(params, ctx),
+            "local.media.image.transform" => image_transform(params, ctx),
+            "local.media.image.convert" => image_convert(params, ctx),
+            "local.media.image.text" => image_text(params, ctx),
+            "local.media.image.fonts" => image_fonts(params),
             other => ToolResult::error(format!("unsupported image action {other:?}")),
         }
     }
@@ -323,7 +323,7 @@ fn read_image(
 
 /// 图片单边上限，与 crop/resize 参数的上限一致；8192² 的 RGBA 约 268 MB。
 const MAX_IMAGE_SIDE: u32 = 8192;
-/// `image.text` 一次最多绘制的字符数。
+/// `local.media.image.text` 一次最多绘制的字符数。
 const MAX_TEXT_CHARS: usize = 1000;
 
 /// 按尺寸上限解码：文件可能很小、但声明的尺寸巨大（解压炸弹）。
@@ -498,9 +498,10 @@ fn load_font(family: Option<&str>) -> Result<FontVec, String> {
     };
     let id = database.query(&query).ok_or_else(|| match family {
         fontdb::Family::Name(name) => {
-            format!("font {name:?} is not installed; call image.fonts to list families")
+            format!("font {name:?} is not installed; call local.media.image.fonts to list families")
         }
-        _ => "no sans-serif font is installed; call image.fonts to list families".to_owned(),
+        _ => "no sans-serif font is installed; call local.media.image.fonts to list families"
+            .to_owned(),
     })?;
     let (data, index) = database
         .with_face_data(id, |data, index| (data.to_vec(), index))

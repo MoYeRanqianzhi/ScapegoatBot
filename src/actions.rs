@@ -1,7 +1,10 @@
 //! `API` 工具的 action 注册表。
 //!
 //! 这里只有数据：action 名、参数 schema、分级、作用域与示例。执行逻辑在
-//! `api.rs`；拆开是为了让 40 个 action 的表与门禁/发送逻辑各自可读。
+//! `tools/api.rs`；拆开是为了让 action 表与门禁/发送逻辑各自可读。
+//!
+//! 命名是分层的，第一段说明效果落在哪里：`napcat.*`（QQ）、`local.*`（只碰 VFS 的本地
+//! 工具，例如 `local.media.image.*`）、`agent.*`（对自己）、`api.*`（查注册表）。
 //!
 //! `specs()` 是唯一事实来源：`api.list` / `api.help`、发送范围校验与
 //! owner 保护都从这张表推导。
@@ -84,8 +87,17 @@ pub struct ActionSpec {
 }
 
 impl ActionSpec {
+    /// 顶层命名空间（第一段）：`napcat`、`local`、`agent`、`api`。
     pub fn namespace(&self) -> &'static str {
         self.action.split_once('.').map(|(ns, _)| ns).unwrap_or("")
+    }
+
+    /// 是否属于某个命名空间或其下层，例如 `local.media` 包含 `local.media.image.info`。
+    pub fn in_namespace(&self, prefix: &str) -> bool {
+        let prefix = prefix.trim_end_matches('.');
+        self.action
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('.'))
     }
 
     /// `hold` 期间是否可用。
@@ -132,7 +144,7 @@ pub fn specs() -> &'static [ActionSpec] {
         specs_napcat_file(&mut list);
         specs_napcat_profile(&mut list);
         specs_agent(&mut list);
-        specs_image(&mut list);
+        specs_local_media_image(&mut list);
         specs_api(&mut list);
         list
     })
@@ -582,16 +594,17 @@ fn specs_agent(list: &mut Vec<ActionSpec>) {
     }
 }
 
-fn specs_image(list: &mut Vec<ActionSpec>) {
+/// `local.media.image.*`：本地工具 → 媒体 → 图片。
+fn specs_local_media_image(list: &mut Vec<ActionSpec>) {
     for (action, summary, params, example) in [
         (
-            "image.info",
+            "local.media.image.info",
             "Inspect an image in the VFS (dimensions, format, bytes).",
             json!({"path": {"type": "string"}}),
             r#"{"path":"/tmp/a.png"}"#,
         ),
         (
-            "image.transform",
+            "local.media.image.transform",
             "Crop, rotate by any angle, and/or resize an image in one pass.",
             json!({
                 "path": {"type": "string"},
@@ -610,13 +623,13 @@ fn specs_image(list: &mut Vec<ActionSpec>) {
             r#"{"path":"/tmp/a.jpg","out":"/tmp/a.png","crop":{"x":0,"y":0,"width":640,"height":640},"rotate":15,"max_width":800,"max_height":800}"#,
         ),
         (
-            "image.convert",
+            "local.media.image.convert",
             "Re-encode as PNG, JPEG or WebP based on the output extension; quality applies to JPEG.",
             json!({"path": {"type": "string"}, "out": {"type": "string"}, "quality": {"type": "number"}}),
             r#"{"path":"/tmp/a.png","out":"/tmp/a.jpg","quality":80}"#,
         ),
         (
-            "image.text",
+            "local.media.image.text",
             "Draw text on an image at any position with font, size, color and opacity.",
             json!({
                 "path": {"type": "string"},
@@ -632,7 +645,7 @@ fn specs_image(list: &mut Vec<ActionSpec>) {
             r##"{"path":"/tmp/a.jpg","out":"/tmp/a-wm.jpg","text":"hello","font":"DejaVu Sans","x":24,"y":24,"size":48,"color":"#ffffff","opacity":0.8}"##,
         ),
         (
-            "image.fonts",
+            "local.media.image.fonts",
             "List installed font families (paths included when available).",
             json!({"query": {"type": "string"}, "limit": {"type": "number"}}),
             r#"{"query":"sans","limit":20}"#,

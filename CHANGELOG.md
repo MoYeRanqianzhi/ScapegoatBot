@@ -5,6 +5,14 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 变更
+
+- 图片工具改名为 `local.media.image.*`（`info`、`transform`、`convert`、`text`、`fonts`），
+  归属“本地工具 → 媒体 → 图片”；旧名 `image.*` 不再可用。`api.list` 的 `namespace`
+  改为层级前缀匹配（`local`、`local.media`、`local.media.image`）。
+
 ## [0.2.0-alpha.36] - 2026-11-07
 
 审查整改第一批：安全与数据正确性。

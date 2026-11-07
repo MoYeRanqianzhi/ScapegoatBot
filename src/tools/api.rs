@@ -241,17 +241,20 @@ impl Tool for ApiTool {
     }
 
     fn description(&self) -> &'static str {
-        "Perform a registered action. `params` must match that action's schema. There are three \
-         namespaces.\n\n\
-         napcat.* — QQ operations. Message segments use the array form, for example \
+        "Perform a registered action. `params` must match that action's schema; undeclared \
+         params are rejected. Action names are hierarchical, and the first segment says where \
+         the effect lands:\n\n\
+         napcat.* — QQ operations: the only actions anyone else can see. Message segments use \
+         the array form, for example \
          [{\"type\":\"reply\",\"data\":{\"id\":98765}},{\"type\":\"text\",\"data\":{\"text\":\"hello\"}}]. \
-         Do not write CQ codes. Use api.list to browse actions and api.help for one action's full \
-         schema. During a hold every napcat.* call returns \
-         `Disabled during hold`.\n\n\
+         Do not write CQ codes. Media segments take `file`: a VFS path, a public http(s) URL, or \
+         base64:// data. During a hold every napcat.* call returns `Disabled during hold`.\n\n\
+         local.* — local tools that only touch the VFS. local.media.image.* inspects, transforms, \
+         re-encodes and draws text on images (system fonts only).\n\n\
          agent.* — operations on yourself; these never reach QQ and are always available: \
-         status, resume, quarantine, compact (optional `chat`), clear_context.\n\n\
-         api.* — read-only registry queries: api.list (namespace/category/query/offset/limit) and \
-         api.help (action).\n\n\
+         status, resume, quarantine, compact, clear_context.\n\n\
+         api.* — read-only registry queries: api.list (namespace prefix such as `local.media`, \
+         category, query, offset, limit) and api.help (action).\n\n\
          Sends return a message_id. Do not retry a send without checking whether it went out."
     }
 
@@ -307,7 +310,8 @@ impl Tool for ApiTool {
 
         match spec.namespace() {
             "agent" => self.run_agent(spec, &params, ctx).await,
-            "image" => self.run_image(spec, &params, ctx),
+            // 本地工具：目前只有 `local.media.image.*`，全部只读写 VFS。
+            "local" => self.run_image(spec, &params, ctx),
             // napcat 的策略链顺序集中在本模块的 `policy` 子模块里。
             "napcat" => self.run_napcat(spec, params, ctx).await,
             _ => ToolResult::error(format!("Unsupported namespace in {}", spec.action)),
@@ -335,7 +339,8 @@ impl ApiTool {
 
         let mut matching: Vec<&ActionSpec> = specs()
             .iter()
-            .filter(|spec| namespace.is_none_or(|ns| spec.namespace() == ns))
+            // `namespace` 按层级前缀匹配：`local`、`local.media`、`local.media.image` 都可以。
+            .filter(|spec| namespace.is_none_or(|ns| spec.in_namespace(ns)))
             .filter(|spec| category.is_none_or(|kind| spec.category == kind))
             .filter(|spec| {
                 query.as_ref().is_none_or(|query| {
@@ -633,6 +638,22 @@ mod tests {
         let value: Value = serde_json::from_str(&result.content).unwrap();
         assert_eq!(value["items"].as_array().unwrap().len(), 3);
         assert!(value["total"].as_u64().unwrap() >= 3);
+    }
+
+    /// 命名空间按层级前缀过滤；图片工具挂在 `local.media.image` 下，没有顶层 `image`。
+    #[tokio::test]
+    async fn api_list_namespace_is_a_hierarchical_prefix() {
+        let tool = tool(None, None);
+        for prefix in ["local", "local.media", "local.media.image"] {
+            let result = call(&tool, "api.list", json!({"namespace": prefix, "limit": 50})).await;
+            let value: Value = serde_json::from_str(&result.content).unwrap();
+            assert_eq!(value["total"], 5, "{prefix}: {}", result.content);
+        }
+        for prefix in ["image", "local.med"] {
+            let result = call(&tool, "api.list", json!({"namespace": prefix})).await;
+            let value: Value = serde_json::from_str(&result.content).unwrap();
+            assert_eq!(value["total"], 0, "{prefix}: {}", result.content);
+        }
     }
 
     #[tokio::test]
@@ -1166,7 +1187,13 @@ mod tests {
         let tool = tool(None, None);
         let ctx = ToolContext::new(Arc::clone(&vfs), None);
 
-        let info = run_image(&tool, &ctx, "image.info", json!({"path": "/tmp/src.png"})).await;
+        let info = run_image(
+            &tool,
+            &ctx,
+            "local.media.image.info",
+            json!({"path": "/tmp/src.png"}),
+        )
+        .await;
         assert!(!info.is_error, "{}", info.content);
         let value: Value = serde_json::from_str(&info.content).unwrap();
         assert_eq!(value["width"], 16);
@@ -1175,7 +1202,7 @@ mod tests {
         let result = run_image(
             &tool,
             &ctx,
-            "image.transform",
+            "local.media.image.transform",
             json!({
                 "path": "/tmp/src.png",
                 "out": "/tmp/rotated.png",
@@ -1193,7 +1220,7 @@ mod tests {
         let result = run_image(
             &tool,
             &ctx,
-            "image.transform",
+            "local.media.image.transform",
             json!({"path": "/tmp/src.png", "out": "/tmp/resized.png", "width": 8, "height": 5}),
         )
         .await;
@@ -1203,7 +1230,7 @@ mod tests {
         let empty = run_image(
             &tool,
             &ctx,
-            "image.transform",
+            "local.media.image.transform",
             json!({"path": "/tmp/src.png", "out": "/tmp/noop.png"}),
         )
         .await;
@@ -1219,7 +1246,13 @@ mod tests {
         seed_image(&vfs, "/tmp/wide.png", 8193, 1);
         let tool = tool(None, None);
         let ctx = ToolContext::new(Arc::clone(&vfs), None);
-        let result = run_image(&tool, &ctx, "image.info", json!({"path": "/tmp/wide.png"})).await;
+        let result = run_image(
+            &tool,
+            &ctx,
+            "local.media.image.info",
+            json!({"path": "/tmp/wide.png"}),
+        )
+        .await;
         assert!(result.is_error);
         assert!(
             result.content.contains("cannot decode"),
@@ -1242,7 +1275,7 @@ mod tests {
             let result = run_image(
                 &tool,
                 &ctx,
-                "image.convert",
+                "local.media.image.convert",
                 json!({"path": "/tmp/src.png", "out": out, "quality": 70}),
             )
             .await;
@@ -1254,7 +1287,7 @@ mod tests {
         let bad = run_image(
             &tool,
             &ctx,
-            "image.convert",
+            "local.media.image.convert",
             json!({"path": "/tmp/src.png", "out": "/tmp/out.gif"}),
         )
         .await;
@@ -1269,7 +1302,7 @@ mod tests {
         let tool = tool(None, None);
         let ctx = ToolContext::new(Arc::clone(&vfs), None);
 
-        let fonts = run_image(&tool, &ctx, "image.fonts", json!({"limit": 5})).await;
+        let fonts = run_image(&tool, &ctx, "local.media.image.fonts", json!({"limit": 5})).await;
         assert!(!fonts.is_error, "{}", fonts.content);
         let value: Value = serde_json::from_str(&fonts.content).unwrap();
         let count = value["count"].as_u64().unwrap_or(0);
@@ -1279,7 +1312,7 @@ mod tests {
             let result = run_image(
                 &tool,
                 &ctx,
-                "image.text",
+                "local.media.image.text",
                 json!({
                     "path": "/tmp/src.png", "out": "/tmp/text.png", "text": "Hi 42",
                     "font": family, "x": 2, "y": 2, "size": 14,
@@ -1298,7 +1331,7 @@ mod tests {
             let result = run_image(
                 &tool,
                 &ctx,
-                "image.text",
+                "local.media.image.text",
                 json!({"path": "/tmp/src.png", "out": "/tmp/text.png", "text": "Hi"}),
             )
             .await;
@@ -1309,7 +1342,7 @@ mod tests {
         let bad = run_image(
             &tool,
             &ctx,
-            "image.text",
+            "local.media.image.text",
             json!({"path": "/tmp/src.png", "out": "/tmp/text.png", "text": "x", "color": "red"}),
         )
         .await;

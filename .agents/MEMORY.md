@@ -5,7 +5,7 @@
 - [版本与发布](memory/release-workflow.md) -- 每批升版本号并自动打 tag；未验证前不 push
 - [安全闸语义](memory/security-gate-semantics.md) -- shadow/enforce、fail-closed、llm 后端装入、hold 只拦 napcat.*、resume 复核
 - [存储不变量](memory/storage-invariants.md) -- append 串行、(chat, message_id) 去重、索引校验、文件头加密、迁移 v12
-- [图片工具 image.*](memory/image-tools.md) -- 5 个 action、系统字体约束、依赖与模块命名坑
+- [图片工具 local.media.image.*](memory/image-tools.md) -- 5 个 action、系统字体约束、依赖与模块命名坑
 - [功能范围纠正](memory/feature-scope-correction.md) -- 不要把代码限制升级成需求；禁止内置字体
 - [发布状态](memory/release-status.md) -- 当前测试基线、tag/release 状态与未实测能力
 - [审查整改计划（2026-11-07）](plan/2026-11-07-review-remediation.md) -- 四份代码审查的已修/待修项与顺序
