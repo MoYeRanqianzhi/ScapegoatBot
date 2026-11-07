@@ -34,6 +34,7 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 | monitor `expires` 过大时 `DateTime + Duration` 溢出 panic | `checked_add_signed` | `monitor::tests::absurd_expiry_is_an_error_not_a_panic` |
 | `get_group_file_url` / `get_group_file_system_info` 被当成变更 | 归 Query | 现有测试 |
 | 模型可见错误串里的断裂空白（policy/action_gate/web） | 修正 + 源码扫描 | `tests/source_hygiene.rs` |
+| steer 进回合的消息在循环最后一次排空之后到达时“收下却不回应”，队列也不补开回合（已核实 runner/queue 代码） | 循环结束立刻关闭 steering；没回应的条数随 `TurnReport` 交还队列，按原顺序放回队首再开一轮 | `queue::tests::unanswered_steering_messages_open_a_follow_up_turn_in_order`、`runner::tests::{steering_closes_as_soon_as_the_model_loop_ends, early_exit_returns_waiting_steering_messages, paused_turn_returns_steering_messages_to_the_queue}` |
 
 ## 3. 待修（按优先级）
 
@@ -46,8 +47,9 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 2. `未核实` 子代理带着 spawn 时的 owner intent 一直运行，且不检查 `ai_enabled` /
    ESTOP / `agent_paused`；`/agents/*.md` 模型可写，能给自定义子代理开 `allow_send`
    （swarm/mod.rs:346-363、454、560、576；runner.rs:837-859）。
-3. `未核实` 回合最后一次 drain 之后 steer 进来的消息丢失（runner.rs:503-519、754-761；
-   loop.rs:429-437）；早退路径同理。
+3. `已修` steering 丢消息（见 §2）。子代理路径（`run_subagent` 不关闭 receiver，
+   `Agent message` 可能报 delivered 后丢失）未改：提前关闭会让 `AgentHub::message`
+   在旧回合收尾时重启并丢弃旧结果（generation 检查），需要先给 hub 加“等旧回合结束”。
 4. `未核实` 非法 `when` 谓词让每个 QQ 事件触发一次完整回合，且阻塞事件循环
    （monitor/mod.rs:496-512）。
 5. `未核实` turn buffer 只在提交前写入，崩溃/停止丢失整个进行中的回合
@@ -112,17 +114,63 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 - `image.*` 五个 action 的命名与参数（11-06 起待确认，见 [[image-tools]]）。
 - 是否 push / release / 部署 hw1；本地 tag `v0.2.0-alpha.35` 未指向 HEAD。
 
-## 5. 文档与命名漂移
+## 5. 文档与命名漂移（2026-11-07 审查，均为 `未核实`，除非另注）
 
-文档/命名审查子代理尚未返回时写入本文；返回后把核实过的条目补到这里。
-11-06 交接里的文档 P1 清单（记忆来源门控承诺、`sbot status` 输出、默认值、热更新、
-迁移版本、`compaction_model` 说明、工具数、源码注释）**尚未处理**。
+11-06 交接里的文档 P1 清单经复查**仍然存在**（记忆来源门控承诺、`sbot status` 输出、
+默认值 max_steps/retry_max_ms、热更新、迁移 v12、`compaction_model` 说明、工具数、
+源码注释若干）。另有：
+
+**模型可见文本（优先，模型会照着做）**
+
+- `assets/system_prompt_v4.template.txt`：`:79` “You cannot write /AGENTS.md” 没有任何
+  强制，而 `/AGENTS.md` 作为可信 owner_context 注入（**安全**）；`:53` 把 AGENTS/SOUL
+  里的长期指示算作 owner intent，代码只认运行时证据，`/SOUL.md` 不存在；`:88` 技能索引
+  从未填充；`:41` “下一条消息会唤醒你”只对 @ 与主人成立；`:28` API 描述并不列出动作；
+  `:120-172` 边界之后的文本不被使用，`session_scope` 不再输出。
+- 工具描述：`fs.rs:63` 示例过滤语法 `contains("...")` 不存在；`fs.rs:973` 承诺 mount 与
+  权限；`actions.rs:541/549` 承诺预算用量、“标记不可执行”；`tools/monitor.rs:46/54`
+  `internal` 源与 `catch_up` 参数无效；`swarm/mod.rs:98/228` 说 general 子代理不能改
+  `/MEMORY.md`、不能删数据，但它有 Write/Edit/RM；`api.rs:244` 仍说三个命名空间。
+
+**用户文档**
+
+- MSRV：README / install 写 Rust 1.85，代码用 let-chains，需要 1.88（审查者引用
+  Rust 1.88.0 发布说明；主代理确认代码大量使用 `if let … && let …`）。
+- README：`sbot chat --scope` 只回显不生效；`model list` / `effort list` 打印的是整份
+  status；目录树过时；`live_napcat` 实为本地 mock、跑在 CI 里。
+- `config.example.toml`：多处默认值与代码不同；`[[hooks.events]] when = [...]` 示例取消
+  注释即加载失败；自定义 `[[hooks.context]]` 会替换全部默认 hook 却鼓励取消注释。
+- configuration/usage/install/limits/security/persona-memory/tools-and-vfs/
+  troubleshooting/prompt-maintenance 各有若干条（详见审查原文要点）：@ 判定、
+  `collect` 与 `followup` 相同、transcript 配额默认不生效、`trusted` 不计速率、
+  hooks 的 `when`/`inject` 不读、ESTOP 不拦控制回合、`turn completed` 是 debug 级、
+  备份包含 `auth.json`、`logs/` 无人写入、`/friends/<qq>.md` 等路由不存在、
+  `Mkdir` 需要 `parents`、Agent 工具示例参数错误、`get_msg` 描述已过时等。
+- `workspace/*.md`：0.1 遗留模板，无任何代码读取，内容与现行提示词矛盾。删除或重写。
+
+**误导性命名（建议）**
+
+- `tests/live_napcat.rs` → `tests/onebot_mock_client.rs`；
+  `approve_mode_nonce_round_trip_over_napcat` 没有回复那一段；
+  `readme_minimal_config_is_valid` 测的是内联副本。
+- `QqMessage::backfilled`（功能已删，保留 DB 列）、`Permission`/`permissions()`（无消费者）、
+  `DynamicProvider`（只有测试实现）、`Category::Media`（只有 image.*）、
+  `ClientConfig.name: IpcConfig`。
+- 忽略参数的函数：`prompt::static_prefix(mode)`、`turn_lock_for/session_for/history_for(chat)`、
+  `compact_chat`、`turn_buffer::append(scope)`、`mentions_self`（含 @全体）、
+  `gate::record_event`（固定 Input）。
+- CLI：`Chat.scope`、`AiCommand::Restart`（同 Start）、`model/effort list`。
+- `wake-on-` 名字前缀决定投递路径（隐藏行为）→ 显式字段。
+- 不起作用的配置键：`[memory].review_model/topics`、`[skills].shared_dir`、
+  `[[monitors]].jitter_secs`、`source = stream|internal`、`[[hooks.events]].when/inject`、
+  `[[hooks.context]].path/scope`、`[queue].mode = collect`、默认保留下的 `max_session_bytes`。
 
 ## 6. 下一步
 
-1. 核实 P0-2 ~ P0-7，逐条修复并补测试（P0-3/4/5 影响消息不丢、不重复计费）。
-2. 处理文档/命名漂移（§5）。
-3. P1 中的安全项（chat 绑定、`/config` 写保护与密钥暴露、配额）。
-4. P2 结构拆分（先测试后拆）。
-5. 每批：`cargo test --locked --all-targets`、`cargo clippy --locked --all-targets -- -D warnings`、
+1. 核实并修 P0-2、P0-4 ~ P0-7（P0-4/5 影响计费与崩溃恢复）。
+2. 模型可见文本的漂移（§5 第一组），尤其 `/AGENTS.md` 写保护——提示词承诺了，代码没做。
+3. 用户文档与命名（§5 其余），配置键“实现或删除”需逐个问用户。
+4. P1 安全项（chat 绑定、`/config` 写保护与密钥暴露、配额）。
+5. P2 结构拆分（先测试后拆）。
+6. 每批：`cargo test --locked --all-targets`、`cargo clippy --locked --all-targets -- -D warnings`、
    `cargo fmt --all --check`，更新 CHANGELOG 的 Unreleased 段与本文。

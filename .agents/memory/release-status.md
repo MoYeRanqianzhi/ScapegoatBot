@@ -9,8 +9,8 @@ metadata:
 ---
 
 版本号仍是 `0.2.0-alpha.35`；之后的修复记在 `CHANGELOG.md` 的 Unreleased 段，
-尚未打新 tag。数据库迁移到 v12。`cargo test --locked --all-targets` = 401 passed
-（388 lib + 13 integration），2 ignored；clippy/fmt 通过。CI 已接入 GitHub Actions。
+尚未打新 tag。数据库迁移到 v12。`cargo test --locked --all-targets` = 404 passed
+（391 lib + 13 integration），2 ignored；clippy/fmt 通过。CI 已接入 GitHub Actions。
 
 发布状态：本地 annotated tag `v0.2.0-alpha.35` 未指向 HEAD；尚未 push/release/deploy。
 当前 HEAD 未跑过 `cargo build --release`（上次早于图片依赖）。服务器 `hw1` 的
@@ -29,11 +29,12 @@ metadata:
 - NapCat 未登录（2026-11-05 05:22 起 QR 失败）；`get_image`、QQ CDN 下载、
   `get_msg`/`get_forward_msg`、发出媒体都未实测。
 - 服务器无系统字体：`image.fonts` 为空、`image.text` 明确报错；不内置字体。
-- 审查发现的 P0（子代理权限、steering 丢消息、非法 monitor 谓词、turn buffer、
+- 审查发现的 P0（子代理权限、非法 monitor 谓词、turn buffer、
   消息索引错位、联系人视图）尚未核实与修复。
 - WebFetch 默认后端模式下内容在 final_url 复核前已被取走；`local = true` 才逐跳抓取。
 - hooks 的 rewrite 只在 BeforeSend；SessionEnd/Stop/ConfigChange 的 inject 无去处。
-- MSRV Rust 1.85（edition 2024），`napcat-link` 固定 0.1.0-alpha.2。
+- README 写 MSRV 1.85，但代码用 let-chains，实际需要 Rust 1.88+（edition 2024；待修文档）。
+  `napcat-link` 固定 0.1.0-alpha.2。
 
 **Evidence:** 2026-11-07 全量测试输出与 `git describe`；`CHANGELOG.md` Unreleased 段；
 `src/security/action_gate.rs` 的 `ApprovalQueue`（数据库加载）与测试

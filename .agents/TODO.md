@@ -12,7 +12,7 @@
 
 ## 当前基线
 
-- `cargo test --locked --all-targets` = 401 passed（388 lib + 13 integration），2 ignored；
+- `cargo test --locked --all-targets` = 404 passed（391 lib + 13 integration），2 ignored；
   clippy / fmt 通过。改动记在 `CHANGELOG.md` 的 Unreleased 段，尚未打 tag。
 - 本地 tag `v0.2.0-alpha.35` 未指向 HEAD；尚未 push/release/deploy。
 - 服务器 `hw1` 的 `sbot.service` 仍停止；NapCat 未登录（2026-11-05 起 QR 登录失败）。
@@ -26,7 +26,7 @@
 
 ## 修复（按计划 §3 / §6 的顺序）
 
-- [ ] P0-2 ~ P0-7：子代理权限与急停、steering 丢消息、非法 monitor 谓词、turn buffer
+- [ ] P0-2、P0-4 ~ P0-7：子代理权限与急停、非法 monitor 谓词、turn buffer
       只在提交时写、消息索引错位、联系人视图为空。先核实再修。
 - [ ] P1 安全项：收缩类群管理的 chat 绑定、`/config` 写保护与密钥暴露、回收站配额。
 - [ ] 文档与命名漂移（计划 §5；含 11-06 的文档 P1 清单）。
