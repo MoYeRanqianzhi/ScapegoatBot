@@ -228,6 +228,8 @@ action 只接受注册表声明过的参数（`api.help` 可查），未声明�
   HKDF 从主密钥派生。
 - 文件头记录算法；改 `[storage].encryption` 不会让旧历史失效。
 - `~/.sbot/key` 是唯一秘密，权限 0600；`sbot backup` **包含它**。
+- `sbot.toml` 里唯一可能带密钥的是 `[[mcp.servers]].env`：agent 的配置视图遮蔽这些值；
+  agent 写配置时临时文件只给属主读写，rename 前复制原文件的权限，不会放宽 `0600`。
 - 索引（SQLite）与路径是明文元数据：能看出“谁在什么时候聊过”，看不到内容。
 - 发送账本 `outbound_intents` 在启动时把久悬的 `pending` 标为 `unknown`；发送超时
   也不会被当成“肯定没发出去”，避免重复发送。

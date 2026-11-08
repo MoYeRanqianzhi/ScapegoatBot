@@ -138,6 +138,9 @@ enabled = true
 ```
 
 MCP 默认关闭；服务器启动失败只告警，不影响主进程。stdio 单行与单次结果都有大小上限。
+token 放在 `env` 里：agent 读到的 `/config/mcp` 与 `/config.toml` 把 `env` 的值显示成
+`<redacted>`（键名保留），整文件写回时原样带回的占位符会恢复成原值。不要把 token 写进
+`args`，那里不遮蔽。
 
 ### `[memory]` / `[skills]` / `[style]`
 

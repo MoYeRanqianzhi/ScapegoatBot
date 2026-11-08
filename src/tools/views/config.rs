@@ -1,15 +1,20 @@
 //! `Views` 的 config 部分。
 //!
-//! 由 `views/mod.rs` 的 `list` / `read` 路由调用。
+//! 由 `views.rs` 的 `list` / `read` / `write` 路由调用。读到的配置经过
+//! [`redact`] 遮蔽（MCP 服务器的 `env` 值）。
+
+mod redact;
 
 use super::*;
 
 impl Views {
-    /// 把当前配置序列化成 TOML 表；失败时视为视图不可用。
+    /// 把当前配置序列化成 TOML 表（密钥已遮蔽）；失败时视为视图不可用。
     pub(super) fn config_table(&self) -> Option<toml::Table> {
         let config = self.config_snapshot()?;
         let text = toml::to_string(&config).ok()?;
-        toml::from_str(&text).ok()
+        let mut table = toml::from_str(&text).ok()?;
+        redact::redact_table(&mut table);
+        Some(table)
     }
 
     pub(super) fn list_config_root(&self) -> Vec<ViewEntry> {
@@ -84,7 +89,7 @@ impl Views {
         Ok(ViewRead::Text(value.to_string()))
     }
 
-    /// `/config.toml`：`sbot.toml` 原文；凭据不在其中。
+    /// `/config.toml`：`sbot.toml` 原文；凭据不在其中，MCP 服务器的 `env` 值已遮蔽。
     pub(super) fn read_config_toml(&self) -> Result<ViewRead, VfsError> {
         let path = self
             .context
@@ -94,6 +99,8 @@ impl Views {
             .ok_or_else(|| VfsError::Offline("/config.toml".to_owned()))?;
         let text =
             std::fs::read_to_string(&path).map_err(|error| VfsError::Storage(error.to_string()))?;
+        let text = redact::redact_document(&text)
+            .map_err(|error| VfsError::Storage(format!("cannot parse sbot.toml: {error}")))?;
         Ok(ViewRead::Text(text))
     }
 
@@ -150,9 +157,12 @@ impl Views {
         let segments = target.path.segments();
         match segments {
             [root] if *root == "config.toml" => {
-                let new_document: toml_edit::DocumentMut = content.parse().map_err(|error| {
-                    VfsError::Storage(format!("the new sbot.toml is not valid TOML: {error}"))
-                })?;
+                let mut new_document: toml_edit::DocumentMut =
+                    content.parse().map_err(|error| {
+                        VfsError::Storage(format!("the new sbot.toml is not valid TOML: {error}"))
+                    })?;
+                // 视图里读到的是遮蔽后的原文：原样带回的占位符换回原值。
+                redact::restore_redacted(&mut new_document, &document);
                 // 逐键对比，只读键发生变化则整体拒绝。
                 let old_value: toml::Value = toml::from_str(&current_text)
                     .map_err(|error| VfsError::Storage(error.to_string()))?;
@@ -235,19 +245,31 @@ impl Views {
         }
     }
 
-    /// 原子写回：临时文件 + fsync + rename。
+    /// 原子写回：临时文件 + fsync + rename，并沿用原文件的权限。
+    ///
+    /// `sbot.toml` 可能被收紧到 `0600`（MCP env 里有 token）；临时文件按默认权限
+    /// 创建再 rename，会悄悄放宽它。Unix 上临时文件一开始就只给属主读写，写完再
+    /// 复制原文件的权限。
     pub(super) fn persist(&self, path: &std::path::Path, text: String) -> Result<(), VfsError> {
+        let storage = |error: std::io::Error| VfsError::Storage(error.to_string());
         let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
         {
             use std::io::Write;
-            let mut file = std::fs::File::create(&tmp)
-                .map_err(|error| VfsError::Storage(error.to_string()))?;
-            file.write_all(text.as_bytes())
-                .map_err(|error| VfsError::Storage(error.to_string()))?;
-            file.sync_all()
-                .map_err(|error| VfsError::Storage(error.to_string()))?;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&tmp).map_err(storage)?;
+            file.write_all(text.as_bytes()).map_err(storage)?;
+            file.sync_all().map_err(storage)?;
         }
-        std::fs::rename(&tmp, path).map_err(|error| VfsError::Storage(error.to_string()))
+        if let Ok(metadata) = std::fs::metadata(path) {
+            std::fs::set_permissions(&tmp, metadata.permissions()).map_err(storage)?;
+        }
+        std::fs::rename(&tmp, path).map_err(storage)
     }
 
     /// 是否属于可写的配置视图（`/config/**` 或 `/config.toml`）。

@@ -862,6 +862,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_secrets_never_reach_the_config_views() {
+        let (views, _dir) = views();
+        // 配一个带 token 的 MCP 服务器：磁盘文件与内存句柄都更新。
+        let handle = views.context.config.clone().unwrap();
+        let path = {
+            let mut loaded = handle.write().unwrap();
+            loaded
+                .config
+                .mcp
+                .servers
+                .push(crate::config::McpServerConfig {
+                    name: "gh".to_owned(),
+                    command: "npx".to_owned(),
+                    env: [("GITHUB_TOKEN".to_owned(), "s3cret".to_owned())].into(),
+                    ..crate::config::McpServerConfig::default()
+                });
+            std::fs::write(&loaded.path, toml::to_string(&loaded.config).unwrap()).unwrap();
+            loaded.path.clone()
+        };
+        let text = |read: ViewRead| match read {
+            ViewRead::Text(text) => text,
+            other => panic!("expected text, got {other:?}"),
+        };
+        let section = text(views.read(&target("/config/mcp")).await.unwrap());
+        assert!(
+            !section.contains("s3cret") && section.contains("GITHUB_TOKEN"),
+            "{section}"
+        );
+        let whole = text(views.read(&target("/config.toml")).await.unwrap());
+        assert!(!whole.contains("s3cret"), "{whole}");
+
+        // 把读到的（遮蔽后的）原文改一个可写键写回：成功，且磁盘上的 token 原样保留。
+        let edited = whole.replace("require_mention = false", "require_mention = true");
+        assert_ne!(edited, whole);
+        views
+            .write_config(&target("/config.toml"), &edited)
+            .unwrap();
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains("s3cret"), "{on_disk}");
+        assert!(handle.read().unwrap().config.filter.require_mention);
+    }
+
+    #[tokio::test]
     async fn config_writes_notify_hot_reload() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let (views, _dir) = views();
