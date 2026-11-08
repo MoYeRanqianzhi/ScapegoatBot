@@ -52,7 +52,7 @@ pub struct TimerSource {
     pub every: Option<String>,
     /// 一次性本地时间（`YYYY-MM-DD HH:MM:SS`）。
     pub at: Option<String>,
-    /// 抖动上限（秒）；0 = 服务端按周期 10%（上限 15 分钟）自动计算。
+    /// 每次触发随机推迟的上限（秒）；不设或 0 = 准点。最多 3600，`every` 时必须短于周期。
     pub jitter_secs: Option<u64>,
 }
 
@@ -257,10 +257,11 @@ pub(in crate::config) fn validate_monitors(
 
         // 与运行时同一个解析器：`at` 的时分范围、cron 的语法与“永远不会匹配”都在这里报错。
         if let Some(timer) = &monitor.source.timer
-            && let Err(error) = crate::monitor::TimerSpec::parse(
+            && let Err(error) = crate::monitor::Timer::parse(
                 timer.cron.as_deref(),
                 timer.every.as_deref(),
                 timer.at.as_deref(),
+                timer.jitter_secs,
             )
         {
             errors.push(ConfigError::new(format!("{field}.source.timer"), error));

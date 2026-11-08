@@ -13,7 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::monitor::{MonitorManager, MonitorSpec, TimerSpec};
+use crate::monitor::{MonitorManager, MonitorSpec, Timer};
 use crate::transcript::ToolResult;
 
 use super::{Tool, ToolContext, arg_opt_str, arg_str, object_schema};
@@ -43,7 +43,9 @@ impl Tool for MonitorTool {
          source — exactly one kind: {\"qq\": true} for inbound QQ events; \
          {\"timer\": {\"every\": \"10m\"}} or {\"timer\": {\"cron\": \"7 9 * * 1-5\"}} or \
          {\"timer\": {\"at\": \"09:07\"}} every day, all in local time (every needs at least \
-         60s; when a cron restricts both day and weekday, either one matching is enough); \
+         60s; when a cron restricts both day and weekday, either one matching is enough); add \
+         \"jitter_secs\": n to a timer to delay each run by a random 0..n seconds (at most \
+         3600, shorter than every); \
          {\"internal\": \"security\" | \"budget\" | \"agent\" | \"storage\"} for runtime state \
          changes. A stream source is config-file only; add rejects it.\n\n\
          when — optional expression over event.*, e.g. event.mentions_self, \
@@ -130,7 +132,7 @@ impl MonitorTool {
         } else if source.get("qq").is_some() {
             ("qq".to_owned(), None)
         } else if let Some(timer) = source.get("timer") {
-            match TimerSpec::from_json(timer) {
+            match Timer::from_json(timer) {
                 Ok(spec) => ("timer".to_owned(), Some(spec)),
                 Err(error) => return ToolResult::error(error),
             }

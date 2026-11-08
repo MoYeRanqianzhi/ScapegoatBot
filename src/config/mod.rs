@@ -439,6 +439,30 @@ deliver = { to = "main", as = "event" }
     }
 
     #[test]
+    fn timer_jitter_is_validated_with_the_schedule() {
+        let text = r#"
+version = 1
+[[monitor]]
+name = "beat"
+source = { timer = { every = "2m", jitter_secs = 120 } }
+deliver = { to = "main", as = "event" }
+"#;
+        let table: toml::Table = toml::from_str(text).unwrap();
+        let config: SbotConfig = toml::Value::Table(table).try_into().unwrap();
+        let errors = config.validate_shape().unwrap_err();
+        assert!(
+            errors
+                .0
+                .iter()
+                .any(|e| e.field == "monitor[0].source.timer" && e.message.contains("jitter_secs"))
+        );
+        let fine = text.replace("jitter_secs = 120", "jitter_secs = 30");
+        let table: toml::Table = toml::from_str(&fine).unwrap();
+        let config: SbotConfig = toml::Value::Table(table).try_into().unwrap();
+        config.validate_shape().unwrap();
+    }
+
+    #[test]
     fn monitor_requires_exactly_one_source() {
         let text = r#"
 version = 1

@@ -1,14 +1,16 @@
 //! 定时源：`every` / `at` / `cron` 的解析、下一次触发时间与重启补投。
 //!
-//! - 三种写法只在 [`TimerSpec::parse`] 解析一次：配置校验、配置加载、`Monitor` 工具与
+//! - 三种写法与抖动只在 [`Timer::parse`] 解析一次：配置校验、配置加载、`Monitor` 工具与
 //!   `Agent` 工具的 monitor 绑定都调用它，写错在添加时就报错，不会到运行时才静默停摆。
 //! - 时间按本地时区的“墙上时间”计算。夏令时跳过的时刻顺延到之后第一个有效分钟，
 //!   回拨造成的重复时刻只取较早的一次（[`resolve_local`]）。
 //! - cron 是标准 5 字段语义：日与周两个字段**都**受限时取“或”，任一以 `*` 开头时只看
 //!   另一个。下一次触发按天推算（[`CronSchedule::next_after`]），永远不会匹配的表达式
 //!   （例如 `0 0 30 2 *`）在解析时拒绝。
-//! - 上次触发时间只在真正触发时写入：`every` 以它为锚点，重启不会让周期漂移；
-//!   补投（`catch_up = "coalesce"`）也以它为起点计数。
+//! - 上次触发只在真正触发时写入，记的是这次触发的**计划时刻**（不含抖动）：`every`
+//!   以它为锚点，重启与抖动都不会让周期漂移；补投（`catch_up = "coalesce"`）也以它为起点计数。
+//! - 抖动（[`Timer::jitter`]）：每次触发前随机推迟 `0..=jitter`，让多个同刻的定时器错开。
+//!   推迟期间到点的下一次触发与这次合并。
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -29,6 +31,89 @@ const LOOKAHEAD_DAYS: u32 = 4 * 366 + 1;
 /// 定时循环每段最多睡这么久再重新计算：系统休眠、改时钟、夏令时切换后能及时纠正，
 /// 取消也不用等一整个周期。
 const MAX_SLEEP: Duration = Duration::from_secs(60);
+/// 抖动上限（秒）：再长就不是“错开”，而是改了触发时间。
+const MAX_JITTER_SECS: u64 = 3_600;
+
+/// 一个定时源：何时触发，以及每次触发前随机推迟的上限。
+#[derive(Debug, Clone)]
+pub struct Timer {
+    /// 触发时刻。
+    pub schedule: TimerSpec,
+    /// 每次触发随机推迟 `0..=jitter`；零表示准点。
+    pub jitter: Duration,
+}
+
+impl Timer {
+    /// 解析 `cron` / `every` / `at` 三选一与可选的 `jitter_secs`。
+    ///
+    /// 抖动最多 [`MAX_JITTER_SECS`] 秒；`every` 的抖动必须短于周期，否则两次触发会颠倒。
+    pub fn parse(
+        cron: Option<&str>,
+        every: Option<&str>,
+        at: Option<&str>,
+        jitter_secs: Option<u64>,
+    ) -> Result<Self, String> {
+        let schedule = TimerSpec::parse(cron, every, at)?;
+        let jitter = jitter_secs.unwrap_or(0);
+        if jitter > MAX_JITTER_SECS {
+            return Err(format!(
+                "timer.jitter_secs must be at most {MAX_JITTER_SECS}"
+            ));
+        }
+        if let TimerSpec::Every(period) = &schedule
+            && jitter >= period.as_secs()
+        {
+            return Err("timer.jitter_secs must be shorter than timer.every".to_owned());
+        }
+        Ok(Self {
+            schedule,
+            jitter: Duration::from_secs(jitter),
+        })
+    }
+
+    /// 从工具参数 `{"cron"|"every"|"at": "...", "jitter_secs"?: n}` 解析。
+    ///
+    /// 字段类型不对、或出现这几个以外的键都报错：拼错的键不能被悄悄忽略。
+    pub fn from_json(value: &serde_json::Value) -> Result<Self, String> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| "timer must be an object".to_owned())?;
+        if let Some(unknown) = object
+            .keys()
+            .find(|key| !matches!(key.as_str(), "cron" | "every" | "at" | "jitter_secs"))
+        {
+            return Err(format!(
+                "unknown timer field {unknown:?}; use cron, every or at, and optionally jitter_secs"
+            ));
+        }
+        let field = |key: &str| match object.get(key) {
+            None => Ok(None),
+            Some(serde_json::Value::String(text)) => Ok(Some(text.as_str())),
+            Some(_) => Err(format!("timer.{key} must be a string")),
+        };
+        let jitter =
+            match object.get("jitter_secs") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => Some(value.as_u64().ok_or_else(|| {
+                    "timer.jitter_secs must be a non-negative integer".to_owned()
+                })?),
+            };
+        Self::parse(field("cron")?, field("every")?, field("at")?, jitter)
+    }
+
+    /// 这一次触发的随机推迟；随机源失败时准点触发。
+    fn draw_delay(&self) -> Duration {
+        let max = self.jitter.as_secs();
+        if max == 0 {
+            return Duration::ZERO;
+        }
+        let mut bytes = [0u8; 8];
+        if getrandom::fill(&mut bytes).is_err() {
+            return Duration::ZERO;
+        }
+        Duration::from_secs(u64::from_le_bytes(bytes) % (max + 1))
+    }
+}
 
 /// 定时源。
 #[derive(Debug, Clone)]
@@ -61,16 +146,6 @@ impl TimerSpec {
             (None, None, Some(at)) => parse_at(at),
             _ => Err("timer must set exactly one of cron, every, at".to_owned()),
         }
-    }
-
-    /// 从工具参数 `{"cron"|"every"|"at": "..."}` 解析；字段存在但不是字符串时报错。
-    pub fn from_json(value: &serde_json::Value) -> Result<Self, String> {
-        let field = |key: &str| match value.get(key) {
-            None => Ok(None),
-            Some(serde_json::Value::String(text)) => Ok(Some(text.as_str())),
-            Some(_) => Err(format!("timer.{key} must be a string")),
-        };
-        Self::parse(field("cron")?, field("every")?, field("at")?)
     }
 
     /// 严格晚于 `after` 的下一次触发；`Every` 把 `after` 当作上次触发。
@@ -318,7 +393,7 @@ fn last_fire_key(name: &str) -> String {
     format!("monitor.last:{name}")
 }
 
-/// 上次真正触发的时间（重启后用来对齐 `every` 与计算补投）。
+/// 上次触发的计划时刻（重启后用来对齐 `every` 与计算补投）。
 fn read_last_fire(db: Option<&Arc<Database>>, name: &str) -> Option<DateTime<Local>> {
     let db = db?;
     let raw = db.meta_get(&last_fire_key(name)).ok()??;
@@ -327,7 +402,7 @@ fn read_last_fire(db: Option<&Arc<Database>>, name: &str) -> Option<DateTime<Loc
     DateTime::from_timestamp(timestamp, 0).map(|utc| utc.with_timezone(&Local))
 }
 
-/// 记录一次真正的触发；只在触发时调用，启动时不写。
+/// 记录一次触发的计划时刻；只在触发时调用，启动时不写。
 fn write_last_fire(db: Option<&Arc<Database>>, name: &str, at: DateTime<Local>) {
     let Some(db) = db else {
         return;
@@ -336,8 +411,9 @@ fn write_last_fire(db: Option<&Arc<Database>>, name: &str, at: DateTime<Local>) 
 }
 
 /// 启动定时循环。
-pub(super) fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, timer: TimerSpec) {
+pub(super) fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, config: Timer) {
     tokio::spawn(async move {
+        let timer = &config.schedule;
         let db = monitor.db.as_ref();
         let mut last = read_last_fire(db, &monitor.name);
         // 重启补投：只补一次（`coalesce`），`skip` 直接放弃。
@@ -345,7 +421,7 @@ pub(super) fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, tim
             && let Some(previous) = last
         {
             let now = Local::now();
-            let missed = missed_occurrences(&timer, previous, now);
+            let missed = missed_occurrences(timer, previous, now);
             if missed > 0 {
                 let event = MonitorEvent {
                     text: format!("[timer catch-up] {missed} missed occurrence(s)"),
@@ -362,8 +438,8 @@ pub(super) fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, tim
                 break;
             }
             let now = Local::now();
-            let next = match &timer {
-                // 以上次真实触发为锚点；没有记录、或已经错过（`skip`）时从现在起算。
+            let next = match timer {
+                // 以上次触发的计划时刻为锚点；没有记录、或已经错过（`skip`）时从现在起算。
                 TimerSpec::Every(_) => last
                     .and_then(|last| timer.next_after(last))
                     .filter(|next| *next > now)
@@ -381,20 +457,24 @@ pub(super) fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, tim
                 .await;
                 break;
             };
-            // 分段睡到 `next`：每段醒来先看是否已取消，再按当前时钟重算剩余时间。
+            // 这一次的抖动；推迟只影响何时投递，锚点仍是计划时刻 `next`。
+            let due = chrono::Duration::from_std(config.draw_delay())
+                .ok()
+                .and_then(|delay| next.checked_add_signed(delay))
+                .unwrap_or(next);
+            // 分段睡到 `due`：每段醒来先看是否已取消，再按当前时钟重算剩余时间。
             loop {
                 if monitor.cancelled.load(Ordering::SeqCst) {
                     return;
                 }
-                let remaining = (next - Local::now()).to_std().unwrap_or_default();
+                let remaining = (due - Local::now()).to_std().unwrap_or_default();
                 if remaining.is_zero() {
                     break;
                 }
                 tokio::time::sleep(remaining.min(MAX_SLEEP)).await;
             }
-            let fired = Local::now();
-            last = Some(fired);
-            write_last_fire(db, &monitor.name, fired);
+            last = Some(next);
+            write_last_fire(db, &monitor.name, next);
             deliver_once(&monitor, &*sink, None, 1, false).await;
             if monitor.one_shot || monitor.cancelled.load(Ordering::SeqCst) {
                 break;
@@ -477,6 +557,26 @@ mod tests {
         assert!(TimerSpec::parse(None, Some("30s"), None).is_err());
         assert!(TimerSpec::parse(Some("* * * * *"), Some("1m"), None).is_err());
         assert!(TimerSpec::parse(None, None, None).is_err());
+    }
+
+    #[test]
+    fn jitter_is_bounded_and_unknown_fields_are_rejected() {
+        let ok = Timer::from_json(&serde_json::json!({"every": "10m", "jitter_secs": 60})).unwrap();
+        assert_eq!(ok.jitter, Duration::from_secs(60));
+        for _ in 0..50 {
+            assert!(ok.draw_delay() <= Duration::from_secs(60));
+        }
+        let exact = Timer::from_json(&serde_json::json!({"at": "09:00"})).unwrap();
+        assert_eq!(exact.draw_delay(), Duration::ZERO);
+        for bad in [
+            serde_json::json!({"every": "2m", "jitter_secs": 120}),
+            serde_json::json!({"cron": "0 9 * * *", "jitter_secs": 3601}),
+            serde_json::json!({"every": "10m", "jitter_secs": -1}),
+            serde_json::json!({"every": "10m", "jitter": 5}),
+            serde_json::json!("10m"),
+        ] {
+            assert!(Timer::from_json(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

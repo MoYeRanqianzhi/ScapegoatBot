@@ -32,7 +32,7 @@ use crate::storage::Database;
 
 mod timer;
 
-pub use timer::TimerSpec;
+pub use timer::Timer;
 use timer::spawn_timer;
 
 /// 单个 monitor 同时等待投递的任务上限。
@@ -284,7 +284,7 @@ pub struct MonitorSpec {
     /// `qq` / `timer` / `internal:<kind>` / `stream`。
     pub source: String,
     /// 定时源；`None` 表示事件驱动。
-    pub timer: Option<TimerSpec>,
+    pub timer: Option<Timer>,
     /// 谓词表达式；`None` 匹配该 source 的全部事件。
     pub when: Option<String>,
     /// `as_prompt = true` 时的模板，支持 `{{event.text}}` / `{{event.chat}}` / `{{count}}`。
@@ -741,10 +741,11 @@ pub async fn load_config_monitors(
             ("qq".to_owned(), None)
         } else if let Some(timer) = &monitor.source.timer {
             // 配置校验已经调用过同一个解析器；这里再出错只可能是绕过了校验。
-            let spec = TimerSpec::parse(
+            let spec = Timer::parse(
                 timer.cron.as_deref(),
                 timer.every.as_deref(),
                 timer.at.as_deref(),
+                timer.jitter_secs,
             )
             .map_err(|error| anyhow::anyhow!("monitor {:?}: {error}", monitor.name))?;
             ("timer".to_owned(), Some(spec))

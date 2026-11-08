@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::{Permission, Tool, ToolContext, arg_opt_str, arg_str, object_schema};
-use crate::monitor::{MonitorManager, MonitorSpec, TimerSpec};
+use crate::monitor::{MonitorManager, MonitorSpec, Timer};
 use crate::swarm::{AgentHub, AgentType};
 use crate::transcript::ToolResult;
 
@@ -58,7 +58,7 @@ impl AgentTool {
         let (kind, timer) = if source.get("qq").is_some() {
             ("qq".to_owned(), None)
         } else if let Some(timer) = source.get("timer") {
-            let spec = TimerSpec::from_json(timer).map_err(|error| anyhow::anyhow!(error))?;
+            let spec = Timer::from_json(timer).map_err(|error| anyhow::anyhow!(error))?;
             ("timer".to_owned(), Some(spec))
         } else if let Some(internal) = source.get("internal").and_then(serde_json::Value::as_str) {
             (format!("internal:{internal}"), None)
