@@ -419,7 +419,7 @@ impl ActionReviewer for LlmActionReviewer {
         let prompt = format!(
             "action: {action}\nparams: {}\nowner_intent: {}\norigin_chat: {}",
             truncate_chars(&params.to_string(), 4_000),
-            evidence.owner_intent,
+            evidence.owner_intent(),
             evidence.origin_chat.as_deref().unwrap_or("unknown")
         );
         let text = match complete_text(
@@ -586,7 +586,7 @@ impl ActionGate {
 
     /// 发送规则：同 chat 重复、跨群同文、@全体。
     fn send_rule(&self, params: &Value, evidence: &TurnEvidence, chat: &str) -> Result<(), String> {
-        if contains_at_all(params) && !evidence.owner_intent {
+        if contains_at_all(params) && !evidence.owner_intent() {
             return Err("message mentions @all; owner intent is required".to_owned());
         }
         self.media_rule(params, evidence, chat)?;
@@ -638,7 +638,7 @@ impl ActionGate {
         targets.push(chat);
         targets.sort_unstable();
         targets.dedup();
-        if targets.len() >= MASS_TARGETS && !evidence.owner_intent {
+        if targets.len() >= MASS_TARGETS && !evidence.owner_intent() {
             return Err(format!(
                 "the same content is being sent to {} different chats within 2 minutes; \
                  mass sending requires owner intent",
@@ -646,7 +646,7 @@ impl ActionGate {
             ));
         }
         // 不是逐字相同但高度重叠（搬运/转发）时也要求 owner intent。
-        if !evidence.owner_intent && content.chars().count() >= NGRAM_MIN_CHARS {
+        if !evidence.owner_intent() && content.chars().count() >= NGRAM_MIN_CHARS {
             let current = ngrams(&content);
             let overlapping = sends.iter().any(|record| {
                 record.chat != chat
@@ -665,7 +665,7 @@ impl ActionGate {
             }
         }
         // 本回合上下文里来自别的 chat 的内容被复述时，同样要求 owner intent。
-        if !evidence.owner_intent && content.chars().count() >= NGRAM_MIN_CHARS {
+        if !evidence.owner_intent() && content.chars().count() >= NGRAM_MIN_CHARS {
             let current = ngrams(&content);
             let sources = evidence
                 .context_sources
@@ -692,7 +692,7 @@ impl ActionGate {
         evidence: &TurnEvidence,
         chat: &str,
     ) -> Result<(), String> {
-        if evidence.owner_intent {
+        if evidence.owner_intent() {
             return Ok(());
         }
         let Some(db) = &self.db else {

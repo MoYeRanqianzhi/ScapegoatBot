@@ -21,10 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, warn};
 
-use crate::agent::message::AgentMessage;
 use crate::config::{DropPolicy, QueueConfig, QueueMode};
 use crate::qq::event::{ChatId, QqMessage};
-use crate::qq::format::render_inbound;
 
 /// 一次回合的输入。
 #[derive(Debug, Clone)]
@@ -63,12 +61,15 @@ impl TurnReport {
 pub trait TurnHandler: Send + Sync {
     /// 执行一个回合；`steering` 在回合运行期间持续接收同 chat 的新消息。
     ///
+    /// 通道里是原始的 [`QqMessage`]：执行器要据发送者更新本回合证据
+    /// （别人的消息进入回合会撤销 owner intent），渲染也由执行器负责。
+    ///
     /// 执行器负责在收尾时关闭 `steering`：关闭之后的 `send` 会失败，队列据此把
     /// 消息留在待处理里。
     async fn handle(
         &self,
         input: TurnInput,
-        steering: mpsc::UnboundedReceiver<AgentMessage>,
+        steering: mpsc::UnboundedReceiver<QqMessage>,
     ) -> TurnReport;
 }
 
@@ -78,7 +79,7 @@ struct ChatState {
     pending: VecDeque<QqMessage>,
     dropped: u64,
     /// 当前回合的 steering 发送端；`None` 表示空闲。
-    active: Option<mpsc::UnboundedSender<AgentMessage>>,
+    active: Option<mpsc::UnboundedSender<QqMessage>>,
     /// 本回合已经 steer 进去的消息（按到达顺序）；回合没回应的部分会放回 `pending`。
     steered: Vec<QqMessage>,
     /// 去抖令牌：只有最新一次计时有效。
@@ -133,9 +134,7 @@ impl ChatQueue {
         if config.mode == QueueMode::Steer
             && let Some(steering) = &state.active
         {
-            let sent = steering
-                .send(AgentMessage::user(render_inbound(&message)))
-                .is_ok();
+            let sent = steering.send(message.clone()).is_ok();
             if sent {
                 // 记下已送进回合的消息：回合若没有回应它们，结束时放回 pending。
                 state.steered.push(message);
@@ -330,7 +329,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingHandler {
         calls: StdMutex<Vec<TurnInput>>,
-        steer: StdMutex<Vec<AgentMessage>>,
+        steer: StdMutex<Vec<QqMessage>>,
         /// 每个回合人为拖延的时间。
         delay_ms: u64,
     }
@@ -340,7 +339,7 @@ mod tests {
         async fn handle(
             &self,
             input: TurnInput,
-            mut steering: mpsc::UnboundedReceiver<AgentMessage>,
+            mut steering: mpsc::UnboundedReceiver<QqMessage>,
         ) -> TurnReport {
             self.calls.lock().unwrap().push(input.clone());
             if self.delay_ms > 0 {
@@ -514,10 +513,7 @@ mod tests {
         drop(calls);
         let steer = handler.steer.lock().unwrap();
         assert_eq!(steer.len(), 1);
-        match &steer[0] {
-            AgentMessage::User { text, .. } => assert!(text.contains("m2")),
-            other => panic!("unexpected {other:?}"),
-        }
+        assert_eq!(steer[0].message_id, 2);
     }
 
     #[tokio::test]
@@ -541,7 +537,7 @@ mod tests {
         async fn handle(
             &self,
             input: TurnInput,
-            mut steering: mpsc::UnboundedReceiver<AgentMessage>,
+            mut steering: mpsc::UnboundedReceiver<QqMessage>,
         ) -> TurnReport {
             self.calls.lock().unwrap().push(input);
             if self.calls.lock().unwrap().len() == 1 {
@@ -594,7 +590,7 @@ mod tests {
         async fn handle(
             &self,
             input: TurnInput,
-            mut steering: mpsc::UnboundedReceiver<AgentMessage>,
+            mut steering: mpsc::UnboundedReceiver<QqMessage>,
         ) -> TurnReport {
             let first = {
                 let mut calls = self.calls.lock().unwrap();

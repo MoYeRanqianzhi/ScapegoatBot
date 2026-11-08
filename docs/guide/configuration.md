@@ -61,7 +61,9 @@ SBOT__NAPCAT__URL=ws://127.0.0.1:3002
   `reportSelfMessage`。
 - 是否因此醒来由 monitor 决定。默认装有 `wake-on-owner`，agent 可以修改或删除它；
   不想看主人的消息也是 agent 自己的选择。
-- `owner_qq` 的非 `self` 消息带 owner intent；控制通道（`sbot chat`）同样带。
+- 触发批次里的非 `self` 消息全部来自 `owner_qq` 时，回合带 owner intent；混进别人的消息、
+  或回合中途有别人的消息经 steering 进入，就没有（见 [安全模型](security.md#owner-intent-与发送)）。
+  控制通道（`sbot chat`）恒带。
 
 ### `[napcat]`
 

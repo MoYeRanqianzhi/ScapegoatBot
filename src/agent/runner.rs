@@ -26,7 +26,7 @@ use crate::agent::{
 use crate::config::{AgentMode, GateMode};
 use crate::prompt::{self, RuntimeContext};
 use crate::providers::{Provider, ProviderSlot, SharedProviderSlot, SystemBlock, ThinkingOptions};
-use crate::qq::event::ChatId;
+use crate::qq::event::{ChatId, QqMessage};
 use crate::qq::{QqClient, format};
 use crate::security::gate::Gate;
 use crate::session::SessionStore;
@@ -504,7 +504,7 @@ impl Runner {
     async fn execute(
         &self,
         input: TurnInput,
-        mut steering_rx: mpsc::UnboundedReceiver<AgentMessage>,
+        mut steering_rx: mpsc::UnboundedReceiver<QqMessage>,
     ) -> TurnReport {
         let mut unanswered = 0usize;
         let result = self
@@ -532,7 +532,7 @@ impl Runner {
     async fn run_turn(
         &self,
         input: TurnInput,
-        steering_rx: &mut mpsc::UnboundedReceiver<AgentMessage>,
+        steering_rx: &mut mpsc::UnboundedReceiver<QqMessage>,
         unanswered: &mut usize,
     ) -> Result<()> {
         // `sbot ai stop` 与 `ESTOP` 都只暂停新回合；消息已经入库，下一回合可见。
@@ -703,11 +703,18 @@ impl Runner {
         working: &mut Vec<AgentMessage>,
         prompts: Vec<AgentMessage>,
         evidence: TurnEvidence,
-        steering_rx: &mut mpsc::UnboundedReceiver<AgentMessage>,
+        steering_rx: &mut mpsc::UnboundedReceiver<QqMessage>,
         mut journal: journal::TurnJournal,
     ) -> (LoopOutcome, usize, journal::TurnJournal) {
         // 4) 运行循环。工具执行器带上本回合证据。
         let slot = self.provider_snapshot();
+        // steering 进来的消息按发送者更新证据：别人的消息会撤销 owner intent。
+        let mut inbound = evidence::SteeredInbound::new(
+            chat,
+            self.config.owner_qq,
+            evidence.clone(),
+            &mut *steering_rx,
+        );
         let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {
             registry: Arc::clone(&self.deps.tools),
             evidence,
@@ -742,10 +749,11 @@ impl Runner {
                 working,
                 prompts,
                 &mut steering,
-                Some(&mut *steering_rx),
+                Some(&mut inbound),
                 &events_tx,
             )
             .await;
+        drop(inbound);
 
         // 模型循环一结束就关闭 steering。之后的 Stop hook、提交、周期审查与已读标记
         // 可能要好几秒；这期间到达的消息 `send` 会失败，由队列留在 pending、回合结束后
@@ -826,7 +834,7 @@ impl TurnHandler for Runner {
     async fn handle(
         &self,
         input: TurnInput,
-        steering: mpsc::UnboundedReceiver<AgentMessage>,
+        steering: mpsc::UnboundedReceiver<QqMessage>,
     ) -> TurnReport {
         self.execute(input, steering).await
     }
@@ -920,7 +928,9 @@ impl crate::swarm::SubagentRunner for Runner {
                 &mut history,
                 Vec::new(),
                 &mut steering,
-                incoming.as_mut(),
+                incoming
+                    .as_mut()
+                    .map(|receiver| receiver as &mut dyn crate::agent::agent_loop::SteeringSource),
                 &tx,
             )
             .await;
@@ -1443,8 +1453,7 @@ mod tests {
 
         let chat = ChatId::Group(1);
         let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(AgentMessage::user("[Alice] steering survives"))
-            .unwrap();
+        tx.send(inbound(chat, 2, "steering survives")).unwrap();
         let unanswered = runner
             .handle(
                 TurnInput {
@@ -1512,7 +1521,7 @@ mod tests {
             .expect_ok();
         assert_eq!(unanswered, 0);
         // 回合结束后发送一定失败：队列据此把消息留在 pending。
-        assert!(tx.send(AgentMessage::user("too late")).is_err());
+        assert!(tx.send(inbound(chat, 2, "too late")).is_err());
     }
 
     /// 回合提前结束时，循环已经取出、但还没进入上下文的 steering 消息交还队列。
@@ -1542,8 +1551,7 @@ mod tests {
         .await;
         let chat = ChatId::Group(1);
         let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(AgentMessage::user("[Alice] are you there?"))
-            .unwrap();
+        tx.send(inbound(chat, 2, "are you there?")).unwrap();
         let unanswered = runner
             .handle(
                 TurnInput {

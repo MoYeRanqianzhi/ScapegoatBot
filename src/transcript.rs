@@ -351,12 +351,16 @@ mod tests {
 /// 一次回合的运行时证据。
 ///
 /// 模型自报的“主人同意了”不算证据；这里只放 runtime 能核实的事实：
-/// - `owner_intent`：本回合由控制通道触发，或触发批次里有 owner_qq 的非 self 消息；
+/// - owner intent：本回合由控制通道触发，或进入本回合的非 self 消息**全部**来自
+///   `owner_qq`（见 [`TurnEvidence::owner_intent`]）；
 /// - `origin_chat`：触发本回合的 chat（`group:<id>` / `private:<qq>` / `control` /
 ///   `monitor`）。同 chat 回复属于“有明确理由”，跨 chat 发送才需要 owner intent。
+///
+/// 克隆共享同一份状态：工具调用拿到的是克隆，回合中途撤销 owner intent 时它们都能看到。
 #[derive(Debug, Clone, Default)]
 pub struct TurnEvidence {
-    pub owner_intent: bool,
+    /// 只能由 `true` 变成 `false`（[`TurnEvidence::revoke_owner_intent`]），不能重新授予。
+    owner_intent: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub origin_chat: Option<String>,
     /// 本回合进入上下文的内容片段及其来源 chat；跨 chat 泄露检查用。
     pub context_sources: std::sync::Arc<std::sync::Mutex<Vec<ContextSource>>>,
@@ -391,27 +395,41 @@ impl TurnEvidence {
 }
 
 impl TurnEvidence {
+    /// 指定 owner intent 与来源 chat 构造。
+    pub fn new(owner_intent: bool, origin: impl Into<String>) -> Self {
+        Self {
+            owner_intent: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(owner_intent)),
+            origin_chat: Some(origin.into()),
+            ..Self::default()
+        }
+    }
+
+    /// 有 owner intent 的回合（控制通道、主人本人的消息）。
     pub fn owner(origin: impl Into<String>) -> Self {
-        Self {
-            owner_intent: true,
-            origin_chat: Some(origin.into()),
-            ..Self::default()
-        }
+        Self::new(true, origin)
     }
 
+    /// 普通 chat 回合：没有 owner intent。
     pub fn chat(origin: impl Into<String>) -> Self {
-        Self {
-            owner_intent: false,
-            origin_chat: Some(origin.into()),
-            ..Self::default()
-        }
+        Self::new(false, origin)
     }
 
+    /// monitor 回合：没有 owner intent。
     pub fn monitor() -> Self {
-        Self {
-            owner_intent: false,
-            origin_chat: Some("monitor".to_owned()),
-            ..Self::default()
-        }
+        Self::new(false, "monitor")
+    }
+
+    /// 本回合此刻是否有 owner intent。
+    pub fn owner_intent(&self) -> bool {
+        self.owner_intent.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// 撤销 owner intent：回合中途有别人的消息进入上下文时调用。
+    ///
+    /// 之后进入的内容无法与主人的请求区分来源，所以不能再沿用主人的授权；
+    /// 撤销对所有克隆立即生效，且不可恢复。
+    pub fn revoke_owner_intent(&self) {
+        self.owner_intent
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 }

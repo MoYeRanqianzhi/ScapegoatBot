@@ -528,7 +528,7 @@ impl AgentHub {
             if *instance.status.lock().await != InstanceStatus::Running {
                 break dispatch;
             }
-            if instance.evidence.owner_intent && !evidence.owner_intent {
+            if instance.evidence.owner_intent() && !evidence.owner_intent() {
                 anyhow::bail!(
                     "subagent {id:?} is running with the owner intent of the turn that spawned \
                      it; this turn has none, so it cannot steer it. Wait for it to finish, then \

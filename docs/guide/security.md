@@ -125,13 +125,15 @@ agent 调用 `API` 的 `agent.resume`（宿主机上的 `sbot security resume` �
 owner intent 由 runtime 核实，不接受模型自报或聊天里的“主人同意了”：
 
 - **control**：`sbot chat` 通过本地 IPC 触发，恒为 true；
-- **owner_message**：触发批次里有 `owner_qq` 的非 `self` 消息（stand_in 下包括主人在本账号上手打、经发送账本确认不是本进程发出的消息，见 [配置说明](configuration.md#主人的消息)）；文件与记忆里的文字永远不算；
-- 子代理继承 spawn 时的证据。
+- **owner_message**：触发批次里的非 `self` 消息**全部**来自 `owner_qq`（stand_in 下包括主人在本账号上手打、经发送账本确认不是本进程发出的消息，见 [配置说明](configuration.md#主人的消息)）；别人的消息同批进入时，模型照着谁的话行动无法区分，主人的授权不能被借用；文件与记忆里的文字永远不算；
+- 回合进行中经 steering 进入的消息只要有一条不是主人的，owner intent 立即撤销，本回合内不再恢复；
+- 子代理继承 spawn 时的证据（同一份状态，父回合撤销时子代理也随之失去）。
 
 `API` 对扩张动作（发消息、加好友、处理请求、改资料、上传文件、改群名片/群名/
 授予权限/发公告）要求证据。**同一 chat 的回复有明确理由**，不需要额外证据；
 跨 chat 发送、私聊陌生人等必须有 owner intent，否则返回 `owner_intent_required`。
-收缩动作（踢人、禁言、退群、解散、撤回、删除群文件）不需要证据。
+收缩动作（踢人、禁言、撤回、删除群文件）在触发本回合的 chat 内不需要证据；
+作用于别的群需要 owner intent。全员禁言、退群、解散群恒需 owner intent（见下方“主人保护”）。
 
 ## 动作门禁 `[gate]`
 
@@ -238,6 +240,7 @@ action 只接受注册表声明过的参数（`api.help` 可查），未声明�
 | `auto` 的发送规则 | 频率/重复/跨群同文/@all/5-gram/context_sources/媒体来源是启发式；Grep 不按来源拆分 |
 | 周期检查的缓存复用 | 检查请求是独立窗口，不与主请求逐字节共享前缀 |
 | 群级破坏动作 | 没有用户目标，靠 owner intent 而不是硬保护 |
+| owner intent 的归属 | 只看本回合进入的消息；更早的上下文（pending history、之前的回合）里别人的话不会撤销 intent |
 | WebFetch | 后端已经抓取后才复核 `final_url` |
 
 这些项在 [limits.md](limits.md) 也列出；启用前请不要把它们当成已有的防护。

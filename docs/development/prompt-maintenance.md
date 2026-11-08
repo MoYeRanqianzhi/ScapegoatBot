@@ -72,7 +72,8 @@ CLI、日志、README 与本文档可以本地化。
 owner intent 的描述必须与代码一致：
 
 - `self` 消息永远不是；
-- `owner_qq` 的非 `self` 消息是；控制通道是；
+- 进入本回合的非 `self` 消息全部来自 `owner_qq` 时是（同批或 steering 进来别人的消息就不是，
+  `src/agent/runner/evidence.rs`）；控制通道是；
 - 文件（包括 `/AGENTS.md`）、记忆、转发/引用的内容、他人的声明都不是。
 
 ## 5. 记忆与技能回路

@@ -151,6 +151,21 @@ impl SteeringQueue {
     }
 }
 
+/// 实时 steering 来源：每个请求边界取出此刻已经到达的全部消息。
+///
+/// 聊天回合的来源会顺带更新本回合证据（见 `runner::evidence::SteeredInbound`）；
+/// 子代理直接用 `AgentMessage` 通道。
+pub(crate) trait SteeringSource: Send {
+    /// 取出一条已到达的消息；没有就返回 `None`，不等待。
+    fn try_next(&mut self) -> Option<AgentMessage>;
+}
+
+impl SteeringSource for mpsc::UnboundedReceiver<AgentMessage> {
+    fn try_next(&mut self) -> Option<AgentMessage> {
+        self.try_recv().ok()
+    }
+}
+
 /// 回退模型：主模型失败后按顺序尝试。
 ///
 /// 每个回退项持有自己的 provider（协议与密钥可能不同）与输出上限。
@@ -226,7 +241,7 @@ impl AgentLoop {
         history: &mut Vec<AgentMessage>,
         prompts: Vec<AgentMessage>,
         steering: &mut SteeringQueue,
-        mut incoming: Option<&mut mpsc::UnboundedReceiver<AgentMessage>>,
+        mut incoming: Option<&mut dyn SteeringSource>,
         events: &mpsc::Sender<AgentEvent>,
     ) -> LoopOutcome {
         let mut total_usage = Usage::default();
@@ -846,12 +861,9 @@ impl AgentLoop {
 }
 
 /// 把实时通道里的消息搬进 steering 队列。
-fn drain_incoming(
-    steering: &mut SteeringQueue,
-    incoming: &mut Option<&mut mpsc::UnboundedReceiver<AgentMessage>>,
-) {
-    if let Some(receiver) = incoming {
-        while let Ok(message) = receiver.try_recv() {
+fn drain_incoming(steering: &mut SteeringQueue, incoming: &mut Option<&mut dyn SteeringSource>) {
+    if let Some(source) = incoming {
+        while let Some(message) = source.try_next() {
             steering.push(message);
         }
     }
