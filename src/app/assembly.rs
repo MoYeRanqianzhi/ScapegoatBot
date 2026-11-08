@@ -78,7 +78,9 @@ pub(super) fn open_stores(paths: &SbotPaths, loaded: &LoadedConfig) -> Result<St
         )?
         .with_retention_days(loaded.config.storage.message_retention_days),
     );
-    if loaded.config.storage.message_retention_days > 0
+    // 保留期或大小上限任一生效就在启动时清理一次；大小上限在每次写入时也会检查（`make_room`）。
+    if (loaded.config.storage.message_retention_days > 0
+        || loaded.config.storage.max_message_bytes != 0)
         && let Err(error) = messages.enforce_retention(loaded.config.storage.message_retention_days)
     {
         warn!(%error, "cannot enforce message retention at startup");
@@ -118,7 +120,8 @@ pub(super) fn open_stores(paths: &SbotPaths, loaded: &LoadedConfig) -> Result<St
         )?
         .with_retention_days(loaded.config.storage.session_retention_days),
     );
-    if loaded.config.storage.session_retention_days > 0
+    // 保留期或大小上限任一生效就在启动时清理一次（默认只有 2 GiB 的大小上限）。
+    if sessions.limits_retention()
         && let Err(error) = sessions.enforce_retention(loaded.config.storage.session_retention_days)
     {
         warn!(%error, "cannot enforce transcript retention at startup");

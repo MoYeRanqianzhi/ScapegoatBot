@@ -256,13 +256,19 @@ impl SessionStore {
             )?;
         }
         let next = self.create(Some(&current.file))?;
-        // 轮转后顺手清理过期的已关闭分段；当前分段不会被删除。
-        if self.retention_days > 0
+        // 轮转后顺手清理：超过保留期或总大小超过 `max_session_bytes` 的已关闭分段。
+        // 两个条件独立——只设了大小上限（默认 2 GiB、保留期 0）时同样要清理。
+        if self.limits_retention()
             && let Err(error) = self.enforce_retention(self.retention_days)
         {
             warn!(%error, "cannot enforce transcript retention");
         }
         Ok(next)
+    }
+
+    /// 是否设了保留期或总大小上限（任一非零就需要清理）。
+    pub(crate) fn limits_retention(&self) -> bool {
+        self.retention_days > 0 || self.max_bytes != 0
     }
 
     /// 记录一次压缩检查点（加密存储）。
@@ -751,6 +757,30 @@ mod tests {
         // 当前分段仍在。
         let current = store.current().unwrap();
         assert!(store.info(&current.file).unwrap().is_some());
+    }
+
+    #[test]
+    fn size_cap_applies_without_a_retention_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let key = Arc::new(MasterKey::from_bytes([3u8; 32]));
+        // 保留期 0（默认），只有 1 字节的大小上限：轮转时旧分段必须被清理。
+        let store =
+            SessionStore::open(db, key, dir.path().to_path_buf(), 1, EncryptionMode::None).unwrap();
+        assert!(store.limits_retention());
+        store.append(&[AgentMessage::user("old segment")]).unwrap();
+        let first = store.current().unwrap();
+        store.rotate().unwrap();
+        let pruned: Option<String> = {
+            let conn = store.db.lock();
+            conn.query_row(
+                "SELECT pruned_at FROM transcript_files WHERE file = ?1",
+                params![first.file],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert!(pruned.is_some(), "the size cap was not enforced on rotate");
     }
 
     #[test]
