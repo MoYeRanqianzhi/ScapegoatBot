@@ -201,9 +201,13 @@ pub struct ProviderError {
 
 impl ProviderError {
     pub fn new(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
+        // 超时只来自 408 / 504（网关或服务端在等待中放弃），与 5xx 一样值得重试。
         let retryable = matches!(
             kind,
-            ProviderErrorKind::Network | ProviderErrorKind::RateLimit | ProviderErrorKind::Server
+            ProviderErrorKind::Network
+                | ProviderErrorKind::RateLimit
+                | ProviderErrorKind::Server
+                | ProviderErrorKind::Timeout
         );
         Self {
             kind,
@@ -633,16 +637,30 @@ pub fn build_metered(
     Ok(metered::Metered::wrap(provider, cost, Arc::clone(sink)))
 }
 
-/// 把 Anthropic / OpenAI 的 stop_reason 字符串映射为内部原因。
+/// 把 Anthropic 的 `stop_reason` 与 Chat Completions 的 `finish_reason` 映射为内部原因。
+///
+/// 已知值来自各家的类型定义：Anthropic SDK 的 `StopReason`（含
+/// `model_context_window_exceeded`）、OpenAI 的 finish_reason、DeepSeek 文档里的
+/// `insufficient_system_resource` / `aborted`。认不出的值按 `Error` 处理并记日志：
+/// 当成正常结束会执行一个可能不完整的回复里的工具调用。
 pub fn map_stop_reason(raw: &str) -> StopReason {
     match raw {
         "end_turn" | "stop" => StopReason::EndTurn,
         "tool_use" | "tool_calls" | "function_call" => StopReason::ToolUse,
-        "max_tokens" | "length" => StopReason::MaxTokens,
+        // 输出到了上限，或上下文窗口被占满：回复都可能被截断。
+        "max_tokens" | "length" | "model_context_window_exceeded" => StopReason::MaxTokens,
         "stop_sequence" => StopReason::StopSequence,
         "refusal" | "content_filter" => StopReason::Refusal,
         "pause_turn" => StopReason::PauseTurn,
-        _ => StopReason::EndTurn,
+        // DeepSeek：推理资源不足或生成被中断。
+        "insufficient_system_resource" | "aborted" => StopReason::Error,
+        other => {
+            tracing::warn!(
+                reason = other,
+                "unknown stop reason; treating the response as failed"
+            );
+            StopReason::Error
+        }
     }
 }
 
@@ -684,7 +702,16 @@ mod tests {
         assert_eq!(map_stop_reason("refusal"), StopReason::Refusal);
         assert_eq!(map_stop_reason("content_filter"), StopReason::Refusal);
         assert_eq!(map_stop_reason("pause_turn"), StopReason::PauseTurn);
-        assert_eq!(map_stop_reason("something-new"), StopReason::EndTurn);
+        assert_eq!(
+            map_stop_reason("model_context_window_exceeded"),
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            map_stop_reason("insufficient_system_resource"),
+            StopReason::Error
+        );
+        // 认不出的值不能当成正常结束。
+        assert_eq!(map_stop_reason("something-new"), StopReason::Error);
     }
 
     #[test]
@@ -702,6 +729,8 @@ mod tests {
             ProviderErrorKind::Server
         );
         assert!(ProviderError::from_status(500, "oops").retryable);
+        assert!(ProviderError::from_status(408, "slow").retryable);
+        assert!(ProviderError::from_status(504, "gateway").retryable);
         assert!(!ProviderError::from_status(400, "bad").retryable);
         assert!(
             ProviderError::from_status(400, &"x".repeat(2000))

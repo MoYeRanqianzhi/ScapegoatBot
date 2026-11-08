@@ -243,7 +243,8 @@ impl StreamState {
                     out.push(ProviderEvent::ThinkingDelta(delta.to_owned()));
                 }
             }
-            "response.completed" => {
+            "response.completed" | "response.incomplete" => {
+                // 截断的响应同样花了 token：两种结束都读取用量。
                 if let Some(usage) = payload.pointer("/response/usage") {
                     // `input_tokens` 包含命中缓存的部分；换算成统一口径（见 `Usage`）。
                     let prompt = usage
@@ -266,10 +267,12 @@ impl StreamState {
                     };
                     out.push(ProviderEvent::Usage(self.usage));
                 }
-                self.emit_stop(&mut out, StopReason::EndTurn);
-            }
-            "response.incomplete" => {
-                self.emit_stop(&mut out, StopReason::MaxTokens);
+                let reason = if kind == "response.completed" {
+                    StopReason::EndTurn
+                } else {
+                    incomplete_reason(&payload)
+                };
+                self.emit_stop(&mut out, reason);
             }
             "response.failed" | "error" => {
                 let message = payload
@@ -290,7 +293,9 @@ impl StreamState {
         if let Some(status) = payload.pointer("/response/status").and_then(Value::as_str) {
             match status {
                 "completed" => self.emit_stop(&mut out, StopReason::EndTurn),
-                "incomplete" => self.emit_stop(&mut out, StopReason::MaxTokens),
+                // `incomplete_details.reason`：被内容过滤截断是拒绝，其余（输出上限、
+                // 消息数上限等）都是截断。
+                "incomplete" => self.emit_stop(&mut out, incomplete_reason(&payload)),
                 "failed" => self.emit_stop(&mut out, StopReason::Error),
                 _ => {}
             }
@@ -313,6 +318,18 @@ impl StreamState {
             reason,
             refusal: None::<RefusalDetails>,
         });
+    }
+}
+
+/// 响应没有完整结束时的原因：`incomplete_details.reason` 为 `content_filter` 是拒绝，
+/// 其余（`max_output_tokens`、`max_messages` 等）都是截断。
+fn incomplete_reason(payload: &Value) -> StopReason {
+    match payload
+        .pointer("/response/incomplete_details/reason")
+        .and_then(Value::as_str)
+    {
+        Some("content_filter") => StopReason::Refusal,
+        _ => StopReason::MaxTokens,
     }
 }
 
@@ -477,6 +494,25 @@ mod tests {
                 reason: StopReason::MaxTokens,
                 refusal: None
             }]
+        );
+
+        // 被内容过滤截断是拒绝；截断的响应也带用量。
+        let mut state = StreamState::default();
+        let events = feed(
+            &mut state,
+            json!({"type": "response.incomplete", "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "content_filter"},
+                "usage": {"input_tokens": 10, "output_tokens": 2}
+            }}),
+        );
+        assert!(matches!(events[0], ProviderEvent::Usage(_)), "{events:?}");
+        assert_eq!(
+            events[1],
+            ProviderEvent::Stop {
+                reason: StopReason::Refusal,
+                refusal: None
+            }
         );
     }
 
