@@ -99,7 +99,8 @@ sbot resume          # 删除 ESTOP
 日志出现 `QuotaExceeded` / `DiskFull`：
 
 - 看 `/system` 的 VFS 用量；
-- 清 `/trash` 或调大 `[storage].max_vfs_bytes`；
+- `QuotaExceeded` 看的是活跃用量（不含 `/trash`）：删掉或移走不用的文件，或调大
+  `[storage].max_vfs_bytes`；从 `/trash` 恢复文件同样要占活跃配额；
 - 磁盘余量低于 1 GiB 时拒绝写入，先腾空间。
 
 ## MCP

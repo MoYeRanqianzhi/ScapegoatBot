@@ -11,6 +11,7 @@
 mod assembly;
 mod bootstrap;
 mod events;
+mod maintenance;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

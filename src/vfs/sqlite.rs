@@ -1290,4 +1290,74 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(store.stat(&trashed).is_err());
     }
+
+    fn limits(max_total_bytes: u64, max_nodes: u64) -> Limits {
+        Limits {
+            max_total_bytes,
+            max_nodes,
+            min_free_bytes: 0,
+            ..Limits::default()
+        }
+    }
+
+    #[test]
+    fn the_trash_is_capped_at_a_tenth_of_the_byte_quota() {
+        // 总量 100 字节 → 回收站最多 10 字节。
+        let (store, _dir) = store_with(limits(100, 0));
+        store.write_text(&path("/a.md"), "aaaaaaaa", None).unwrap();
+        let first = store.remove(&path("/a.md"), false).unwrap();
+        let first = first.trashed_to.expect("8 bytes fit in the trash");
+        store.write_text(&path("/b.md"), "bbbbbbbb", None).unwrap();
+        let second = store.remove(&path("/b.md"), false).unwrap();
+        // 16 字节超过上限：最早移入的 a 被清除，刚移入的 b 保留。
+        assert!(store.stat(&first).is_err());
+        assert!(store.stat(&second.trashed_to.unwrap()).is_ok());
+        assert_eq!(store.usage().unwrap().trash_bytes, 8);
+
+        // 单独就超过上限的条目无处可放：如实报告为永久删除。
+        store
+            .write_text(&path("/big.md"), &"x".repeat(20), None)
+            .unwrap();
+        let big = store.remove(&path("/big.md"), false).unwrap();
+        assert!(big.trashed_to.is_none());
+        assert_eq!(big.removed_nodes, 1);
+    }
+
+    #[test]
+    fn the_trash_is_capped_at_a_tenth_of_the_node_quota() {
+        // 节点上限 60 → 回收站最多 6 个节点；空文件不占字节，只能按节点数限制。
+        let (store, _dir) = store_with(limits(0, 60));
+        for index in 0..8 {
+            store
+                .write_text(&path(&format!("/many/{index}.md")), "", None)
+                .unwrap();
+        }
+        let outcome = store.remove(&path("/many"), false).unwrap();
+        assert!(outcome.trashed_to.is_none(), "9 nodes exceed the cap of 6");
+        assert_eq!(outcome.removed_nodes, 9);
+        assert_eq!(store.usage().unwrap().trash_nodes, 0);
+    }
+
+    #[test]
+    fn restoring_from_the_trash_respects_the_quota() {
+        let (store, _dir) = store_with(limits(1000, 0));
+        store
+            .write_text(&path("/a.md"), &"a".repeat(60), None)
+            .unwrap();
+        let trashed = store
+            .remove(&path("/a.md"), false)
+            .unwrap()
+            .trashed_to
+            .unwrap();
+        // 删除释放了活跃配额，于是又写满了它。
+        store
+            .write_text(&path("/b.md"), &"b".repeat(960), None)
+            .unwrap();
+        let error = store.rename(&trashed, &path("/a.md")).unwrap_err();
+        assert!(matches!(error, VfsError::QuotaExceeded { .. }), "{error:?}");
+        // 腾出空间后可以恢复。
+        store.remove(&path("/b.md"), true).unwrap();
+        store.rename(&trashed, &path("/a.md")).unwrap();
+        assert!(store.stat(&path("/a.md")).is_ok());
+    }
 }

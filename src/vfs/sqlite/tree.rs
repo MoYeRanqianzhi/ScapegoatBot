@@ -14,7 +14,10 @@ impl super::VfsStore {
         VfsPath::parse("/trash").expect("trash path is valid")
     }
 
-    /// 递归删除子树，返回删除的节点 id（用于清理 blob 文件）。
+    /// 在事务里递归删除子树的数据库记录，返回删除的节点 id。
+    ///
+    /// 磁盘上的 blob 目录**不在这里删**：事务可能随后回滚，先删文件会留下指向
+    /// 不存在内容的节点。调用方提交成功后再用 [`Self::remove_blob_dirs`] 清理。
     fn delete_subtree(&self, conn: &Connection, id: i64) -> Result<Vec<i64>, VfsError> {
         let mut statement = conn.prepare(
             "WITH RECURSIVE sub(id) AS (
@@ -28,14 +31,6 @@ impl super::VfsStore {
             .query_map(params![id], |row| row.get(0))?
             .collect::<Result<_, _>>()?;
         drop(statement);
-
-        for node_id in &ids {
-            // 目录也要清理，blobs 目录可能不存在，忽略 NotFound。
-            let dir = self.storage.join("blobs").join(node_id.to_string());
-            if dir.exists() {
-                let _ = std::fs::remove_dir_all(&dir);
-            }
-        }
         conn.execute(
             "WITH RECURSIVE sub(id) AS (
                  SELECT id FROM vfs_nodes WHERE id = ?1
@@ -46,6 +41,20 @@ impl super::VfsStore {
             params![id],
         )?;
         Ok(ids)
+    }
+
+    /// 事务提交后清理被删节点的 blob 目录；不存在的目录（文本节点、目录节点）跳过。
+    ///
+    /// 删除失败只留下孤立文件，不影响一致性，所以只记录不报错。
+    fn remove_blob_dirs(&self, ids: &[i64]) {
+        for node_id in ids {
+            let dir = self.storage.join("blobs").join(node_id.to_string());
+            if dir.exists()
+                && let Err(error) = std::fs::remove_dir_all(&dir)
+            {
+                tracing::warn!(%error, node = node_id, "cannot remove a deleted blob directory");
+            }
+        }
     }
 
     /// 子树占用的字节与节点数（含目录自身）。
@@ -86,12 +95,13 @@ impl super::VfsStore {
         let in_trash = path.starts_with(&trash);
 
         if permanent || in_trash {
-            let removed = self.delete_subtree(&tx, row.id)?.len() as u64;
+            let removed = self.delete_subtree(&tx, row.id)?;
             tx.commit()?;
+            self.remove_blob_dirs(&removed);
             return Ok(RemoveOutcome {
                 trashed_to: None,
                 recursive: row.kind == NodeKind::Dir,
-                removed_nodes: removed,
+                removed_nodes: removed.len() as u64,
             });
         }
 
@@ -133,12 +143,29 @@ impl super::VfsStore {
              UPDATE vfs_nodes SET trashed_at = ?2 WHERE id IN (SELECT id FROM sub)",
             params![row.id, at],
         )?;
+        // 回收站有上限：超出时从最早移入的条目开始清除。刚移入的条目最新，
+        // 只有它自己就超过上限时才会被清掉——此时如实报告为永久删除。
+        let (_, moved_nodes) = Self::subtree_usage(&tx, row.id)?;
+        let purged = self.enforce_trash_limits(&tx)?;
+        let kept = tx
+            .query_row(
+                "SELECT 1 FROM vfs_nodes WHERE id = ?1",
+                params![row.id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
 
         tx.commit()?;
+        self.remove_blob_dirs(&purged);
         Ok(RemoveOutcome {
-            trashed_to: Some(trash.join(&candidate)?),
+            trashed_to: if kept {
+                Some(trash.join(&candidate)?)
+            } else {
+                None
+            },
             recursive: row.kind == NodeKind::Dir,
-            removed_nodes: 0,
+            removed_nodes: if kept { 0 } else { moved_nodes },
         })
     }
 
@@ -168,6 +195,13 @@ impl super::VfsStore {
 
         let was_trashed = row.trashed_at.is_some();
         let going_to_trash = to.starts_with(&trash);
+        // 从回收站恢复会让这棵子树重新计入活跃用量：按新增量检查配额。
+        if was_trashed && !going_to_trash {
+            let (bytes, nodes) = self.active_usage(&tx)?;
+            let (add_bytes, add_nodes) = Self::subtree_usage(&tx, row.id)?;
+            self.quota
+                .check_growth(bytes, nodes, add_bytes, add_nodes)?;
+        }
         let trashed_at = match (was_trashed, going_to_trash) {
             (_, true) => Some(now()),
             (true, false) => None,
@@ -202,8 +236,14 @@ impl super::VfsStore {
              UPDATE vfs_nodes SET trashed_at = ?2 WHERE id IN (SELECT id FROM sub)",
             params![row.id, trashed_at],
         )?;
+        let purged = if going_to_trash && !was_trashed {
+            self.enforce_trash_limits(&tx)?
+        } else {
+            Vec::new()
+        };
 
         tx.commit()?;
+        self.remove_blob_dirs(&purged);
         Ok(())
     }
 
@@ -351,13 +391,28 @@ impl super::VfsStore {
         }
     }
 
+    /// 清理回收站（运行时定期调用，见 `app::maintenance`）。返回清除的节点数。
     pub(super) fn purge_trash_entries(&self) -> Result<u64, VfsError> {
         let mut conn = self.db.lock();
         let tx = conn.transaction()?;
+        let deleted = self.enforce_trash_limits(&tx)?;
+        tx.commit()?;
+        self.remove_blob_dirs(&deleted);
+        Ok(deleted.len() as u64)
+    }
 
+    /// 回收站的三条规则，在调用方的事务里执行；超限时从最早移入的条目开始清除：
+    ///
+    /// - 保留期：移入超过 [`TRASH_RETENTION_DAYS`] 天；
+    /// - 字节：不超过 VFS 总量上限的 10%（总量不限时不按字节清理）；
+    /// - 节点：不超过节点上限的 10%（空文件不占字节，但每个都是一行数据库记录）。
+    ///
+    /// 活跃配额不含回收站；这两条上限保证删除再写入不能让存储无限增长。
+    /// 返回清除的节点 id；调用方提交后用 [`Self::remove_blob_dirs`] 清理文件。
+    fn enforce_trash_limits(&self, tx: &Connection) -> Result<Vec<i64>, VfsError> {
         let trash = self.trash_path();
-        let Some(trash_root) = self.lookup(&tx, &trash)? else {
-            return Ok(0);
+        let Some(trash_root) = self.lookup(tx, &trash)? else {
+            return Ok(Vec::new());
         };
 
         let entries = {
@@ -373,50 +428,36 @@ impl super::VfsStore {
                 .collect::<Result<Vec<_>, _>>()?
         };
 
-        let (trash_bytes, _) = {
-            let value: (u64, u64) = tx.query_row(
-                "SELECT COALESCE(SUM(CASE WHEN kind != 'dir' THEN size ELSE 0 END), 0), COUNT(*)
-                 FROM vfs_nodes WHERE trashed_at IS NOT NULL",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            value
-        };
+        let (trash_bytes, trash_nodes): (u64, u64) = tx.query_row(
+            "SELECT COALESCE(SUM(CASE WHEN kind != 'dir' THEN size ELSE 0 END), 0), COUNT(*)
+             FROM vfs_nodes WHERE trashed_at IS NOT NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
 
-        // 回收站上限：总量的 10%（总量为 0 时不按比例清理）。
-        let cap = match self.quota.max_total_bytes() {
-            0 => 0,
-            total => total / 10,
-        };
+        // 0 表示对应的上限不启用。
+        let byte_cap = self.quota.max_total_bytes() / 10;
+        let node_cap = self.quota.max_nodes() / 10;
         let cutoff = Utc::now() - chrono::Duration::days(TRASH_RETENTION_DAYS);
 
-        let mut deleted = 0u64;
-        let mut remaining = trash_bytes;
+        let mut deleted = Vec::new();
+        let mut bytes = trash_bytes;
+        let mut nodes = trash_nodes;
         for (id, trashed_at) in entries {
             let expired = trashed_at
                 .as_deref()
                 .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
                 .is_some_and(|time| time < cutoff);
-            let over_cap = cap != 0 && remaining > cap;
-            if expired || over_cap {
-                let size: u64 = tx.query_row(
-                    "WITH RECURSIVE sub(id) AS (
-                         SELECT id FROM vfs_nodes WHERE id = ?1
-                         UNION ALL
-                         SELECT n.id FROM vfs_nodes n JOIN sub s ON n.parent_id = s.id
-                     )
-                     SELECT COALESCE(SUM(CASE WHEN kind != 'dir' THEN size ELSE 0 END), 0)
-                     FROM vfs_nodes WHERE id IN (SELECT id FROM sub)",
-                    params![id],
-                    |row| row.get(0),
-                )?;
-                let removed = self.delete_subtree(&tx, id)?.len() as u64;
-                deleted += removed;
-                remaining = remaining.saturating_sub(size);
+            let over_bytes = byte_cap != 0 && bytes > byte_cap;
+            let over_nodes = node_cap != 0 && nodes > node_cap;
+            if expired || over_bytes || over_nodes {
+                let (size, _) = Self::subtree_usage(tx, id)?;
+                let removed = self.delete_subtree(tx, id)?;
+                bytes = bytes.saturating_sub(size);
+                nodes = nodes.saturating_sub(removed.len() as u64);
+                deleted.extend(removed);
             }
         }
-
-        tx.commit()?;
         Ok(deleted)
     }
 }

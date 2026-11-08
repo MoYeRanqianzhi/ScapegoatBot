@@ -199,32 +199,15 @@ async fn assemble_tools(
     tools.register(Arc::new(
         SkillTool::new(Arc::clone(&vfs)).with_db(Arc::clone(&db)),
     ));
-    // 技能 curator：每小时检查一次；只在积累足够新技能时运行，只归档不删除。
+    // 后台维护：技能 curator（可关）与回收站清理（总是开启）。
     if config.skills.curator {
-        let vfs_curator = Arc::clone(&vfs);
-        let db_curator = Arc::clone(&db);
-        let skills_config = config.skills.clone();
-        tokio::spawn(async move {
-            loop {
-                let vfs = Arc::clone(&vfs_curator);
-                let db = Arc::clone(&db_curator);
-                let cfg = skills_config.clone();
-                match tokio::task::spawn_blocking(move || {
-                    crate::tools::skill::curate(&vfs, &db, &cfg)
-                })
-                .await
-                {
-                    Ok(Ok(report)) if !report.archived.is_empty() => {
-                        info!(archived = ?report.archived, "skill curator archived unused skills");
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => warn!(%error, "skill curator failed"),
-                    Err(error) => warn!(%error, "skill curator task failed"),
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-            }
-        });
+        super::maintenance::spawn_skill_curator(
+            Arc::clone(&vfs),
+            Arc::clone(&db),
+            config.skills.clone(),
+        );
     }
+    super::maintenance::spawn_trash_purge(Arc::clone(&vfs));
     // Agent 工具先注册；hub 需要 runner，稍后注入。
     let hub_handle = Arc::new(HubHandle::new());
     if config.swarm.enabled {

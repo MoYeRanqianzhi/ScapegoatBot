@@ -71,6 +71,11 @@ impl Quota {
         self.limits.max_total_bytes
     }
 
+    /// 节点上限（0 = 不限制）；回收站比例清理需要它。
+    pub fn max_nodes(&self) -> u64 {
+        self.limits.max_nodes
+    }
+
     /// 文本写入检查。
     pub fn check_text(&self, len: u64) -> Result<(), VfsError> {
         if self.limits.max_text_bytes != 0 && len > self.limits.max_text_bytes {
