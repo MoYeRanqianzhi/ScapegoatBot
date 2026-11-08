@@ -3,8 +3,8 @@
 //! 设计依据：设计 §5.11。
 //!
 //! 结构：`{source, when?, deliver, lifecycle?}`。
-//! - source：`qq` / `timer` / `internal`（运行时状态变化，见 [`internal`]）；`stream` 只允许
-//!   写在配置文件里；
+//! - source：`qq` / `timer` / `internal`（运行时状态变化，见 [`internal`]）；`stream`
+//!   （外部 WebSocket / SSE，见 `stream.rs`）只允许写在配置文件里；
 //! - when：谓词子集（`event.mentions_self`、`event.type == 'message'`、
 //!   `event.chat == 'group:123'`、`event.sender == '10001'` / `!=`、`event.text contains 'x'`，
 //!   前缀 `not` 取反，用 `and` 组合）；
@@ -32,6 +32,7 @@ use crate::qq::format;
 use crate::storage::Database;
 
 pub mod internal;
+mod stream;
 mod timer;
 
 pub use internal::{InternalBus, InternalEvent, InternalKind};
@@ -578,7 +579,7 @@ impl MonitorManager {
         };
         for monitor in monitors {
             match matches(monitor.when.as_deref(), view) {
-                Ok(true) => self.enqueue(&monitor, view).await,
+                Ok(true) => enqueue(&monitor, &self.sink, view).await,
                 Ok(false) => {}
                 // `add` 已校验表达式，这里不应发生。真发生了就停掉这个 monitor 并只通知一次：
                 // 否则每个 QQ 事件都会投递一条系统通知（每条都是一个回合）。
@@ -601,10 +602,20 @@ impl MonitorManager {
         }
     }
 
-    /// 按批处理窗口投递事件；窗口为 0 时立即投递。
-    ///
-    /// 投递在独立任务里执行，避免 `idle_only` 等待空闲时阻塞 QQ 事件处理。
-    async fn enqueue(&self, monitor: &Arc<Monitor>, event: &MonitorEvent) {
+    /// 为配置里的 `stream` monitor 建立连接；只由 [`load_config_monitors`] 调用。
+    async fn attach_stream(&self, name: &str, url: String, kind: crate::config::StreamKind) {
+        let monitor = self.monitors.read().await.get(name).cloned();
+        if let Some(monitor) = monitor {
+            stream::spawn_stream(monitor, Arc::clone(&self.sink), url, kind);
+        }
+    }
+}
+
+/// 按批处理窗口投递事件；窗口为 0 时立即投递。
+///
+/// 投递在独立任务里执行，避免 `idle_only` 等待空闲时阻塞事件源。
+async fn enqueue(monitor: &Arc<Monitor>, sink: &Arc<dyn MonitorSink>, event: &MonitorEvent) {
+    {
         if monitor.pending_deliveries.load(Ordering::SeqCst) >= MAX_PENDING_DELIVERIES {
             debug!(
                 monitor = %monitor.name,
@@ -616,12 +627,12 @@ impl MonitorManager {
             // 无批处理且无需等空闲时直接投递，保持调用方看到同步结果。
             if !monitor.idle_only {
                 monitor.pending_deliveries.fetch_add(1, Ordering::SeqCst);
-                deliver_once(monitor, &*self.sink, Some(event), 1, false).await;
+                deliver_once(monitor, &**sink, Some(event), 1, false).await;
                 monitor.pending_deliveries.fetch_sub(1, Ordering::SeqCst);
                 return;
             }
             let monitor = Arc::clone(monitor);
-            let sink = Arc::clone(&self.sink);
+            let sink = Arc::clone(sink);
             let event = event.clone();
             monitor.pending_deliveries.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
@@ -635,12 +646,17 @@ impl MonitorManager {
             .batch
             .lock()
             .expect("monitor lock")
-            .push(format!("[{}] {}", event.chat, event.text));
+            .push(if event.chat.is_empty() {
+                // 定时、内部、外部流事件没有 chat。
+                event.text.clone()
+            } else {
+                format!("[{}] {}", event.chat, event.text)
+            });
         if monitor.flush_queued.swap(true, Ordering::SeqCst) {
             return;
         }
         let monitor = Arc::clone(monitor);
-        let sink = Arc::clone(&self.sink);
+        let sink = Arc::clone(sink);
         monitor.pending_deliveries.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
             tokio::time::sleep(monitor.batch_window).await;
@@ -659,6 +675,7 @@ impl MonitorManager {
         });
     }
 }
+
 async fn deliver_once(
     monitor: &Monitor,
     sink: &dyn MonitorSink,
@@ -712,6 +729,11 @@ async fn deliver_once(
             .replace("{{event.chat}}", &event.chat)
             .replace("{{count}}", &count.to_string()),
         (Some(template), None) => template.clone(),
+        // 没有 chat 的事件（定时、内部、外部流、合并后的批次）不写空的 chat 段。
+        (None, Some(event)) if event.chat.is_empty() => format!(
+            "[monitor {} | {}]\n{}",
+            monitor.name, monitor.source, event.text
+        ),
         (None, Some(event)) => format!(
             "[monitor {} | {} | {}]\n{}",
             monitor.name, monitor.source, event.chat, event.text
@@ -802,6 +824,7 @@ pub async fn load_config_monitors(
         } else {
             continue;
         };
+        let stream = monitor.source.stream.clone();
 
         let expires = match monitor.lifecycle.expires.as_str() {
             "0" => None,
@@ -835,6 +858,12 @@ pub async fn load_config_monitors(
                 on_missing: monitor.on_missing,
             })
             .await?;
+        // 外部流：添加之后再连接，连接任务拿到的是已注册的 monitor。
+        if let Some(stream) = stream {
+            manager
+                .attach_stream(&monitor.name, stream.url, stream.kind)
+                .await;
+        }
 
         // `backlog = "inbox"`：创建时把匹配的未读消息补投一次；
         // 只有真正投递出去的条目才标记已读。
@@ -1208,8 +1237,8 @@ mod tests {
             .get("batched")
             .cloned()
             .unwrap();
-        manager.enqueue(&monitor, &first).await;
-        manager.enqueue(&monitor, &second).await;
+        enqueue(&monitor, &manager.sink, &first).await;
+        enqueue(&monitor, &manager.sink, &second).await;
         // 窗口未到时不应投递。
         assert!(sink.deliveries.lock().unwrap().is_empty());
 
@@ -1249,7 +1278,7 @@ mod tests {
 
         let event = event("private:10001", "hello", false);
         let monitor = manager.monitors.read().await.get("idle").cloned().unwrap();
-        manager.enqueue(&monitor, &event).await;
+        enqueue(&monitor, &manager.sink, &event).await;
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert!(sink.deliveries.lock().unwrap().is_empty());
 

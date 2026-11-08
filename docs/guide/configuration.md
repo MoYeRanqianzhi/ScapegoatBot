@@ -200,6 +200,13 @@ lifecycle = { idle_only = false, max_events = 1000 }
 
 例：`source = { internal = { kind = "security" } }`，`when = "event.type == 'security:hold'"`。
 
+`stream = { url = "…", kind = "websocket" | "sse" }` 订阅外部事件流（CI、Webhook 中转等），
+**只能写在配置文件里**，`Monitor` 工具拒绝创建。`websocket` 要 `ws://` / `wss://`，每个文本
+帧是一个事件；`sse` 要 `http://` / `https://`，每个 SSE 事件是一个事件（带 `event:` 名时
+文本前缀 `[名字]`）。事件的 `event.type` 是 `stream`，`event.text` 是消息原文（超过 4000
+字符截断）。断线后 5 秒起指数退避重连（最长 5 分钟）；断开与恢复各发一条系统通知。
+外部内容和 QQ 消息一样经过输入闸。
+
 运行时也能通过 `Monitor` 工具增删，但重启即消失；配置文件里的才是常驻。
 
 `when` 是用 `and` 连接的谓词：`event.type == '…'`、`event.chat == '…'`、

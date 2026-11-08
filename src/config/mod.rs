@@ -463,6 +463,30 @@ deliver = { to = "main", as = "event" }
     }
 
     #[test]
+    fn stream_url_scheme_must_match_its_kind() {
+        let text = r#"
+version = 1
+[[monitor]]
+name = "ci"
+source = { stream = { url = "https://ci.example.com/events", kind = "websocket" } }
+deliver = { to = "main", as = "event" }
+"#;
+        let table: toml::Table = toml::from_str(text).unwrap();
+        let config: SbotConfig = toml::Value::Table(table).try_into().unwrap();
+        let errors = config.validate_shape().unwrap_err();
+        assert!(
+            errors
+                .0
+                .iter()
+                .any(|e| e.field == "monitor[0].source.stream.url")
+        );
+        let sse = text.replace("\"websocket\"", "\"sse\"");
+        let table: toml::Table = toml::from_str(&sse).unwrap();
+        let config: SbotConfig = toml::Value::Table(table).try_into().unwrap();
+        config.validate_shape().unwrap();
+    }
+
+    #[test]
     fn monitor_requires_exactly_one_source() {
         let text = r#"
 version = 1

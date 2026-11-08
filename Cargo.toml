@@ -25,6 +25,8 @@ napcat-link = "=0.1.0-alpha.2"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 # 流式读取 SSE 与并行工具执行。
 futures-util = "0.3"
+# monitor 的 stream 源（外部 WebSocket）；与 napcat-link 用同一版本与 TLS 后端。
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 # 异步 trait：IPC Handler 需要 `Arc<dyn Handler>`。
 async-trait = "0.1"
 # 序列化 / 反序列化：IPC 帧、auth.json、models.json、审计记录。
@@ -84,7 +86,6 @@ napcat-link = { path = "vendor/napcat-link" }
 tempfile = "3"
 # 暂停时钟：队列去抖与定时器测试。
 tokio = { version = "1", features = ["test-util"] }
-tokio-tungstenite = "0.26"
 
 # 发布构建：运行时性能优先，其次体积；构建时间不重要（CI 上跑）。
 [profile.release]

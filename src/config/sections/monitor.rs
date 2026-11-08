@@ -56,7 +56,7 @@ pub struct TimerSource {
     pub jitter_secs: Option<u64>,
 }
 
-/// 外部流源（只能由主人写进配置文件）。
+/// 外部流源（只能由主人写进配置文件），实现见 `monitor/stream.rs`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct StreamSource {
@@ -267,16 +267,18 @@ pub(in crate::config) fn validate_monitors(
             errors.push(ConfigError::new(format!("{field}.source.timer"), error));
         }
 
-        if let Some(stream) = &monitor.source.stream
-            && !(stream.url.starts_with("ws://")
-                || stream.url.starts_with("wss://")
-                || stream.url.starts_with("http://")
-                || stream.url.starts_with("https://"))
-        {
-            errors.push(ConfigError::new(
-                format!("{field}.source.stream.url"),
-                "must be an http(s) or ws(s) URL",
-            ));
+        // WebSocket 只接受 ws(s)://，SSE 只接受 http(s)://：写反了连接会一直失败。
+        if let Some(stream) = &monitor.source.stream {
+            let (schemes, expected) = match stream.kind {
+                StreamKind::Websocket => (["ws://", "wss://"], "a ws:// or wss:// URL"),
+                StreamKind::Sse => (["http://", "https://"], "an http:// or https:// URL"),
+            };
+            if !schemes.iter().any(|scheme| stream.url.starts_with(scheme)) {
+                errors.push(ConfigError::new(
+                    format!("{field}.source.stream.url"),
+                    format!("must be {expected} for kind = {:?}", stream.kind),
+                ));
+            }
         }
 
         if let Some(internal) = &monitor.source.internal
