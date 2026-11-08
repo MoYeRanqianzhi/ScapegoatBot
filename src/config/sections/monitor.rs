@@ -255,34 +255,15 @@ pub(in crate::config) fn validate_monitors(
             continue;
         };
 
-        if let Some(timer) = &monitor.source.timer {
-            let set = [
-                timer.cron.is_some(),
-                timer.every.is_some(),
-                timer.at.is_some(),
-            ]
-            .into_iter()
-            .filter(|present| *present)
-            .count();
-            if set != 1 {
-                errors.push(ConfigError::new(
-                    format!("{field}.source.timer"),
-                    "must set exactly one of \"cron\", \"every\" or \"at\"",
-                ));
-            }
-            if let Some(every) = &timer.every {
-                match parse_duration_secs(every) {
-                    Some(secs) if secs >= 60 => {}
-                    Some(_) => errors.push(ConfigError::new(
-                        format!("{field}.source.timer.every"),
-                        "must be at least 60s",
-                    )),
-                    None => errors.push(ConfigError::new(
-                        format!("{field}.source.timer.every"),
-                        format!("invalid duration {every:?}"),
-                    )),
-                }
-            }
+        // 与运行时同一个解析器：`at` 的时分范围、cron 的语法与“永远不会匹配”都在这里报错。
+        if let Some(timer) = &monitor.source.timer
+            && let Err(error) = crate::monitor::TimerSpec::parse(
+                timer.cron.as_deref(),
+                timer.every.as_deref(),
+                timer.at.as_deref(),
+            )
+        {
+            errors.push(ConfigError::new(format!("{field}.source.timer"), error));
         }
 
         if let Some(stream) = &monitor.source.stream

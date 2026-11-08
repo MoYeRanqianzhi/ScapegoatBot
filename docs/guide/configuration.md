@@ -176,8 +176,16 @@ deliver = { to = "main", as = "event", batch_window_ms = 200 }
 lifecycle = { idle_only = false, max_events = 1000 }
 ```
 
-`source` 四选一：`qq` / `timer` / `stream` / `internal`。`timer` 支持 `every`、`at`、
-`cron`（5 字段）。运行时也能通过 `Monitor` 工具增删，但重启即消失；配置文件里的才是常驻。
+`source` 四选一：`qq` / `timer` / `stream` / `internal`。`timer` 三选一，都按本地时间：
+
+- `every`：固定周期，至少 `60s`；以上次真正触发的时间为锚点，重启不会让周期漂移。
+- `at = "HH:MM"`：**每天**这个时刻（一次性的提醒用 `lifecycle.one_shot = true`）。
+- `cron`：标准 5 字段（分 时 日 月 周，`0`/`7` 都是周日）。日与周两个字段都写了具体值时，
+  任一满足即触发；任一以 `*` 开头时只看另一个。永远不会匹配的表达式（如 `0 0 30 2 *`）
+  加载时报错。
+- 夏令时跳过的时刻顺延到之后第一个有效分钟；回拨造成的重复时刻只触发较早的一次。
+
+运行时也能通过 `Monitor` 工具增删，但重启即消失；配置文件里的才是常驻。
 
 `when` 是用 `and` 连接的谓词：`event.type == '…'`、`event.chat == '…'`、
 `event.sender == '…'` / `!=`、`event.text contains '…'`、`event.mentions_self`，

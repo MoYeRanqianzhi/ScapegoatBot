@@ -434,7 +434,7 @@ deliver = { to = "main", as = "event" }
             errors
                 .0
                 .iter()
-                .any(|e| e.field == "monitor[0].source.timer.every")
+                .any(|e| e.field == "monitor[0].source.timer" && e.message.contains("60s"))
         );
     }
 

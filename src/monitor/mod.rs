@@ -19,8 +19,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
+use anyhow::Result;
+use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -29,6 +29,11 @@ use crate::config::CatchUp;
 use crate::qq::event::QqEvent;
 use crate::qq::format;
 use crate::storage::Database;
+
+mod timer;
+
+pub use timer::TimerSpec;
+use timer::spawn_timer;
 
 /// 单个 monitor 同时等待投递的任务上限。
 ///
@@ -198,14 +203,6 @@ fn match_term(term: &str, event: &MonitorEvent) -> Result<bool, String> {
 
 fn unquote(value: &str) -> &str {
     value.trim().trim_matches(|c| c == '\'' || c == '"')
-}
-
-/// 定时源。
-#[derive(Debug, Clone)]
-pub enum TimerSpec {
-    Every(Duration),
-    At { hour: u32, minute: u32 },
-    Cron(String),
 }
 
 /// 运行时 monitor。
@@ -732,257 +729,6 @@ async fn deliver_once(
     }
 }
 
-/// 启动定时循环。
-fn spawn_timer(monitor: Arc<Monitor>, sink: Arc<dyn MonitorSink>, timer: TimerSpec) {
-    tokio::spawn(async move {
-        let now = Local::now();
-        // 重启补投：只补一次（`coalesce`），`skip` 直接放弃。
-        if monitor.catch_up == CatchUp::Coalesce
-            && let Some(last) = read_last_fire(monitor.db.as_ref(), &monitor.name)
-        {
-            let missed = missed_occurrences(&timer, last, now);
-            if missed > 0 {
-                let event = MonitorEvent {
-                    text: format!("[timer catch-up] {missed} missed occurrence(s)"),
-                    ..MonitorEvent::default()
-                };
-                deliver_once(&monitor, &*sink, Some(&event), missed, false).await;
-            }
-        }
-        write_last_fire(monitor.db.as_ref(), &monitor.name, now);
-
-        loop {
-            if monitor.cancelled.load(Ordering::SeqCst) {
-                break;
-            }
-            let delay = match &timer {
-                TimerSpec::Every(period) => *period,
-                TimerSpec::At { hour, minute } => match next_local_time(*hour, *minute) {
-                    Some(duration) => duration,
-                    None => break,
-                },
-                TimerSpec::Cron(expression) => {
-                    match CronSchedule::parse(expression)
-                        .and_then(|cron| cron.next_delay(Local::now()))
-                    {
-                        Ok(duration) => duration,
-                        Err(error) => {
-                            sink.deliver(monitor.system_delivery(
-                                "internal",
-                                format!(
-                                    "system: monitor {:?} has an invalid cron expression: {error}",
-                                    monitor.name
-                                ),
-                            ))
-                            .await;
-                            break;
-                        }
-                    }
-                }
-            };
-            tokio::time::sleep(delay).await;
-            if monitor.cancelled.load(Ordering::SeqCst) {
-                break;
-            }
-            write_last_fire(monitor.db.as_ref(), &monitor.name, Local::now());
-            deliver_once(&monitor, &*sink, None, 1, false).await;
-            if monitor.one_shot
-                || monitor.cancelled.load(Ordering::SeqCst)
-                || matches!(timer, TimerSpec::At { .. })
-            {
-                break;
-            }
-        }
-    });
-}
-
-fn last_fire_key(name: &str) -> String {
-    format!("monitor.last:{name}")
-}
-
-fn read_last_fire(db: Option<&Arc<Database>>, name: &str) -> Option<DateTime<Local>> {
-    let db = db?;
-    let raw = db.meta_get(&last_fire_key(name)).ok()??;
-    let text = String::from_utf8(raw).ok()?;
-    let timestamp: i64 = text.trim().parse().ok()?;
-    DateTime::from_timestamp(timestamp, 0).map(|utc| utc.with_timezone(&Local))
-}
-
-fn write_last_fire(db: Option<&Arc<Database>>, name: &str, at: DateTime<Local>) {
-    let Some(db) = db else {
-        return;
-    };
-    let _ = db.meta_set(&last_fire_key(name), at.timestamp().to_string().as_bytes());
-}
-
-/// 计算 `last` 到 `now` 之间错过的触发次数（有上限，避免长停机扫太久）。
-pub(crate) fn missed_occurrences(
-    timer: &TimerSpec,
-    last: DateTime<Local>,
-    now: DateTime<Local>,
-) -> u64 {
-    if now <= last {
-        return 0;
-    }
-    match timer {
-        TimerSpec::Every(period) => {
-            let seconds = (now - last).num_seconds().max(0) as u64;
-            (seconds / period.as_secs().max(1)).min(1_000)
-        }
-        TimerSpec::At { hour, minute } => {
-            let mut count = 0u64;
-            let mut day = last.date_naive();
-            let end = now.date_naive();
-            let mut guard = 0;
-            while day <= end && guard < 400 {
-                if let Some(naive) = day.and_hms_opt(*hour, *minute, 0)
-                    && let Some(at) = Local.from_local_datetime(&naive).single()
-                    && at > last
-                    && at <= now
-                {
-                    count += 1;
-                }
-                let Some(next) = day.succ_opt() else {
-                    break;
-                };
-                day = next;
-                guard += 1;
-            }
-            count
-        }
-        TimerSpec::Cron(expression) => {
-            let Ok(cron) = CronSchedule::parse(expression) else {
-                return 0;
-            };
-            let mut at = last.with_second(0).unwrap_or(last) + chrono::Duration::minutes(1);
-            let mut count = 0u64;
-            let mut guard = 0;
-            while at <= now && guard < 1_440 {
-                if cron.matches(at) {
-                    count += 1;
-                }
-                at += chrono::Duration::minutes(1);
-                guard += 1;
-            }
-            count
-        }
-    }
-}
-
-fn next_local_time(hour: u32, minute: u32) -> Option<Duration> {
-    let now = Local::now();
-    let mut target = Local
-        .with_ymd_and_hms(now.year(), now.month(), now.day(), hour, minute, 0)
-        .single()?;
-    if target <= now {
-        target += chrono::Duration::days(1);
-    }
-    (target - now).to_std().ok()
-}
-
-/// 5 字段 cron（本地时区）：分 时 日 月 周。
-#[derive(Debug, Clone)]
-pub struct CronSchedule {
-    minutes: Vec<u32>,
-    hours: Vec<u32>,
-    days: Vec<u32>,
-    months: Vec<u32>,
-    weekdays: Vec<u32>,
-}
-
-impl CronSchedule {
-    pub fn parse(expression: &str) -> Result<Self, String> {
-        let fields: Vec<&str> = expression.split_whitespace().collect();
-        if fields.len() != 5 {
-            return Err("cron needs 5 fields: minute hour day month weekday".to_owned());
-        }
-        Ok(Self {
-            minutes: parse_field(fields[0], 0, 59)?,
-            hours: parse_field(fields[1], 0, 23)?,
-            days: parse_field(fields[2], 1, 31)?,
-            months: parse_field(fields[3], 1, 12)?,
-            weekdays: parse_field(fields[4], 0, 7)?
-                .into_iter()
-                .map(|day| if day == 7 { 0 } else { day })
-                .collect(),
-        })
-    }
-
-    /// 距离下一次匹配还有多久（最多向前看一年）。
-    pub fn next_delay(&self, from: DateTime<Local>) -> Result<Duration, String> {
-        let mut candidate = (from + chrono::Duration::minutes(1))
-            .with_second(0)
-            .and_then(|time| time.with_nanosecond(0))
-            .ok_or_else(|| "cannot normalize time".to_owned())?;
-        for _ in 0..(366 * 24 * 60) {
-            if self.matches(candidate) {
-                return (candidate - from)
-                    .to_std()
-                    .map_err(|error| error.to_string());
-            }
-            candidate += chrono::Duration::minutes(1);
-        }
-        Err("cron never matches within a year".to_owned())
-    }
-
-    fn matches(&self, time: DateTime<Local>) -> bool {
-        let weekday = time.weekday().num_days_from_sunday();
-        self.minutes.contains(&time.minute())
-            && self.hours.contains(&time.hour())
-            && self.days.contains(&time.day())
-            && self.months.contains(&time.month())
-            && self.weekdays.contains(&weekday)
-    }
-}
-
-/// 解析 cron 字段：`*`、`*/n`、`a-b`、`a-b/n`、逗号列表。
-fn parse_field(field: &str, min: u32, max: u32) -> Result<Vec<u32>, String> {
-    let mut values = Vec::new();
-    for part in field.split(',') {
-        let (range_part, step) = match part.split_once('/') {
-            Some((range, step)) => (
-                range,
-                step.parse::<u32>()
-                    .map_err(|_| format!("invalid step in {part:?}"))?,
-            ),
-            None => (part, 1),
-        };
-        if step == 0 {
-            return Err("cron step must be greater than zero".to_owned());
-        }
-        let (start, end) = if range_part == "*" {
-            (min, max)
-        } else if let Some((start, end)) = range_part.split_once('-') {
-            (
-                start
-                    .parse::<u32>()
-                    .map_err(|_| format!("invalid range start in {part:?}"))?,
-                end.parse::<u32>()
-                    .map_err(|_| format!("invalid range end in {part:?}"))?,
-            )
-        } else {
-            let value = range_part
-                .parse::<u32>()
-                .map_err(|_| format!("invalid value in {part:?}"))?;
-            (value, value)
-        };
-        if start < min || end > max || start > end {
-            return Err(format!("cron value out of range in {part:?}"));
-        }
-        let mut value = start;
-        while value <= end {
-            values.push(value);
-            value += step;
-        }
-    }
-    values.sort_unstable();
-    values.dedup();
-    if values.is_empty() {
-        return Err("cron field is empty".to_owned());
-    }
-    Ok(values)
-}
-
 /// 从配置构造长期常驻 monitor。
 pub async fn load_config_monitors(
     manager: &Arc<MonitorManager>,
@@ -994,18 +740,13 @@ pub async fn load_config_monitors(
         let (source, timer) = if monitor.source.qq.is_some() {
             ("qq".to_owned(), None)
         } else if let Some(timer) = &monitor.source.timer {
-            let spec = if let Some(every) = &timer.every {
-                let seconds =
-                    crate::config::parse_duration_secs(every).context("timer.every is invalid")?;
-                TimerSpec::Every(Duration::from_secs(seconds))
-            } else if let Some(at) = &timer.at {
-                parse_at(at).context("timer.at is invalid")?
-            } else if let Some(cron) = &timer.cron {
-                CronSchedule::parse(cron).map_err(|error| anyhow::anyhow!(error))?;
-                TimerSpec::Cron(cron.clone())
-            } else {
-                continue;
-            };
+            // 配置校验已经调用过同一个解析器；这里再出错只可能是绕过了校验。
+            let spec = TimerSpec::parse(
+                timer.cron.as_deref(),
+                timer.every.as_deref(),
+                timer.at.as_deref(),
+            )
+            .map_err(|error| anyhow::anyhow!("monitor {:?}: {error}", monitor.name))?;
             ("timer".to_owned(), Some(spec))
         } else if let Some(internal) = &monitor.source.internal {
             (format!("internal:{}", internal.kind), None)
@@ -1083,14 +824,6 @@ pub async fn load_config_monitors(
     Ok(())
 }
 
-fn parse_at(raw: &str) -> Result<TimerSpec> {
-    let (hour, minute) = raw.split_once(':').context("timer.at must be HH:MM")?;
-    Ok(TimerSpec::At {
-        hour: hour.parse().context("invalid hour")?,
-        minute: minute.parse().context("invalid minute")?,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1150,48 +883,6 @@ mod tests {
         );
         assert!(!matches(Some("event.chat == 'private:1'"), &event).unwrap());
         assert!(matches(Some("event.nonexistent"), &event).is_err());
-    }
-
-    #[test]
-    fn cron_parser_handles_ranges_steps_and_lists() {
-        let schedule = CronSchedule::parse("*/15 9-11 * * 1-5").unwrap();
-        assert_eq!(schedule.minutes, vec![0, 15, 30, 45]);
-        assert_eq!(schedule.hours, vec![9, 10, 11]);
-        assert_eq!(schedule.weekdays, vec![1, 2, 3, 4, 5]);
-        assert!(CronSchedule::parse("* * *").is_err());
-        assert!(CronSchedule::parse("60 * * * *").is_err());
-    }
-
-    #[test]
-    fn cron_next_delay_is_within_a_minute() {
-        let schedule = CronSchedule::parse("* * * * *").unwrap();
-        assert!(schedule.next_delay(Local::now()).unwrap() <= Duration::from_secs(60));
-    }
-
-    #[test]
-    fn catch_up_counts_missed_occurrences() {
-        let last = Local.with_ymd_and_hms(2026, 11, 4, 0, 0, 0).unwrap();
-        let now = last + chrono::Duration::minutes(5);
-        assert_eq!(
-            missed_occurrences(&TimerSpec::Every(Duration::from_secs(60)), last, now),
-            5
-        );
-        assert_eq!(
-            missed_occurrences(&TimerSpec::Cron("* * * * *".to_owned()), last, now),
-            5
-        );
-        // 时间倒过来不计。
-        assert_eq!(
-            missed_occurrences(&TimerSpec::Every(Duration::from_secs(60)), now, last),
-            0
-        );
-        // 每天固定时刻：跨两天补两次。
-        let last = Local.with_ymd_and_hms(2026, 11, 2, 10, 0, 0).unwrap();
-        let now = Local.with_ymd_and_hms(2026, 11, 4, 10, 30, 0).unwrap();
-        assert_eq!(
-            missed_occurrences(&TimerSpec::At { hour: 9, minute: 0 }, last, now),
-            2
-        );
     }
 
     /// 模型可以写任意大的 `expires`；以前 `Local::now() + duration` 溢出会 panic，

@@ -13,7 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::monitor::{CronSchedule, MonitorManager, MonitorSpec, TimerSpec};
+use crate::monitor::{MonitorManager, MonitorSpec, TimerSpec};
 use crate::transcript::ToolResult;
 
 use super::{Tool, ToolContext, arg_opt_str, arg_str, object_schema};
@@ -42,7 +42,8 @@ impl Tool for MonitorTool {
          optional lifecycle.\n\n\
          source — exactly one kind: {\"qq\": true} for inbound QQ events; \
          {\"timer\": {\"every\": \"10m\"}} or {\"timer\": {\"cron\": \"7 9 * * 1-5\"}} or \
-         {\"timer\": {\"at\": \"09:07\"}} in local time (every needs at least 60s); \
+         {\"timer\": {\"at\": \"09:07\"}} every day, all in local time (every needs at least \
+         60s; when a cron restricts both day and weekday, either one matching is enough); \
          {\"internal\": \"security\" | \"budget\" | \"agent\" | \"storage\"} for runtime state \
          changes. A stream source is config-file only; add rejects it.\n\n\
          when — optional expression over event.*, e.g. event.mentions_self, \
@@ -129,9 +130,9 @@ impl MonitorTool {
         } else if source.get("qq").is_some() {
             ("qq".to_owned(), None)
         } else if let Some(timer) = source.get("timer") {
-            match parse_timer(timer) {
+            match TimerSpec::from_json(timer) {
                 Ok(spec) => ("timer".to_owned(), Some(spec)),
-                Err(error) => return error,
+                Err(error) => return ToolResult::error(error),
             }
         } else if let Some(internal) = source.get("internal").and_then(Value::as_str) {
             if !["security", "budget", "agent", "storage"].contains(&internal) {
@@ -228,45 +229,6 @@ impl MonitorTool {
             Err(error) => ToolResult::error(error.to_string()),
         }
     }
-}
-
-fn parse_timer(value: &Value) -> Result<TimerSpec, ToolResult> {
-    let set = ["cron", "every", "at"]
-        .iter()
-        .filter(|key| value.get(**key).is_some())
-        .count();
-    if set != 1 {
-        return Err(ToolResult::error(
-            "timer must set exactly one of cron, every, at.",
-        ));
-    }
-    if let Some(every) = value.get("every").and_then(Value::as_str) {
-        let seconds = crate::config::parse_duration_secs(every)
-            .ok_or_else(|| ToolResult::error(format!("invalid duration {every:?}")))?;
-        if seconds < 60 {
-            return Err(ToolResult::error("timer.every must be at least 60s."));
-        }
-        return Ok(TimerSpec::Every(Duration::from_secs(seconds)));
-    }
-    if let Some(at) = value.get("at").and_then(Value::as_str) {
-        let (hour, minute) = at
-            .split_once(':')
-            .ok_or_else(|| ToolResult::error("timer.at must be HH:MM"))?;
-        return Ok(TimerSpec::At {
-            hour: hour
-                .parse()
-                .map_err(|_| ToolResult::error("invalid hour"))?,
-            minute: minute
-                .parse()
-                .map_err(|_| ToolResult::error("invalid minute"))?,
-        });
-    }
-    let cron = value
-        .get("cron")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    CronSchedule::parse(cron).map_err(ToolResult::error)?;
-    Ok(TimerSpec::Cron(cron.to_owned()))
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::{Permission, Tool, ToolContext, arg_opt_str, arg_str, object_schema};
-use crate::monitor::{CronSchedule, MonitorManager, MonitorSpec, TimerSpec};
+use crate::monitor::{MonitorManager, MonitorSpec, TimerSpec};
 use crate::swarm::{AgentHub, AgentType};
 use crate::transcript::ToolResult;
 
@@ -58,33 +58,8 @@ impl AgentTool {
         let (kind, timer) = if source.get("qq").is_some() {
             ("qq".to_owned(), None)
         } else if let Some(timer) = source.get("timer") {
-            if let Some(every) = timer.get("every").and_then(serde_json::Value::as_str) {
-                let seconds = crate::config::parse_duration_secs(every)
-                    .ok_or_else(|| anyhow::anyhow!("invalid timer.every {every:?}"))?;
-                if seconds < 60 {
-                    anyhow::bail!("timer.every must be at least 60s");
-                }
-                (
-                    "timer".to_owned(),
-                    Some(TimerSpec::Every(std::time::Duration::from_secs(seconds))),
-                )
-            } else if let Some(cron) = timer.get("cron").and_then(serde_json::Value::as_str) {
-                CronSchedule::parse(cron).map_err(|error| anyhow::anyhow!(error))?;
-                ("timer".to_owned(), Some(TimerSpec::Cron(cron.to_owned())))
-            } else if let Some(at) = timer.get("at").and_then(serde_json::Value::as_str) {
-                let (hour, minute) = at
-                    .split_once(':')
-                    .ok_or_else(|| anyhow::anyhow!("timer.at must be HH:MM"))?;
-                (
-                    "timer".to_owned(),
-                    Some(TimerSpec::At {
-                        hour: hour.parse()?,
-                        minute: minute.parse()?,
-                    }),
-                )
-            } else {
-                anyhow::bail!("timer requires every, cron or at");
-            }
+            let spec = TimerSpec::from_json(timer).map_err(|error| anyhow::anyhow!(error))?;
+            ("timer".to_owned(), Some(spec))
         } else if let Some(internal) = source.get("internal").and_then(serde_json::Value::as_str) {
             (format!("internal:{internal}"), None)
         } else {
