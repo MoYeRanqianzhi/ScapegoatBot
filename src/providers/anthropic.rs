@@ -39,11 +39,15 @@ impl AnthropicProvider {
 
     /// 请求体构造，独立成函数便于单元测试。
     pub fn build_body(request: &LlmRequest) -> Value {
+        let mut messages = messages_json(&request.messages);
+        if request.cache_history {
+            mark_history_cacheable(&mut messages);
+        }
         let mut body = json!({
             "model": request.model,
             "max_tokens": request.max_tokens,
             "stream": true,
-            "messages": messages_json(&request.messages),
+            "messages": messages,
         });
 
         if !request.system.is_empty() {
@@ -94,6 +98,12 @@ fn system_json(blocks: &[SystemBlock]) -> Vec<Value> {
         .collect()
 }
 
+/// 历史 → `messages`。
+///
+/// 回放时跳过 API 会以 400 拒绝的块：空白文本块、没有签名的 thinking 块（例如回退链里
+/// 别的协议产生的推理摘要，或流中断时没拿到签名）。一条消息因此变空时整条跳过——
+/// Messages API 会把相邻的同角色消息合并成一轮，跳过不会破坏轮次交替；空消息里也
+/// 不可能有 `tool_use`，工具调用与结果的配对不受影响。
 fn messages_json(messages: &[super::ProviderMessage]) -> Vec<Value> {
     let mut out = Vec::with_capacity(messages.len());
     for message in messages {
@@ -101,10 +111,53 @@ fn messages_json(messages: &[super::ProviderMessage]) -> Vec<Value> {
             Role::User => "user",
             Role::Assistant => "assistant",
         };
-        let content: Vec<Value> = message.content.iter().map(block_json).collect();
+        let content: Vec<Value> = message
+            .content
+            .iter()
+            .filter(|block| replayable(block))
+            .map(block_json)
+            .collect();
+        if content.is_empty() {
+            continue;
+        }
         out.push(json!({ "role": role, "content": content }));
     }
     out
+}
+
+/// 这个块能否原样回放给 Anthropic。
+fn replayable(block: &ContentBlock) -> bool {
+    match block {
+        ContentBlock::Text { text } => !text.trim().is_empty(),
+        ContentBlock::Thinking { signature, .. } => signature
+            .as_deref()
+            .is_some_and(|signature| !signature.is_empty()),
+        _ => true,
+    }
+}
+
+/// 在最后一条消息的最后一个块上打缓存断点，让整段对话历史成为可缓存前缀。
+///
+/// 下一次请求只在末尾追加了几个块；服务端会在断点之前约 20 个块边界内查找已写入的
+/// 前缀，于是工具循环的每一步都命中上一步写下的缓存。thinking 块不能带
+/// `cache_control`，遇到时不打断点（静态 system 前缀的断点仍在）。
+fn mark_history_cacheable(messages: &mut [Value]) {
+    let Some(block) = messages
+        .last_mut()
+        .and_then(|message| message.get_mut("content"))
+        .and_then(Value::as_array_mut)
+        .and_then(|content| content.last_mut())
+    else {
+        return;
+    };
+    let kind = block
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(kind, "thinking" | "redacted_thinking") {
+        return;
+    }
+    block["cache_control"] = json!({ "type": "ephemeral" });
 }
 
 fn block_json(block: &ContentBlock) -> Value {
@@ -152,6 +205,42 @@ struct StreamState {
     stop_sent: bool,
     stop_reason: Option<StopReason>,
     refusal: Option<RefusalDetails>,
+    /// 正在接收参数的服务端工具调用（`server_tool_use` 块）。
+    server_tool: Option<PendingServerTool>,
+}
+
+/// 服务端工具调用的参数和普通工具一样，通过 `input_json_delta` 分段到达
+/// （`content_block_start` 里的 `input` 是空对象）；块结束时才拼出完整参数。
+#[derive(Debug)]
+struct PendingServerTool {
+    index: u32,
+    id: String,
+    name: String,
+    /// `content_block_start` 自带的 `input`；没有收到任何分段时用它。
+    initial: Value,
+    json: String,
+}
+
+impl PendingServerTool {
+    /// 拼好的参数事件；分段 JSON 解析失败时退回块开始时的 `input` 并记日志。
+    fn into_event(self) -> ProviderEvent {
+        let input = if self.json.trim().is_empty() {
+            self.initial
+        } else {
+            match serde_json::from_str(&self.json) {
+                Ok(input) => input,
+                Err(error) => {
+                    tracing::warn!(%error, tool = %self.name, "cannot parse server tool input");
+                    self.initial
+                }
+            }
+        };
+        ProviderEvent::ServerToolUse {
+            id: self.id,
+            name: self.name,
+            input,
+        }
+    }
 }
 
 impl StreamState {
@@ -219,10 +308,16 @@ impl StreamState {
                         });
                     }
                     "server_tool_use" => {
-                        out.push(ProviderEvent::ServerToolUse {
+                        // 上一个没有收到结束事件的调用先发出去，不丢。
+                        if let Some(previous) = self.server_tool.take() {
+                            out.push(previous.into_event());
+                        }
+                        self.server_tool = Some(PendingServerTool {
+                            index: block_index,
                             id: block["id"].as_str().unwrap_or_default().to_owned(),
                             name: block["name"].as_str().unwrap_or_default().to_owned(),
-                            input: block.get("input").cloned().unwrap_or(Value::Null),
+                            initial: block.get("input").cloned().unwrap_or(Value::Null),
+                            json: String::new(),
                         });
                     }
                     "web_search_tool_result" | "web_fetch_tool_result" => {
@@ -263,13 +358,30 @@ impl StreamState {
                     }
                     "input_json_delta" => {
                         if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
-                            out.push(ProviderEvent::ToolCallArgumentsDelta {
-                                index: block_index,
-                                delta: partial.to_owned(),
-                            });
+                            match &mut self.server_tool {
+                                // 服务端工具的参数留在这里拼，不当成普通工具调用的参数。
+                                Some(pending) if pending.index == block_index => {
+                                    pending.json.push_str(partial);
+                                }
+                                _ => out.push(ProviderEvent::ToolCallArgumentsDelta {
+                                    index: block_index,
+                                    delta: partial.to_owned(),
+                                }),
+                            }
                         }
                     }
                     _ => {}
+                }
+            }
+            "content_block_stop" => {
+                let block_index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+                if self
+                    .server_tool
+                    .as_ref()
+                    .is_some_and(|pending| pending.index == block_index)
+                    && let Some(pending) = self.server_tool.take()
+                {
+                    out.push(pending.into_event());
                 }
             }
             "message_delta" => {
@@ -341,13 +453,20 @@ impl super::StreamDecoder for StreamState {
     }
 
     fn finish(&mut self) -> Vec<ProviderEvent> {
-        if self.stop_sent {
-            return Vec::new();
+        // 收到一半的服务端工具调用也要交出去：结果块可能已经到了，配对不能断。
+        let mut out: Vec<ProviderEvent> = self
+            .server_tool
+            .take()
+            .map(PendingServerTool::into_event)
+            .into_iter()
+            .collect();
+        if !self.stop_sent {
+            out.push(ProviderEvent::Error(ProviderError::new(
+                super::ProviderErrorKind::Network,
+                "stream ended without a stop event",
+            )));
         }
-        vec![ProviderEvent::Error(ProviderError::new(
-            super::ProviderErrorKind::Network,
-            "stream ended without a stop event",
-        ))]
+        out
     }
 }
 
@@ -440,6 +559,7 @@ mod tests {
                 effort: Some("high".to_owned()),
             },
             server_tools: vec![ServerToolKind::WebSearch],
+            cache_history: false,
         }
     }
 
@@ -596,6 +716,95 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn server_tool_input_is_assembled_from_deltas() {
+        let mut state = StreamState::default();
+        let start = feed(
+            &mut state,
+            json!({
+                "type": "content_block_start", "index": 1,
+                "content_block": {"type": "server_tool_use", "id": "srvtoolu_1",
+                                  "name": "web_search", "input": {}}
+            }),
+        );
+        assert!(
+            start.is_empty(),
+            "the call is emitted once its input is complete"
+        );
+        for part in ["{\"query\": \"rust ", "2024 edition\"}"] {
+            let events = feed(
+                &mut state,
+                json!({"type": "content_block_delta", "index": 1,
+                       "delta": {"type": "input_json_delta", "partial_json": part}}),
+            );
+            assert!(
+                events.is_empty(),
+                "server tool arguments are not tool-call deltas"
+            );
+        }
+        let events = feed(
+            &mut state,
+            json!({"type": "content_block_stop", "index": 1}),
+        );
+        assert_eq!(
+            events,
+            vec![ProviderEvent::ServerToolUse {
+                id: "srvtoolu_1".to_owned(),
+                name: "web_search".to_owned(),
+                input: json!({"query": "rust 2024 edition"}),
+            }]
+        );
+    }
+
+    #[test]
+    fn unreplayable_blocks_are_dropped_and_history_is_cacheable() {
+        let mut request = request();
+        request.messages = vec![
+            super::super::ProviderMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "hi".to_owned(),
+                }],
+            },
+            // 只有空白文本和没签名的 thinking：整条跳过。
+            super::super::ProviderMessage {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        text: "summary from another protocol".to_owned(),
+                        signature: None,
+                    },
+                    ContentBlock::Text {
+                        text: "  ".to_owned(),
+                    },
+                ],
+            },
+            super::super::ProviderMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: "again".to_owned(),
+                }],
+            },
+        ];
+        request.cache_history = true;
+        let body = AnthropicProvider::build_body(&request);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        assert!(messages.iter().all(|message| message["role"] == "user"));
+        // 断点打在最后一个块上；一次性请求不打。
+        assert_eq!(
+            messages[1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        request.cache_history = false;
+        let body = AnthropicProvider::build_body(&request);
+        assert!(
+            body["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
     }
 
     #[test]

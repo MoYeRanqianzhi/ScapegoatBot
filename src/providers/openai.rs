@@ -396,6 +396,7 @@ mod tests {
                 effort: Some("xhigh".to_owned()),
             },
             server_tools: vec![super::super::ServerToolKind::WebSearch],
+            cache_history: false,
         }
     }
 

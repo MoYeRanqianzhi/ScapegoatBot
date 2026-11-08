@@ -40,6 +40,7 @@ fn live_request(model: &str) -> LlmRequest {
         max_tokens: 64,
         thinking: ThinkingOptions::default(),
         server_tools: Vec::new(),
+        cache_history: false,
     }
 }
 

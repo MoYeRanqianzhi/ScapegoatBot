@@ -611,6 +611,8 @@ impl AgentLoop {
             max_tokens: self.config.max_tokens,
             thinking: self.config.thinking.clone(),
             server_tools: self.config.server_tools.clone(),
+            // 多步循环：下一次请求会复用这段历史前缀。
+            cache_history: true,
         }
     }
 

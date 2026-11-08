@@ -401,6 +401,7 @@ mod tests {
                 effort: Some("max".to_owned()),
             },
             server_tools: Vec::new(),
+            cache_history: false,
         }
     }
 

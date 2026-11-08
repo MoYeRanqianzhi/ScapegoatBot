@@ -333,6 +333,9 @@ key 放 `auth.json`：
 - `cost` 是每百万 token 的美元价：`input`、`output`，以及可选的 `cache_read`（命中缓存的输入）、
   `cache_write`（写入缓存的输入）。后两项没写时按 `input` 计——预算宁可多算。
 - `sbot model set` 热切换后，新模型的 `context_window`、图片能力与价格立即生效。
+- 提示缓存：Anthropic 协议在静态 system 前缀与（agent 循环的）对话历史末尾各打一个缓存断点，
+  工具循环的每一步都命中上一步写下的前缀；摘要、审查这类一次性请求不打历史断点。
+  OpenAI 兼容接口由服务端自动缓存。
 - `base_url` 留空时由各 provider 用自己的默认地址（Anthropic 官方；OpenAI 兼容
   端点通常必须显式配置）。
 - `models.json` 不存在时只使用内置清单（`assets/models.default.json`）；存在时按

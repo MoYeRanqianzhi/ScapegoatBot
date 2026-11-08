@@ -135,6 +135,11 @@ pub struct LlmRequest {
     pub max_tokens: u32,
     pub thinking: ThinkingOptions,
     pub server_tools: Vec<ServerToolKind>,
+    /// 把对话历史也标为可缓存（Anthropic 在最后一个块上打缓存断点）。
+    ///
+    /// 多步循环的下一次请求会命中这段前缀；一次性请求（摘要、审查、分类）不会复用，
+    /// 写缓存只多付一笔写入费，所以由调用方决定。OpenAI 兼容接口自动缓存，忽略此项。
+    pub cache_history: bool,
 }
 
 /// provider 流事件。
@@ -358,6 +363,7 @@ pub async fn complete_text(
         max_tokens,
         thinking: ThinkingOptions::default(),
         server_tools: Vec::new(),
+        cache_history: false,
     };
     let mut receiver = provider
         .stream(request)

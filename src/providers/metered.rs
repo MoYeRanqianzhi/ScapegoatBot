@@ -134,6 +134,7 @@ mod tests {
             max_tokens: 16,
             thinking: Default::default(),
             server_tools: Vec::new(),
+            cache_history: false,
         }
     }
 
