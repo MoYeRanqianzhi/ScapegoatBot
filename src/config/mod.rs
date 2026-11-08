@@ -511,6 +511,20 @@ deliver = { to = "main", as = "prompt" }
     }
 
     #[test]
+    fn retired_skills_shared_dir_fails_with_a_migration_hint() {
+        let config: SbotConfig =
+            toml::from_str("[skills]\nshared_dir = \"~/.sbot/skills\"\n").unwrap();
+        let errors = config.validate_shape().unwrap_err();
+        assert!(
+            errors.0.iter().any(
+                |error| error.field == "skills.shared_dir" && error.message.contains("removed")
+            )
+        );
+        // 序列化（/config 视图、persist）不会把它写回去。
+        assert!(!toml::to_string(&config).unwrap().contains("shared_dir"));
+    }
+
+    #[test]
     fn rewrite_hook_requires_valid_regex() {
         let mut hooks = HooksConfig::default();
         hooks.events.push(EventHookConfig {

@@ -40,7 +40,6 @@ fn run_with_paths(
         );
     }
 
-    let skills_dir = paths.resolve(&loaded.config.skills.shared_dir, &loaded.dir);
     let agents_dir = paths.resolve(&loaded.config.swarm.agents_dir, &loaded.dir);
 
     let output = output.unwrap_or_else(|| {
@@ -52,7 +51,6 @@ fn run_with_paths(
     // 归档目录不能落在被复制的目录里，否则复制会递归包含正在写入的归档。
     for (name, source) in [
         ("storage.path", &data_dir),
-        ("skills.shared_dir", &skills_dir),
         ("swarm.agents_dir", &agents_dir),
     ] {
         if output.starts_with(source) {
@@ -136,8 +134,7 @@ fn run_with_paths(
         (data_dir.join("messages"), "messages"),
         (data_dir.join("sessions"), "sessions"),
         (data_dir.join("blobs"), "blobs"),
-        // 技能与子代理定义可能在根目录，也可能被配置指到别处。
-        (skills_dir, "skills"),
+        // 宿主机上的子代理定义（`[swarm].agents_dir`）；技能在 VFS 里，已随数据库快照。
         (agents_dir, "agents"),
     ] {
         if source.exists() {

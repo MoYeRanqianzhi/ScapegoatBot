@@ -127,10 +127,10 @@ review_model = ""
 topics = true
 
 [skills]
-shared_dir = "~/.sbot/skills"
+# 技能存放在 VFS 的 /skills，随数据库一起备份。
 curator = true
 curator_interval_hours = 168
-curator_min_new_skills = 2
+curator_min_new_skills = 3
 
 [style]
 enabled = true

@@ -147,7 +147,7 @@ token 放在 `env` 里：agent 读到的 `/config/mcp` 与 `/config.toml` 把 `e
 | 节 | 关键键 | 说明 |
 |----|--------|------|
 | `[memory]` | `enabled`、`review = off\|idle\|every_turn`、`idle_minutes`、`review_interval_minutes`、字符预算 | 记忆索引与后台复盘 |
-| `[skills]` | `shared_dir`、`curator`、`curator_interval_hours`、`curator_min_new_skills` | 技能加载与归档 |
+| `[skills]` | `curator`、`curator_interval_hours`、`curator_min_new_skills` | 技能归档（技能本身在 VFS 的 `/skills`；`shared_dir` 已在 0.2.0-alpha.40 移除） |
 | `[style]` | `enabled`、`profile_path`、`max_chars` | 语气画像 |
 
 ### `[swarm]`

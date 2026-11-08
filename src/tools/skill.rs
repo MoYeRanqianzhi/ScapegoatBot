@@ -346,12 +346,10 @@ mod tests {
             )
             .unwrap();
 
-        let config = crate::config::SkillsConfig {
-            curator: true,
-            curator_interval_hours: 168,
-            curator_min_new_skills: 1,
-            ..crate::config::SkillsConfig::default()
-        };
+        let mut config = crate::config::SkillsConfig::default();
+        config.curator = true;
+        config.curator_interval_hours = 168;
+        config.curator_min_new_skills = 1;
         let report = curate(&vfs, &db, &config).unwrap();
         assert_eq!(report.archived, vec!["old".to_owned()]);
         assert!(vfs.stat(&VfsPath::parse("/skills/old").unwrap()).is_err());
