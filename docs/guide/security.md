@@ -228,6 +228,10 @@ action 只接受注册表声明过的参数（`api.help` 可查），未声明�
   HKDF 从主密钥派生。
 - 文件头记录算法；改 `[storage].encryption` 不会让旧历史失效。
 - `~/.sbot/key` 是唯一秘密，权限 0600；`sbot backup` **包含它**。
+- 日志写出前遮蔽 `access_token=…` 与 `Bearer …`（NapCat 连接地址会带 token）；`auth.json`
+  解析失败只报错误类别与行列，不引用原文。
+- 控制通道：Windows 命名管道带只允许当前用户的安全描述符；Unix 套接字放在只有当前用户
+  能进入的目录（`$XDG_RUNTIME_DIR` 或 `~/.sbot/run`），不放共享的临时目录。
 - `sbot.toml` 里唯一可能带密钥的是 `[[mcp.servers]].env`：agent 的配置视图遮蔽这些值；
   agent 写配置时临时文件只给属主读写，rename 前复制原文件的权限，不会放宽 `0600`。
 - 索引（SQLite）与路径是明文元数据：能看出“谁在什么时候聊过”，看不到内容。

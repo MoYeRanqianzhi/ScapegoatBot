@@ -64,8 +64,26 @@ impl AuthFile {
     }
 
     /// 解析 JSON 文本。
-    pub fn parse(text: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(text)
+    ///
+    /// 错误只报类别与位置，不带 serde 的原始信息：后者会引用出错的值或字段名
+    /// （`invalid type: integer 12345…`、``unknown field `sk-…` ``），而这个文件里
+    /// 的值就是密钥，错误信息会进日志、`sbot doctor` 的输出和 issue。
+    pub fn parse(text: &str) -> Result<Self, String> {
+        serde_json::from_str(text).map_err(|error| {
+            let kind = match error.classify() {
+                serde_json::error::Category::Io => "cannot read the JSON",
+                serde_json::error::Category::Syntax => "invalid JSON syntax",
+                serde_json::error::Category::Data => {
+                    "a field or value does not match the expected structure"
+                }
+                serde_json::error::Category::Eof => "unexpected end of file",
+            };
+            format!(
+                "{kind} at line {} column {} (details omitted: they could quote a secret)",
+                error.line(),
+                error.column()
+            )
+        })
     }
 
     /// 取某个 provider 的 key。
@@ -131,6 +149,24 @@ mod tests {
         let auth = AuthFile::parse(r#"{"providers": {"a": {"api_key": "x"}}}"#).unwrap();
         let missing = auth.missing_providers(["a".to_owned(), "b".to_owned(), "b".to_owned()]);
         assert_eq!(missing, vec!["b".to_owned()]);
+    }
+
+    #[test]
+    fn parse_errors_never_quote_the_file() {
+        for text in [
+            // 类型错误：serde 会引用这个数字。
+            r#"{"providers": {"a": {"api_key": 987654321987}}}"#,
+            // 写错位置的密钥：serde 会把它当成未知字段名引用出来。
+            r#"{"providers": {"a": {"sk-987654321987": "x"}}}"#,
+            // 未知枚举/字段值同理。
+            r#"{"napcat": "sk-987654321987"}"#,
+        ] {
+            let error = AuthFile::parse(text).unwrap_err();
+            assert!(!error.contains("987654321987"), "{error}");
+            assert!(error.contains("line 1"), "{error}");
+        }
+        let syntax = AuthFile::parse("{\"providers\": ").unwrap_err();
+        assert!(syntax.contains("end of file"), "{syntax}");
     }
 
     #[test]

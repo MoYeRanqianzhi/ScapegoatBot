@@ -264,11 +264,13 @@ impl Endpoint {
         }
         #[cfg(unix)]
         {
-            // 优先 XDG_RUNTIME_DIR（用户私有、重启清空），回退临时目录并按 uid 区分。
+            // 优先 XDG_RUNTIME_DIR（用户私有、重启清空），回退 `~/.sbot/run`。
+            // 不回退共享的临时目录：其他用户可以在那里抢先放一个同名套接字，
+            // 守护进程起不来，`sbot` 客户端还会把控制命令与审批码发给对方。
             let dir = std::env::var_os("XDG_RUNTIME_DIR")
+                .filter(|dir| !dir.is_empty())
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir);
-            let _ = paths;
+                .unwrap_or_else(|| paths.run_dir());
             Self::Socket(dir.join(format!("{}.sock", config.name)))
         }
     }

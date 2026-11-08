@@ -117,6 +117,9 @@ sbot resume          # 删除 ESTOP
 - 守护进程没跑：先 `sbot start`；
 - 自定义了 `[ipc].name`：CLI 会读同一份配置，确保命令与进程用的是同一份；
 - Windows 下同名管道被旧进程占用：`sbot stop` 后重试。
+- Unix 下套接字在 `$XDG_RUNTIME_DIR/<name>.sock`，没有这个变量时在 `~/.sbot/run/<name>.sock`；
+  守护进程与 CLI 必须看到同一个 `XDG_RUNTIME_DIR`（例如 systemd 用户服务与登录 shell）。
+  所在目录必须只有当前用户能进入，启动时会收紧到 0700，收紧不了就拒绝启动。
 
 ## 提交问题前
 

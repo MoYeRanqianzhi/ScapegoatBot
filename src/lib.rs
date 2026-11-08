@@ -16,6 +16,8 @@ pub mod hooks;
 pub(crate) mod ipc;
 // LLM 公共类型：provider 与 agent 共享的用量、停止原因与拒绝细节。
 pub(crate) mod llm;
+// 日志初始化：写出前遮蔽凭据（`main.rs` 调用）。
+pub mod logging;
 // MCP 可选，默认关闭；启用时由 app 连接 stdio 服务器。
 pub(crate) mod mcp;
 // 后台复盘：记忆候选与 /STYLE.md；只在空闲时运行。

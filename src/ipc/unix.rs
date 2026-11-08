@@ -2,9 +2,11 @@
 //!
 //! 设计依据：设计 §2.2。
 //!
-//! - 路径优先 `$XDG_RUNTIME_DIR/<name>.sock`，回退临时目录。
+//! - 路径优先 `$XDG_RUNTIME_DIR/<name>.sock`，回退 `~/.sbot/run/<name>.sock`。
+//! - 所在目录必须只有当前用户能进入（0700）：别人既不能抢先放同名套接字，也不能
+//!   在 bind 与 chmod 之间连进来。
 //! - 启动时先探测：能连上说明已有实例，拒绝启动；连不上说明是陈旧文件，删除后重新 bind。
-//! - 权限设置为 0600，只允许当前用户连接。
+//! - 套接字本身再设为 0600。
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -24,8 +26,7 @@ pub async fn serve(
     shutdown: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
+        ensure_private_dir(parent)?;
     }
 
     // 先判断是否为陈旧套接字：能连上 = 已有实例；连不上 = 可以安全删除。
@@ -57,6 +58,35 @@ pub async fn serve(
         warn!(%error, path = %path.display(), "cannot remove socket on shutdown");
     }
     result
+}
+
+/// 确保 `dir` 存在且只有当前用户能进入。
+///
+/// 新建时直接用 0700；已存在但对其他用户开放时收紧到 0700。收紧失败（目录不属于
+/// 当前用户）就拒绝启动——在别人控制的目录里放控制套接字不安全。
+fn ensure_private_dir(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("cannot create {}", dir.display()))?;
+    let mode = std::fs::metadata(dir)
+        .with_context(|| format!("cannot inspect {}", dir.display()))?
+        .permissions()
+        .mode();
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).with_context(
+            || {
+                format!(
+                    "{} is accessible to other users and cannot be made private; \
+                     set XDG_RUNTIME_DIR to a directory only you can enter",
+                    dir.display()
+                )
+            },
+        )?;
+    }
+    Ok(())
 }
 
 async fn accept_loop(
