@@ -125,6 +125,18 @@ impl Views {
                 "configuration is not attached".to_owned(),
             ));
         };
+        // hold 意味着上下文可能已被注入：此时改配置（放宽过滤、改技能目录、
+        // 换模型……）会把一次注入变成持久的设置，等 hold 解除后仍然生效。
+        if self
+            .context
+            .gate
+            .as_ref()
+            .is_some_and(|gate| gate.hold_active())
+        {
+            return Err(VfsError::Storage(
+                crate::tools::CONFIG_HOLD_DISABLED.to_owned(),
+            ));
+        }
         let path = {
             let guard = handle.read().expect("config lock poisoned");
             guard.path.clone()

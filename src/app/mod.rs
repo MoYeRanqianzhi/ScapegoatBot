@@ -571,7 +571,7 @@ impl AgentRuntime {
             .filter
             .read()
             .expect("filter lock poisoned")
-            .check(message, self.self_id)
+            .check(message, self.self_id, self.owner_qq)
             .is_accept();
         if !accept {
             self.filtered.fetch_add(1, Ordering::Relaxed);

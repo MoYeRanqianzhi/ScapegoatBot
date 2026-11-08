@@ -76,6 +76,7 @@ access token 在 `auth.json`，不在这里。
 ### `[filter]`：准入门
 
 语义是**拒收**：命中的消息不写 JSONL、不进 inbox、不进 transcript，monitor 也看不到。
+`owner_qq` 的消息不受过滤：主人的话总会进 inbox，看不看、醒不醒由 agent 的 monitor 决定。
 
 | 键 | 默认 | 说明 |
 |----|------|------|

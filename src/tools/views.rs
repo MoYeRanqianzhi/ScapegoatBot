@@ -841,6 +841,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_is_read_only_during_hold() {
+        let (mut views, dir) = views();
+        let gate = Arc::new(crate::security::gate::Gate::from_config(
+            &crate::config::GuardConfig {
+                enabled: true,
+                backend: crate::config::GuardBackend::Off,
+                ..crate::config::GuardConfig::default()
+            },
+            None,
+            None,
+            crate::security::gate::hold_path(dir.path()),
+        ));
+        views.context.gate = Some(Arc::clone(&gate));
+        gate.force_hold("test");
+        let error = views
+            .write_config(&target("/config/filter/ignore_users"), "[2]")
+            .unwrap_err();
+        assert!(error.to_string().contains("during hold"), "{error}");
+    }
+
+    #[tokio::test]
     async fn config_writes_notify_hot_reload() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let (views, _dir) = views();

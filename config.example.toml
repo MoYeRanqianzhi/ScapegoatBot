@@ -51,6 +51,7 @@ url = "ws://127.0.0.1:3001"
 
 [filter]
 # 准入是“拒收”：命中的消息不写 JSONL、不进 inbox、不进 transcript。
+# owner_qq 的消息不受过滤，总会进 inbox。
 ignore_groups = []
 ignore_users = []
 ignore_patterns = []

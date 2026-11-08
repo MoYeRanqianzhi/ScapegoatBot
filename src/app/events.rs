@@ -78,11 +78,7 @@ impl MonitorSink for RunnerSink {
                         .spawn(
                             Some("general"),
                             None,
-                            format!(
-                                "[monitor {}]
-{}",
-                                delivery.name, delivery.text
-                            ),
+                            format!("[monitor {}]\n{}", delivery.name, delivery.text),
                             0,
                             crate::transcript::TurnEvidence::monitor(),
                         )

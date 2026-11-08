@@ -10,6 +10,9 @@
 
 /// `hold` 生效期间拒绝 QQ 操作（`napcat.*`）的统一文案。
 pub(crate) const HOLD_DISABLED: &str = "Disabled during hold";
+/// `hold` 生效期间拒绝写 `/config` 的统一文案。
+pub(crate) const CONFIG_HOLD_DISABLED: &str = "Configuration is read-only during hold: \
+    resolve the hold first (see `agent.status`).";
 /// 动态视图只读的统一提示。
 pub(crate) const DYNAMIC_READ_ONLY: &str = "Dynamic views are read-only.";
 /// 运行时未挂载动态视图时的统一提示。
@@ -130,7 +133,7 @@ pub struct ToolRegistry {
     /// 执行上下文；`None` 只用于不依赖 VFS 的测试工具。
     vfs: Option<Arc<VfsStore>>,
     views: Option<Arc<views::Views>>,
-    /// 安全闸；`hold` 期间只有 API 的 `napcat.*` 分支拒绝。
+    /// 安全闸；`hold` 期间 API 的 `napcat.*` 分支与 `/config` 写入拒绝。
     gate: Option<Arc<crate::security::gate::Gate>>,
     /// 只读 `API` 的替身；docs 等子代理用。
     read_only_api: Option<Arc<dyn Tool>>,
@@ -180,7 +183,7 @@ impl ToolRegistry {
         self
     }
 
-    /// 注入安全闸；hold 只由 API 的 `napcat.*` 分支执行，Download/Web/MCP 不受影响。
+    /// 注入安全闸；hold 由 API 的 `napcat.*` 分支与 `/config` 写入执行，Download/Web/MCP 不受影响。
     pub(crate) fn with_gate(mut self, gate: Arc<crate::security::gate::Gate>) -> Self {
         self.gate = Some(gate);
         self

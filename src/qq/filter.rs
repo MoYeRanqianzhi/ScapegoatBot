@@ -56,9 +56,16 @@ impl MessageFilter {
     }
 
     /// 判定一条消息是否准入。
-    pub fn check(&self, message: &QqMessage, self_id: u64) -> FilterVerdict {
+    ///
+    /// `owner_qq` 的消息永远准入：过滤器挡的是外部噪声与注入，不是主人。主人的话
+    /// 和别人的一样进 inbox，看不看、醒不醒由 agent 的 monitor 决定——过滤器（包括
+    /// 模型可写的 `/config/filter`）不能让主人的消息从归档里消失。
+    pub fn check(&self, message: &QqMessage, self_id: u64, owner_qq: u64) -> FilterVerdict {
         // 自己发出的消息永远记录：过滤只针对外部输入。
         if message.is_self {
+            return FilterVerdict::Accept;
+        }
+        if owner_qq != 0 && message.sender.qq == Some(owner_qq) {
             return FilterVerdict::Accept;
         }
 
@@ -129,7 +136,7 @@ mod tests {
     #[test]
     fn accepts_ordinary_messages() {
         let filter = filter(FilterConfig::default());
-        assert!(filter.check(&message(1, 2, "hi"), 10).is_accept());
+        assert!(filter.check(&message(1, 2, "hi"), 10, 0).is_accept());
     }
 
     #[test]
@@ -140,13 +147,13 @@ mod tests {
             ..FilterConfig::default()
         });
         assert_eq!(
-            filter.check(&message(1, 3, "hi"), 10),
+            filter.check(&message(1, 3, "hi"), 10, 0),
             FilterVerdict::Reject {
                 rule: "ignore_groups"
             }
         );
         assert_eq!(
-            filter.check(&message(4, 2, "hi"), 10),
+            filter.check(&message(4, 2, "hi"), 10, 0),
             FilterVerdict::Reject {
                 rule: "ignore_users"
             }
@@ -160,11 +167,31 @@ mod tests {
             ..FilterConfig::default()
         });
         assert_eq!(
-            filter.check(&message(1, 2, "这是机密内容"), 10),
+            filter.check(&message(1, 2, "这是机密内容"), 10, 0),
             FilterVerdict::Reject {
                 rule: "ignore_patterns"
             }
         );
+    }
+
+    #[test]
+    fn the_owner_always_reaches_the_inbox() {
+        // 即使模型把主人写进 ignore_users、或开了 require_mention / 匹配主人话的正则，
+        // 主人的消息仍然入库；是否醒来交给 monitor。
+        let filter = filter(FilterConfig {
+            ignore_users: vec![2],
+            ignore_patterns: vec!["hi".to_owned()],
+            require_mention: true,
+            ..FilterConfig::default()
+        });
+        assert!(filter.check(&message(1, 2, "hi"), 10, 2).is_accept());
+        assert!(!filter.check(&message(1, 3, "hi"), 10, 2).is_accept());
+        // ignore_groups 同样不挡主人。
+        let groups = MessageFilter::from_config(&FilterConfig {
+            ignore_groups: vec![1],
+            ..FilterConfig::default()
+        });
+        assert!(groups.check(&message(1, 2, "hi"), 10, 2).is_accept());
     }
 
     #[test]
@@ -174,7 +201,7 @@ mod tests {
             ..FilterConfig::default()
         });
         assert_eq!(
-            filter.check(&message(1, 2, "hi"), 10),
+            filter.check(&message(1, 2, "hi"), 10, 0),
             FilterVerdict::Reject {
                 rule: "require_mention"
             }
@@ -184,11 +211,11 @@ mod tests {
         mentioned.segments.push(Segment::At {
             qq: "10".to_owned(),
         });
-        assert!(filter.check(&mentioned, 10).is_accept());
+        assert!(filter.check(&mentioned, 10, 0).is_accept());
 
         let mut private = message(1, 2, "hi");
         private.chat = ChatId::Private(2);
-        assert!(filter.check(&private, 10).is_accept());
+        assert!(filter.check(&private, 10, 0).is_accept());
     }
 
     #[test]
@@ -201,6 +228,6 @@ mod tests {
         let mut own = message(1, 2, "anything");
         own.is_self = true;
         own.sender.qq = None;
-        assert!(filter.check(&own, 10).is_accept());
+        assert!(filter.check(&own, 10, 0).is_accept());
     }
 }

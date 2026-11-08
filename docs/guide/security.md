@@ -98,6 +98,7 @@ timeout_ms = 800
 
 - 写 `~/.sbot/SECURITY_HOLD`（重启仍然有效；只记原因，不记被判危险的原文）；
 - 所有 `napcat.*` 动作返回 `Disabled during hold`，包括拉黑、禁言、踢人；
+- `/config` 与 `/config.toml` 只读：上下文可能已被注入，此时改配置会把一次注入变成持久设置；
 - 其余工具（文件、记忆、`WebSearch`、`WebFetch`、`MCP`、`Download`）不受影响；
 - 回合照常运行：`agent.*` 与 `api.*` 仍可用，agent 可以看状态、隔离可疑内容、自查。
 
