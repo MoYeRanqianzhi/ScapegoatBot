@@ -29,7 +29,7 @@ use crate::ipc::{self, AiAction, Handler, Request, RequestBody, Response};
 use crate::monitor::MonitorManager;
 use crate::paths::SbotPaths;
 use crate::providers::ProviderSlot;
-use crate::providers::{ThinkingOptions, build_provider};
+use crate::providers::{ThinkingOptions, build_metered, build_provider};
 use crate::qq::filter::MessageFilter;
 use crate::security::gate::Gate;
 use crate::session::SessionStore;
@@ -337,8 +337,16 @@ impl Runtime {
         let Some(reference) = self.models.find(model) else {
             anyhow::bail!("model {model:?} is not defined in models.json");
         };
-        // 先构造新 provider：失败时保持旧配置与旧 provider 不变。
-        let provider = build_provider(&self.models, &self.auth, model)?;
+        let agent = self.agent.read().expect("agent lock poisoned").clone();
+        // 先构造新 provider：失败时保持旧配置与旧 provider 不变。新 provider 接到同一个
+        // 预算计量上，按新模型自己的价格记账（见 `providers::metered`）。
+        let provider = match agent.as_ref().and_then(|agent| agent.runner.budget()) {
+            Some(budget) => {
+                let sink: Arc<dyn crate::providers::metered::UsageSink> = budget;
+                build_metered(&self.models, &self.auth, model, &sink)?
+            }
+            None => build_provider(&self.models, &self.auth, model)?,
+        };
         let api_model = reference.model.id.clone();
         let thinking = ThinkingOptions {
             enabled: reference.model.reasoning,
@@ -354,8 +362,9 @@ impl Runtime {
         if let Err(error) = persist_agent_setting(&loaded.path, "model", model) {
             warn!(%error, "cannot persist agent.model; change is runtime-only");
         }
-        // 热切换：下一回合使用新 provider；在飞回合继续用旧快照。
-        if let Some(agent) = self.agent.read().expect("agent lock poisoned").as_ref() {
+        // 热切换：下一回合使用新 provider；在飞回合继续用旧快照。窗口与图片能力随模型
+        // 一起换，压缩阈值与入站图片注入立即按新模型计算。
+        if let Some(agent) = agent.as_ref() {
             *agent
                 .runner
                 .provider_slot()
@@ -366,6 +375,8 @@ impl Runtime {
                 provider,
                 max_tokens,
                 thinking,
+                context_window: reference.model.context_window,
+                supports_images: reference.model.accepts_images(),
             };
             *agent.ops.model.write().expect("model lock poisoned") = model.to_owned();
         }

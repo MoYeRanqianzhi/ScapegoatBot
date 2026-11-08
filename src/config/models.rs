@@ -107,6 +107,11 @@ impl Default for ModelDef {
 }
 
 impl ModelDef {
+    /// 是否接受图片输入：`input` 含 `image`，或能力里声明了 `vision`。
+    pub fn accepts_images(&self) -> bool {
+        self.input.iter().any(|input| input == "image") || self.supports("vision")
+    }
+
     /// 是否声明了某项能力。
     pub fn supports(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|item| item == capability)
@@ -114,11 +119,18 @@ impl ModelDef {
 }
 
 /// 价格（每百万 token，美元）。
+///
+/// `cache_read` / `cache_write` 是命中缓存、写入缓存的输入单价。各服务商差别很大
+/// （有的命中只收一成，有的写入还要加价），不猜：没声明时按 `input` 计，预算宁可多算。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CostDef {
     pub input: f64,
     pub output: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<f64>,
 }
 
 /// 一次解析后的模型引用。

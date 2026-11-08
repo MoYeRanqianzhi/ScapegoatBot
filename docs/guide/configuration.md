@@ -262,7 +262,11 @@ key 放 `auth.json`：
 
 - `[budget]`：`daily_tokens`、`daily_usd`、`turn_tokens`、`chat_sends_per_hour`、
   `chat_turns_per_hour`、`round_trip_wall_secs`、`guard_usd_per_day`。
-  - 每日 token/USD 在回合开始时检查，超限跳过新回合（消息仍然入库）；
+  - 每日 token/USD 在回合开始时检查（在自动压缩之前），超限跳过新回合（消息仍然入库）；
+  - 每日用量逐请求记账：主回合、回退、子代理、压缩摘要、记忆 flush、周期安全审查、
+    LLM 门禁的每次模型请求，都按**发出请求的那个模型**的价格计入，缓存读写 token 也算；
+  - `turn_tokens` 计的是本回合**新增**的 token：所有请求的输出之和，加上最后一次请求的
+    完整提示比第一次多出的部分（每次请求重发的历史不重复计算）；
   - `turn_tokens` 与 `round_trip_wall_secs` 是硬停：循环到上限就以 error 结束；
   - 每 chat 每小时只统计成功发送/已开始的回合；
   - `guard_usd_per_day` 用估算成本，耗尽后分类器降级为规则层。
@@ -318,6 +322,9 @@ key 放 `auth.json`：
 - `api` 三选一：`anthropic`、`openai`（Responses）、`chat`（Chat Completions）。
 - 模型引用是 `provider/id`；`id` 同时作为发给 API 的 model 字段。
 - `capabilities` 决定是否启用服务端工具；入站 QQ 图片按 `input`/`vision` 门控，`Read`/MCP 工具图片仍直接附加。
+- `cost` 是每百万 token 的美元价：`input`、`output`，以及可选的 `cache_read`（命中缓存的输入）、
+  `cache_write`（写入缓存的输入）。后两项没写时按 `input` 计——预算宁可多算。
+- `sbot model set` 热切换后，新模型的 `context_window`、图片能力与价格立即生效。
 - `base_url` 留空时由各 provider 用自己的默认地址（Anthropic 官方；OpenAI 兼容
   端点通常必须显式配置）。
 - `models.json` 不存在时只使用内置清单（`assets/models.default.json`）；存在时按

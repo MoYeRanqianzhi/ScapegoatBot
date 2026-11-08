@@ -98,7 +98,7 @@ pub struct LoopConfig {
     pub prune_soft_limit: usize,
     /// 最近多少个“回合起点”不裁剪。
     pub prune_keep_turns: u32,
-    /// 单回合 token 上限；0 = 不限制。
+    /// 单回合 token 上限（按 [`TurnMeter`] 的口径）；0 = 不限制。
     pub max_turn_tokens: u64,
     /// 单回合墙钟上限（秒）；0 = 不限制。
     pub max_wall_secs: u64,
@@ -163,6 +163,37 @@ pub(crate) trait SteeringSource: Send {
 impl SteeringSource for mpsc::UnboundedReceiver<AgentMessage> {
     fn try_next(&mut self) -> Option<AgentMessage> {
         self.try_recv().ok()
+    }
+}
+
+/// 单回合的 token 计量：本回合**新增**了多少 token。
+///
+/// 口径 = 所有请求的输出之和 + 最后一次请求的完整提示比第一次多出的部分。
+/// 每次请求都会重发整段历史；如果把每次请求的提示相加，75k 的上下文跑两步就是
+/// 150k，任何稍长的会话都会被单回合上限立刻截停。新增量与缓存、协议都无关，
+/// 仍然能拦住“工具结果不断撑大上下文”的失控回合。
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct TurnMeter {
+    output: u64,
+    first_prompt: Option<u64>,
+    last_prompt: u64,
+}
+
+impl TurnMeter {
+    /// 记入一次请求的用量。
+    pub(crate) fn observe(&mut self, usage: &Usage) {
+        let prompt = usage.prompt_tokens();
+        self.first_prompt.get_or_insert(prompt);
+        self.last_prompt = prompt;
+        self.output = self.output.saturating_add(usage.output_tokens);
+    }
+
+    /// 本回合新增的 token。
+    pub(crate) fn spent(&self) -> u64 {
+        let growth = self
+            .last_prompt
+            .saturating_sub(self.first_prompt.unwrap_or(self.last_prompt));
+        self.output.saturating_add(growth)
     }
 }
 
@@ -245,6 +276,7 @@ impl AgentLoop {
         events: &mpsc::Sender<AgentEvent>,
     ) -> LoopOutcome {
         let mut total_usage = Usage::default();
+        let mut meter = TurnMeter::default();
         let mut turns = 0u32;
         let started = std::time::Instant::now();
         let mut pending = prompts;
@@ -271,14 +303,9 @@ impl AgentLoop {
                     );
                     return conclude(events, total_usage, turns, StopReason::Error).await;
                 }
-                if self.config.max_turn_tokens > 0
-                    && total_usage
-                        .input_tokens
-                        .saturating_add(total_usage.output_tokens)
-                        >= self.config.max_turn_tokens
-                {
+                if self.config.max_turn_tokens > 0 && meter.spent() >= self.config.max_turn_tokens {
                     warn!(
-                        tokens = total_usage.input_tokens + total_usage.output_tokens,
+                        tokens = meter.spent(),
                         limit = self.config.max_turn_tokens,
                         "turn token budget exhausted"
                     );
@@ -382,6 +409,7 @@ impl AgentLoop {
                 }
 
                 total_usage.add(assistant.usage);
+                meter.observe(&assistant.usage);
                 let stop_reason = assistant.stop_reason;
                 let has_calls = !assistant.tool_calls().is_empty();
 
@@ -1123,6 +1151,24 @@ async fn finish(events: &mpsc::Sender<AgentEvent>, outcome: &LoopOutcome) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_turn_meter_counts_new_tokens_not_resent_history() {
+        let mut meter = super::TurnMeter::default();
+        let step = |prompt: u64, output: u64| crate::llm::types::Usage {
+            input_tokens: prompt / 2,
+            cache_read_tokens: prompt - prompt / 2,
+            output_tokens: output,
+            ..Default::default()
+        };
+        // 75k 的上下文跑三步：每步的提示都重发历史，只多了上一步的输出与工具结果。
+        meter.observe(&step(75_000, 500));
+        meter.observe(&step(77_000, 400));
+        meter.observe(&step(79_500, 300));
+        // 新增 = 输出 1200 + 提示增长 4500；而不是三次提示之和（23 万多）。
+        assert_eq!(meter.spent(), 5_700);
+        assert_eq!(super::TurnMeter::default().spent(), 0);
+    }
+
     use std::sync::Mutex;
 
     use async_trait::async_trait;

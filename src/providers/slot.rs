@@ -17,6 +17,10 @@ pub struct ProviderSlot {
     pub provider: Arc<dyn Provider>,
     pub max_tokens: u32,
     pub thinking: ThinkingOptions,
+    /// 模型上下文窗口（`models.json`）；0 = 未声明。压缩阈值按它计算。
+    pub context_window: u64,
+    /// 模型是否接受图片输入；只影响入站 QQ 图片是否自动注入。
+    pub supports_images: bool,
 }
 
 /// 共享的 provider 槽位。

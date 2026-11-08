@@ -315,7 +315,26 @@ mod tests {
         });
         assert_eq!(usage.input_tokens, 1_500_000);
         // 1.5M 输入 @ $4/M + 0.1M 输出 @ $20/M = 6 + 2 = 8
-        assert!((usage.cost_usd(4.0, 20.0) - 8.0).abs() < f64::EPSILON);
+        let cost = crate::config::models::CostDef {
+            input: 4.0,
+            output: 20.0,
+            ..Default::default()
+        };
+        assert!((usage.cost_usd(&cost) - 8.0).abs() < f64::EPSILON);
+        // 缓存读写：声明了单价就用它，没声明按完整输入价。
+        let cached = Usage {
+            cache_read_tokens: 1_000_000,
+            cache_write_tokens: 1_000_000,
+            ..Usage::default()
+        };
+        assert!((cached.cost_usd(&cost) - 8.0).abs() < 1e-9);
+        let priced = crate::config::models::CostDef {
+            cache_read: Some(0.4),
+            cache_write: Some(5.0),
+            ..cost
+        };
+        assert!((cached.cost_usd(&priced) - 5.4).abs() < 1e-9);
+        assert_eq!(cached.prompt_tokens(), 2_000_000);
     }
 
     #[test]

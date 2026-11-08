@@ -19,7 +19,16 @@ pub enum StopReason {
     Aborted,
 }
 
-/// 用量。
+/// 用量：一次请求，或一个回合的累计。
+///
+/// 统一口径（各协议解析时换算成这一口径）：
+/// - `input_tokens`：既没命中缓存、也不是本次写入缓存的输入；
+/// - `cache_read_tokens`：命中缓存的输入；
+/// - `cache_write_tokens`：本次写入缓存的输入（只有 Anthropic 单列，其余为 0）；
+/// - `output_tokens`：输出（含思考）。
+///
+/// 三项输入之和才是这次请求的完整提示（[`Usage::prompt_tokens`]）。Anthropic 原生就是
+/// 这个口径；OpenAI 的 `input_tokens` / `prompt_tokens` 包含命中缓存的部分，解析时减掉。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -37,12 +46,34 @@ impl Usage {
         self.cache_write_tokens += other.cache_write_tokens;
     }
 
-    /// 按 `models.json` 的价格估算美元金额。
-    pub fn cost_usd(&self, input_per_mtok: f64, output_per_mtok: f64) -> f64 {
-        let input =
-            (self.input_tokens + self.cache_write_tokens) as f64 * input_per_mtok / 1_000_000.0;
-        let output = self.output_tokens as f64 * output_per_mtok / 1_000_000.0;
-        input + output
+    /// 这次请求的完整提示大小：三项输入之和。
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+    }
+
+    /// 全部 token：完整提示加输出。
+    pub fn total_tokens(&self) -> u64 {
+        self.prompt_tokens().saturating_add(self.output_tokens)
+    }
+
+    /// 按 `models.json` 的价格（每百万 token，美元）估算金额。
+    ///
+    /// 缓存读写各按自己的单价；`models.json` 没声明时按完整输入价计（见
+    /// [`crate::config::models::CostDef`]）。
+    pub fn cost_usd(&self, cost: &crate::config::models::CostDef) -> f64 {
+        let per_token = |tokens: u64, per_mtok: f64| tokens as f64 * per_mtok / 1_000_000.0;
+        per_token(self.input_tokens, cost.input)
+            + per_token(
+                self.cache_read_tokens,
+                cost.cache_read.unwrap_or(cost.input),
+            )
+            + per_token(
+                self.cache_write_tokens,
+                cost.cache_write.unwrap_or(cost.input),
+            )
+            + per_token(self.output_tokens, cost.output)
     }
 }
 

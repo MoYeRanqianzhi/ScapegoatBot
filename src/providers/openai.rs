@@ -245,19 +245,23 @@ impl StreamState {
             }
             "response.completed" => {
                 if let Some(usage) = payload.pointer("/response/usage") {
+                    // `input_tokens` 包含命中缓存的部分；换算成统一口径（见 `Usage`）。
+                    let prompt = usage
+                        .get("input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let cached = usage
+                        .pointer("/input_tokens_details/cached_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                        .min(prompt);
                     self.usage = Usage {
-                        input_tokens: usage
-                            .get("input_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
+                        input_tokens: prompt - cached,
                         output_tokens: usage
                             .get("output_tokens")
                             .and_then(Value::as_u64)
                             .unwrap_or(0),
-                        cache_read_tokens: usage
-                            .pointer("/input_tokens_details/cached_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
+                        cache_read_tokens: cached,
                         cache_write_tokens: 0,
                     };
                     out.push(ProviderEvent::Usage(self.usage));
@@ -438,6 +442,23 @@ mod tests {
                 refusal: None
             }
         );
+    }
+
+    #[test]
+    fn cached_input_tokens_are_split_out_of_the_input() {
+        let mut state = StreamState::default();
+        let events = feed(
+            &mut state,
+            json!({"type": "response.completed", "response": {"usage": {
+                "input_tokens": 1000, "output_tokens": 4,
+                "input_tokens_details": {"cached_tokens": 900}
+            }}}),
+        );
+        let ProviderEvent::Usage(usage) = events[0] else {
+            panic!("expected usage, got {events:?}");
+        };
+        assert_eq!((usage.input_tokens, usage.cache_read_tokens), (100, 900));
+        assert_eq!(usage.prompt_tokens(), 1000);
     }
 
     #[test]

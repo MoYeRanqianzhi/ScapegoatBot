@@ -136,11 +136,7 @@ impl Runner {
                 super::journal::TurnJournal::new(Arc::clone(&self.deps.turn_buffer), turn_id, 0)
             }
         };
-        if let Some(budget) = &self.config.budget {
-            budget
-                .record_usage(outcome.usage.input_tokens, outcome.usage.output_tokens)
-                .await;
-        }
+        // 用量已由计量 provider 逐请求记账（见 `providers::metered`）。
 
         for message in steering.drain() {
             working.push(message);

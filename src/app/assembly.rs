@@ -17,7 +17,8 @@ use crate::config::{AgentMode, AuthFile, EncryptionMode, LoadedConfig, ModelsFil
 use crate::mcp::{McpManager, McpTool};
 use crate::monitor::{MonitorManager, MonitorSink, MonitorSpec};
 use crate::paths::SbotPaths;
-use crate::providers::{Provider, ServerToolKind, ThinkingOptions, build_provider};
+use crate::providers::metered::UsageSink;
+use crate::providers::{Provider, ServerToolKind, ThinkingOptions, build_metered};
 use crate::qq::filter::MessageFilter;
 use crate::qq::{LoginInfo, QqClient};
 use crate::security::gate::Gate;
@@ -518,15 +519,30 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
         agents_dir,
     } = input;
     let config = &loaded.config;
-    let provider: Arc<dyn Provider> = match build_provider(models, auth, &config.agent.model) {
+    let Some(model_ref) = models.find(&config.agent.model) else {
+        warn!(model = %config.agent.model, "the primary model is not defined in models.json");
+        return Ok(None);
+    };
+    // 预算先于任何 provider：所有模型请求都经 `build_metered` 记进这里。
+    let guard_cost = match config.security.guard.backend {
+        crate::config::GuardBackend::Off => 0.0,
+        crate::config::GuardBackend::Jev => crate::budget::JEV_CALL_USD,
+        crate::config::GuardBackend::Llm => {
+            // 粗略：一次判定约 3k 输入 + 100 输出 token。
+            let input = 3_000.0 * model_ref.model.cost.input;
+            let output = 100.0 * model_ref.model.cost.output;
+            (input + output) / 1_000_000.0
+        }
+    };
+    let budget = crate::budget::Budget::new(Arc::clone(&db), &config.budget, guard_cost);
+    let meter: Arc<dyn UsageSink> = budget.clone();
+    let provider: Arc<dyn Provider> = match build_metered(models, auth, &config.agent.model, &meter)
+    {
         Ok(provider) => provider,
         Err(error) => {
             warn!(%error, model = %config.agent.model, "cannot build a provider");
             return Ok(None);
         }
-    };
-    let Some(model_ref) = models.find(&config.agent.model) else {
-        anyhow::bail!("model {} disappeared from models.json", config.agent.model);
     };
     // 回退链：每个模型单独构造 provider（协议/密钥可能不同）。
     let fallbacks: Vec<crate::agent::FallbackProvider> = config
@@ -538,7 +554,7 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
                 warn!(model = %reference, "fallback model is not defined in models.json");
                 return None;
             };
-            match build_provider(models, auth, reference) {
+            match build_metered(models, auth, reference, &meter) {
                 Ok(provider) => Some(crate::agent::FallbackProvider {
                     model: def.model.id.clone(),
                     provider,
@@ -622,22 +638,6 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
     monitors.set_self_id(self_id);
     monitors.set_owner_qq(owner_qq);
 
-    let guard_cost = match config.security.guard.backend {
-        crate::config::GuardBackend::Off => 0.0,
-        crate::config::GuardBackend::Jev => crate::budget::JEV_CALL_USD,
-        crate::config::GuardBackend::Llm => {
-            // 粗略：一次判定约 3k 输入 + 100 输出 token。
-            let input = 3_000.0 * model_ref.model.cost.input;
-            let output = 100.0 * model_ref.model.cost.output;
-            (input + output) / 1_000_000.0
-        }
-    };
-    let budget = crate::budget::Budget::new(
-        Arc::clone(&db),
-        &config.budget,
-        &model_ref.model.cost,
-        guard_cost,
-    );
     gate.set_budget(Arc::clone(&budget));
 
     let (tools, server_tools, hub_handle, approvals) = assemble_tools(ToolAssembly {
@@ -661,7 +661,8 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
     })
     .await;
 
-    let security_review = security_reviewer(&config.security, models, auth, &provider, model_ref);
+    let security_review =
+        security_reviewer(&config.security, models, auth, &provider, model_ref, &meter);
     let last_activity = Arc::new(std::sync::atomic::AtomicI64::new(
         chrono::Utc::now().timestamp(),
     ));
@@ -679,7 +680,7 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
     let compaction = if config.agent.compaction_model.trim().is_empty() {
         None
     } else {
-        match build_provider(models, auth, config.agent.compaction_model.trim()) {
+        match build_metered(models, auth, config.agent.compaction_model.trim(), &meter) {
             Ok(provider) => models
                 .find(config.agent.compaction_model.trim())
                 .map(|found| {
@@ -716,12 +717,7 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
             send_scopes: config.agent.send_scopes.clone(),
             gate_mode: config.gate.mode,
             max_tokens: config.agent.max_output_tokens,
-            supports_images: model_ref.model.input.iter().any(|input| input == "image")
-                || model_ref
-                    .model
-                    .capabilities
-                    .iter()
-                    .any(|cap| cap == "vision"),
+            supports_images: model_ref.model.accepts_images(),
             thinking,
             max_steps: config.agent.max_steps,
             retry: crate::agent::agent_loop::RetryPolicy {
@@ -955,6 +951,7 @@ fn security_reviewer(
     auth: &AuthFile,
     provider: &Arc<dyn Provider>,
     model_ref: crate::config::models::ModelRef<'_>,
+    meter: &Arc<dyn UsageSink>,
 ) -> Option<Arc<dyn crate::security::review::SecurityCheck>> {
     if security.check_every_tokens == 0 && !security.check_on_compaction {
         return None;
@@ -967,7 +964,7 @@ fn security_reviewer(
             warn!(model = %reference, "security.review_model is not defined in models.json");
             return None;
         };
-        match build_provider(models, auth, reference) {
+        match build_metered(models, auth, reference, meter) {
             Ok(provider) => (provider, found.model.id.clone()),
             Err(error) => {
                 warn!(%error, model = %reference, "cannot build the security review provider");

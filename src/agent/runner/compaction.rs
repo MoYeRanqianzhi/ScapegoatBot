@@ -155,7 +155,14 @@ impl Runner {
             .record_checkpoint(&previous.file, &summary)
             .map_err(|error| anyhow::anyhow!("cannot record the compaction checkpoint: {error}"))?;
         let mut new_history = vec![summary_message];
-        new_history.extend(keep);
+        // 保留消息上的 `usage` 描述的是压缩前那段（已经不存在的）提示：留着它，
+        // `estimate_messages` 会拿它当基准，判定仍然超限，下次唤醒又压缩一次。
+        new_history.extend(keep.into_iter().map(|mut message| {
+            if let AgentMessage::Assistant(assistant) = &mut message {
+                assistant.usage = Default::default();
+            }
+            message
+        }));
         for text in crate::agent::hooks::injected(
             &self.config.event_hooks,
             crate::config::HookEvent::PostCompact,
@@ -206,14 +213,17 @@ impl Runner {
     }
 
     /// 自动压缩阈值：配置的工作集上限与模型窗口减去预留后的较小者。
+    ///
+    /// 窗口与输出上限取当前 provider 槽位：热切换到窗口更小的模型后，阈值随之收紧。
     fn compaction_budget(&self) -> usize {
+        let slot = self.provider_snapshot();
         // `context_window = 0` 表示模型没有声明窗口；只用配置的工作集上限。
-        let by_window = if self.config.context_window == 0 {
+        let by_window = if slot.context_window == 0 {
             self.config.turn_context_budget as usize
         } else {
-            let reserve = u64::from(self.config.reserve_tokens)
-                .saturating_add(u64::from(self.config.max_tokens));
-            self.config.context_window.saturating_sub(reserve).max(1) as usize
+            let reserve =
+                u64::from(self.config.reserve_tokens).saturating_add(u64::from(slot.max_tokens));
+            slot.context_window.saturating_sub(reserve).max(1) as usize
         };
         by_window
             .min(self.config.turn_context_budget as usize)

@@ -58,6 +58,8 @@ pub struct RunnerConfig {
     pub receive_scopes: Vec<String>,
     pub send_scopes: Vec<String>,
     pub gate_mode: GateMode,
+    /// 以下几项是**启动时**的模型设置，只用来初始化 provider 槽位；运行中以槽位为准
+    /// （`sbot model set` 热切换会整体替换槽位，见 [`ProviderSlot`]）。
     pub max_tokens: u32,
     /// 模型是否声明接受图片输入；只影响入站图片自动注入。
     pub supports_images: bool,
@@ -84,7 +86,7 @@ pub struct RunnerConfig {
     pub check_overlap_tokens: u64,
     /// 压缩前也检查一次。
     pub check_on_compaction: bool,
-    /// 模型上下文窗口；与 `turn_context_budget` 一起决定压缩阈值。
+    /// 模型上下文窗口（启动时的值，初始化槽位用）；与 `turn_context_budget` 一起决定压缩阈值。
     pub context_window: u64,
     /// 压缩预算里预留给输出/系统提示的 token。
     pub reserve_tokens: u32,
@@ -291,6 +293,8 @@ impl Runner {
             provider,
             max_tokens: config.max_tokens,
             thinking: config.thinking.clone(),
+            context_window: config.context_window,
+            supports_images: config.supports_images,
         }));
 
         let deps = Arc::new(RunnerDeps {
@@ -445,13 +449,14 @@ impl Runner {
         }
     }
 
-    /// 控制通道输入：`sbot chat` 注入的一句话。
-    ///
-    /// 作为 `<owner_context source="control:<id>">` 注入并立即跑一个回合；
-    /// 不依赖任何 QQ chat，因此 `origin_chat` 标为 `control`。
     /// 共享槽位；runtime 用它实现模型/effort 热切换。
     pub(crate) fn provider_slot(&self) -> SharedProviderSlot {
         Arc::clone(&self.slot)
+    }
+
+    /// 运行预算；热切换新模型时，新 provider 要接到同一个计量去处。
+    pub(crate) fn budget(&self) -> Option<Arc<crate::budget::Budget>> {
+        self.config.budget.clone()
     }
 
     /// 注入子代理 hub；之后嵌套 spawn 才能为子代理注册 `Agent` 工具。
@@ -603,16 +608,11 @@ impl Runner {
             history.clone()
         };
 
-        // 2.5) 超过工作集上限时先压缩，再重新载入历史副本。
-        self.maybe_auto_compact(&mut working, &history, &sessions)
-            .await;
-        // 压缩会改写 `working`，基点在压缩之后取：否则 `working[base..]` 既会越界，
-        // 也会把保留的旧块重复提交。
-        let base = working.len();
         let image_prompts = self.inbound_image_prompts(&accepted_messages).await;
 
-        // 2.6) 预算：消息已经入库，只跳过模型回合；下一个窗口/日期自动恢复。
-        // 图片也持久化，避免预算恢复后丢失视觉上下文。
+        // 2.5) 预算：消息已经入库，只跳过模型回合；下一个窗口/日期自动恢复。
+        // 图片也持久化，避免预算恢复后丢失视觉上下文。预算检查必须在压缩之前：
+        // 压缩本身要请求模型，预算耗尽后每次唤醒都会白白摘要一次。
         if let Some(budget) = &self.config.budget {
             if let Some(reason) = budget.check_daily().await {
                 warn!(chat = %chat, %reason, "skipping this turn");
@@ -647,6 +647,13 @@ impl Runner {
                 queue.push_back(Instant::now());
             }
         }
+
+        // 2.6) 超过工作集上限时先压缩，再重新载入历史副本。
+        self.maybe_auto_compact(&mut working, &history, &sessions)
+            .await;
+        // 压缩会改写 `working`，基点在压缩之后取：否则 `working[base..]` 既会越界，
+        // 也会把保留的旧块重复提交。
+        let base = working.len();
 
         // 3) 组装本回合的即时提示。
         let evidence = self.evidence_for_batch(chat, &inbound_messages);
@@ -777,11 +784,7 @@ impl Runner {
                 journal::TurnJournal::new(Arc::clone(&self.deps.turn_buffer), turn_id, 0)
             }
         };
-        if let Some(budget) = &self.config.budget {
-            budget
-                .record_usage(outcome.usage.input_tokens, outcome.usage.output_tokens)
-                .await;
-        }
+        // 用量已由计量 provider 逐请求记账（见 `providers::metered`）。
         let _ = self
             .fire_hooks(
                 crate::config::HookEvent::Stop,
@@ -1699,6 +1702,19 @@ mod tests {
             for index in 0..20 {
                 shared.push(AgentMessage::user(format!("old message {index}")));
             }
+            // 最近的一条回复带着压缩前那段大提示的用量。
+            shared.push(AgentMessage::Assistant(crate::agent::AssistantMessage {
+                content: vec![crate::agent::AssistantBlock::Text {
+                    text: "recent reply".to_owned(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: Usage {
+                    input_tokens: 150_000,
+                    output_tokens: 10,
+                    ..Usage::default()
+                },
+                refusal: None,
+            }));
         }
         let previous = sessions.current().unwrap();
         let value = runner.compact_now("test").await.unwrap();
@@ -1714,7 +1730,17 @@ mod tests {
             }
             other => panic!("expected a summary system message, got {other:?}"),
         }
-        assert!(new_history.len() < 21);
+        assert!(new_history.len() < 22);
+        // 保留下来的回复不再带压缩前的用量：否则估算仍然超限，下次唤醒又会压缩。
+        assert!(new_history.iter().any(|message| matches!(
+            message,
+            AgentMessage::Assistant(assistant) if assistant.text() == "recent reply"
+        )));
+        assert!(new_history.iter().all(|message| match message {
+            AgentMessage::Assistant(assistant) => assistant.usage == Usage::default(),
+            _ => true,
+        }));
+        assert!(crate::session::compaction::estimate_messages(&new_history) < 10_000);
     }
 
     #[tokio::test]

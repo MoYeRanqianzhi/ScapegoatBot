@@ -27,6 +27,7 @@ use self::sse::{SseEvent, SseParser, Utf8Stream};
 
 pub mod anthropic;
 pub mod chat;
+pub mod metered;
 pub mod openai;
 pub mod server_tools;
 pub mod sse;
@@ -611,6 +612,25 @@ pub fn build_provider(
         )?),
     };
     Ok(provider)
+}
+
+/// 构造 provider 并装上计量：这个模型的每次请求都按它自己的价格记进 `sink`。
+///
+/// 运行时的模型请求都应经由这里构造（主模型、回退链、压缩、审查、热切换），
+/// 否则用量不会进入每日预算（见 [`metered`]）。
+pub fn build_metered(
+    models: &ModelsFile,
+    auth: &AuthFile,
+    reference: &str,
+    sink: &Arc<dyn metered::UsageSink>,
+) -> Result<Arc<dyn Provider>, ProviderError> {
+    let provider = build_provider(models, auth, reference)?;
+    // `build_provider` 成功说明模型存在；价格取自同一条定义。
+    let cost = models
+        .find(reference)
+        .map(|found| found.model.cost)
+        .unwrap_or_default();
+    Ok(metered::Metered::wrap(provider, cost, Arc::clone(sink)))
 }
 
 /// 把 Anthropic / OpenAI 的 stop_reason 字符串映射为内部原因。

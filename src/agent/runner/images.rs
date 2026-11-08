@@ -10,7 +10,8 @@ impl Runner {
         &self,
         messages: &[crate::qq::event::QqMessage],
     ) -> Vec<AgentMessage> {
-        if !self.config.supports_images {
+        // 取当前槽位：热切换到不接受图片的模型后不再注入。
+        if !self.provider_snapshot().supports_images {
             return Vec::new();
         }
         use base64::Engine as _;

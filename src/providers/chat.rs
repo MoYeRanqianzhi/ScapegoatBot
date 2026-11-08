@@ -223,19 +223,26 @@ impl StreamState {
         }
 
         if let Some(usage) = payload.get("usage").filter(|value| !value.is_null()) {
+            // `prompt_tokens` 包含命中缓存的部分；换算成统一口径（见 `Usage`）。
+            // 命中数：OpenAI 写在 `prompt_tokens_details.cached_tokens`，DeepSeek 另有
+            // 同义的 `prompt_cache_hit_tokens`（其文档：prompt = hit + miss）。
+            let prompt = usage
+                .get("prompt_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let cached = usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .or_else(|| usage.get("prompt_cache_hit_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(prompt);
             self.usage = Usage {
-                input_tokens: usage
-                    .get("prompt_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
+                input_tokens: prompt - cached,
                 output_tokens: usage
                     .get("completion_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
-                cache_read_tokens: usage
-                    .pointer("/prompt_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
+                cache_read_tokens: cached,
                 cache_write_tokens: 0,
             };
             out.push(ProviderEvent::Usage(self.usage));
@@ -449,6 +456,30 @@ mod tests {
                 refusal: None
             }]
         );
+    }
+
+    #[test]
+    fn cached_prompt_tokens_are_split_out_of_the_input() {
+        // OpenAI：`prompt_tokens` 含 `prompt_tokens_details.cached_tokens`。
+        let mut state = StreamState::default();
+        let events = state.handle(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":6,"prompt_tokens_details":{"cached_tokens":40}}}"#,
+        );
+        let ProviderEvent::Usage(usage) = events[0] else {
+            panic!("expected usage, got {events:?}");
+        };
+        assert_eq!((usage.input_tokens, usage.cache_read_tokens), (60, 40));
+        assert_eq!(usage.prompt_tokens(), 100);
+
+        // DeepSeek：同义的 `prompt_cache_hit_tokens`。
+        let mut state = StreamState::default();
+        let events = state.handle(
+            r#"{"choices":[],"usage":{"prompt_tokens":70,"completion_tokens":1,"prompt_cache_hit_tokens":64,"prompt_cache_miss_tokens":6}}"#,
+        );
+        let ProviderEvent::Usage(usage) = events[0] else {
+            panic!("expected usage, got {events:?}");
+        };
+        assert_eq!((usage.input_tokens, usage.cache_read_tokens), (6, 64));
     }
 
     #[test]

@@ -3,8 +3,14 @@
 //! 设计依据：设计 §5.12 与 `[budget]`。
 //!
 //! 计数器按本地日期存放在 `meta` 表，进程重启不清零；写入串行化，避免多个
-//! chat 并发回合丢更新。guard 花费是估算值：Jev 按固定每次调用成本，LLM
-//! 分类器按输入长度与输出预留估算（见 `guard_call_usd`）。
+//! chat 并发回合丢更新。
+//!
+//! 模型用量不由调用方上报：每个运行时 provider 都经 `providers::build_metered`
+//! 包了一层计量，每次请求结束时按**发出请求的那个模型**的价格记进来——主回合、
+//! 回退、子代理、压缩、记忆 flush、安全审查、LLM 门禁都一样，含缓存读写 token。
+//!
+//! guard 花费另计且是估算值：Jev 按固定每次调用成本，LLM 分类器按一次判定的
+//! 典型输入输出估算（`app::assembly` 里的 `guard_cost`）。
 
 use std::sync::Arc;
 
@@ -14,6 +20,7 @@ use tokio::sync::Mutex;
 
 use crate::config::BudgetConfig;
 use crate::config::models::CostDef;
+use crate::llm::types::Usage;
 use crate::storage::Database;
 
 const MICROS_PER_USD: f64 = 1_000_000.0;
@@ -26,25 +33,16 @@ pub const JEV_CALL_USD: f64 = 0.000_02;
 pub struct Budget {
     db: Arc<Database>,
     config: BudgetConfig,
-    input_cost: f64,
-    output_cost: f64,
     /// 单次 guard 调用的估算成本。
     guard_cost: f64,
     lock: Mutex<()>,
 }
 
 impl Budget {
-    pub fn new(
-        db: Arc<Database>,
-        config: &BudgetConfig,
-        cost: &CostDef,
-        guard_cost: f64,
-    ) -> Arc<Self> {
+    pub fn new(db: Arc<Database>, config: &BudgetConfig, guard_cost: f64) -> Arc<Self> {
         Arc::new(Self {
             db,
             config: config.clone(),
-            input_cost: cost.input,
-            output_cost: cost.output,
             guard_cost,
             lock: Mutex::new(()),
         })
@@ -88,14 +86,11 @@ impl Budget {
         None
     }
 
-    /// 记录一次模型调用（或一个回合累计）的输入/输出 token。
-    pub async fn record_usage(&self, input: u64, output: u64) {
+    /// 记录一次模型请求：全部 token（含缓存读写）计入每日 token，金额按 `cost`。
+    pub async fn record(&self, cost: &CostDef, usage: &Usage) {
         let _guard = self.lock.lock().await;
-        let tokens = input.saturating_add(output);
-        let micros = (input as f64 * self.input_cost + output as f64 * self.output_cost)
-            .round()
-            .max(0.0) as u64;
-        let _ = self.add("tokens", tokens).await;
+        let micros = (usage.cost_usd(cost) * MICROS_PER_USD).round().max(0.0) as u64;
+        let _ = self.add("tokens", usage.total_tokens()).await;
         let _ = self.add("usd", micros).await;
     }
 
@@ -170,62 +165,88 @@ impl Budget {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::providers::metered::UsageSink for Budget {
+    async fn record(&self, cost: &CostDef, usage: &Usage) {
+        Budget::record(self, cost, usage).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn budget(config: BudgetConfig, cost: CostDef) -> Arc<Budget> {
+    fn budget(config: BudgetConfig) -> Arc<Budget> {
         let db = Arc::new(Database::open_in_memory().unwrap());
-        Budget::new(db, &config, &cost, 0.01)
+        Budget::new(db, &config, 0.01)
+    }
+
+    fn usage(input: u64, output: u64) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            ..Usage::default()
+        }
     }
 
     #[tokio::test]
     async fn daily_limits_accumulate() {
-        let budget = budget(
-            BudgetConfig {
-                daily_tokens: 100,
-                daily_usd: 1.0,
-                ..BudgetConfig::default()
-            },
-            CostDef {
-                input: 10.0,
-                output: 10.0,
-            },
-        );
+        let budget = budget(BudgetConfig {
+            daily_tokens: 100,
+            daily_usd: 1.0,
+            ..BudgetConfig::default()
+        });
+        let cost = CostDef {
+            input: 10.0,
+            output: 10.0,
+            ..CostDef::default()
+        };
         assert!(budget.check_daily().await.is_none());
-        budget.record_usage(50, 30).await;
+        budget.record(&cost, &usage(50, 30)).await;
         assert_eq!(budget.today().await.0, 80);
-        budget.record_usage(10, 10).await;
+        // 缓存读写也是 token：计入每日总量。
+        budget
+            .record(
+                &cost,
+                &Usage {
+                    cache_read_tokens: 15,
+                    cache_write_tokens: 5,
+                    ..Usage::default()
+                },
+            )
+            .await;
         let reason = budget.check_daily().await.expect("token budget");
         assert!(reason.contains("daily token"));
     }
 
     #[tokio::test]
-    async fn daily_usd_uses_model_cost() {
-        let budget = budget(
-            BudgetConfig {
-                daily_tokens: 0,
-                daily_usd: 0.5,
-                ..BudgetConfig::default()
-            },
-            CostDef {
-                input: 1_000_000.0,
-                output: 1_000_000.0,
-            },
-        );
-        budget.record_usage(1, 0).await;
+    async fn daily_usd_uses_each_requests_model_cost() {
+        let budget = budget(BudgetConfig {
+            daily_tokens: 0,
+            daily_usd: 0.5,
+            ..BudgetConfig::default()
+        });
+        // 便宜模型的 0.1 美元不触发上限；贵模型的一次请求触发。
+        let cheap = CostDef {
+            input: 100_000.0,
+            ..CostDef::default()
+        };
+        budget.record(&cheap, &usage(1, 0)).await;
+        assert!(budget.check_daily().await.is_none());
+        let expensive = CostDef {
+            input: 1_000_000.0,
+            ..CostDef::default()
+        };
+        budget.record(&expensive, &usage(1, 0)).await;
         assert!(budget.check_daily().await.is_some());
     }
 
     #[tokio::test]
     async fn guard_budget_stops_spending() {
-        let budget = budget(
-            BudgetConfig {
-                guard_usd_per_day: 0.025,
-                ..BudgetConfig::default()
-            },
-            CostDef::default(),
-        );
+        let budget = budget(BudgetConfig {
+            guard_usd_per_day: 0.025,
+            ..BudgetConfig::default()
+        });
         assert!(budget.guard_allowed().await);
         budget.record_guard().await;
         assert!(budget.guard_allowed().await);
