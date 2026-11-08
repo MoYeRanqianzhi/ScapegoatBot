@@ -59,11 +59,11 @@ impl MessageFilter {
     ///
     /// 被忽略的群里的进群、撤回、戳一戳等通知，以及被忽略的人发来的好友/加群请求，
     /// 与消息一样不入库、不进 inbox、不进 monitor。正则与 `require_mention` 只对
-    /// 有正文的消息有意义；主人发起的事件照常准入。其余事件（meta、连接状态、
-    /// 无法归类的事件）不属于任何 chat，放行。
-    pub fn check_event(&self, event: &QqEvent, self_id: u64, owner_qq: u64) -> FilterVerdict {
+    /// 有正文的消息有意义。其余事件（meta、连接状态、无法归类的事件）不属于任何
+    /// chat，放行。
+    pub fn check_event(&self, event: &QqEvent, self_id: u64) -> FilterVerdict {
         let (group, actor) = match event {
-            QqEvent::Message(message) => return self.check(message, self_id, owner_qq),
+            QqEvent::Message(message) => return self.check(message, self_id),
             QqEvent::Notice(notice) => (
                 notice.chat.and_then(|chat| match chat {
                     ChatId::Group(group) => Some(group),
@@ -74,9 +74,6 @@ impl MessageFilter {
             QqEvent::Request(request) => (request.group, request.actor),
             _ => return FilterVerdict::Accept,
         };
-        if owner_qq != 0 && actor == Some(owner_qq) {
-            return FilterVerdict::Accept;
-        }
         if group.is_some_and(|group| self.ignore_groups.contains(&group)) {
             return FilterVerdict::Reject {
                 rule: "ignore_groups",
@@ -92,15 +89,12 @@ impl MessageFilter {
 
     /// 判定一条消息是否准入。
     ///
-    /// `owner_qq` 的消息永远准入：过滤器挡的是外部噪声与注入，不是主人。主人的话
-    /// 和别人的一样进 inbox，看不看、醒不醒由 agent 的 monitor 决定——过滤器（包括
-    /// 模型可写的 `/config/filter`）不能让主人的消息从归档里消失。
-    pub fn check(&self, message: &QqMessage, self_id: u64, owner_qq: u64) -> FilterVerdict {
+    /// 主人的消息没有豁免（用户决定：主人不走特权通道）。过滤器是 agent 划定自己
+    /// 活动范围的工具，把主人也排除在外同样是它的选择；主人始终可以用控制通道，
+    /// gate 确认码的回复在过滤之前处理（见 `app::events`）。
+    pub fn check(&self, message: &QqMessage, self_id: u64) -> FilterVerdict {
         // 自己发出的消息永远记录：过滤只针对外部输入。
         if message.is_self {
-            return FilterVerdict::Accept;
-        }
-        if owner_qq != 0 && message.sender.qq == Some(owner_qq) {
             return FilterVerdict::Accept;
         }
 
@@ -171,7 +165,7 @@ mod tests {
     #[test]
     fn accepts_ordinary_messages() {
         let filter = filter(FilterConfig::default());
-        assert!(filter.check(&message(1, 2, "hi"), 10, 0).is_accept());
+        assert!(filter.check(&message(1, 2, "hi"), 10).is_accept());
     }
 
     #[test]
@@ -182,13 +176,13 @@ mod tests {
             ..FilterConfig::default()
         });
         assert_eq!(
-            filter.check(&message(1, 3, "hi"), 10, 0),
+            filter.check(&message(1, 3, "hi"), 10),
             FilterVerdict::Reject {
                 rule: "ignore_groups"
             }
         );
         assert_eq!(
-            filter.check(&message(4, 2, "hi"), 10, 0),
+            filter.check(&message(4, 2, "hi"), 10),
             FilterVerdict::Reject {
                 rule: "ignore_users"
             }
@@ -202,7 +196,7 @@ mod tests {
             ..FilterConfig::default()
         });
         assert_eq!(
-            filter.check(&message(1, 2, "这是机密内容"), 10, 0),
+            filter.check(&message(1, 2, "这是机密内容"), 10),
             FilterVerdict::Reject {
                 rule: "ignore_patterns"
             }
@@ -239,61 +233,27 @@ mod tests {
         // 被忽略的群、被忽略的人：拒收。
         assert!(
             !filter
-                .check_event(&notice(Some(ChatId::Group(1)), Some(5)), 10, 0)
+                .check_event(&notice(Some(ChatId::Group(1)), Some(5)), 10)
                 .is_accept()
         );
         assert!(
             !filter
-                .check_event(&notice(Some(ChatId::Group(2)), Some(3)), 10, 0)
+                .check_event(&notice(Some(ChatId::Group(2)), Some(3)), 10)
                 .is_accept()
         );
         assert!(
             !filter
-                .check_event(&request(Some(1), Some(5)), 10, 0)
+                .check_event(&request(Some(1), Some(5)), 10)
                 .is_accept()
         );
-        assert!(
-            !filter
-                .check_event(&request(None, Some(3)), 10, 0)
-                .is_accept()
-        );
+        assert!(!filter.check_event(&request(None, Some(3)), 10).is_accept());
         // 正则与 require_mention 不作用于没有正文的事件。
         assert!(
             filter
-                .check_event(&notice(Some(ChatId::Group(2)), Some(5)), 10, 0)
+                .check_event(&notice(Some(ChatId::Group(2)), Some(5)), 10)
                 .is_accept()
         );
-        assert!(
-            filter
-                .check_event(&request(None, Some(5)), 10, 0)
-                .is_accept()
-        );
-        // 主人发起的事件照常准入。
-        assert!(
-            filter
-                .check_event(&notice(Some(ChatId::Group(1)), Some(3)), 10, 3)
-                .is_accept()
-        );
-    }
-
-    #[test]
-    fn the_owner_always_reaches_the_inbox() {
-        // 即使模型把主人写进 ignore_users、或开了 require_mention / 匹配主人话的正则，
-        // 主人的消息仍然入库；是否醒来交给 monitor。
-        let filter = filter(FilterConfig {
-            ignore_users: vec![2],
-            ignore_patterns: vec!["hi".to_owned()],
-            require_mention: true,
-            ..FilterConfig::default()
-        });
-        assert!(filter.check(&message(1, 2, "hi"), 10, 2).is_accept());
-        assert!(!filter.check(&message(1, 3, "hi"), 10, 2).is_accept());
-        // ignore_groups 同样不挡主人。
-        let groups = MessageFilter::from_config(&FilterConfig {
-            ignore_groups: vec![1],
-            ..FilterConfig::default()
-        });
-        assert!(groups.check(&message(1, 2, "hi"), 10, 2).is_accept());
+        assert!(filter.check_event(&request(None, Some(5)), 10).is_accept());
     }
 
     #[test]
@@ -303,7 +263,7 @@ mod tests {
             ..FilterConfig::default()
         });
         assert_eq!(
-            filter.check(&message(1, 2, "hi"), 10, 0),
+            filter.check(&message(1, 2, "hi"), 10),
             FilterVerdict::Reject {
                 rule: "require_mention"
             }
@@ -313,11 +273,11 @@ mod tests {
         mentioned.segments.push(Segment::At {
             qq: "10".to_owned(),
         });
-        assert!(filter.check(&mentioned, 10, 0).is_accept());
+        assert!(filter.check(&mentioned, 10).is_accept());
 
         let mut private = message(1, 2, "hi");
         private.chat = ChatId::Private(2);
-        assert!(filter.check(&private, 10, 0).is_accept());
+        assert!(filter.check(&private, 10).is_accept());
     }
 
     #[test]
@@ -330,6 +290,6 @@ mod tests {
         let mut own = message(1, 2, "anything");
         own.is_self = true;
         own.sender.qq = None;
-        assert!(filter.check(&own, 10, 0).is_accept());
+        assert!(filter.check(&own, 10).is_accept());
     }
 }

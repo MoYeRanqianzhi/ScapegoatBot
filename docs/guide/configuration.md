@@ -79,7 +79,8 @@ access token 在 `auth.json`，不在这里。
 `ignore_groups` / `ignore_users` 同样作用于通知与请求（被忽略的群里的进群、撤回、戳一戳，
 被忽略的人发来的好友/加群请求），它们也不进 `/system/events`；正则与 `require_mention`
 只对有正文的消息生效。
-`owner_qq` 的消息不受过滤：主人的话总会进 inbox，看不看、醒不醒由 agent 的 monitor 决定。
+主人的消息没有豁免：过滤器是 agent 划定自己活动范围的工具，把主人也排除在外同样是它的选择。
+主人始终可以用控制通道（`sbot chat`），gate 确认码的私聊回复在过滤之前处理。
 
 | 键 | 默认 | 说明 |
 |----|------|------|
