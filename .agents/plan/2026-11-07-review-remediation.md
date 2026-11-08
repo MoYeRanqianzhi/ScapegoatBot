@@ -84,19 +84,21 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 
 ### P1
 
-- `未核实` 收缩类群管理没有 chat 绑定：`delete_msg` 可召回任意 message_id；从 A 群回合
+- `已修 alpha.40` 收缩类群管理没有 chat 绑定：`delete_msg` 可召回任意 message_id；从 A 群回合
   踢/禁 B 群成员（B 在 send_scopes 内即可）。修法：`delete_msg` 用 `chat_for_message`
   反查并过发送范围；跨 chat 的群管理要求 owner intent。
-- `未核实` 群公告、上传文件不走 ActionGate 发送规则、BeforeSend 与发送账本
+- `已修 alpha.40` 群公告、上传文件不走 ActionGate 发送规则、BeforeSend 与发送账本
   （这些仍只按 `Category::Message` 判断）。
-- `未核实` owner intent 覆盖整个批次与 steering 注入的非主人消息
+- `已修 alpha.40` owner intent 覆盖整个批次与 steering 注入的非主人消息
   （evidence.rs:5-25、runner.rs:646）。
-- `未核实` 模型写 `/config/filter` 可把 owner 加进 `ignore_users`；可删除 wake 预设；
-  hold 期间也能写配置。
-- `未核实` `/config/mcp` 与 `/config.toml` 暴露 `mcp.servers[].env` 里的 token；
+- `已修 alpha.40`（部分按设计）模型写 `/config/filter` 可把 owner 加进 `ignore_users`；
+  可删除 wake 预设；hold 期间也能写配置。hold 期间 `/config` 只读已修；排除主人、删除
+  wake 预设按用户 alpha.38 的决定属于 agent 自己的选择，不加特权通道（曾误加主人免过滤，
+  已在 b52a58b 撤回）。
+- `已修 alpha.40` `/config/mcp` 与 `/config.toml` 暴露 `mcp.servers[].env` 里的 token；
   `persist()` 重建 `sbot.toml` 时用默认权限。
-- `未核实` VFS 回收站不计配额、`purge_trash` 运行时从不调用；从回收站恢复不检查配额。
-- `未核实` `[skills].shared_dir` 宿主机路径模型可写，只有 `sbot backup` 使用。
+- `已修 alpha.40` VFS 回收站不计配额、`purge_trash` 运行时从不调用；从回收站恢复不检查配额。
+- `已修 alpha.40`（删除该键） `[skills].shared_dir` 宿主机路径模型可写，只有 `sbot backup` 使用。
 - `未核实` 预算缺口：子代理、压缩摘要、记忆 flush、审查、门禁 LLM 都不计入；
   `record_usage` 丢弃 cache token；各 provider 的 `input_tokens` 口径不一
   （openai/chat 含缓存，anthropic 不含）。
@@ -107,13 +109,13 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
   任务；cron 补投只扫 1440 分钟；日/周字段按 AND 而非 OR；`0 0 30 2 *` 长时间空转。
 - `未核实` Anthropic：server tool 的查询参数没被收集；空 `content` 的 assistant、
   无签名 thinking 会被原样回放导致 400；只缓存静态前缀。
-- `未核实` 准入过滤只作用于消息；被忽略群的 notice/request 仍入库、进 inbox、进 monitor。
+- `已修 alpha.40` 准入过滤只作用于消息；被忽略群的 notice/request 仍入库、进 inbox、进 monitor。
 - `未核实` 停止原因未知时当作 EndTurn；408/504 不重试。
 - `未核实` `/messages` 的 `offset` / `order` 被忽略；`Stat` 动态文件几乎总失败；
   `Read` 工具示例里的过滤语法不存在。
 - `未核实` 资源放大：图片转换、下载整块驻留内存；无 `spawn_blocking`；`html_to_text`
   可能二次方。
-- `未核实` Unix socket 回退到 `/tmp/<name>.sock` 无 uid；`napcat-link` 在 INFO 日志里打印
+- `已修 alpha.40` Unix socket 回退到 `/tmp/<name>.sock` 无 uid；`napcat-link` 在 INFO 日志里打印
   带 access_token 的 URL；`auth.json` 解析错误会回显密钥值。
 
 ### P2 / 结构与冗余（沿用 11-06 交接，未重新核实行号）

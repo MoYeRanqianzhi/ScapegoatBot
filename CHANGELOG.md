@@ -7,6 +7,56 @@
 
 ## [Unreleased]
 
+## [0.2.0-alpha.40] - 2026-11-08
+
+安全审查 P1。
+
+### 安全
+
+- 只带 `message_id` 的动作（撤回、表情回应）按消息归档反查所属 chat，再按 `send_scopes`
+  判断；归档里查不到的 id 拒绝。以前可以拿任意 id 撤回别处的消息。
+- 踢人、禁言、改名片等群管理只在触发本回合的群里免 owner intent；在 A 群的回合里管理 B 群
+  需要 owner intent。
+- 群公告与上传文件纳入 `[gate]` 发送规则（重复、群发、搬运、媒体来源、每 chat 上限）、
+  BeforeSend hook 与内部标签剥离：三处共用 `actions::published_view` / `published_text_field`。
+  `hooks::before_send` 多了正文字段参数，`rewrite` 改写消息文本段与公告正文，上传只受
+  `block` / `log` 影响。
+- owner intent 不能被别人借用：批次里的非 `self` 消息**全部**来自主人才算；回合中途经
+  steering 进来别人的消息时立即撤销（不可恢复）。steering 通道改为直接传 `QqMessage`，由
+  runner 渲染并更新证据；`TurnEvidence` 的 intent 变成克隆间共享、只能撤销的标志
+  （`owner_intent()` / `revoke_owner_intent()`），子代理与工具调用都能看到撤销。
+- hold 期间 `/config` 与 `/config.toml` 只读：上下文可能已被注入，改配置会把一次注入变成
+  持久设置。
+- `/config/**` 与 `/config.toml` 把 `[[mcp.servers]].env` 的值显示成 `<redacted>`；整文件写回时
+  原样带回的占位符恢复成原值。`persist()` 的临时文件只给属主读写，rename 前复制原文件权限，
+  不会放宽 `0600`。
+- Unix 控制套接字不再回退到共享临时目录：没有 `XDG_RUNTIME_DIR` 时放在 `~/.sbot/run`，
+  bind 前把所在目录收紧到 0700，收紧不了就拒绝启动。
+- 日志写出前统一遮蔽 `access_token=…` 与 `Bearer …`（`src/logging.rs`）：napcat-link 在
+  INFO 级别打印带 token 的 WebSocket 地址。
+- `auth.json` 解析失败只报错误类别与行列，不再引用 serde 的原始信息（会带出密钥）。
+- 准入过滤的 `ignore_groups` / `ignore_users` 也作用于通知与请求：被忽略的群里的进群、撤回、
+  戳一戳，被忽略的人发来的好友/加群请求不入库、不进 inbox、不进 monitor 与 `/system/events`。
+  主人的消息不豁免（与 0.2.0-alpha.38 的决定一致）：排除谁是 agent 自己的选择。
+
+### 修复
+
+- VFS 回收站有了上限并真正被清理：移入时在同一事务里执行 30 天保留期、字节 ≤ 总量 10%、
+  节点 ≤ 节点上限 10%，单个条目自己就超限时如实报告为永久删除；从回收站恢复按活跃配额检查；
+  每天一次的后台清理移除过期条目（`app::maintenance`，技能 curator 也搬到这里）。
+- 删除节点时先提交事务、再删磁盘上的 blob 目录；以前事务回滚会留下指向不存在内容的节点。
+
+### 移除
+
+- `[skills].shared_dir`：技能一直在 VFS 的 `/skills`，这个宿主路径只被 `sbot backup` 读取，
+  模型却能通过 `/config/skills` 改写它，让下一次备份打包任意目录。旧配置启动时报迁移提示。
+
+### 其他
+
+- 源码卫生扫描收紧：普通字符串里的任何裸换行都报错（SQL 除外），剩余 20 处 shell 编辑留下的
+  痕迹改写为 `\n` 转义，逐个核对值不变。另修 `app/events.rs` 子代理 monitor 提示里的一处。
+- `config.example.toml` 的 `curator_min_new_skills` 与代码默认值一致（3）。
+
 ## [0.2.0-alpha.39] - 2026-11-08
 
 运行时正确性（审查 P0）。

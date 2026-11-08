@@ -15,26 +15,15 @@
 
 ## 当前基线
 
-- `cargo test --locked --all-targets` = 432 passed，2 ignored；clippy / fmt 通过。
-  当前 `0.2.0-alpha.39`（本地 tag）；每批升版本、打 tag，未验证前不 push。
+- `cargo test --locked --all-targets` = 452 passed，2 ignored；clippy / fmt 通过；
+  Linux `cargo check -D warnings` 通过（WSL Debian，脚本 `G:/sbot-wsl/check.sh`，
+  产物与 cargo 缓存都在 G:；WSL 工具链没有 clippy）。
+  当前 `0.2.0-alpha.40`（本地 tag）；每批升版本、打 tag，未验证前不 push。
 - 服务器 `hw1` 的 `sbot.service` 仍停止；NapCat 未登录（2026-11-05 起 QR 登录失败）。
 
 ## 待用户确认
 
 - [ ] 是否授权 `git push origin main --tags`、GitHub release、部署 hw1。
-
-## 安全（P1）
-
-- [ ] 收缩类群管理没有 chat 绑定：`delete_msg` 可召回任意 id；从 A 群回合踢/禁 B 群成员。
-- [ ] 群公告、上传文件不走 ActionGate 发送规则与 BeforeSend。
-- [ ] owner intent 覆盖整个批次与 steering 注入的非主人消息。
-- [ ] 模型写 `/config/filter` 可把 owner 加进 `ignore_users`；hold 期间也能写配置。
-- [ ] `/config/mcp`、`/config.toml` 暴露 `mcp.servers[].env` 的 token；`persist()` 用默认权限。
-- [ ] VFS 回收站不计配额、`purge_trash` 运行时从不调用；恢复不检查配额。
-- [ ] `[skills].shared_dir` 宿主机路径模型可写，只有 `sbot backup` 使用。
-- [ ] Unix socket 回退 `/tmp/<name>.sock` 无 uid；napcat-link INFO 日志打印带 token 的 URL；
-      `auth.json` 解析错误回显密钥值。
-- [ ] 准入过滤只作用于消息；被忽略群的 notice/request 仍入库、进 inbox、进 monitor。
 
 ## 预算、定时与 provider（P1）
 
@@ -49,7 +38,7 @@
 
 ## 配置重构
 
-- [ ] 实现或删除不起作用的键：`[memory].review_model/topics`、`[skills].shared_dir`、
+- [ ] 实现或删除不起作用的键：`[memory].review_model/topics`、
       `[[monitor]].jitter_secs`、`source = stream|internal`、`[[hooks.events]].when/inject`、
       `[queue].mode = collect`、默认保留下的 `max_session_bytes`、`sbot chat --scope`。
 - [ ] hooks 事件/动作矩阵与文档不一致（文档说所有事件支持 log/block/inject/notify）。
