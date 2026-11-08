@@ -76,6 +76,16 @@ impl Quota {
         self.limits.max_nodes
     }
 
+    /// 单个文本节点的上限（0 = 不限制）。
+    pub fn max_text_bytes(&self) -> u64 {
+        self.limits.max_text_bytes
+    }
+
+    /// 单个二进制节点的上限；`None` 表示不限制。分段写入边收边检查。
+    pub fn max_blob_bytes(&self) -> Option<u64> {
+        (self.limits.max_blob_bytes != 0).then_some(self.limits.max_blob_bytes)
+    }
+
     /// 文本写入检查。
     pub fn check_text(&self, len: u64) -> Result<(), VfsError> {
         if self.limits.max_text_bytes != 0 && len > self.limits.max_text_bytes {

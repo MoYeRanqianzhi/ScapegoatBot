@@ -19,6 +19,12 @@ use serde_json::{Value, json};
 use crate::transcript::ToolResult;
 
 use super::net::NetPolicy;
+use html::html_to_text;
+
+mod html;
+
+/// 搜索 / 抓取后端单个响应的字节上限。
+const MAX_BACKEND_BYTES: u64 = 16 * 1024 * 1024;
 use super::{Permission, Tool, ToolContext, arg_opt_u64, arg_str, object_schema};
 
 /// 工具后端。
@@ -57,7 +63,9 @@ impl WebBackend {
             .await
             .map_err(|error| error.to_string())?;
         let status = response.status();
-        let text = response.text().await.map_err(|error| error.to_string())?;
+        // 后端是配置里的可信服务，但响应体仍有上限：异常时不把整块读进内存。
+        let (body, _) = super::net::read_limited(response, MAX_BACKEND_BYTES).await?;
+        let text = String::from_utf8_lossy(&body);
         if !status.is_success() {
             return Err(format!("backend returned HTTP {status}: {text}"));
         }
@@ -220,30 +228,33 @@ impl WebFetchTool {
                 .unwrap_or("text/plain")
                 .to_owned();
             let mut body = Vec::new();
+            // 正文是否因字节上限被截断。
+            let mut cut = false;
             while let Some(chunk) = response
                 .chunk()
                 .await
                 .map_err(|error| format!("cannot read the response body: {error}"))?
             {
                 let remaining = max_bytes.saturating_sub(body.len() as u64) as usize;
-                if remaining == 0 {
-                    break;
-                }
                 if chunk.len() > remaining {
                     body.extend_from_slice(&chunk[..remaining]);
+                    cut = true;
                     break;
                 }
                 body.extend_from_slice(&chunk);
             }
+            // 截断处可能落在多字节字符中间；lossy 把残缺的尾巴换成替换字符。
             let text = String::from_utf8_lossy(&body);
             let text = if content_type.contains("html") {
                 html_to_text(&text)
             } else {
                 text.into_owned()
             };
+            // 按字符数截到 token 预算（约 4 字符 / token），并标出截断。
             let limit = (tokens as usize).saturating_mul(4).max(256);
-            let mut text: String = text.chars().take(limit).collect();
-            if text.chars().count() >= limit {
+            let mut chars = text.chars();
+            let mut text: String = chars.by_ref().take(limit).collect();
+            if cut || chars.next().is_some() {
                 text.push('…');
             }
             return Ok((text, current.to_string(), content_type));
@@ -365,24 +376,6 @@ impl Tool for WebFetchTool {
     }
 }
 
-/// 极简 HTML → 文本：去掉 script/style 与标签，解码常见实体并折叠空白。
-fn html_to_text(html: &str) -> String {
-    static TAGS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let tags = TAGS.get_or_init(|| {
-        regex::Regex::new(r"(?is)<script.*?</script>|<style.*?</style>|<[^>]*>")
-            .expect("valid HTML regex")
-    });
-    let text = tags.replace_all(html, " ");
-    let text = text
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'");
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,14 +390,6 @@ mod tests {
         let fetch = WebFetchTool::build_body("https://example.com", 1000);
         assert_eq!(fetch["url"], "https://example.com");
         assert_eq!(fetch["max_content_tokens"], 1000);
-    }
-
-    #[test]
-    fn html_is_reduced_to_readable_text() {
-        let text = html_to_text(
-            "<html><style>x{}</style><script>alert(1)</script><p>Hello&nbsp;world &amp; friends</p></html>",
-        );
-        assert_eq!(text, "Hello world & friends");
     }
 
     #[tokio::test]

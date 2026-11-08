@@ -28,7 +28,8 @@
 | `config/mod.rs` | 根结构、加载、环境变量覆盖、校验分派 | `SbotConfig::load` |
 | `config/sections/` | 分节 schema（agent/queue/security/monitor/hooks…），每节一个文件 | 各 `Config` 结构 |
 | `storage/` | 迁移 v1–v11、主密钥、消息归档 | `Database`、`MessageStore` |
-| `vfs/` | VFS 路径、查询串与 `filter` 语法、SQLite 后端、配额 | `VfsStore`、`VfsPath`、`ViewQuery`、`ViewFilter` |
+| `vfs/` | VFS 路径、查询串与 `filter` 语法、SQLite 后端（`sqlite/stage.rs` 是分段写入）、配额 | `VfsStore`、`BlobStage`、`VfsPath`、`ViewQuery`、`ViewFilter` |
+| `media.rs` | 图片解码上限、缩图、阻塞线程池（`Read` / 图片动作 / MCP 共用） | `decode_limited`、`shrink_to_fit`、`blocking` |
 | `providers/` | 三种协议、SSE、回退 | `build_provider`、`AgentLoop::new_with_fallbacks` |
 | `agent/` | 循环、消息/事件、队列、runner | `AgentLoop`、`Runner` |
 | `security/` | 内容闸、Jev/llm 分类器、周期检查、动作门禁、hold、审计 | `Gate`、`ActionGate`、`SecurityReviewer` |
@@ -36,7 +37,7 @@
 | `session/` | 分段、turn buffer、压缩 | `SessionStore`、`compaction` |
 | `actions.rs` | 约 50 个 API action 的注册表数据（由 `tools` 重导出） | `specs()` |
 | `tools/api.rs` | `API` 工具的执行、作用域、hold、发送账本 | `ApiTool` |
-| `tools/` | Tool trait、文件/记忆/技能/下载/Web/Monitor | `ToolRegistry` |
+| `tools/` | Tool trait、文件/记忆/技能/下载/Web/Monitor；`web/html.rs` 是线性的 HTML → 文本 | `ToolRegistry` |
 | `tools/views/` | 动态视图：messages/inbox/sessions/contacts/config/system；`filter.rs` 是条件求值与分页 | `Views`、`Page` |
 | `monitor/` | qq/timer/internal 源、cron、投递 | `MonitorManager` |
 | `ipc/` | 命名管道 / UDS、帧协议 | `Endpoint`、`Client` |

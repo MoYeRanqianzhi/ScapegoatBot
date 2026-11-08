@@ -320,7 +320,7 @@ impl Tool for ApiTool {
         match spec.namespace() {
             "agent" => self.run_agent(spec, &params, ctx).await,
             // 本地工具：目前只有 `local.media.image.*`，全部只读写 VFS。
-            "local" => self.run_image(spec, &params, ctx),
+            "local" => self.run_image(spec, &params, ctx).await,
             // napcat 的策略链顺序集中在本模块的 `policy` 子模块里。
             "napcat" => self.run_napcat(spec, params, ctx).await,
             _ => ToolResult::error(format!("Unsupported namespace in {}", spec.action)),

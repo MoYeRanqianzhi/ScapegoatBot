@@ -70,7 +70,7 @@ impl Runner {
                 if reference.starts_with("base64://") {
                     let payload = reference.trim_start_matches("base64://");
                     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload)
-                        && bytes.len() <= 3_500_000
+                        && bytes.len() <= crate::media::VISION_MAX_BYTES
                     {
                         let mime = mime_for_bytes(&bytes);
                         image_count += 1;
@@ -119,7 +119,7 @@ impl Runner {
                 if reference.starts_with("base64://")
                     && let Ok(value) = base64::engine::general_purpose::STANDARD
                         .decode(reference.trim_start_matches("base64://"))
-                    && value.len() <= 3_500_000
+                    && value.len() <= crate::media::VISION_MAX_BYTES
                     && matches!(
                         mime_for_bytes(&value).as_str(),
                         "image/png" | "image/jpeg" | "image/gif" | "image/webp"
@@ -167,7 +167,7 @@ impl Runner {
                     .next()
                     .unwrap_or("")
                     .to_owned();
-                let bytes = match read_capped(response, 3_500_000).await {
+                let bytes = match read_capped(response, crate::media::VISION_MAX_BYTES).await {
                     Ok(bytes) => bytes,
                     Err(error) => {
                         warn!(%error, "cannot read a QQ image");

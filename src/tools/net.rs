@@ -253,33 +253,77 @@ fn is_link_local_v6(ip: std::net::Ipv6Addr) -> bool {
     (ip.segments()[0] & 0xffc0) == 0xfe80
 }
 
-/// 读取响应体，超过 `max_bytes` 立即中止。
+/// 读取响应体到内存，超过 `max_bytes` 立即中止。返回内容与 `Content-Type`。
+///
+/// 只适合小响应；可能很大的下载用 [`stream_limited`] 边收边写。
 pub async fn read_limited(
     response: reqwest::Response,
     max_bytes: u64,
 ) -> Result<(Vec<u8>, String), String> {
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/octet-stream")
-        .to_owned();
-    if let Some(length) = response.content_length()
-        && length > max_bytes
-    {
-        return Err(format!(
-            "response is {length} bytes; the limit is {max_bytes}"
-        ));
-    }
-    let mut response = response;
+    let mut body = LimitedBody::new(response, max_bytes)?;
     let mut out = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
-        out.extend_from_slice(&chunk);
-        if out.len() as u64 > max_bytes {
-            return Err(format!("response exceeded the {max_bytes}-byte limit"));
-        }
+    while let Some(chunk) = body.next_chunk().await? {
+        out.extend_from_slice(chunk.as_ref());
     }
-    Ok((out, content_type))
+    Ok((out, body.content_type))
+}
+
+/// 有字节上限的响应体：逐段拉取，累计超过上限立即报错。
+///
+/// 声明的 `Content-Length` 已经超限时在创建时就报错，一个字节都不读；没有声明或声明
+/// 不实时按实际字节数判断，超限的那一段不会交出去。
+pub struct LimitedBody {
+    response: reqwest::Response,
+    max_bytes: u64,
+    /// 已交出的字节数。
+    received: u64,
+    /// 响应的 `Content-Type`；缺省为 `application/octet-stream`。
+    pub content_type: String,
+}
+
+impl LimitedBody {
+    /// 检查声明长度并记下 `Content-Type`。
+    pub fn new(response: reqwest::Response, max_bytes: u64) -> Result<Self, String> {
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        if let Some(length) = response.content_length()
+            && length > max_bytes
+        {
+            return Err(format!(
+                "response is {length} bytes; the limit is {max_bytes}"
+            ));
+        }
+        Ok(Self {
+            response,
+            max_bytes,
+            received: 0,
+            content_type,
+        })
+    }
+
+    /// 下一段；读完返回 `None`。
+    pub async fn next_chunk(&mut self) -> Result<Option<impl AsRef<[u8]> + use<>>, String> {
+        let Some(chunk) = self
+            .response
+            .chunk()
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        self.received = self.received.saturating_add(chunk.len() as u64);
+        if self.received > self.max_bytes {
+            return Err(format!(
+                "response exceeded the {}-byte limit",
+                self.max_bytes
+            ));
+        }
+        Ok(Some(chunk))
+    }
 }
 
 #[cfg(test)]

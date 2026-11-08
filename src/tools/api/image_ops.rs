@@ -1,6 +1,8 @@
 //! `API` 的 `local.media.image.*` 分支：VFS 内图片的检查、变换、编码与文字。
 //!
 //! 只读写 VFS，不产生对外影响；字体来自系统字体库（`fontdb`），不内置字体。
+//! 解码、变换、编码都是 CPU 密集的同步工作，整个动作在阻塞线程池里跑
+//! （[`crate::media::blocking`]），解码上限与 `Read` 看图、MCP 截图一致。
 
 use std::collections::HashSet;
 
@@ -10,23 +12,30 @@ use imageproc::drawing::draw_text_mut;
 use imageproc::geometric_transformations::{Border, Interpolation, rotate_about_center_no_crop};
 
 use super::*;
+use crate::media::{MAX_IMAGE_SIDE, MAX_INPUT_BYTES, decode_limited};
 use crate::vfs::Vfs;
 
 impl ApiTool {
-    pub(super) fn run_image(
+    pub(super) async fn run_image(
         &self,
         spec: &ActionSpec,
         params: &Value,
         ctx: &ToolContext,
     ) -> ToolResult {
-        match spec.action {
-            "local.media.image.info" => image_info(params, ctx),
-            "local.media.image.transform" => image_transform(params, ctx),
-            "local.media.image.convert" => image_convert(params, ctx),
-            "local.media.image.text" => image_text(params, ctx),
-            "local.media.image.fonts" => image_fonts(params),
+        // 阻塞任务要求 `'static`：动作名本来就是静态的，参数与上下文（全是 Arc）克隆进去。
+        let action = spec.action;
+        let params = params.clone();
+        let ctx = ctx.clone();
+        let outcome = crate::media::blocking(move || match action {
+            "local.media.image.info" => image_info(&params, &ctx),
+            "local.media.image.transform" => image_transform(&params, &ctx),
+            "local.media.image.convert" => image_convert(&params, &ctx),
+            "local.media.image.text" => image_text(&params, &ctx),
+            "local.media.image.fonts" => image_fonts(&params),
             other => ToolResult::error(format!("unsupported image action {other:?}")),
-        }
+        })
+        .await;
+        outcome.unwrap_or_else(ToolResult::error)
     }
 
     /// NapCat/扩展动作若直接返回 base64 图片，把它作为 tool result 的图片附件；
@@ -313,6 +322,13 @@ fn read_image(
     let input = arg_str(params, "path").map_err(|error| error.content)?;
     let path = crate::vfs::path::VfsPath::parse(input)
         .map_err(|error| format!("invalid VFS path: {error}"))?;
+    // 先看大小再读：超过解码上限的文件不读进内存。
+    let size = ctx.vfs.stat(&path).map_err(|error| error.to_string())?.size;
+    if size > MAX_INPUT_BYTES {
+        return Err(format!(
+            "{input} is {size} bytes; image actions accept at most {MAX_INPUT_BYTES}"
+        ));
+    }
     let bytes = ctx
         .vfs
         .read_bytes(&path)
@@ -321,27 +337,8 @@ fn read_image(
     Ok((input.to_owned(), image, bytes))
 }
 
-/// 图片单边上限，与 crop/resize 参数的上限一致；8192² 的 RGBA 约 268 MB。
-const MAX_IMAGE_SIDE: u32 = 8192;
 /// `local.media.image.text` 一次最多绘制的字符数。
 const MAX_TEXT_CHARS: usize = 1000;
-
-/// 按尺寸上限解码：文件可能很小、但声明的尺寸巨大（解压炸弹）。
-///
-/// `image` 默认只限制 512 MiB 的“分配估算”、不限宽高，1×100000 的细图能通过它，
-/// 转个角度却要几十 GB。宽高限制是严格的，超限在分配之前就报错。
-fn decode_limited(bytes: &[u8]) -> Result<DynamicImage, String> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|error| format!("cannot read image: {error}"))?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_SIDE);
-    limits.max_image_height = Some(MAX_IMAGE_SIDE);
-    reader.limits(limits);
-    reader
-        .decode()
-        .map_err(|error| format!("cannot decode image: {error}"))
-}
 
 fn output_path(params: &Value) -> Result<(String, crate::vfs::VfsPath, String), String> {
     let out = arg_str(params, "out").map_err(|error| error.content)?;

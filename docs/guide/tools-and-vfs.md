@@ -108,7 +108,7 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 | `API` | 唯一的 QQ 动作入口；`api.list` / `api.help` 查表 |
 | `Memory` | `/USER.md`、`/memory/*`、`/MEMORY.md` 的唯一写入口 |
 | `Skill` | 加载 `/skills/<name>/SKILL.md` 与资源清单 |
-| `Download` | HTTP(S) 下载到 VFS，带 SSRF/域名/大小限制 |
+| `Download` | HTTP(S) 下载到 VFS，带 SSRF/域名/大小限制；边收边加密暂存，不把整个文件留在内存里。文本类型（`text/*`、JSON、XML、JS）且不超过文本上限、是合法 UTF-8 时存成文本节点，否则存成二进制 |
 | `WebSearch` / `WebFetch` | 搜索 / 抓取；由服务端工具或你配置的后端执行 |
 | `Monitor` | 增删查事件订阅，手动触发一次 |
 | `Agent` | 生成/续聊/查询/等待子代理 |
@@ -127,7 +127,9 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 
 `Read` 读取 VFS 图片时会把图片作为 tool result 的 image attachment 交给 provider；
 图片处理工具的输出同样适用；图片附件会随 transcript 持久化，重启后仍可恢复
-（受 3.5 MB / MIME 限制）。`API` 的响应若包含 `base64` / `image` 字段，也会自动
+（受 3.5 MB / MIME 限制）。超过 3.5 MB 的图片先缩成 JPEG（最长边从 2000px 起逐级
+缩小，直到放得下）；超过 64 MB 或单边超过 8192px 的图片不解码。解码与编码在阻塞
+线程池里进行，`Read`、`local.media.image.*` 与 MCP 截图共用 `src/media.rs` 的上限。`API` 的响应若包含 `base64` / `image` 字段，也会自动
 转成图片附件，而不是只把 JSON 塞进文本。
 
 发送、请求处理、管理动作都在表里标注了作用域与是否 destructive；目标为 owner/master

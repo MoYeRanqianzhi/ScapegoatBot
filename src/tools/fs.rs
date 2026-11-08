@@ -19,16 +19,6 @@ use super::ExecutionMode;
 use crate::transcript::ToolResult;
 use crate::vfs::{FileContent, NodeKind, Vfs, VfsError, VfsPath};
 use base64::Engine as _;
-/// 超过视觉上限时缩到 2000px 内并转 JPEG；返回新 mime 与字节。
-fn shrink_image(bytes: &[u8]) -> Option<(String, Vec<u8>)> {
-    let image = image::load_from_memory(bytes).ok()?;
-    let shrunk = image.thumbnail(2000, 2000).to_rgb8();
-    let mut encoded = Vec::new();
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 85);
-    encoder.encode_image(&shrunk).ok()?;
-    Some(("image/jpeg".to_owned(), encoded))
-}
-
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use super::{
@@ -40,6 +30,8 @@ use super::{
 const GREP_MAX_FILES: usize = 200;
 /// 单次 Grep 的匹配上限。
 const GREP_MAX_MATCHES: usize = 200;
+/// 直接交给视觉模型的图片字节上限；超过时先缩小。
+use crate::media::VISION_MAX_BYTES;
 
 // ---------------------------------------------------------------------------
 // Read
@@ -120,60 +112,68 @@ impl Tool for ReadTool {
         if let Ok(meta) = ctx.vfs.stat(&target.path)
             && meta.kind == crate::vfs::NodeKind::Image
         {
-            let bytes = match ctx.vfs.read_bytes(&target.path) {
-                Ok(bytes) => bytes,
-                Err(error) => return vfs_error(error),
-            };
-            let mime = meta.mime.unwrap_or_else(|| "image/jpeg".to_owned());
-            if !matches!(
-                mime.as_str(),
-                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-            ) {
-                return ToolResult::ok(format!(
-                    "Image {} ({} bytes, {mime}); unsupported for vision. Convert it with the API action local.media.image.convert first.",
-                    target.path,
-                    bytes.len()
-                ));
-            }
-            let (mime, bytes) = if bytes.len() > 3_500_000 {
-                match shrink_image(&bytes) {
-                    Some((mime, shrunk)) => (mime, shrunk),
-                    None => {
-                        return ToolResult::ok(format!(
-                            "Image {} ({} bytes, {mime}); too large for vision and could not be resized.",
-                            target.path,
-                            bytes.len()
-                        ));
-                    }
-                }
-            } else {
-                (mime, bytes)
-            };
-            let note = if bytes.len() > 3_500_000 {
-                format!(
-                    "Image {} ({} bytes, {mime}); still too large for vision.",
-                    target.path,
-                    bytes.len()
-                )
-            } else {
-                format!("Image {} ({} bytes, {mime})", target.path, bytes.len())
-            };
-            if bytes.len() > 3_500_000 {
-                return ToolResult::ok(note);
-            }
-            return ToolResult::with_images(
-                note,
-                vec![crate::transcript::ImageAttachment {
-                    mime,
-                    data_base64: BASE64.encode(bytes),
-                }],
-            );
+            return read_image(ctx, &target.path, meta).await;
         }
         match ctx.vfs.read_lines(&target.path, offset, limit) {
             Ok(content) => ToolResult::ok(render_content(&target.path, content)),
             Err(error) => vfs_error(error),
         }
     }
+}
+
+/// `Read` 一张图片：可直接看的格式作为附件返回，过大的先缩小。
+///
+/// 读入前先看大小，超过解码上限的不读进内存；缩小（解码 + 编码）在阻塞线程池里做。
+async fn read_image(ctx: &ToolContext, path: &VfsPath, meta: crate::vfs::NodeMeta) -> ToolResult {
+    let mime = meta.mime.unwrap_or_else(|| "image/jpeg".to_owned());
+    if !matches!(
+        mime.as_str(),
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    ) {
+        return ToolResult::ok(format!(
+            "Image {path} ({} bytes, {mime}); unsupported for vision. Convert it with the API \
+             action local.media.image.convert first.",
+            meta.size
+        ));
+    }
+    if meta.size > crate::media::MAX_INPUT_BYTES {
+        return ToolResult::ok(format!(
+            "Image {path} ({} bytes, {mime}); too large to open (limit {} bytes). Use the API \
+             action local.media.image.info or download a smaller version.",
+            meta.size,
+            crate::media::MAX_INPUT_BYTES
+        ));
+    }
+    let bytes = match ctx.vfs.read_bytes(path) {
+        Ok(bytes) => bytes,
+        Err(error) => return vfs_error(error),
+    };
+    let original = bytes.len();
+    let (mime, bytes) = if original > VISION_MAX_BYTES {
+        let shrunk = crate::media::blocking(move || {
+            crate::media::shrink_to_fit(&bytes, crate::media::VISION_MAX_SIDE, VISION_MAX_BYTES)
+        })
+        .await
+        .and_then(|result| result);
+        match shrunk {
+            Ok(shrunk) => ("image/jpeg".to_owned(), shrunk),
+            Err(error) => {
+                return ToolResult::ok(format!(
+                    "Image {path} ({original} bytes, {mime}); too large for vision and could \
+                     not be resized: {error}"
+                ));
+            }
+        }
+    } else {
+        (mime, bytes)
+    };
+    ToolResult::with_images(
+        format!("Image {path} ({} bytes, {mime})", bytes.len()),
+        vec![crate::transcript::ImageAttachment {
+            mime,
+            data_base64: BASE64.encode(bytes),
+        }],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1373,17 +1373,37 @@ mod tests {
         assert_eq!(result.images[0].data_base64, BASE64.encode(bytes));
     }
 
-    #[test]
-    fn large_images_are_shrunk_for_vision() {
-        let image = image::DynamicImage::new_rgb8(2500, 2500);
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn large_images_are_shrunk_for_vision() {
+        let (registry, vfs, _dir) = setup();
+        // 噪声图压不小：2500² 的 PNG 远超直接给视觉模型的字节上限。
+        let mut raw = image::RgbImage::new(2500, 2500);
+        let mut seed = 0x2545_f491_u32;
+        for pixel in raw.pixels_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let [r, g, b, _] = seed.to_le_bytes();
+            *pixel = image::Rgb([r, g, b]);
+        }
         let mut encoded = std::io::Cursor::new(Vec::new());
-        image
+        image::DynamicImage::ImageRgb8(raw)
             .write_to(&mut encoded, image::ImageFormat::Png)
             .unwrap();
-        let (mime, bytes) = shrink_image(&encoded.into_inner()).expect("shrink");
-        assert_eq!(mime, "image/jpeg");
+        let encoded = encoded.into_inner();
+        assert!(encoded.len() > VISION_MAX_BYTES);
+        let path = crate::vfs::path::VfsPath::parse("/img/big.png").unwrap();
+        vfs.write_binary(&path, &encoded, crate::vfs::NodeKind::Image)
+            .unwrap();
+
+        let result = run(&registry, "Read", json!({"path": "/img/big.png"})).await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(result.images.len(), 1, "{}", result.content);
+        assert_eq!(result.images[0].mime, "image/jpeg");
+        let bytes = BASE64.decode(&result.images[0].data_base64).unwrap();
+        // 噪声在 2000px 时仍超限，逐级缩小到放得下为止。
+        assert!(bytes.len() <= VISION_MAX_BYTES);
         let decoded = image::load_from_memory(&bytes).unwrap();
-        assert!(decoded.width() <= 2000);
-        assert!(decoded.height() <= 2000);
+        assert!(decoded.width() < 2000 && decoded.width() == decoded.height());
     }
 }

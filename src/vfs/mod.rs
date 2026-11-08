@@ -185,7 +185,9 @@ impl From<anyhow::Error> for VfsError {
 
 /// VFS 核心接口。
 ///
-/// 方法都是同步的：底层是单个 SQLite 连接，工具层用 `spawn_blocking` 包一层即可。
+/// 方法都是同步的：底层是单个 SQLite 连接。多数调用只是一次短查询或不超过 1 MB 的
+/// 文本，工具直接在异步任务里调用；可能耗时的路径放进阻塞线程池——图片解码/编码
+/// （`media::blocking`）、`Download` 的分段暂存与提交（`sqlite::BlobStage`）。
 /// 全进程只有一个 agent，按节点加锁的收益不及“单连接串行”带来的确定性，
 /// 因此写路径统一由存储层的互斥锁串行化（见 `sqlite::VfsStore`）。
 pub trait Vfs: Send + Sync {

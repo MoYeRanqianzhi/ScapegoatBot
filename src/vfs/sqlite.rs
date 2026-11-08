@@ -5,12 +5,14 @@
 //! 存储约定：
 //! - 文本内容加密后存在 `vfs_nodes.content_enc`，AAD 绑定 `vfs:<node_id>:<version>`；
 //! - 二进制按 1 MiB 分块，密文写到 `blobs/<node_id>/<idx>`，AAD 绑定 `blob:<node_id>:<idx>`；
+//!   大文件可经 [`BlobStage`] 分段写入，内存里最多留一个分块（见 `stage.rs`）；
 //! - 索引（路径、大小、hash、时间）明文，供 `LS` / `Glob` / `Grep` 与 SQL 查询使用；
 //! - 删除先进回收站；回收站内的 `RM` 是永久删除。
 //!
 //! 并发：全进程单连接，写路径由 `Database::lock` 串行化；这比按节点加锁更容易验证，
 //! 也满足“同一节点串行、不同节点不冲突”的要求（串行是更强的不冲突）。
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,7 +29,10 @@ use super::quota::{Limits, Quota};
 use super::{FileContent, NodeKind, NodeMeta, RemoveOutcome, Usage, Vfs, VfsError, guess_mime};
 
 mod codec;
+mod stage;
 mod tree;
+
+pub use stage::BlobStage;
 
 /// 二进制分块大小：1 MiB。
 const BLOB_CHUNK_BYTES: usize = 1024 * 1024;
@@ -60,6 +65,8 @@ impl VfsStore {
             storage,
             quota: Quota::new(limits),
         };
+        // 上次运行崩溃时可能留下没提交的暂存目录。
+        store.remove_stale_stages();
         store.ensure_seeds()?;
         Ok(store)
     }
@@ -555,6 +562,123 @@ fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(digest)
 }
 
+impl VfsStore {
+    /// 写入二进制节点的公共实现：整块写入与分段提交共用。
+    ///
+    /// `chunks` 依次给出 1 MiB 的明文分块（最后一块可以更短），总长必须是 `len`、
+    /// 整体 SHA-256 必须是 `hash`。新分块先写进临时目录、事务提交前整体替换旧目录，
+    /// 中途失败不留半份数据。
+    fn write_binary_chunks(
+        &self,
+        path: &VfsPath,
+        kind: NodeKind,
+        len: u64,
+        hash: &str,
+        chunks: &mut dyn Iterator<Item = Result<Cow<'_, [u8]>, VfsError>>,
+    ) -> Result<NodeMeta, VfsError> {
+        if kind == NodeKind::Dir {
+            return Err(VfsError::IsADirectory(path.to_string()));
+        }
+        // 文本节点的内容在 `content_enc` 列里；按分块写会得到一个读不出来的文本节点。
+        if kind == NodeKind::Text {
+            return Err(VfsError::Storage(format!(
+                "{path}: text content must be written with write_text, not as blob chunks"
+            )));
+        }
+        if is_dynamic(path) {
+            return Err(VfsError::Storage(format!(
+                "{path} is a read-only dynamic view"
+            )));
+        }
+        self.quota.check_blob(len)?;
+        self.quota.check_disk(&self.storage)?;
+
+        let mut conn = self.db.lock();
+        let tx = conn.transaction()?;
+
+        let existing = self.lookup(&tx, path)?;
+        if let Some(row) = &existing {
+            if row.kind == NodeKind::Dir {
+                return Err(VfsError::IsADirectory(path.to_string()));
+            }
+            self.check_read_before_edit(&tx, row)?;
+        }
+        let parent_id = self.ensure_parent(&tx, path, &now())?;
+        let name = path.file_name().expect("non-root path has a name");
+        let now_value = now();
+        let mime = guess_mime(name).unwrap_or("application/octet-stream");
+
+        let (bytes, nodes) = self.active_usage(&tx)?;
+        let delta = len.saturating_sub(existing.as_ref().map_or(0, |row| row.size));
+        self.quota
+            .check_growth(bytes, nodes, delta, u64::from(existing.is_none()))?;
+
+        let (id, version) = match &existing {
+            None => {
+                tx.execute(
+                    "INSERT INTO vfs_nodes
+                        (parent_id, name, kind, size, mime, mode, version, created_at, updated_at, hash)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 420, 1, ?6, ?6, ?7)",
+                    params![parent_id, name, kind.as_str(), len, mime, now_value, hash],
+                )?;
+                (tx.last_insert_rowid(), 1u64)
+            }
+            Some(row) => (row.id, row.version + 1),
+        };
+
+        // 先把新分块写进临时目录，再整体替换旧目录，避免中途失败留下半份数据。
+        let blobs = self.storage.join("blobs");
+        let target = blobs.join(id.to_string());
+        let staging = blobs.join(format!("{id}.tmp-{}", std::process::id()));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        std::fs::create_dir_all(&staging)?;
+
+        tx.execute("DELETE FROM vfs_chunks WHERE node_id = ?1", params![id])?;
+        let mut offset = 0u64;
+        for (index, chunk) in chunks.enumerate() {
+            let chunk = chunk?;
+            let sealed = self.seal_blob(id, index, &chunk)?;
+            std::fs::write(staging.join(index.to_string()), sealed)?;
+            tx.execute(
+                "INSERT INTO vfs_chunks (node_id, idx, offset, length, hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    id,
+                    index as i64,
+                    offset as i64,
+                    chunk.len() as i64,
+                    hash_bytes(&chunk)
+                ],
+            )?;
+            offset += chunk.len() as u64;
+        }
+
+        if target.exists() {
+            std::fs::remove_dir_all(&target)?;
+        }
+        std::fs::rename(&staging, &target)?;
+
+        tx.execute(
+            "UPDATE vfs_nodes
+             SET size = ?1, mime = ?2, version = ?3, updated_at = ?4, hash = ?5, kind = ?6
+             WHERE id = ?7",
+            params![len, mime, version, now_value, hash, kind.as_str(), id],
+        )?;
+        self.record_read(&tx, id, version, Some(hash), false)?;
+        tx.commit()?;
+        // 先释放连接锁再重新读取，否则会自锁。
+        drop(conn);
+
+        let conn = self.db.lock();
+        let row = self
+            .lookup(&conn, path)?
+            .ok_or_else(|| VfsError::Storage("just-written binary disappeared".to_owned()))?;
+        Ok(self.meta(path, &row))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Vfs 实现
 // ---------------------------------------------------------------------------
@@ -725,101 +849,11 @@ impl Vfs for VfsStore {
         data: &[u8],
         kind: NodeKind,
     ) -> Result<NodeMeta, VfsError> {
-        if kind == NodeKind::Dir {
-            return Err(VfsError::IsADirectory(path.to_string()));
-        }
-        if is_dynamic(path) {
-            return Err(VfsError::Storage(format!(
-                "{path} is a read-only dynamic view"
-            )));
-        }
-        let len = data.len() as u64;
-        self.quota.check_blob(len)?;
-        self.quota.check_disk(&self.storage)?;
-
-        let mut conn = self.db.lock();
-        let tx = conn.transaction()?;
-
-        let existing = self.lookup(&tx, path)?;
-        if let Some(row) = &existing {
-            if row.kind == NodeKind::Dir {
-                return Err(VfsError::IsADirectory(path.to_string()));
-            }
-            self.check_read_before_edit(&tx, row)?;
-        }
-        let parent_id = self.ensure_parent(&tx, path, &now())?;
-        let name = path.file_name().expect("non-root path has a name");
-        let now_value = now();
         let hash = hash_bytes(data);
-        let mime = guess_mime(name).unwrap_or("application/octet-stream");
-
-        let (bytes, nodes) = self.active_usage(&tx)?;
-        let delta = len.saturating_sub(existing.as_ref().map_or(0, |row| row.size));
-        self.quota
-            .check_growth(bytes, nodes, delta, u64::from(existing.is_none()))?;
-
-        let (id, version) = match &existing {
-            None => {
-                tx.execute(
-                    "INSERT INTO vfs_nodes
-                        (parent_id, name, kind, size, mime, mode, version, created_at, updated_at, hash)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 420, 1, ?6, ?6, ?7)",
-                    params![parent_id, name, kind.as_str(), len, mime, now_value, hash],
-                )?;
-                (tx.last_insert_rowid(), 1u64)
-            }
-            Some(row) => (row.id, row.version + 1),
-        };
-
-        // 先把新分块写进临时目录，再整体替换旧目录，避免中途失败留下半份数据。
-        let blobs = self.storage.join("blobs");
-        let target = blobs.join(id.to_string());
-        let staging = blobs.join(format!("{id}.tmp-{}", std::process::id()));
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging)?;
-        }
-        std::fs::create_dir_all(&staging)?;
-
-        tx.execute("DELETE FROM vfs_chunks WHERE node_id = ?1", params![id])?;
-        let mut offset = 0u64;
-        for (index, chunk) in data.chunks(BLOB_CHUNK_BYTES).enumerate() {
-            let sealed = self.seal_blob(id, index, chunk)?;
-            std::fs::write(staging.join(index.to_string()), sealed)?;
-            tx.execute(
-                "INSERT INTO vfs_chunks (node_id, idx, offset, length, hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    id,
-                    index as i64,
-                    offset as i64,
-                    chunk.len() as i64,
-                    hash_bytes(chunk)
-                ],
-            )?;
-            offset += chunk.len() as u64;
-        }
-
-        if target.exists() {
-            std::fs::remove_dir_all(&target)?;
-        }
-        std::fs::rename(&staging, &target)?;
-
-        tx.execute(
-            "UPDATE vfs_nodes
-             SET size = ?1, mime = ?2, version = ?3, updated_at = ?4, hash = ?5, kind = ?6
-             WHERE id = ?7",
-            params![len, mime, version, now_value, hash, kind.as_str(), id],
-        )?;
-        self.record_read(&tx, id, version, Some(&hash), false)?;
-        tx.commit()?;
-        // 先释放连接锁再重新读取，否则会自锁。
-        drop(conn);
-
-        let conn = self.db.lock();
-        let row = self
-            .lookup(&conn, path)?
-            .ok_or_else(|| VfsError::Storage("just-written binary disappeared".to_owned()))?;
-        Ok(self.meta(path, &row))
+        let mut chunks = data
+            .chunks(BLOB_CHUNK_BYTES)
+            .map(|chunk| Ok(Cow::Borrowed(chunk)));
+        self.write_binary_chunks(path, kind, data.len() as u64, &hash, &mut chunks)
     }
 
     fn mkdir_all(&self, path: &VfsPath) -> Result<(), VfsError> {

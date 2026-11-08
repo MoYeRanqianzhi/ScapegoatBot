@@ -265,8 +265,15 @@ impl McpClient {
                                 "image/png" | "image/jpeg" | "image/gif" | "image/webp"
                             ) {
                                 // MCP 服务常直接返回截图原图；先缩到 2000px JPEG，
-                                // 再按 provider 的 base64 上限过滤。
-                                let (mime, data) = compress_mcp_image(data, mime);
+                                // 再按 provider 的 base64 上限过滤。解码与编码在阻塞
+                                // 线程池里做，不卡住读 MCP 管道的异步任务。
+                                let data = data.to_owned();
+                                let original = mime.to_owned();
+                                let (mime, data) = crate::media::blocking(move || {
+                                    compress_mcp_image(&data, &original)
+                                })
+                                .await
+                                .map_err(anyhow::Error::msg)?;
                                 if data.len() <= 4_700_000 {
                                     images.push(crate::agent::message::ImageAttachment {
                                         mime,
@@ -480,7 +487,9 @@ impl Tool for McpTool {
     }
 }
 
-/// 把过大的 MCP 图片压成 2000px JPEG；解码/编码失败时原样返回。
+/// 把过大的 MCP 图片压成不超过视觉上限的 JPEG（最长边从 2000px 起逐步缩小）；
+/// 解码/编码失败时原样返回，之后由调用方按 provider 的 base64 上限决定是否丢弃。
+/// 解码受 [`crate::media`] 的宽高上限约束。
 fn compress_mcp_image(data: &str, mime: &str) -> (String, String) {
     use base64::Engine as _;
     if data.len() <= 1_000_000 {
@@ -489,19 +498,20 @@ fn compress_mcp_image(data: &str, mime: &str) -> (String, String) {
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
         return (mime.to_owned(), data.to_owned());
     };
-    let Ok(image) = image::load_from_memory(&bytes) else {
-        return (mime.to_owned(), data.to_owned());
-    };
-    let rgb = image.thumbnail(2000, 2000).to_rgb8();
-    let mut encoded = Vec::new();
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut encoded, 85);
-    if encoder.encode_image(&rgb).is_err() {
-        return (mime.to_owned(), data.to_owned());
+    match crate::media::shrink_to_fit(
+        &bytes,
+        crate::media::VISION_MAX_SIDE,
+        crate::media::VISION_MAX_BYTES,
+    ) {
+        Ok(encoded) => (
+            "image/jpeg".to_owned(),
+            base64::engine::general_purpose::STANDARD.encode(encoded),
+        ),
+        Err(error) => {
+            tracing::debug!(%error, "cannot shrink an MCP image; keeping the original");
+            (mime.to_owned(), data.to_owned())
+        }
     }
-    (
-        "image/jpeg".to_owned(),
-        base64::engine::general_purpose::STANDARD.encode(encoded),
-    )
 }
 
 #[cfg(test)]

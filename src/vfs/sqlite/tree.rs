@@ -338,18 +338,19 @@ impl super::VfsStore {
                 Ok(new_id)
             }
             _ => {
-                // 二进制：读出全部明文再按新 id 重新分块加密。
-                let mut data = Vec::with_capacity(source.size as usize);
-                let chunks: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM vfs_chunks WHERE node_id = ?1",
-                    params![source.id],
-                    |row| row.get(0),
-                )?;
-                for idx in 0..chunks {
-                    let sealed = std::fs::read(self.blob_path(source.id, idx as usize))?;
-                    let plain = self.open_blob(source.id, idx as usize, &sealed)?;
-                    data.extend_from_slice(&plain);
-                }
+                // 二进制：逐块解密、按新 id 重新加密；内存里同时只有一个分块。
+                // 分块的偏移、长度与 hash 不变，直接沿用源节点的索引行。
+                let chunks: Vec<(i64, i64, i64, String)> = {
+                    let mut statement = conn.prepare(
+                        "SELECT idx, offset, length, hash FROM vfs_chunks
+                         WHERE node_id = ?1 ORDER BY idx ASC",
+                    )?;
+                    statement
+                        .query_map(params![source.id], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
 
                 conn.execute(
                     "INSERT INTO vfs_nodes
@@ -369,22 +370,17 @@ impl super::VfsStore {
 
                 let target = self.storage.join("blobs").join(new_id.to_string());
                 std::fs::create_dir_all(&target)?;
-                let mut offset = 0u64;
-                for (index, chunk) in data.chunks(BLOB_CHUNK_BYTES).enumerate() {
-                    let sealed = self.seal_blob(new_id, index, chunk)?;
-                    std::fs::write(target.join(index.to_string()), sealed)?;
+                for (idx, offset, length, hash) in chunks {
+                    let index = idx as usize;
+                    let sealed = std::fs::read(self.blob_path(source.id, index))?;
+                    let plain = self.open_blob(source.id, index, &sealed)?;
+                    let resealed = self.seal_blob(new_id, index, &plain)?;
+                    std::fs::write(target.join(index.to_string()), resealed)?;
                     conn.execute(
                         "INSERT INTO vfs_chunks (node_id, idx, offset, length, hash)
                          VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![
-                            new_id,
-                            index as i64,
-                            offset as i64,
-                            chunk.len() as i64,
-                            hash_bytes(chunk)
-                        ],
+                        params![new_id, idx, offset, length, hash],
                     )?;
-                    offset += chunk.len() as u64;
                 }
                 Ok(new_id)
             }

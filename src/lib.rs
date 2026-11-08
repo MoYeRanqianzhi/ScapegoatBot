@@ -20,6 +20,8 @@ pub(crate) mod llm;
 pub mod logging;
 // MCP 可选，默认关闭；启用时由 app 连接 stdio 服务器。
 pub(crate) mod mcp;
+// 图片解码上限、缩图与阻塞线程池：`Read`、`API` 图片动作与 MCP 共用。
+pub(crate) mod media;
 // 后台复盘：记忆候选与 /STYLE.md；只在空闲时运行。
 pub mod memory;
 pub(crate) mod monitor;
