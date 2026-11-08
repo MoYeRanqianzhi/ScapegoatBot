@@ -3,6 +3,9 @@
 //! 多行字符串字面量漏写行尾的 `\` 时，下一行的缩进会原样进入字符串，模型看到的
 //! 错误提示就变成 `... not                          allowed`。这类错误编译器不报，
 //! 只能靠扫描源码发现；历史上它出现过十多处。
+//!
+//! 普通字符串里的换行一律写成 `\n`：真实换行即使碰巧没有缩进（下一行顶格），
+//! 也几乎都是编辑工具吞掉反斜杠留下的，读代码的人也分不清它是不是有意的。
 
 use std::path::Path;
 
@@ -38,9 +41,10 @@ fn string_literals_have_no_broken_indentation() {
                 hits.push(format!("{}:{}: {}", file.display(), index + 1, line.trim()));
             }
         }
-        for line in raw_newlines_followed_by_indentation(&text) {
+        for line in raw_newlines_in_strings(&text) {
             hits.push(format!(
-                "{}:{line}: string literal continues on an indented line without `\\`",
+                "{}:{line}: string literal contains a raw newline (write `\\n`, or end the \
+                 line with `\\`)",
                 file.display()
             ));
         }
@@ -52,12 +56,12 @@ fn string_literals_have_no_broken_indentation() {
     );
 }
 
-/// 普通（非 raw）字符串字面量里的真实换行，且下一行以缩进开头：几乎一定是漏写了 `\`。
+/// 普通（非 raw）字符串字面量里的真实换行（SQL 除外）。
 ///
 /// 单行正则看不到跨行的字面量（开引号在上一行），所以这里用一个最小的词法扫描：
 /// 跳过注释、raw 字符串与字符字面量，只在普通字符串内部检查换行。
 /// 返回出问题的行号（1 起）。
-fn raw_newlines_followed_by_indentation(source: &str) -> Vec<usize> {
+fn raw_newlines_in_strings(source: &str) -> Vec<usize> {
     // Windows checkout（`core.autocrlf`）是 CRLF；`\` 续行后面是 `\r\n`，先归一化。
     let chars: Vec<char> = source.replace("\r\n", "\n").chars().collect();
     let mut hits = Vec::new();
@@ -151,11 +155,7 @@ fn raw_newlines_followed_by_indentation(source: &str) -> Vec<usize> {
                         }
                         '\n' => {
                             line += 1;
-                            let indented =
-                                chars[index + 1..].iter().take_while(|c| **c == ' ').count() >= 4;
-                            if indented {
-                                suspicious.push(line);
-                            }
+                            suspicious.push(line);
                         }
                         _ => {}
                     }
@@ -201,7 +201,10 @@ fn is_sql(literal: &str) -> bool {
 #[test]
 fn the_scanner_finds_continuations_missing_their_backslash() {
     let broken = "fn f() {\n    let s = \"one\n        two\";\n}\n";
-    assert_eq!(raw_newlines_followed_by_indentation(broken), vec![3]);
+    assert_eq!(raw_newlines_in_strings(broken), vec![3]);
+    // 顶格的下一行同样算：这是编辑工具吞掉 `\n` 的典型痕迹。
+    let flush = "fn f() {\n    let s = \"one\n{}\";\n}\n";
+    assert_eq!(raw_newlines_in_strings(flush), vec![3]);
     let fine = "fn f() {\n    let s = \"one \\\n        two\";\n    let r = r#\"a\n    b\"#;\n    let c = '\"';\n    // \"x\n    y\n}\n";
-    assert!(raw_newlines_followed_by_indentation(fine).is_empty());
+    assert!(raw_newlines_in_strings(fine).is_empty());
 }

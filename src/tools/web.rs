@@ -310,10 +310,7 @@ impl Tool for WebFetchTool {
                 .await
             {
                 Ok((content, final_url, content_type)) => ToolResult::ok(format!(
-                    "{content}
-
-[final_url] {final_url}
-[content_type] {content_type}"
+                    "{content}\n\n[final_url] {final_url}\n[content_type] {content_type}"
                 )),
                 Err(error) => ToolResult::error(error),
             };

@@ -58,10 +58,7 @@ impl Runner {
         history.clear();
         for text in &session_end {
             let message = AgentMessage::System {
-                text: format!(
-                    "[hook context | SessionEnd]
-{text}"
-                ),
+                text: format!("[hook context | SessionEnd]\n{text}"),
             };
             self.deps.sessions.append(std::slice::from_ref(&message))?;
             history.push(message);
@@ -129,16 +126,8 @@ impl Runner {
             crate::config::HookEvent::PreCompact,
         );
         if !pre_compact.is_empty() {
-            input.push_str(
-                "
-
-[hook context]
-",
-            );
-            input.push_str(&pre_compact.join(
-                "
-",
-            ));
+            input.push_str("\n\n[hook context]\n");
+            input.push_str(&pre_compact.join("\n"));
         }
         let previous = sessions.current()?;
         // 摘要可以用独立模型；默认仍是主 provider。
@@ -155,7 +144,7 @@ impl Runner {
 
         let summary_message = AgentMessage::System {
             text: format!(
-                "[checkpoint summary | previous_session=/sessions/{} | reason={reason}]
+                "[checkpoint summary | previous_session=/sessions/{} | reason={reason}]\n\
 {summary}",
                 previous.file
             ),
@@ -172,10 +161,7 @@ impl Runner {
             crate::config::HookEvent::PostCompact,
         ) {
             new_history.push(AgentMessage::System {
-                text: format!(
-                    "[hook context | PostCompact]
-{text}"
-                ),
+                text: format!("[hook context | PostCompact]\n{text}"),
             });
         }
         // PostCompact recall：把记忆索引作为新分段的第一条上下文，避免压缩后
@@ -193,9 +179,7 @@ impl Runner {
             }
             new_history.push(AgentMessage::System {
                 text: format!(
-                    "<memory_context source=\"post_compact\">
-{text}
-</memory_context>"
+                    "<memory_context source=\"post_compact\">\n{text}\n</memory_context>"
                 ),
             });
         }

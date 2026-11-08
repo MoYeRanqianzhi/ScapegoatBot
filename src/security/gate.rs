@@ -327,13 +327,7 @@ impl SafetyJudge for LlmJudge {
             Checkpoint::Gate => "a planned QQ action",
         };
         let prompt = format!(
-            "checkpoint: {where_}
-
-state:
-{}
-
-new content:
-{delta}",
+            "checkpoint: {where_}\n\nstate:\n{}\n\nnew content:\n{delta}",
             truncate_chars(state, 24_000)
         );
         let text = match complete_text(

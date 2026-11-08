@@ -1025,17 +1025,11 @@ pub(crate) fn prune_tool_results(
         if let AgentMessage::Tool(result) = message {
             if !result.images.is_empty() {
                 result.images.clear();
-                result.content.push_str(
-                    "
-[image detached]",
-                );
+                result.content.push_str("\n[image detached]");
             }
             if result.content.chars().count() > soft_limit {
                 let mut trimmed: String = result.content.chars().take(soft_limit).collect();
-                trimmed.push_str(
-                    "
-[tool result trimmed]",
-                );
+                trimmed.push_str("\n[tool result trimmed]");
                 result.content = trimmed;
             }
         }

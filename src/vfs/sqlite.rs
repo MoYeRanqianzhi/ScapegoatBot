@@ -247,10 +247,7 @@ impl VfsStore {
                 return Err(VfsError::RangeOutOfBounds);
             }
             let end = start.saturating_add(take).min(lines.len());
-            lines[start..end].join(
-                "
-",
-            )
+            lines[start..end].join("\n")
         } else {
             text
         };

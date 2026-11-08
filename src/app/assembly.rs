@@ -855,10 +855,7 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
                     let mut history = history_handle.lock().await;
                     for text in injected {
                         history.push(crate::agent::AgentMessage::System {
-                            text: format!(
-                                "[hook context | ConfigChange]
-{text}"
-                            ),
+                            text: format!("[hook context | ConfigChange]\n{text}"),
                         });
                     }
                 });

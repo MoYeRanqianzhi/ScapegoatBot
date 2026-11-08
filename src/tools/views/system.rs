@@ -49,10 +49,7 @@ impl Views {
                 out
             }
             "events" => {
-                let mut out = String::from(
-                    "# Event audit (newest first)
-",
-                );
+                let mut out = String::from("# Event audit (newest first)\n");
                 let Some(db) = &self.context.db else {
                     return Err(VfsError::Offline("/system/events".to_owned()));
                 };
@@ -68,12 +65,7 @@ impl Views {
                         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                         .unwrap_or_else(|_| "<cannot decrypt>".to_owned());
                     out.push_str(&format!(
-                        "## {kind} {created_at}
-chat: {}
-actor: {}
-{raw}
-
-",
+                        "## {kind} {created_at}\nchat: {}\nactor: {}\n{raw}\n\n",
                         chat.as_deref().unwrap_or("-"),
                         actor
                             .map(|a| a.to_string())

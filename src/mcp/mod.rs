@@ -645,13 +645,7 @@ mod tests {
                 };
                 let response = json!({"jsonrpc": "2.0", "id": id, "result": result});
                 server_write
-                    .write_all(
-                        format!(
-                            "{response}
-"
-                        )
-                        .as_bytes(),
-                    )
+                    .write_all(format!("{response}\n").as_bytes())
                     .await
                     .unwrap();
                 server_write.flush().await.unwrap();

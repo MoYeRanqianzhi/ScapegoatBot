@@ -148,17 +148,13 @@ fn provider_messages(messages: &[super::ProviderMessage]) -> Vec<Value> {
                     if !text_parts.is_empty() {
                         content.push(json!({
                             "type": "text",
-                            "text": text_parts.join("
-
-")
+                            "text": text_parts.join("\n\n")
                         }));
                     }
                     content.extend(image_parts);
                     out.push(json!({ "role": "user", "content": content }));
                 } else if !text_parts.is_empty() {
-                    out.push(json!({ "role": "user", "content": text_parts.join("
-
-") }));
+                    out.push(json!({ "role": "user", "content": text_parts.join("\n\n") }));
                 }
             }
             Role::Assistant => {

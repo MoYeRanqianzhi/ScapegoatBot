@@ -442,11 +442,9 @@ fn truncate_result(mut result: ToolResult, limit: usize) -> ToolResult {
         cut -= 1;
     }
     result.content.truncate(cut);
-    result.content.push_str(
-        "
-
-[result truncated: exceeded tools.max_result_bytes]",
-    );
+    result
+        .content
+        .push_str("\n\n[result truncated: exceeded tools.max_result_bytes]");
     result
 }
 
