@@ -1,4 +1,4 @@
-//! 消息准入过滤器。
+//! 准入过滤器：消息、通知与请求。
 //!
 //! 设计依据：设计 §4 / §13「过滤是拒收，不是提示开关」。
 //!
@@ -14,7 +14,7 @@ use regex::Regex;
 
 use crate::config::FilterConfig;
 
-use super::event::QqMessage;
+use super::event::{ChatId, QqEvent, QqMessage};
 
 /// 过滤结论。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +55,41 @@ impl MessageFilter {
         }
     }
 
+    /// 判定一个事件是否准入：消息走 [`Self::check`]；notice / request 按群与发起人过滤。
+    ///
+    /// 被忽略的群里的进群、撤回、戳一戳等通知，以及被忽略的人发来的好友/加群请求，
+    /// 与消息一样不入库、不进 inbox、不进 monitor。正则与 `require_mention` 只对
+    /// 有正文的消息有意义；主人发起的事件照常准入。其余事件（meta、连接状态、
+    /// 无法归类的事件）不属于任何 chat，放行。
+    pub fn check_event(&self, event: &QqEvent, self_id: u64, owner_qq: u64) -> FilterVerdict {
+        let (group, actor) = match event {
+            QqEvent::Message(message) => return self.check(message, self_id, owner_qq),
+            QqEvent::Notice(notice) => (
+                notice.chat.and_then(|chat| match chat {
+                    ChatId::Group(group) => Some(group),
+                    ChatId::Private(_) => None,
+                }),
+                notice.actor,
+            ),
+            QqEvent::Request(request) => (request.group, request.actor),
+            _ => return FilterVerdict::Accept,
+        };
+        if owner_qq != 0 && actor == Some(owner_qq) {
+            return FilterVerdict::Accept;
+        }
+        if group.is_some_and(|group| self.ignore_groups.contains(&group)) {
+            return FilterVerdict::Reject {
+                rule: "ignore_groups",
+            };
+        }
+        if actor.is_some_and(|actor| self.ignore_users.contains(&actor)) {
+            return FilterVerdict::Reject {
+                rule: "ignore_users",
+            };
+        }
+        FilterVerdict::Accept
+    }
+
     /// 判定一条消息是否准入。
     ///
     /// `owner_qq` 的消息永远准入：过滤器挡的是外部噪声与注入，不是主人。主人的话
@@ -69,7 +104,7 @@ impl MessageFilter {
             return FilterVerdict::Accept;
         }
 
-        if let super::event::ChatId::Group(group) = message.chat {
+        if let ChatId::Group(group) = message.chat {
             if self.ignore_groups.contains(&group) {
                 return FilterVerdict::Reject {
                     rule: "ignore_groups",
@@ -171,6 +206,73 @@ mod tests {
             FilterVerdict::Reject {
                 rule: "ignore_patterns"
             }
+        );
+    }
+
+    #[test]
+    fn notices_and_requests_follow_the_group_and_user_rules() {
+        let filter = filter(FilterConfig {
+            ignore_groups: vec![1],
+            ignore_users: vec![3],
+            ignore_patterns: vec![".*".to_owned()],
+            require_mention: true,
+        });
+        let notice = |chat: Option<ChatId>, actor: Option<u64>| {
+            QqEvent::Notice(crate::qq::event::QqNotice {
+                kind: "group_recall".to_owned(),
+                chat,
+                actor,
+                target: None,
+                raw: Value::Null,
+            })
+        };
+        let request = |group: Option<u64>, actor: Option<u64>| {
+            QqEvent::Request(crate::qq::event::QqRequest {
+                kind: "friend".to_owned(),
+                group,
+                actor,
+                comment: String::new(),
+                flag: "f".to_owned(),
+                raw: Value::Null,
+            })
+        };
+        // 被忽略的群、被忽略的人：拒收。
+        assert!(
+            !filter
+                .check_event(&notice(Some(ChatId::Group(1)), Some(5)), 10, 0)
+                .is_accept()
+        );
+        assert!(
+            !filter
+                .check_event(&notice(Some(ChatId::Group(2)), Some(3)), 10, 0)
+                .is_accept()
+        );
+        assert!(
+            !filter
+                .check_event(&request(Some(1), Some(5)), 10, 0)
+                .is_accept()
+        );
+        assert!(
+            !filter
+                .check_event(&request(None, Some(3)), 10, 0)
+                .is_accept()
+        );
+        // 正则与 require_mention 不作用于没有正文的事件。
+        assert!(
+            filter
+                .check_event(&notice(Some(ChatId::Group(2)), Some(5)), 10, 0)
+                .is_accept()
+        );
+        assert!(
+            filter
+                .check_event(&request(None, Some(5)), 10, 0)
+                .is_accept()
+        );
+        // 主人发起的事件照常准入。
+        assert!(
+            filter
+                .check_event(&notice(Some(ChatId::Group(1)), Some(3)), 10, 3)
+                .is_accept()
         );
     }
 

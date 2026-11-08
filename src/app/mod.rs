@@ -567,12 +567,13 @@ impl Runtime {
 }
 
 impl AgentRuntime {
-    fn filter_and_count(&self, message: &crate::qq::event::QqMessage) -> bool {
+    /// 准入过滤（消息、notice、request）；拒收的事件计入 `filtered`。
+    fn admit(&self, event: &crate::qq::event::QqEvent) -> bool {
         let accept = self
             .filter
             .read()
             .expect("filter lock poisoned")
-            .check(message, self.self_id, self.owner_qq)
+            .check_event(event, self.self_id, self.owner_qq)
             .is_accept();
         if !accept {
             self.filtered.fetch_add(1, Ordering::Relaxed);

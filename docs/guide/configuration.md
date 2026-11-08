@@ -76,6 +76,9 @@ access token 在 `auth.json`，不在这里。
 ### `[filter]`：准入门
 
 语义是**拒收**：命中的消息不写 JSONL、不进 inbox、不进 transcript，monitor 也看不到。
+`ignore_groups` / `ignore_users` 同样作用于通知与请求（被忽略的群里的进群、撤回、戳一戳，
+被忽略的人发来的好友/加群请求），它们也不进 `/system/events`；正则与 `require_mention`
+只对有正文的消息生效。
 `owner_qq` 的消息不受过滤：主人的话总会进 inbox，看不看、醒不醒由 agent 的 monitor 决定。
 
 | 键 | 默认 | 说明 |

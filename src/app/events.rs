@@ -210,12 +210,10 @@ async fn handle_qq_event(
         }
         return;
     }
-    // 准入过滤必须在 monitor 之前：被拒消息既不应入库，也不应通过 monitor
-    // 进入上下文（否则过滤只剩“不写 JSONL”，挡不住注入）。
-    if let QqEvent::Message(message) = &event
-        && !agent.filter_and_count(message)
-    {
-        debug!(chat = %message.chat, "message rejected by the admission filter");
+    // 准入过滤必须在审计、入库与 monitor 之前：被拒事件既不应入库，也不应通过
+    // monitor 或 `/system/events` 进入上下文（否则过滤只剩“不写 JSONL”，挡不住注入）。
+    if !agent.admit(&event) {
+        debug!("event rejected by the admission filter");
         return;
     }
     if !matches!(&event, QqEvent::Message(_)) {
