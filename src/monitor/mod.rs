@@ -3,7 +3,8 @@
 //! 设计依据：设计 §5.11。
 //!
 //! 结构：`{source, when?, deliver, lifecycle?}`。
-//! - source：`qq` / `timer` / `internal`；`stream` 只允许写在配置文件里；
+//! - source：`qq` / `timer` / `internal`（运行时状态变化，见 [`internal`]）；`stream` 只允许
+//!   写在配置文件里；
 //! - when：谓词子集（`event.mentions_self`、`event.type == 'message'`、
 //!   `event.chat == 'group:123'`、`event.sender == '10001'` / `!=`、`event.text contains 'x'`，
 //!   前缀 `not` 取反，用 `and` 组合）；
@@ -30,8 +31,10 @@ use crate::qq::event::QqEvent;
 use crate::qq::format;
 use crate::storage::Database;
 
+pub mod internal;
 mod timer;
 
+pub use internal::{InternalBus, InternalEvent, InternalKind};
 pub use timer::Timer;
 use timer::spawn_timer;
 
@@ -526,17 +529,56 @@ impl MonitorManager {
         let owner_qq = self.owner_qq.load(Ordering::Relaxed);
         view.owner_intent =
             view.kind == "message" && owner_qq != 0 && view.sender == Some(owner_qq);
+        self.dispatch("qq", &view).await;
+    }
+
+    /// 订阅内部事件总线：之后发出的事件交给 `internal:<kind>` 的 monitor。
+    ///
+    /// 监听任务只持有弱引用，管理器释放后自行退出；积压过多被覆盖时记日志后继续。
+    pub fn listen(self: &Arc<Self>, bus: &InternalBus) {
+        let mut receiver = bus.subscribe();
+        let manager = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let event = match receiver.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "internal monitor events were dropped");
+                        continue;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let Some(manager) = manager.upgrade() else {
+                    break;
+                };
+                manager.on_internal(&event).await;
+            }
+        });
+    }
+
+    /// 喂入一个内部事件。
+    pub async fn on_internal(&self, event: &InternalEvent) {
+        let view = MonitorEvent {
+            kind: event.event_type(),
+            text: event.text.clone(),
+            ..MonitorEvent::default()
+        };
+        self.dispatch(&event.kind.source(), &view).await;
+    }
+
+    /// 把事件交给 `source` 相同的每个 monitor；`when` 不满足的跳过。
+    async fn dispatch(&self, source: &str, view: &MonitorEvent) {
         let monitors: Vec<Arc<Monitor>> = {
             let monitors = self.monitors.read().await;
             monitors
                 .values()
-                .filter(|monitor| monitor.source == "qq")
+                .filter(|monitor| monitor.source == source)
                 .cloned()
                 .collect()
         };
         for monitor in monitors {
-            match matches(monitor.when.as_deref(), &view) {
-                Ok(true) => self.enqueue(&monitor, &view).await,
+            match matches(monitor.when.as_deref(), view) {
+                Ok(true) => self.enqueue(&monitor, view).await,
                 Ok(false) => {}
                 // `add` 已校验表达式，这里不应发生。真发生了就停掉这个 monitor 并只通知一次：
                 // 否则每个 QQ 事件都会投递一条系统通知（每条都是一个回合）。
@@ -750,7 +792,11 @@ pub async fn load_config_monitors(
             .map_err(|error| anyhow::anyhow!("monitor {:?}: {error}", monitor.name))?;
             ("timer".to_owned(), Some(spec))
         } else if let Some(internal) = &monitor.source.internal {
-            (format!("internal:{}", internal.kind), None)
+            // 种类已由配置校验保证；这里再防御一次，不让拼错的种类变成永远收不到事件的 monitor。
+            let kind = InternalKind::parse(&internal.kind).ok_or_else(|| {
+                anyhow::anyhow!("monitor {:?}: {}", monitor.name, InternalKind::expected())
+            })?;
+            (kind.source(), None)
         } else if monitor.source.stream.is_some() {
             ("stream".to_owned(), None)
         } else {
@@ -884,6 +930,71 @@ mod tests {
         );
         assert!(!matches(Some("event.chat == 'private:1'"), &event).unwrap());
         assert!(matches(Some("event.nonexistent"), &event).is_err());
+    }
+
+    #[tokio::test]
+    async fn internal_events_reach_only_their_kind() {
+        let sink = Arc::new(RecordingSink::default());
+        let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+        let bus = InternalBus::new();
+        manager.listen(&bus);
+        for (name, kind, when) in [
+            (
+                "on-hold",
+                InternalKind::Security,
+                Some("event.type == 'security:hold'"),
+            ),
+            ("on-budget", InternalKind::Budget, None),
+        ] {
+            manager
+                .add(MonitorSpec {
+                    name: name.to_owned(),
+                    source: kind.source(),
+                    timer: None,
+                    when: when.map(str::to_owned),
+                    prompt: None,
+                    as_prompt: false,
+                    max_events: 100,
+                    expires: None,
+                    one_shot: false,
+                    min_interval: Duration::ZERO,
+                    idle_only: false,
+                    batch_window: Duration::ZERO,
+                    target: None,
+                    catch_up: CatchUp::Coalesce,
+                    cc: false,
+                    on_missing: crate::config::OnMissing::Queue,
+                })
+                .await
+                .unwrap();
+        }
+        bus.emit(InternalKind::Security, "released", "not matched by when");
+        bus.emit(
+            InternalKind::Security,
+            "hold",
+            "security hold entered: test",
+        );
+        bus.emit(InternalKind::Storage, "disk", "nobody listens to storage");
+        bus.emit(
+            InternalKind::Budget,
+            "exhausted",
+            "daily token budget exhausted",
+        );
+        // 监听任务异步投递；等到两条都到达。
+        for _ in 0..100 {
+            if sink.deliveries.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let deliveries = sink.deliveries.lock().unwrap().clone();
+        let names: Vec<&str> = deliveries
+            .iter()
+            .map(|delivery| delivery.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["on-hold", "on-budget"], "{deliveries:?}");
+        assert!(deliveries[0].text.contains("security hold entered"));
+        assert!(deliveries.iter().all(|delivery| !delivery.owner_intent));
     }
 
     /// 模型可以写任意大的 `expires`；以前 `Local::now() + duration` 溢出会 panic，

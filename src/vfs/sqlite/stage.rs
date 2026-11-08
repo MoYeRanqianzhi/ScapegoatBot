@@ -124,7 +124,46 @@ impl Drop for BlobStage {
     }
 }
 
+/// 存储压力；字段为 `None` 表示该项正常。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StoragePressure {
+    /// VFS 活跃用量（字节或节点数）达到配额的 [`PRESSURE_PERCENT`]% 时的说明。
+    pub quota: Option<String>,
+    /// 磁盘剩余低于写入下限时的说明。
+    pub disk: Option<String>,
+}
+
+/// 用量达到配额的这个百分比就算有压力。
+pub const PRESSURE_PERCENT: u64 = 90;
+
 impl VfsStore {
+    /// 当前存储压力：配额用量与磁盘剩余（`internal:storage` monitor 用）。
+    pub fn pressure(&self) -> Result<StoragePressure, VfsError> {
+        let usage = self.usage()?;
+        let near = |used: u64, limit: u64| {
+            limit != 0 && used.saturating_mul(100) >= limit.saturating_mul(PRESSURE_PERCENT)
+        };
+        let quota = if near(usage.active_bytes, self.quota.max_total_bytes()) {
+            Some(format!(
+                "VFS uses {} of {} bytes (at least {PRESSURE_PERCENT}%); writes fail once it is full",
+                usage.active_bytes,
+                self.quota.max_total_bytes()
+            ))
+        } else if near(usage.nodes, self.quota.max_nodes()) {
+            Some(format!(
+                "VFS holds {} of {} nodes (at least {PRESSURE_PERCENT}%); writes fail once it is full",
+                usage.nodes,
+                self.quota.max_nodes()
+            ))
+        } else {
+            None
+        };
+        let disk = self.quota.disk_shortfall(&self.storage).map(|(free, floor)| {
+            format!("free disk space is {free} bytes, below the {floor}-byte write floor; VFS writes are refused")
+        });
+        Ok(StoragePressure { quota, disk })
+    }
+
     /// 单个文本节点的字节上限（0 = 不限）；分段写入的内容按文本保存前用它判断。
     pub fn text_limit(&self) -> u64 {
         self.quota.max_text_bytes()
@@ -274,6 +313,33 @@ mod tests {
         let path = VfsPath::parse("/tmp/empty.bin").unwrap();
         store.commit_stage(empty, &path, NodeKind::Binary).unwrap();
         assert!(store.read_bytes(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pressure_reports_quota_usage_near_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VfsStore::open(
+            Arc::new(Database::open_in_memory().unwrap()),
+            Arc::new(MasterKey::from_bytes([9u8; 32])),
+            dir.path().to_path_buf(),
+            Limits {
+                max_total_bytes: 1_000,
+                min_free_bytes: 0,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(store.pressure().unwrap(), StoragePressure::default());
+        store
+            .write_binary(
+                &VfsPath::parse("/tmp/fill.bin").unwrap(),
+                &[0u8; 950],
+                NodeKind::Binary,
+            )
+            .unwrap();
+        let pressure = store.pressure().unwrap();
+        assert!(pressure.quota.unwrap().contains("950 of 1000"));
+        assert!(pressure.disk.is_none());
     }
 
     #[test]

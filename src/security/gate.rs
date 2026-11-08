@@ -397,6 +397,8 @@ pub struct Gate {
     classifier_required: bool,
     /// guard 花费预算；超过后跳过分类器、只跑规则层。
     budget: std::sync::OnceLock<Arc<crate::budget::Budget>>,
+    /// 进入 / 解除 hold 时通知 `internal:security` monitor；运行时装配后接入。
+    events: std::sync::OnceLock<crate::monitor::InternalBus>,
 }
 
 impl Gate {
@@ -465,6 +467,19 @@ impl Gate {
             hold: AtomicBool::new(false),
             classifier_required: config.enabled && config.backend != GuardBackend::Off,
             budget: std::sync::OnceLock::new(),
+            events: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// 接入内部事件总线；只接一次。
+    pub(crate) fn set_events(&self, bus: crate::monitor::InternalBus) {
+        let _ = self.events.set(bus);
+    }
+
+    /// 发一个 `internal:security` 事件（没接总线时什么也不做）。
+    fn emit(&self, name: &'static str, text: String) {
+        if let Some(bus) = self.events.get() {
+            bus.emit(crate::monitor::InternalKind::Security, name, text);
         }
     }
 
@@ -523,12 +538,16 @@ impl Gate {
 
     /// 解除 hold；调用方必须先让当前上下文再过一次闸。
     pub(crate) fn clear_hold(&self) -> std::io::Result<()> {
-        self.hold.store(false, Ordering::SeqCst);
-        match std::fs::remove_file(&self.hold_file) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
+        let was_held = self.hold.swap(false, Ordering::SeqCst);
+        let removed = match std::fs::remove_file(&self.hold_file) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        if was_held || removed {
+            self.emit("released", "security hold released".to_owned());
         }
+        Ok(())
     }
 
     /// 由外部事件（provider 拒绝）直接进入 hold。
@@ -538,7 +557,13 @@ impl Gate {
 
     /// 进入 hold：写哨兵文件（重启后仍然有效），更新内存状态。
     fn enter_hold(&self, checkpoint: Checkpoint, reason: &str) {
-        self.hold.store(true, Ordering::SeqCst);
+        // 只在状态变化时通知：已经 hold 时再次命中不重复唤醒。
+        if !self.hold.swap(true, Ordering::SeqCst) {
+            self.emit(
+                "hold",
+                format!("security hold entered at {checkpoint:?}: {reason}"),
+            );
+        }
         if let Err(error) = std::fs::write(
             &self.hold_file,
             format!(
@@ -799,6 +824,25 @@ mod tests {
         assert!(decision.dangerous);
         assert!(!decision.allowed);
         assert!(gate.hold_active());
+    }
+
+    #[test]
+    fn hold_transitions_emit_internal_events_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(GuardMode::Enforce, 0.9, dir.path());
+        let bus = crate::monitor::InternalBus::new();
+        let mut events = bus.subscribe();
+        gate.set_events(bus);
+        // 已经 hold 时再次命中、没 hold 时再解除，都不重复发。
+        gate.force_hold("first");
+        gate.force_hold("again");
+        gate.clear_hold().unwrap();
+        gate.clear_hold().unwrap();
+        let mut seen = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            seen.push(event.event_type());
+        }
+        assert_eq!(seen, vec!["security:hold", "security:released"]);
     }
 
     #[tokio::test]

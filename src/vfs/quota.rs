@@ -76,6 +76,15 @@ impl Quota {
         self.limits.max_nodes
     }
 
+    /// 磁盘剩余低于写入下限时返回 `(剩余, 下限)`；不限制或读不到剩余空间时为 `None`。
+    pub fn disk_shortfall(&self, storage_path: &Path) -> Option<(u64, u64)> {
+        if self.limits.min_free_bytes == 0 {
+            return None;
+        }
+        let free = fs2::available_space(storage_path).ok()?;
+        (free < self.limits.min_free_bytes).then_some((free, self.limits.min_free_bytes))
+    }
+
     /// 单个文本节点的上限（0 = 不限制）。
     pub fn max_text_bytes(&self) -> u64 {
         self.limits.max_text_bytes

@@ -13,7 +13,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::monitor::{MonitorManager, MonitorSpec, Timer};
+use crate::monitor::{InternalKind, MonitorManager, MonitorSpec, Timer};
 use crate::transcript::ToolResult;
 
 use super::{Tool, ToolContext, arg_opt_str, arg_str, object_schema};
@@ -47,7 +47,9 @@ impl Tool for MonitorTool {
          \"jitter_secs\": n to a timer to delay each run by a random 0..n seconds (at most \
          3600, shorter than every); \
          {\"internal\": \"security\" | \"budget\" | \"agent\" | \"storage\"} for runtime state \
-         changes. A stream source is config-file only; add rejects it.\n\n\
+         changes; event.type is security:hold, security:released, budget:exhausted, agent:done, \
+         agent:failed, storage:quota or storage:disk. A stream source is config-file only; add \
+         rejects it.\n\n\
          when — optional expression over event.*, e.g. event.mentions_self, \
          event.sender == \"10001\", event.text contains \"报名\", event.chat == \"group:123\"; \
          join terms with and, negate one with not. A broken expression is \
@@ -137,12 +139,10 @@ impl MonitorTool {
                 Err(error) => return ToolResult::error(error),
             }
         } else if let Some(internal) = source.get("internal").and_then(Value::as_str) {
-            if !["security", "budget", "agent", "storage"].contains(&internal) {
-                return ToolResult::error(
-                    "internal source must be security, budget, agent or storage.",
-                );
+            match InternalKind::parse(internal) {
+                Some(kind) => (kind.source(), None),
+                None => return ToolResult::error(InternalKind::expected()),
             }
-            (format!("internal:{internal}"), None)
         } else {
             return ToolResult::error(
                 "source must set exactly one of qq, timer, internal (stream is rejected here).",

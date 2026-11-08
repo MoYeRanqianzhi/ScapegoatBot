@@ -32,7 +32,7 @@ mod codec;
 mod stage;
 mod tree;
 
-pub use stage::BlobStage;
+pub use stage::{BlobStage, StoragePressure};
 
 /// 二进制分块大小：1 MiB。
 const BLOB_CHUNK_BYTES: usize = 1024 * 1024;

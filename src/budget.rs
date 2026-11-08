@@ -36,6 +36,10 @@ pub struct Budget {
     /// 单次 guard 调用的估算成本。
     guard_cost: f64,
     lock: Mutex<()>,
+    /// 预算耗尽时通知 `internal:budget` monitor；运行时装配后接入。
+    events: std::sync::OnceLock<crate::monitor::InternalBus>,
+    /// 已经通知过耗尽的那一天（本地日期）；每天最多通知一次。
+    exhausted_day: std::sync::Mutex<String>,
 }
 
 impl Budget {
@@ -45,7 +49,14 @@ impl Budget {
             config: config.clone(),
             guard_cost,
             lock: Mutex::new(()),
+            events: std::sync::OnceLock::new(),
+            exhausted_day: std::sync::Mutex::new(String::new()),
         })
+    }
+
+    /// 接入内部事件总线；只接一次。
+    pub fn set_events(&self, bus: crate::monitor::InternalBus) {
+        let _ = self.events.set(bus);
     }
 
     /// 单回合 token 上限；0 = 不限制。
@@ -69,21 +80,38 @@ impl Budget {
     }
 
     /// 新回合开始前的每日检查；返回拒绝原因。
+    ///
+    /// 当天第一次耗尽时发一个 `budget:exhausted` 内部事件。
     pub async fn check_daily(&self) -> Option<String> {
         let (tokens, usd) = self.today().await;
-        if self.config.daily_tokens > 0 && tokens >= self.config.daily_tokens {
-            return Some(format!(
+        let reason = if self.config.daily_tokens > 0 && tokens >= self.config.daily_tokens {
+            format!(
                 "daily token budget exhausted ({tokens}/{}); next turn after local midnight",
                 self.config.daily_tokens
-            ));
-        }
-        if self.config.daily_usd > 0.0 && usd >= self.config.daily_usd {
-            return Some(format!(
+            )
+        } else if self.config.daily_usd > 0.0 && usd >= self.config.daily_usd {
+            format!(
                 "daily USD budget exhausted (${:.4}/${:.4}); next turn after local midnight",
                 usd, self.config.daily_usd
-            ));
+            )
+        } else {
+            return None;
+        };
+        self.notify_exhausted(&reason);
+        Some(reason)
+    }
+
+    /// 每天最多通知一次耗尽。
+    fn notify_exhausted(&self, reason: &str) {
+        let Some(bus) = self.events.get() else {
+            return;
+        };
+        let today = self.day();
+        let mut notified = self.exhausted_day.lock().expect("budget day lock");
+        if *notified != today {
+            *notified = today;
+            bus.emit(crate::monitor::InternalKind::Budget, "exhausted", reason);
         }
-        None
     }
 
     /// 记录一次模型请求：全部 token（含缓存读写）计入每日 token，金额按 `cost`。
@@ -217,6 +245,26 @@ mod tests {
             .await;
         let reason = budget.check_daily().await.expect("token budget");
         assert!(reason.contains("daily token"));
+    }
+
+    #[tokio::test]
+    async fn exhaustion_is_announced_once_per_day() {
+        let budget = budget(BudgetConfig {
+            daily_tokens: 10,
+            ..BudgetConfig::default()
+        });
+        let bus = crate::monitor::InternalBus::new();
+        let mut events = bus.subscribe();
+        budget.set_events(bus);
+        budget.record(&CostDef::default(), &usage(20, 0)).await;
+        // 每次唤醒都会检查；同一天只发一次事件。
+        for _ in 0..3 {
+            assert!(budget.check_daily().await.is_some());
+        }
+        let event = events.try_recv().unwrap();
+        assert_eq!(event.event_type(), "budget:exhausted");
+        assert!(event.text.contains("daily token budget exhausted"));
+        assert!(events.try_recv().is_err());
     }
 
     #[tokio::test]

@@ -188,6 +188,18 @@ lifecycle = { idle_only = false, max_events = 1000 }
   准点。最多 `3600`，`every` 时必须短于周期；推迟期间到点的下一次触发与这次合并。
   例：`source = { timer = { every = "10m", jitter_secs = 60 } }`。
 
+`internal = { kind = "security" | "budget" | "agent" | "storage" }` 订阅运行时状态变化，
+`event.type` 是 `<kind>:<事件>`：
+
+| kind | `event.type` | 何时 |
+|------|--------------|------|
+| `security` | `security:hold` / `security:released` | 进入 / 解除 hold（状态变化时各一次） |
+| `budget` | `budget:exhausted` | 每日 token 或金额预算当天第一次耗尽 |
+| `agent` | `agent:done` / `agent:failed` | 子代理一次运行结束 |
+| `storage` | `storage:quota` / `storage:disk` | VFS 用量达到配额 90%、磁盘剩余低于写入下限（每 5 分钟检查，越线时一次） |
+
+例：`source = { internal = { kind = "security" } }`，`when = "event.type == 'security:hold'"`。
+
 运行时也能通过 `Monitor` 工具增删，但重启即消失；配置文件里的才是常驻。
 
 `when` 是用 `and` 连接的谓词：`event.type == '…'`、`event.chat == '…'`、

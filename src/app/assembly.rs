@@ -638,6 +638,12 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
     monitors.set_db(Arc::clone(&db));
     monitors.set_self_id(self_id);
     monitors.set_owner_qq(owner_qq);
+    // 内部事件：安全闸、预算、子代理与存储巡检的状态变化交给 `internal:*` monitor。
+    let internal = crate::monitor::InternalBus::new();
+    monitors.listen(&internal);
+    gate.set_events(internal.clone());
+    budget.set_events(internal.clone());
+    super::maintenance::spawn_storage_watch(Arc::clone(&vfs), internal.clone());
 
     gate.set_budget(Arc::clone(&budget));
 
@@ -771,6 +777,7 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
             warn!("subagent hub was already initialized");
         }
         if let Some(hub) = hub_handle.get() {
+            hub.set_events(internal.clone());
             runner.set_hub(Arc::clone(hub));
             let _ = sink.hub.set(Arc::clone(hub));
         }

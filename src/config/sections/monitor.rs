@@ -280,7 +280,7 @@ pub(in crate::config) fn validate_monitors(
         }
 
         if let Some(internal) = &monitor.source.internal
-            && !["agent", "security", "budget", "storage"].contains(&internal.kind.as_str())
+            && crate::monitor::InternalKind::parse(&internal.kind).is_none()
         {
             errors.push(ConfigError::new(
                 format!("{field}.source.internal.kind"),

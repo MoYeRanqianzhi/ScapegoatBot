@@ -293,9 +293,16 @@ pub struct AgentHub {
     host_dir: PathBuf,
     instances: RwLock<HashMap<String, Arc<AgentInstance>>>,
     counter: AtomicU64,
+    /// 子代理运行结束时通知 `internal:agent` monitor；运行时装配后接入。
+    events: std::sync::OnceLock<crate::monitor::InternalBus>,
 }
 
 impl AgentHub {
+    /// 接入内部事件总线；只接一次。
+    pub fn set_events(&self, bus: crate::monitor::InternalBus) {
+        let _ = self.events.set(bus);
+    }
+
     pub fn new(
         runner: Arc<dyn SubagentRunner>,
         config: SwarmConfig,
@@ -309,6 +316,7 @@ impl AgentHub {
             host_dir,
             instances: RwLock::new(HashMap::new()),
             counter: AtomicU64::new(1),
+            events: std::sync::OnceLock::new(),
         })
     }
 
@@ -488,8 +496,9 @@ impl AgentHub {
         let generation = instance
             .generation
             .load(std::sync::atomic::Ordering::SeqCst);
+        let events = self.events.get().cloned();
         tokio::spawn(async move {
-            run_instance(instance, runner, request, generation).await;
+            run_instance(instance, runner, request, generation, events).await;
         });
 
         Ok(serde_json::json!({
@@ -581,8 +590,9 @@ impl AgentHub {
         let generation = instance
             .generation
             .load(std::sync::atomic::Ordering::SeqCst);
+        let events = self.events.get().cloned();
         tokio::spawn(async move {
-            run_instance(instance, runner, request, generation).await;
+            run_instance(instance, runner, request, generation, events).await;
         });
         Ok(serde_json::json!({"id": id, "restarted": true}))
     }
@@ -692,12 +702,13 @@ fn assistant_text(text: String) -> AgentMessage {
     })
 }
 
-/// 运行一个实例：执行、记录历史、写入状态。
+/// 运行一个实例：执行、记录历史、写入状态，结束时发 `agent:done` / `agent:failed`。
 async fn run_instance(
     instance: Arc<AgentInstance>,
     runner: Arc<dyn SubagentRunner>,
     request: SubagentRequest,
     generation: u64,
+    events: Option<crate::monitor::InternalBus>,
 ) {
     let task = request.task.clone();
     let outcome = runner.run_subagent(request).await;
@@ -712,21 +723,34 @@ async fn run_instance(
     }
     *instance.incoming.lock().await = None;
     let mut history = instance.history.lock().await;
-    match outcome {
+    // 事件只说明谁结束了、怎么结束的；结果本身用 `Agent check` 读取。
+    let (name, summary) = match outcome {
         Ok(result) => {
             history.push(assistant_text(result.clone()));
             *instance.result.lock().await = Some(result);
             *instance.status.lock().await = InstanceStatus::Done;
+            (
+                "done",
+                "finished; read the result with Agent check".to_owned(),
+            )
         }
         Err(error) => {
             let message = error.to_string();
             history.push(assistant_text(format!("Subagent failed: {message}")));
             *instance.result.lock().await = Some(message.clone());
-            *instance.status.lock().await = InstanceStatus::Failed(message);
+            *instance.status.lock().await = InstanceStatus::Failed(message.clone());
+            ("failed", format!("failed: {message}"))
         }
-    }
+    };
     drop(history);
     instance.finished.notify_waiters();
+    if let Some(bus) = events {
+        bus.emit(
+            crate::monitor::InternalKind::Agent,
+            name,
+            format!("subagent {} ({}) {summary}", instance.id, instance.label),
+        );
+    }
     // 任务文本已在首轮历史里；`task` 只用于日志级别的可追溯性。
     let _ = task;
 }
@@ -813,6 +837,9 @@ mod tests {
     async fn spawn_check_wait_list() {
         let runner = Arc::new(FakeRunner::default());
         let hub = hub(Arc::clone(&runner) as Arc<dyn SubagentRunner>);
+        let bus = crate::monitor::InternalBus::new();
+        let mut events = bus.subscribe();
+        hub.set_events(bus);
         let spawned = hub
             .spawn(
                 Some("explore"),
@@ -834,6 +861,10 @@ mod tests {
         let list = hub.check(None).await.unwrap();
         assert_eq!(list.as_array().unwrap().len(), 1);
         assert!(hub.list().await["definitions"].is_array());
+        // 结束时发一个 `agent:done` 内部事件，说明是谁。
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.event_type(), "agent:done");
+        assert!(event.text.contains(&id), "{}", event.text);
     }
 
     #[tokio::test]
