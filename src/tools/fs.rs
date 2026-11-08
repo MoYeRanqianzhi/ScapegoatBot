@@ -59,10 +59,17 @@ impl Tool for ReadTool {
          `offset` and `limit` select lines. For images, returns content; for other binary files, \
          returns metadata only. A full text read (no offset/limit) is required before `Edit` or \
          overwriting with `Write`.\n\n\
-         Dynamic views accept query parameters: `/inbox?filter=from:10001&limit=20`, \
-         `/messages/groups/123/2026-10?filter=contains(\"活动\")&order=desc`. `limit` defaults \
-         to 50 (max 500). Whatever this call returns is marked read; items beyond `limit` stay \
-         unread. Use `LS` or `Stat` when you only want names and counts."
+         Message views take query parameters: `/inbox`, `/inbox/<chat>`, `/messages`, and a \
+         day file such as `/messages/groups/123/2026-10/05.md`. Example: \
+         `/messages/groups/123/2026-10/05.md?filter=contains:活动&order=desc&limit=20`. \
+         `filter` is space-separated terms that must all match: `unread`, \
+         `state:unread|read|dismissed`, `from:<qq>`, `mentions_self`, `contains:<text>` \
+         (case-insensitive; quote text with spaces: `contains:\"two words\"`), \
+         `after:YYYY-MM-DD`, `before:YYYY-MM-DD`; percent-encode spaces in the path (`%20`). \
+         `limit` defaults to 50 (max 500), `offset` skips matches, `order=desc` puts the \
+         newest first. Whatever this call returns is marked read; items beyond `limit` stay \
+         unread and the result says how many remain. Use `LS` or `Stat` when you only want \
+         names and counts."
     }
 
     fn parameters(&self) -> Value {
@@ -94,6 +101,13 @@ impl Tool for ReadTool {
             let Some(views) = &ctx.views else {
                 return ToolResult::error(crate::tools::DYNAMIC_UNAVAILABLE);
             };
+            // 动态视图按条翻页；按行截取会把整页标记已读、却只有几行进入上下文。
+            if offset.is_some() || limit.is_some() {
+                return ToolResult::error(
+                    "Dynamic views page by item, not by line: put limit/offset in the path's \
+                     query string, e.g. /inbox?limit=20&offset=20.",
+                );
+            }
             return match views.read(&target).await {
                 Ok(views::ViewRead::Text(text)) => ToolResult::ok(text),
                 Ok(views::ViewRead::Metadata { kind, size, mime }) => {
@@ -346,8 +360,10 @@ impl Tool for LsTool {
 
     fn description(&self) -> &'static str {
         "List a VFS directory. `recursive` includes descendants. Returns type, size, mtime, and \
-         path; does not return file content. Accepts the same query parameters as `Read` on \
-         dynamic views. Listing never marks anything read."
+         path; does not return file content. On dynamic views (`/inbox`, `/messages`, \
+         `/friends`, `/groups`, ...) it accepts `limit`, `offset`, `order`, and a `filter` made \
+         of `contains:<text>` terms matched against entry paths. In `/inbox` a directory's size \
+         is its unread count. Listing never marks anything read."
     }
 
     fn parameters(&self) -> Value {
@@ -374,13 +390,21 @@ impl Tool for LsTool {
             let Some(views) = &ctx.views else {
                 return ToolResult::error(crate::tools::DYNAMIC_UNAVAILABLE);
             };
-            let entries = if recursive {
-                views.walk(&target.path).await
+            let listed = if recursive {
+                views.list_tree(&target).await
             } else {
                 views.list(&target).await
             };
-            return match entries {
-                Ok(entries) => ToolResult::ok(render_entries(&entries)),
+            return match listed {
+                Ok(page) => {
+                    let mut text = render_entries(&page.items);
+                    // 截断时告诉模型怎样翻页，避免把第一页误当成全部。
+                    if let Some(hint) = page.next_page_hint() {
+                        text.push('\n');
+                        text.push_str(&hint);
+                    }
+                    ToolResult::ok(text)
+                }
                 Err(error) => vfs_error(error),
             };
         }
@@ -706,9 +730,11 @@ impl Tool for RmTool {
          item to `/trash` unless `permanent: true`.\n\n\
          On `/inbox`, removal means dismiss: the entry leaves the inbox without being marked \
          read. `RM /inbox/<chat>/<message_id>.md` dismisses one message; \
-         `RM /inbox/<chat>/index.md` dismisses every unread message from that chat; \
-         `RM /inbox?filter=...` dismisses the matches and the filter is required. Dismissing \
-         never deletes the underlying message: it stays searchable under `/messages`."
+         `RM /inbox/<chat>` (or its `index.md`) dismisses every unread message from that chat; \
+         `RM /inbox?filter=...` dismisses matching unread messages across chats and the filter \
+         is required. With query parameters only the selected page is dismissed (same \
+         `filter`/`limit`/`offset`/`order` as `Read`). Dismissing never deletes the underlying \
+         message: it stays searchable under `/messages`."
     }
 
     fn parameters(&self) -> Value {
@@ -754,10 +780,23 @@ impl Tool for RmTool {
                 return ToolResult::error(crate::tools::DYNAMIC_UNAVAILABLE);
             };
             return match views.dismiss(&target) {
-                Ok(count) => ToolResult::ok(format!(
-                    "Dismissed {count} inbox entr{}.",
-                    if count == 1 { "y" } else { "ies" }
-                )),
+                Ok(dismissed) => {
+                    let count = dismissed.count;
+                    let mut text = format!(
+                        "Dismissed {count} inbox entr{}.",
+                        if count == 1 { "y" } else { "ies" }
+                    );
+                    // 带 limit 时只处理了一页；说明还剩多少同样满足条件。
+                    if dismissed.remaining > 0 {
+                        text.push_str(&format!(
+                            " {} more match{} and stay{} in the inbox; repeat to dismiss them.",
+                            dismissed.remaining,
+                            if dismissed.remaining == 1 { "es" } else { "" },
+                            if dismissed.remaining == 1 { "s" } else { "" },
+                        ));
+                    }
+                    ToolResult::ok(text)
+                }
                 Err(error) => vfs_error(error),
             };
         }

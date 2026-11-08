@@ -390,6 +390,32 @@ impl MessageStore {
         Ok(raw.as_deref().and_then(InboxState::parse))
     }
 
+    /// 某个 chat 某一天全部消息的收件箱状态（`message_id` → 状态），一次查询取完。
+    ///
+    /// 不在收件箱里的消息（本账号发出的、补抓的历史）没有状态，不出现在结果里。
+    pub(crate) fn states_for_day(
+        &self,
+        chat: ChatId,
+        day: &str,
+    ) -> Result<std::collections::HashMap<i64, InboxState>> {
+        let conn = self.db.lock();
+        let mut statement = conn.prepare(
+            "SELECT s.message_id, s.state FROM inbox_state s
+             JOIN messages m ON m.chat = s.chat AND m.message_id = s.message_id
+             WHERE m.chat = ?1 AND m.day = ?2",
+        )?;
+        let rows = statement
+            .query_map(params![chat.to_string(), day], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        // 认不出的状态字符串（理论上不会出现）按“没有状态”处理。
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, state)| InboxState::parse(&state).map(|state| (id, state)))
+            .collect())
+    }
+
     /// 设置状态；`dismissed` 不会被后续 `read` 覆盖。
     pub(crate) fn set_state(&self, chat: ChatId, message_id: i64, state: InboxState) -> Result<()> {
         let conn = self.db.lock();
@@ -499,16 +525,6 @@ impl MessageStore {
         Ok(statement
             .query_map(params![scope], |row| row.get::<_, u64>(0))?
             .collect::<Result<Vec<_>, _>>()?)
-    }
-
-    /// 读取某天某 chat 的收件箱条目（带状态）。
-    pub(crate) fn inbox_for_chat(&self, chat: ChatId, state: InboxState) -> Result<Vec<QqMessage>> {
-        self.load_indexed(
-            "SELECT m.file_path, m.line_no, m.message_id FROM messages m
-             JOIN inbox_state s ON s.chat = m.chat AND s.message_id = m.message_id
-             WHERE m.chat = ?1 AND s.state = ?2 ORDER BY m.ts ASC",
-            params![chat.to_string(), state.as_str()],
-        )
     }
 }
 

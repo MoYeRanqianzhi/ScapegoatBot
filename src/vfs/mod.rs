@@ -4,6 +4,7 @@
 //!
 //! 分工：
 //! - [`path`]：路径解析、NFC、查询参数；
+//! - [`filter`]：查询参数 `filter` 的条件语法；
 //! - [`sqlite`]：SQLite 后端（文本加密、二进制分块、回收站、Read-before-Edit）；
 //! - [`quota`]：配额与磁盘水位；
 //! - [`dynamic`]：动态视图（`/friends`、`/messages` 等，数据源由运行时提供）。
@@ -13,6 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod dynamic;
+pub mod filter;
 pub mod path;
 pub mod quota;
 pub mod sqlite;

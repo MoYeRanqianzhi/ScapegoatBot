@@ -630,6 +630,7 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
             db: Some(Arc::clone(&db)),
             key: Some(Arc::clone(&key)),
             receive_scopes: config.agent.receive_scopes.clone(),
+            self_id,
         }),
     );
     let sink = Arc::new(RunnerSink::default());

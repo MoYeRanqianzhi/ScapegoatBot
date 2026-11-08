@@ -15,6 +15,8 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::vfs::filter::ViewFilter;
+
 /// 路径长度上限（字符数）。
 pub const MAX_PATH_CHARS: usize = 255;
 /// 路径深度上限。
@@ -191,12 +193,19 @@ pub enum PathError {
     InvalidSegment,
     #[error("query parameters are only allowed on dynamic views")]
     QueryOnStaticPath,
+    #[error(
+        "{0} does not take query parameters; Read takes them on /inbox, /inbox/<chat>, \
+         /messages and /messages/.../<DD>.md, and LS takes them on dynamic directories"
+    )]
+    QueryNotSupported(String),
     #[error("malformed query string")]
     BadQuery,
     #[error("unknown query parameter {0:?}")]
     UnknownQueryKey(String),
     #[error("invalid value for query parameter {0:?}")]
     BadQueryValue(&'static str),
+    #[error("invalid filter: {0}")]
+    BadFilter(String),
 }
 
 /// 查询排序。
@@ -208,13 +217,17 @@ pub enum Order {
 }
 
 /// 动态视图查询参数（设计 §6.3）。
+///
+/// 视图先按 `filter` 筛选，再按 `order` 排序，然后跳过 `offset` 条、最多取 `limit` 条。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewQuery {
-    /// 与 monitor `when` 同一套谓词语法；此处只保存原文，求值在视图层。
-    pub filter: Option<String>,
-    /// 默认 50，上限 500。
+    /// 筛选条件，语法见 [`crate::vfs::filter`]；解析时已校验，求值在视图层。
+    pub filter: Option<ViewFilter>,
+    /// 最多返回的条数：默认 50，上限 500。
     pub limit: usize,
+    /// 筛选、排序之后跳过的条数。
     pub offset: usize,
+    /// `asc` 旧的在前（默认），`desc` 新的在前。
     pub order: Order,
 }
 
@@ -280,6 +293,15 @@ pub fn is_dynamic(path: &VfsPath) -> bool {
 }
 
 impl ViewQuery {
+    /// 不筛选、不截断：内部扫描（`Grep`、`Stat` 计算大小、无查询的整 chat 忽略）用，
+    /// 不受模型可写的 500 条上限约束。
+    pub fn unbounded() -> Self {
+        Self {
+            limit: usize::MAX,
+            ..Self::default()
+        }
+    }
+
     /// 解析 `k=v&k=v` 形式。
     pub fn parse(raw: &str) -> Result<Self, PathError> {
         let mut query = Self::default();
@@ -290,10 +312,7 @@ impl ViewQuery {
             let value = percent_decode(value)?;
             match key {
                 "filter" => {
-                    if value.trim().is_empty() {
-                        return Err(PathError::BadQueryValue("filter"));
-                    }
-                    query.filter = Some(value);
+                    query.filter = Some(ViewFilter::parse(&value).map_err(PathError::BadFilter)?);
                 }
                 "limit" => {
                     let limit: usize = value
@@ -349,6 +368,8 @@ fn percent_decode(raw: &str) -> Result<String, PathError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::messages::InboxState;
+    use crate::vfs::filter::FilterTerm;
 
     #[test]
     fn parses_and_displays_absolute_paths() {
@@ -425,7 +446,10 @@ mod tests {
         assert!(ParsedTarget::parse("/AGENTS.md?limit=5").is_err());
         let target = ParsedTarget::parse("/inbox?filter=unread&limit=20&order=desc").unwrap();
         let query = target.query.unwrap();
-        assert_eq!(query.filter.as_deref(), Some("unread"));
+        assert_eq!(
+            query.filter.unwrap().terms(),
+            &[FilterTerm::State(InboxState::Unread)]
+        );
         assert_eq!(query.limit, 20);
         assert_eq!(query.order, Order::Desc);
     }
@@ -436,12 +460,24 @@ mod tests {
         assert!(ViewQuery::parse("limit=501").is_err());
         assert!(ViewQuery::parse("order=sideways").is_err());
         assert!(ViewQuery::parse("nope=1").is_err());
+        // filter 写错时在解析阶段就报错，而不是求值时当成不匹配。
+        assert!(matches!(
+            ViewQuery::parse("filter=contains(x)"),
+            Err(PathError::BadFilter(_))
+        ));
+        assert!(ViewQuery::parse("filter=").is_err());
     }
 
     #[test]
     fn query_values_are_percent_decoded() {
-        let query = ViewQuery::parse("filter=contains%28%22%E6%B4%BB%E5%8A%A8%22%29").unwrap();
-        assert_eq!(query.filter.as_deref(), Some("contains(\"活动\")"));
+        // contains:"活动 安排"
+        let query =
+            ViewQuery::parse("filter=contains:%22%E6%B4%BB%E5%8A%A8%20%E5%AE%89%E6%8E%92%22")
+                .unwrap();
+        assert_eq!(
+            query.filter.unwrap().terms(),
+            &[FilterTerm::Contains("活动 安排".to_owned())]
+        );
     }
 
     #[test]

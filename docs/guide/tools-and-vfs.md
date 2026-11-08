@@ -43,21 +43,45 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 | `/config` / `/config.toml` | 配置视图 |
 | `/system` / `/system/<section>` | 运行状态、hold、用量 |
 
-查询参数只允许出现在这些路径上：
+查询参数只允许出现在这些路径上，静态文件带查询直接报错：
 
 ```text
-/messages/groups/123/2026-11/?limit=20&offset=0&order=desc&filter=contains:deploy
+/messages/groups/123/2026-11/05.md?filter=contains:deploy%20from:10001&order=desc&limit=20
+/inbox?filter=mentions_self&limit=10
 ```
 
-- `filter` 与 monitor 的 `when` 同一套谓词语法，如 `state:unread`、`from:<qq>`、
-  `contains:<text>`。
-- `limit` 默认 50、上限 500；`offset`；`order = asc | desc`。
+视图先按 `filter` 筛选，再按 `order` 排序（`asc` 旧的在前，默认；`desc` 新的在前），
+然后跳过 `offset` 条、最多取 `limit` 条（默认 50、上限 500）。结果没给全时末尾附一行
+说明：可翻页的视图写明下一页的 `offset`，`/inbox` 写明还剩多少未读。
+
+- `Read` 只在消息集合上接受查询串：`/inbox`、`/inbox/<chat>`（及其 `index.md`）、
+  `/messages`（未读摘要，`filter` 按条件数每个 chat 的未读）、`/messages/.../<DD>.md`。
+  其余单文档视图（`/config.toml`、`/system/*`、单条消息等）带查询串报错。
+  `Read` 的按行 `offset` / `limit` 参数不用于动态视图，传了会报错，翻页写在查询串里。
+- `LS` 在任何动态目录上接受查询串，`filter` 只认 `contains:`（比较条目路径），
+  其他条件报错。
+- `RM` 带查询串时与 `Read` 同样筛选、分页，只忽略这一页，并报告还剩多少满足条件。
+
+`filter` 是空白分隔的若干条件，全部满足才算匹配（实现：`src/vfs/filter.rs`）：
+
+| 条件 | 含义 |
+|------|------|
+| `unread` | 等同 `state:unread` |
+| `state:<unread\|read\|dismissed>` | 收件箱状态；不在收件箱里的消息（本账号发出的）不满足任何 `state:` |
+| `from:<qq>` | 发送者 QQ 号 |
+| `mentions_self` | @ 了本账号或 @全体成员 |
+| `contains:<text>` | 正文包含子串，不区分大小写；含空白时加双引号 `contains:"a b"`，引号内 `\"`、`\\` 转义 |
+| `after:<YYYY-MM-DD>` / `before:<YYYY-MM-DD>` | 本地日期不早于 / 不晚于这一天（都包含当天） |
+
+条件写错（未知条件、`from:` 不是数字、不存在的日期、引号没闭合）在解析时报错，
+不会被当成“不匹配”返回空结果。路径里的空白写成 `%20`，引号写成 `%22`。
 
 ### 读状态语义
 
 - `Read` 进来的内容算“读过”，按条标记已读。
 - `Grep` **不**标记：只扫描、不读入上下文。
-- `LS` / `Stat` 只给元信息，不标记。
+- `LS` / `Stat` 只给元信息，不标记。`Stat` 对动态文件给出类型与大小，对 `/inbox/<chat>`
+  这类目录给出未读数。
 - monitor 投递同样算读入。
 
 ## 内置工具

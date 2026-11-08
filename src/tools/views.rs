@@ -5,10 +5,12 @@
 //! 视图不落盘：每次读取都从 JSONL、SQLite 索引或 NapCat 实时查询生成。
 //! 读状态规则：内容进入上下文就算读过；`LS` / `Stat` 只看元信息，不标记。
 //!
-//! 查询参数目前支持一个保守子集（后续与 monitor 的 `when` 合并为同一套求值器）：
-//! `state:unread|read|dismissed`、`from:<qq>`、`contains:<text>`、
-//! `after:<YYYY-MM-DD>`、`before:<YYYY-MM-DD>`、`unread`、`mentions_self`。
-//! 多个条件用空白分隔，按 AND 组合。
+//! 查询串（`?filter=…&limit=…&offset=…&order=…`）：
+//! - `Read` 在 `/inbox`、`/inbox/<chat>`、`/messages` 与 `/messages/.../<DD>.md` 上接受；
+//!   其余单文档视图带查询串直接报错，不悄悄忽略；
+//! - `LS` 在任何动态目录上接受，`filter` 只认 `contains:`（比较条目路径）。
+//!
+//! `filter` 的语法在 [`crate::vfs::filter`]，求值与分页在 `views/filter.rs`。
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,8 +27,12 @@ use crate::session::SessionStore;
 use crate::storage::Database;
 use crate::storage::messages::{InboxState, MessageStore};
 use crate::transcript::{AgentMessage, AssistantBlock};
+use crate::vfs::path::{ParsedTarget, ViewQuery};
 use crate::vfs::sqlite::VfsStore;
-use crate::vfs::{NodeKind, Vfs, VfsError, VfsPath, path::ParsedTarget};
+use crate::vfs::{NodeKind, PathError, Vfs, VfsError, VfsPath};
+
+pub(crate) use filter::Page;
+pub(crate) use inbox::Dismissed;
 
 /// 视图条目。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +60,7 @@ pub type HotReload = Arc<dyn Fn(&SbotConfig) + Send + Sync>;
 /// 动态视图服务。
 mod config;
 mod contacts;
+mod filter;
 mod inbox;
 mod messages;
 mod sessions;
@@ -85,6 +92,8 @@ pub struct ViewContext {
     pub key: Option<Arc<crate::storage::crypto::MasterKey>>,
     /// 允许读取的 chat；`["*"]` = 全部，空 = 拒绝一切。
     pub receive_scopes: Vec<String>,
+    /// 本账号 QQ；`filter` 的 `mentions_self` 用它判断“@ 的是不是自己”。
+    pub self_id: u64,
 }
 
 impl Default for ViewContext {
@@ -99,6 +108,7 @@ impl Default for ViewContext {
             db: None,
             key: None,
             receive_scopes: vec!["*".to_owned()],
+            self_id: 0,
         }
     }
 }
@@ -162,10 +172,29 @@ impl Views {
         crate::vfs::path::is_dynamic(path)
     }
 
-    /// 列出目录。
-    pub(crate) async fn list(&self, target: &ParsedTarget) -> Result<Vec<ViewEntry>, VfsError> {
-        let path = &target.path;
-        let mut entries = match path.segments() {
+    /// 列出目录（不标记读）。
+    ///
+    /// 带查询串时按 `filter`（只认 `contains:`）、`order`、`offset`、`limit` 截取；
+    /// 不带时给出全部条目。
+    pub(crate) async fn list(&self, target: &ParsedTarget) -> Result<Page<ViewEntry>, VfsError> {
+        check_listing_query(target.query.as_ref())?;
+        let entries = self.list_all(&target.path).await?;
+        Ok(page_entries(entries, target.query.as_ref()))
+    }
+
+    /// 递归列出（`LS` 的 `recursive`）；查询串的语义与 [`Self::list`] 相同，作用于整棵树。
+    pub(crate) async fn list_tree(
+        &self,
+        target: &ParsedTarget,
+    ) -> Result<Page<ViewEntry>, VfsError> {
+        check_listing_query(target.query.as_ref())?;
+        let entries = self.walk(&target.path).await?;
+        Ok(page_entries(entries, target.query.as_ref()))
+    }
+
+    /// 一个目录的全部条目，按路由分派。
+    async fn list_all(&self, path: &VfsPath) -> Result<Vec<ViewEntry>, VfsError> {
+        match path.segments() {
             [root] if root == "messages" => self.list_messages_root(),
             [root] if root == "inbox" => self.list_inbox_root(),
             [root] if root == "sessions" => self.list_sessions_root(),
@@ -182,62 +211,57 @@ impl Views {
             [root, section] if root == "config" => Ok(self.list_config_section(section)),
             [root, _, _] if root == "config" => Ok(Vec::new()),
             [root] if root == "system" => Ok(self.list_system()),
+            // 整文件配置视图是文件，不是目录。
+            [root] if root == "config.toml" => Err(VfsError::NotADirectory(path.to_string())),
             _ => self.vfs_list_fallback(path),
-        }?;
-
-        // 过滤作用于条目路径与元信息；列表不标记读。
-        if let Some(query) = &target.query
-            && let Some(filter) = &query.filter
-        {
-            entries.retain(|entry| filter_matches_path(filter, &entry.path));
-            entries.truncate(query.limit);
         }
-        Ok(entries)
     }
 
     /// 读取一个动态文件；内容进入上下文即标记已读。
+    ///
+    /// 不带查询串时按默认参数（`limit` 50）取第一页；接受查询串的视图见模块文档。
     pub(crate) async fn read(&self, target: &ParsedTarget) -> Result<ViewRead, VfsError> {
-        self.read_internal(target, true).await
+        let query = match &target.query {
+            Some(_) if !accepts_read_query(&target.path) => {
+                return Err(PathError::QueryNotSupported(target.path.to_string()).into());
+            }
+            Some(query) => query.clone(),
+            None => ViewQuery::default(),
+        };
+        self.read_internal(&target.path, &query, true).await
     }
 
-    /// 读取但不标记已读；`Grep` 与 `Stat` 用它。
+    /// 完整读取但不标记已读、不分页；`Grep` 与 `Stat` 用它。
     ///
-    /// 工具描述承诺“只扫描的文件不算读过”；搜索时把候选文件整体读一遍
-    /// 不能悄悄把未读清空。
-    pub(crate) async fn peek(&self, target: &ParsedTarget) -> Result<ViewRead, VfsError> {
-        self.read_internal(target, false).await
+    /// 工具描述承诺“只扫描的文件不算读过”：搜索时把候选文件整体读一遍不能悄悄把未读
+    /// 清空；也不能只搜第一页，否则一天里第 51 条之后的消息永远搜不到。
+    pub(crate) async fn scan(&self, path: &VfsPath) -> Result<ViewRead, VfsError> {
+        self.read_internal(path, &ViewQuery::unbounded(), false)
+            .await
     }
 
     async fn read_internal(
         &self,
-        target: &ParsedTarget,
+        path: &VfsPath,
+        query: &ViewQuery,
         mark_read: bool,
     ) -> Result<ViewRead, VfsError> {
-        let path = &target.path;
-        let filter = target.query.as_ref().and_then(|query| query.filter.clone());
-        let limit = target.query.as_ref().map(|query| query.limit).unwrap_or(50);
-
         match path.segments() {
-            [root] if root == "messages" => self.read_messages_digest(filter.as_deref(), limit),
+            [root] if root == "messages" => self.read_messages_digest(query),
             [root] if root == "sessions" => self.read_sessions_digest(),
             [root, scope, peer, month, day] if root == "messages" && day.ends_with(".md") => {
-                let day = day.trim_end_matches(".md");
-                self.read_message_day(scope, peer, month, day, filter.as_deref(), limit, mark_read)
+                let chat = chat_from(normalize_scope(scope)?, peer)?;
+                let date = format!("{month}-{:0>2}", day.trim_end_matches(".md"));
+                self.read_message_day(path, chat, &date, query, mark_read)
             }
-            [root] if root == "inbox" => self.read_inbox_root(filter.as_deref(), limit, mark_read),
-            [root, chat] if root == "inbox" => {
-                self.read_inbox_chat(chat, filter.as_deref(), limit, mark_read)
+            [root] if root == "inbox" => self.read_inbox(None, query, mark_read),
+            [root, chat] if root == "inbox" => self.read_inbox(Some(chat), query, mark_read),
+            [root, chat, id] if root == "inbox" && id == "index.md" => {
+                self.read_inbox(Some(chat), query, mark_read)
             }
             [root, chat, id] if root == "inbox" && id.ends_with(".md") => {
-                if id == "index.md" {
-                    self.read_inbox_chat(chat, filter.as_deref(), limit, mark_read)
-                } else {
-                    let message_id: i64 = id
-                        .trim_end_matches(".md")
-                        .parse()
-                        .map_err(|_| VfsError::NotFound(path.to_string()))?;
-                    self.read_inbox_message(chat, message_id, mark_read)
-                }
+                let message_id = parse_message_file(path, id)?;
+                self.read_inbox_message(chat, message_id, mark_read)
             }
             [root, file] if root == "sessions" => {
                 if file == "index.jsonl" {
@@ -261,35 +285,44 @@ impl Views {
     }
 
     /// 元信息（不标记读）。
+    ///
+    /// 依次尝试：父目录列举里的条目（带未读数等元信息）；视图根本身（能列举就是目录）；
+    /// 最后完整读一遍取大小（父目录不列出的文件，例如已读过的单条消息）。
     pub(crate) async fn stat(&self, path: &VfsPath) -> Result<ViewEntry, VfsError> {
-        let target = ParsedTarget {
-            path: path.clone(),
-            query: None,
-        };
-        if let Some(found) = self
-            .list(&target)
-            .await?
-            .into_iter()
-            .find(|entry| entry.path == path.to_string())
+        let wanted = path.to_string();
+        // 父目录本身也是动态视图时才去列举它；`/inbox` 的父目录是根，不在此列。
+        if let Some(parent) = path.parent().filter(Self::handles)
+            && let Ok(entries) = self.list_all(&parent).await
+            && let Some(found) = entries.into_iter().find(|entry| entry.path == wanted)
         {
             return Ok(found);
         }
-        // 文件本身不在父目录的列举结果里时，构造一个条目。
-        match self.peek(&target).await {
-            Ok(ViewRead::Text(text)) => Ok(ViewEntry {
-                path: path.to_string(),
-                kind: "text",
-                size: text.len() as u64,
-                mtime: String::new(),
-            }),
-            Ok(ViewRead::Metadata { kind, size, .. }) => Ok(ViewEntry {
-                path: path.to_string(),
-                kind,
-                size,
-                mtime: String::new(),
-            }),
-            Err(error) => Err(error),
+        if path.segments().len() == 1 {
+            match self.list_all(path).await {
+                Ok(children) => {
+                    return Ok(ViewEntry {
+                        path: wanted,
+                        kind: "dir",
+                        size: children.len() as u64,
+                        mtime: String::new(),
+                    });
+                }
+                // `/config.toml` 是文件：继续按文件处理。
+                Err(VfsError::NotADirectory(_)) => {}
+                // 离线、越界等错误原样交出，不伪装成“不存在”。
+                Err(error) => return Err(error),
+            }
         }
+        let (kind, size) = match self.scan(path).await? {
+            ViewRead::Text(text) => ("text", text.len() as u64),
+            ViewRead::Metadata { kind, size, .. } => (kind, size),
+        };
+        Ok(ViewEntry {
+            path: wanted,
+            kind,
+            size,
+            mtime: String::new(),
+        })
     }
 
     /// 递归遍历（Glob / Grep 使用）。
@@ -297,11 +330,7 @@ impl Views {
         let mut out = Vec::new();
         let mut stack = vec![path.clone()];
         while let Some(current) = stack.pop() {
-            let target = ParsedTarget {
-                path: current,
-                query: None,
-            };
-            for entry in self.list(&target).await? {
+            for entry in self.list_all(&current).await? {
                 if let Ok(child) = VfsPath::parse(&entry.path)
                     && entry.kind == "dir"
                 {
@@ -339,71 +368,41 @@ impl Views {
         }
     }
 
-    /// `/inbox` 的忽略语义：`dismiss` 不删除消息本体。
-    pub(crate) fn dismiss(&self, target: &ParsedTarget) -> Result<usize, VfsError> {
+    /// `/inbox` 的忽略语义：条目离开收件箱、不标记已读，消息本体不删除。
+    ///
+    /// - `/inbox/<chat>/<id>.md`：一条；不接受查询串。
+    /// - `/inbox/<chat>`、`/inbox/<chat>/index.md`：不带查询串时是该 chat 的全部未读，
+    ///   带查询串时与 `Read` 同样筛选、分页，只处理这一页；
+    /// - `/inbox`：必须带 `filter`，跨全部 chat，同样只处理一页。
+    pub(crate) fn dismiss(&self, target: &ParsedTarget) -> Result<Dismissed, VfsError> {
         let path = &target.path;
         match path.segments() {
-            [root, chat] if root == "inbox" => {
-                let chat = parse_chat_segment(chat)?;
-                self.ensure_receive(chat)?;
-                let ids: Vec<i64> = self
-                    .messages
-                    .inbox_for_chat(chat, InboxState::Unread)
-                    .map_err(storage)?
-                    .iter()
-                    .map(|message| message.message_id)
-                    .collect();
-                self.messages.dismiss(chat, &ids).map_err(storage)
+            [root, chat] if root == "inbox" => self.dismiss_chat(chat, target.query.as_ref()),
+            [root, chat, file] if root == "inbox" && file == "index.md" => {
+                self.dismiss_chat(chat, target.query.as_ref())
             }
             [root, chat, id] if root == "inbox" && id.ends_with(".md") => {
+                if target.query.is_some() {
+                    return Err(PathError::QueryNotSupported(path.to_string()).into());
+                }
                 let chat = parse_chat_segment(chat)?;
                 self.ensure_receive(chat)?;
-                if id == "index.md" {
-                    let ids: Vec<i64> = self
-                        .messages
-                        .inbox_for_chat(chat, InboxState::Unread)
-                        .map_err(storage)?
-                        .iter()
-                        .map(|message| message.message_id)
-                        .collect();
-                    self.messages.dismiss(chat, &ids).map_err(storage)
-                } else {
-                    let message_id: i64 = id
-                        .trim_end_matches(".md")
-                        .parse()
-                        .map_err(|_| VfsError::NotFound(path.to_string()))?;
-                    self.messages.dismiss(chat, &[message_id]).map_err(storage)
-                }
+                self.dismiss_one(chat, parse_message_file(path, id)?)
             }
             [root] if root == "inbox" => {
-                let Some(filter) = target
-                    .query
-                    .as_ref()
-                    .and_then(|query| query.filter.as_ref())
+                let Some(query) = target.query.as_ref().filter(|query| query.filter.is_some())
                 else {
                     return Err(VfsError::Storage(
                         "RM /inbox requires a filter; refusing to dismiss everything".to_owned(),
                     ));
                 };
-                let mut total = 0;
-                for message in self.messages.unread(None).map_err(storage)? {
-                    if !self.receive_allows(message.chat) {
-                        continue;
-                    }
-                    if filter_matches_message(filter, &message, Some(InboxState::Unread)) {
-                        total += self
-                            .messages
-                            .dismiss(message.chat, &[message.message_id])
-                            .map_err(storage)?;
-                    }
-                }
-                Ok(total)
+                self.dismiss_unread(None, query)
             }
             _ => Err(VfsError::NotFound(path.to_string())),
         }
     }
 
-    /// 动态路径中的 grep：只返回匹配，并把匹配条目记为已读。
+    /// 动态路径中的 grep：只返回匹配，不标记已读（内容没有进入上下文）。
     pub(crate) async fn grep(
         &self,
         root: &VfsPath,
@@ -424,11 +423,7 @@ impl Views {
             let Ok(path) = VfsPath::parse(&entry.path) else {
                 continue;
             };
-            let target = ParsedTarget {
-                path: path.clone(),
-                query: None,
-            };
-            let Ok(ViewRead::Text(text)) = self.peek(&target).await else {
+            let Ok(ViewRead::Text(text)) = self.scan(&path).await else {
                 continue;
             };
             for (line_no, line) in text.lines().enumerate() {
@@ -502,6 +497,43 @@ fn parse_chat_segment(segment: &str) -> Result<ChatId, VfsError> {
     ChatId::parse(segment).ok_or_else(|| VfsError::NotFound(format!("/inbox/{segment}")))
 }
 
+/// `/inbox/<chat>/<message_id>.md` 的文件名 → 消息 id；不是数字就是不存在的文件。
+fn parse_message_file(path: &VfsPath, file: &str) -> Result<i64, VfsError> {
+    file.trim_end_matches(".md")
+        .parse()
+        .map_err(|_| VfsError::NotFound(path.to_string()))
+}
+
+/// `Read` 接受查询串的视图：可筛选、可翻页的消息集合。
+fn accepts_read_query(path: &VfsPath) -> bool {
+    match path.segments() {
+        [root] => root == "inbox" || root == "messages",
+        [root, _] => root == "inbox",
+        [root, _, file] => root == "inbox" && file == "index.md",
+        [root, _, _, _, day] => root == "messages" && day.ends_with(".md"),
+        _ => false,
+    }
+}
+
+/// 列举的查询串里，`filter` 只能有 `contains:`；先于列举检查，写错时不白做一次列举。
+fn check_listing_query(query: Option<&ViewQuery>) -> Result<(), VfsError> {
+    match query.and_then(|query| query.filter.as_ref()) {
+        Some(filter) => filter::check_listing_filter(filter),
+        None => Ok(()),
+    }
+}
+
+/// 列举结果按查询串筛选、分页；没有查询串时整页给出。
+fn page_entries(mut entries: Vec<ViewEntry>, query: Option<&ViewQuery>) -> Page<ViewEntry> {
+    let Some(query) = query else {
+        return Page::all(entries);
+    };
+    if let Some(filter) = &query.filter {
+        entries.retain(|entry| filter::matches_path(filter, &entry.path));
+    }
+    filter::page(entries, query)
+}
+
 fn storage(error: anyhow::Error) -> VfsError {
     VfsError::Storage(error.to_string())
 }
@@ -542,79 +574,6 @@ fn render_agent_message(message: &AgentMessage) -> String {
             tool.content
         ),
     }
-}
-
-/// 视图过滤器的保守子集。
-fn filter_matches_message(filter: &str, message: &QqMessage, state: Option<InboxState>) -> bool {
-    let text = message.plain_text();
-    for term in filter.split_whitespace() {
-        if term == "unread" {
-            if state != Some(InboxState::Unread) {
-                return false;
-            }
-            continue;
-        }
-        if term == "mentions_self" {
-            if !message.segments.iter().any(|segment| {
-                matches!(segment, crate::qq::event::Segment::At { qq } if qq.parse::<u64>().is_ok())
-            }) {
-                return false;
-            }
-            continue;
-        }
-        if let Some(value) = term.strip_prefix("from:") {
-            if message.sender.qq.map(|qq| qq.to_string()).as_deref() != Some(value) {
-                return false;
-            }
-            continue;
-        }
-        if let Some(value) = term.strip_prefix("state:") {
-            let want = InboxState::parse(value);
-            if want != state {
-                return false;
-            }
-            continue;
-        }
-        if let Some(value) = term.strip_prefix("contains:") {
-            let value = value.trim_matches('"');
-            if !text.contains(value) {
-                return false;
-            }
-            continue;
-        }
-        if let Some(value) = term.strip_prefix("after:") {
-            let date = message
-                .time
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d")
-                .to_string();
-            if date.as_str() < value {
-                return false;
-            }
-            continue;
-        }
-        if let Some(value) = term.strip_prefix("before:") {
-            let date = message
-                .time
-                .with_timezone(&chrono::Local)
-                .format("%Y-%m-%d")
-                .to_string();
-            if date.as_str() > value {
-                return false;
-            }
-            continue;
-        }
-        // 未知条件按不匹配处理，避免把全部内容当成命中。
-        return false;
-    }
-    true
-}
-
-fn filter_matches_path(filter: &str, path: &str) -> bool {
-    filter
-        .split_whitespace()
-        .filter_map(|term| term.strip_prefix("contains:"))
-        .all(|value| path.contains(value.trim_matches('"')))
 }
 
 /// 判断工具是否应该走动态视图。
@@ -734,16 +693,290 @@ mod tests {
     }
 
     fn target(path: &str) -> ParsedTarget {
-        ParsedTarget {
-            path: VfsPath::parse(path).unwrap(),
-            query: None,
+        ParsedTarget::parse(path).unwrap()
+    }
+
+    /// 2026-11-05 本地正午起每条间隔一秒：同一天、顺序确定。
+    fn day_message(chat: ChatId, id: i64, text: &str) -> QqMessage {
+        use chrono::TimeZone;
+        let mut message = message(chat, id, text);
+        message.time = chrono::Local
+            .with_ymd_and_hms(2026, 11, 5, 12, 0, id as u32)
+            .unwrap()
+            .with_timezone(&Utc);
+        message
+    }
+
+    fn text(read: ViewRead) -> String {
+        match read {
+            ViewRead::Text(text) => text,
+            other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn stat_describes_dynamic_files_and_directories_without_reading() {
+        let (views, _dir) = views();
+        let chat = ChatId::Group(42);
+        views.messages.append(&day_message(chat, 1, "one")).unwrap();
+        views.messages.append(&day_message(chat, 2, "two")).unwrap();
+
+        // 视图根：能列举就是目录，大小是条目数。
+        let root = views
+            .stat(&VfsPath::parse("/inbox").unwrap())
+            .await
+            .unwrap();
+        assert_eq!((root.kind, root.size), ("dir", 1));
+        // 父目录列举里的条目：chat 目录的大小是未读数。
+        let chat_dir = views
+            .stat(&VfsPath::parse("/inbox/group:42").unwrap())
+            .await
+            .unwrap();
+        assert_eq!((chat_dir.kind, chat_dir.size), ("dir", 2));
+        for file in [
+            "/inbox/group:42/1.md",
+            "/messages/groups/42/2026-11/05.md",
+            "/config.toml",
+            "/config/agent/model",
+        ] {
+            let entry = views.stat(&VfsPath::parse(file).unwrap()).await.unwrap();
+            assert_eq!(entry.path, file);
+            assert_eq!(entry.kind, "text", "{file}");
+        }
+        // 已读消息不在父目录列举里，仍可 Stat。
+        views.messages.mark_read(chat, &[1]).unwrap();
+        let read = views
+            .stat(&VfsPath::parse("/inbox/group:42/1.md").unwrap())
+            .await
+            .unwrap();
+        assert!(read.size > 0);
+        assert!(
+            views
+                .stat(&VfsPath::parse("/inbox/group:42/999.md").unwrap())
+                .await
+                .is_err()
+        );
+        assert!(
+            views
+                .stat(&VfsPath::parse("/messages/groups/42/2026-11/06.md").unwrap())
+                .await
+                .is_err(),
+            "a day without messages does not exist"
+        );
+        // Stat 不标记已读。
+        assert_eq!(views.messages.unread_counts().unwrap(), vec![(chat, 1)]);
+    }
+
+    #[tokio::test]
+    async fn inbox_reads_page_and_mark_only_what_they_show() {
+        let (views, _dir) = views();
+        let chat = ChatId::Group(42);
+        for id in 1..=5 {
+            views
+                .messages
+                .append(&day_message(chat, id, &format!("msg-{id}")))
+                .unwrap();
+        }
+        let first = text(
+            views
+                .read(&target("/inbox/group:42?limit=2&order=desc"))
+                .await
+                .unwrap(),
+        );
+        // 新的在前；页外 3 条保持未读并提示。
+        assert!(
+            first.find("msg-5").unwrap() < first.find("msg-4").unwrap(),
+            "{first}"
+        );
+        assert!(!first.contains("msg-3"), "{first}");
+        assert!(first.contains("3 more unread"), "{first}");
+        assert_eq!(views.messages.unread_counts().unwrap(), vec![(chat, 3)]);
+
+        // offset 跳过未读里的前几条，被跳过的不标记。
+        let skipped = text(
+            views
+                .read(&target("/inbox?offset=1&limit=1"))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            skipped.contains("msg-2") && !skipped.contains("msg-1"),
+            "{skipped}"
+        );
+        assert_eq!(views.messages.unread_counts().unwrap(), vec![(chat, 2)]);
+
+        let none = text(
+            views
+                .read(&target("/inbox?filter=from:99999"))
+                .await
+                .unwrap(),
+        );
+        assert!(none.contains("No unread message matches"), "{none}");
+        let digest = text(
+            views
+                .read(&target("/messages?filter=contains:MSG-3"))
+                .await
+                .unwrap(),
+        );
+        assert!(digest.contains("group:42: 1 unread"), "{digest}");
+    }
+
+    #[tokio::test]
+    async fn message_days_support_paging_and_state_filters() {
+        let (views, _dir) = views();
+        let chat = ChatId::Group(42);
+        for id in 1..=4 {
+            views
+                .messages
+                .append(&day_message(chat, id, &format!("day-{id}")))
+                .unwrap();
+        }
+        views.messages.mark_read(chat, &[1, 2]).unwrap();
+        let day = "/messages/groups/42/2026-11/05.md";
+
+        // 扫描（Grep / Stat 的读法）给出全部、不分页、不标记。
+        assert!(text(views.scan(&VfsPath::parse(day).unwrap()).await.unwrap()).contains("day-4"));
+        assert_eq!(views.messages.unread_counts().unwrap(), vec![(chat, 2)]);
+
+        let unread = text(
+            views
+                .read(&target(&format!(
+                    "{day}?filter=state:unread&order=desc&limit=1"
+                )))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            unread.contains("day-4") && !unread.contains("day-3"),
+            "{unread}"
+        );
+        assert!(
+            unread.contains("[showing 1-1 of 2; continue with offset=1]"),
+            "{unread}"
+        );
+        // 读过的 day-4 变成已读：按状态筛选看到的是当前状态。
+        let read = text(
+            views
+                .read(&target(&format!("{day}?filter=state:read")))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            read.contains("day-1") && read.contains("day-4") && !read.contains("day-3"),
+            "{read}"
+        );
+        let middle = text(
+            views
+                .read(&target(&format!("{day}?order=desc&offset=1&limit=2")))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            middle.find("day-3").unwrap() < middle.find("day-2").unwrap()
+                && !middle.contains("day-4")
+                && !middle.contains("day-1"),
+            "{middle}"
+        );
+    }
+
+    #[tokio::test]
+    async fn queries_are_rejected_where_they_mean_nothing() {
+        let (views, _dir) = views();
+        for path in ["/config.toml?limit=5", "/system/status?order=desc"] {
+            let error = views.read(&target(path)).await.unwrap_err();
+            assert!(error.to_string().contains("does not take query"), "{error}");
+        }
+        // 列举只认 contains:。
+        let error = views
+            .list(&target("/inbox?filter=unread"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("listings only support"),
+            "{error}"
+        );
+        let config = views
+            .list(&target("/config?filter=contains:AGENT&limit=1"))
+            .await
+            .unwrap();
+        assert_eq!(config.items.len(), 1);
+        assert_eq!(config.items[0].path, "/config/agent");
+    }
+
+    #[tokio::test]
+    async fn mentions_self_uses_the_account_qq() {
+        let (views, _dir) = views();
+        let views = views.with_context(ViewContext {
+            self_id: 999,
+            ..ViewContext::default()
+        });
+        let chat = ChatId::Group(42);
+        let mut other = day_message(chat, 1, "for someone else");
+        other.segments.push(crate::qq::event::Segment::At {
+            qq: "555".to_owned(),
+        });
+        let mut mine = day_message(chat, 2, "for me");
+        mine.segments.push(crate::qq::event::Segment::At {
+            qq: "999".to_owned(),
+        });
+        views.messages.append(&other).unwrap();
+        views.messages.append(&mine).unwrap();
+        let shown = text(
+            views
+                .read(&target("/inbox?filter=mentions_self"))
+                .await
+                .unwrap(),
+        );
+        assert!(
+            shown.contains("for me") && !shown.contains("someone else"),
+            "{shown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dismissing_with_a_query_handles_one_page() {
+        let (views, _dir) = views();
+        let chat = ChatId::Group(42);
+        for id in 1..=3 {
+            views
+                .messages
+                .append(&day_message(chat, id, &format!("x-{id}")))
+                .unwrap();
+        }
+        views
+            .messages
+            .append(&day_message(ChatId::Group(7), 9, "x-other"))
+            .unwrap();
+        // 根目录不带 filter 拒绝；带 filter 时只处理一页并报告剩余。
+        assert!(views.dismiss(&target("/inbox")).is_err());
+        let dismissed = views
+            .dismiss(&target("/inbox?filter=contains:x-&limit=2"))
+            .unwrap();
+        assert_eq!(
+            dismissed,
+            Dismissed {
+                count: 2,
+                remaining: 2
+            }
+        );
+        // 单条不接受查询串；整个 chat 不带查询串时全部忽略。
+        assert!(
+            views
+                .dismiss(&target("/inbox/group:42/3.md?limit=1"))
+                .is_err()
+        );
+        let rest = views.dismiss(&target("/inbox/group:42/index.md")).unwrap();
+        assert_eq!(rest.count, 1);
+        assert_eq!(
+            views.messages.unread_counts().unwrap(),
+            vec![(ChatId::Group(7), 1)]
+        );
     }
 
     #[tokio::test]
     async fn config_tree_and_leaves_are_readable() {
         let (views, _dir) = views();
-        let sections = views.list(&target("/config")).await.unwrap();
+        let sections = views.list(&target("/config")).await.unwrap().items;
         assert!(sections.iter().any(|entry| entry.path == "/config/agent"));
         assert!(
             sections
@@ -751,7 +984,7 @@ mod tests {
                 .any(|entry| entry.path == "/config/models.json")
         );
 
-        let keys = views.list(&target("/config/agent")).await.unwrap();
+        let keys = views.list(&target("/config/agent")).await.unwrap().items;
         assert!(keys.iter().any(|entry| entry.path == "/config/agent/model"));
 
         match views.read(&target("/config/agent/model")).await.unwrap() {
@@ -934,7 +1167,11 @@ mod tests {
             receive_scopes: vec!["group:1".to_owned()],
             ..ViewContext::default()
         });
-        let listed = scoped.list(&target("/messages/groups")).await.unwrap();
+        let listed = scoped
+            .list(&target("/messages/groups"))
+            .await
+            .unwrap()
+            .items;
         let paths: Vec<&str> = listed.iter().map(|entry| entry.path.as_str()).collect();
         assert_eq!(paths, vec!["/messages/groups/1"]);
 
