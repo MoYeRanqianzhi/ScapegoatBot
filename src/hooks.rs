@@ -1,8 +1,13 @@
-//! 事件 hook 的发送前阶段。
+//! 事件 hook（`[[hooks.events]]`）的求值。
 //!
-//! 设计依据：设计 §7.4 与 `[hooks.events]`。当前只接线 `BeforeSend`：
-//! `log` 记录、`block` 拒绝、`rewrite` 改写文本段；其他事件/动作尚未
-//! 接入运行时（见 `docs/guide/limits.md`）。
+//! 设计依据：设计 §7.5。可用的事件 / 动作组合由配置校验限定
+//! （`config::sections::hooks::action_allowed_on`），这里按事件分三个入口：
+//! - [`before_send`]：`API` 发布动作之前，`log` / `block` / `rewrite`；
+//! - [`fire`]：其余事件的 `log` / `block` / `notify`（`notify` 由调用方发出）；
+//! - [`injected`]：`inject_context` 的文本，`text` 原样、`path` 从 VFS 读取。
+//!
+//! 三个入口用同一套 `match` 规则（[`matches`]）：要求 `group_id` / `user_id` 的 hook
+//! 只在有对应 chat 的事件上命中。
 
 use regex::Regex;
 use serde_json::Value;
@@ -11,28 +16,45 @@ use tracing::{info, warn};
 use crate::config::{EventHookConfig, HookAction, HookEvent};
 use crate::qq::event::ChatId;
 
-fn matches(hook: &EventHookConfig, chat: ChatId, message_type: &str) -> bool {
+/// `inject_context` 从 `path` 读取的文本上限（字符）。
+const MAX_INJECT_CHARS: usize = 8_000;
+
+/// hook 的 `match` 是否命中这个事件；`chat` 为 `None` 的事件（会话开始、压缩等）
+/// 不满足任何 chat 条件。
+fn matches(hook: &EventHookConfig, chat: Option<ChatId>) -> bool {
     let spec = &hook.match_;
     if let Some(group) = spec.group_id
-        && !matches!(chat, ChatId::Group(id) if id == group)
+        && !matches!(chat, Some(ChatId::Group(id)) if id == group)
     {
         return false;
     }
     if let Some(user) = spec.user_id
-        && !matches!(chat, ChatId::Private(id) if id == user)
+        && !matches!(chat, Some(ChatId::Private(id)) if id == user)
     {
         return false;
     }
-    if let Some(kind) = &spec.message_type
-        && kind != message_type
-    {
-        return false;
-    }
-    // 发送路径没有工具名；要求 tool_name 的 hook 不会命中。
-    if spec.tool_name.is_some() {
-        return false;
+    if let Some(kind) = &spec.message_type {
+        let actual = match chat {
+            Some(chat) if chat.is_group() => "group",
+            Some(_) => "private",
+            None => return false,
+        };
+        if kind != actual {
+            return false;
+        }
     }
     true
+}
+
+/// 这个事件上启用、且 `match` 命中的 hook。
+fn selected(
+    hooks: &[EventHookConfig],
+    event: HookEvent,
+    chat: Option<ChatId>,
+) -> impl Iterator<Item = &EventHookConfig> {
+    hooks
+        .iter()
+        .filter(move |hook| hook.enabled && hook.event == event && matches(hook, chat))
 }
 
 /// 对发布动作的参数依次应用 `BeforeSend` hook。
@@ -46,15 +68,7 @@ pub fn before_send(
     text_field: Option<&str>,
     params: &mut Value,
 ) -> Result<(), String> {
-    let message_type = if chat.is_group() { "group" } else { "private" };
-    for hook in hooks.iter().filter(|hook| {
-        hook.enabled
-            && hook.event == HookEvent::BeforeSend
-            && (hook.scope.is_empty() || hook.scope == "model" || hook.scope == "all")
-    }) {
-        if !matches(hook, chat, message_type) {
-            continue;
-        }
+    for hook in selected(hooks, HookEvent::BeforeSend, Some(chat)) {
         match hook.action {
             HookAction::Log => {
                 info!(chat = %chat, "BeforeSend hook matched");
@@ -72,9 +86,8 @@ pub fn before_send(
                     rewrite(params, field, &hook.pattern, &hook.replacement)?;
                 }
             }
-            HookAction::InjectContext | HookAction::Notify => {
-                // 这两个动作对发送内容没有定义；忽略而不是猜语义。
-            }
+            // 校验不允许这两个动作出现在 BeforeSend 上。
+            HookAction::InjectContext | HookAction::Notify => {}
         }
     }
     Ok(())
@@ -175,29 +188,83 @@ mod tests {
     }
 
     #[test]
-    fn fire_collects_block_and_inject() {
-        let block = hook(HookAction::Block, "", "");
-        let mut inject = hook(HookAction::InjectContext, "", "");
-        inject.event = HookEvent::MessageReceived;
-        inject.text = "remember the rules".to_owned();
-        let mut block = block;
+    fn fire_collects_block_and_notify_only_when_matched() {
+        let mut block = hook(HookAction::Block, "", "");
         block.event = HookEvent::MessageReceived;
+        block.match_.group_id = Some(1);
+        let mut silent = hook(HookAction::Notify, "", "");
+        silent.event = HookEvent::SessionEnd;
+        let mut owner = silent.clone();
+        owner.notify_channel = "owner".to_owned();
+
         let outcome = fire(
-            &[block, inject],
+            std::slice::from_ref(&block),
             HookEvent::MessageReceived,
             Some(ChatId::Group(1)),
-            Some("hi"),
-            None,
         );
         assert_eq!(outcome.blocked.as_deref(), Some("nope"));
-        assert_eq!(outcome.injected, vec!["remember the rules"]);
+        // 别的群、没有 chat 的事件都不命中带 group_id 的 hook。
         assert!(
-            injected(
-                &[hook(HookAction::InjectContext, "", "")],
-                HookEvent::SessionStart
+            fire(
+                std::slice::from_ref(&block),
+                HookEvent::MessageReceived,
+                Some(ChatId::Group(2))
             )
-            .is_empty()
+            .blocked
+            .is_none()
         );
+        assert!(
+            fire(
+                std::slice::from_ref(&block),
+                HookEvent::MessageReceived,
+                None
+            )
+            .blocked
+            .is_none()
+        );
+        // 没写 notify_channel 只记日志，不私聊（设计 §7.5）。
+        let outcome = fire(&[silent, owner], HookEvent::SessionEnd, None);
+        assert_eq!(outcome.notify, 1);
+    }
+
+    #[test]
+    fn injection_reads_text_or_vfs_paths_and_honours_match() {
+        use crate::vfs::Vfs;
+        let dir = tempfile::tempdir().unwrap();
+        let vfs = crate::vfs::sqlite::VfsStore::open(
+            std::sync::Arc::new(crate::storage::Database::open_in_memory().unwrap()),
+            std::sync::Arc::new(crate::storage::crypto::MasterKey::from_bytes([6u8; 32])),
+            dir.path().to_path_buf(),
+            crate::vfs::quota::Limits::default(),
+        )
+        .unwrap();
+        vfs.write_text(
+            &crate::vfs::VfsPath::parse("/rules.md").unwrap(),
+            "from the file",
+            None,
+        )
+        .unwrap();
+        let mut text = hook(HookAction::InjectContext, "", "");
+        text.event = HookEvent::MessageReceived;
+        text.text = "inline rule".to_owned();
+        let mut file = text.clone();
+        file.text.clear();
+        file.path = "/rules.md".to_owned();
+        let mut missing = file.clone();
+        missing.path = "/nope.md".to_owned();
+        let mut other_group = text.clone();
+        other_group.match_.group_id = Some(9);
+
+        let hooks = [text, file, missing, other_group];
+        let got = injected(
+            &hooks,
+            HookEvent::MessageReceived,
+            Some(ChatId::Group(1)),
+            &vfs,
+        );
+        assert_eq!(got, vec!["inline rule", "from the file"]);
+        // 读取不标记“读过”：hook 注入不是 agent 的 Read。
+        assert!(injected(&hooks, HookEvent::SessionStart, None, &vfs).is_empty());
     }
 
     #[test]
@@ -205,6 +272,15 @@ mod tests {
         let mut params = json!({"group_id": 2, "message": "hello"});
         let mut filtered = hook(HookAction::Block, "", "");
         filtered.match_.group_id = Some(1);
+        before_send(
+            &[filtered.clone()],
+            ChatId::Group(2),
+            Some("message"),
+            &mut params,
+        )
+        .unwrap();
+        filtered.match_.group_id = None;
+        filtered.match_.message_type = Some("private".to_owned());
         before_send(&[filtered], ChatId::Group(2), Some("message"), &mut params).unwrap();
     }
 
@@ -232,47 +308,19 @@ mod tests {
 /// 除 BeforeSend 之外的事件 hook 结果。
 #[derive(Debug, Default)]
 pub struct HookOutcome {
+    /// 第一个命中的 `block` 的原因。
     pub blocked: Option<String>,
-    pub injected: Vec<String>,
-    pub notify: Vec<String>,
+    /// 命中的 `notify_channel = "owner"`（或 `"master"`）的条数：调用方据此私聊主人一次。
+    pub notify: usize,
 }
 
-/// 触发一个事件 hook；`chat` 用于匹配群/私聊条件。
+/// 触发一个事件：`log` 记录、`block` 返回原因、`notify` 计数。
 ///
-/// 这里只做与内容无关的动作：`log`、`block`、`inject_context`、`notify`。
-/// `rewrite` 只对 BeforeSend 有定义，其他事件忽略。
-pub fn fire(
-    hooks: &[EventHookConfig],
-    event: HookEvent,
-    chat: Option<ChatId>,
-    text: Option<&str>,
-    tool: Option<&str>,
-) -> HookOutcome {
+/// `inject_context` 不在这里处理（见 [`injected`]），`rewrite` 只属于 [`before_send`]。
+/// 没写 `notify_channel` 的 `notify` 只记日志（设计 §7.5：私聊必须显式开启）。
+pub fn fire(hooks: &[EventHookConfig], event: HookEvent, chat: Option<ChatId>) -> HookOutcome {
     let mut outcome = HookOutcome::default();
-    for hook in hooks
-        .iter()
-        .filter(|hook| hook.enabled && hook.event == event)
-    {
-        if let Some(chat) = chat
-            && !matches(
-                hook,
-                chat,
-                if chat.is_group() { "group" } else { "private" },
-            )
-        {
-            continue;
-        }
-        if hook.match_.group_id.is_some() && chat.is_none() {
-            continue;
-        }
-        if hook.match_.user_id.is_some() && chat.is_none() {
-            continue;
-        }
-        if let Some(name) = &hook.match_.tool_name
-            && tool != Some(name.as_str())
-        {
-            continue;
-        }
+    for hook in selected(hooks, event, chat) {
         match hook.action {
             HookAction::Log => {
                 info!(event = ?event, chat = ?chat, "event hook matched");
@@ -286,37 +334,53 @@ pub fn fire(
                     });
                 }
             }
-            HookAction::InjectContext => {
-                if !hook.text.trim().is_empty() {
-                    outcome.injected.push(hook.text.clone());
-                } else if !hook.path.trim().is_empty() {
-                    // path 需要 VFS，调用方在能读盘时自行处理；这里只记录。
-                    warn!(path = %hook.path, "inject_context hook path requires the caller");
+            HookAction::Notify => {
+                info!(event = ?event, chat = ?chat, "notify hook matched");
+                if matches!(hook.notify_channel.as_str(), "owner" | "master") {
+                    outcome.notify += 1;
                 }
             }
-            HookAction::Notify => {
-                outcome.notify.push(if hook.notify_channel.is_empty() {
-                    "owner".to_owned()
-                } else {
-                    hook.notify_channel.clone()
-                });
-            }
-            HookAction::Rewrite => {}
+            HookAction::InjectContext | HookAction::Rewrite => {}
         }
     }
-    let _ = text;
     outcome
 }
 
-/// 读取某个事件配置的注入文本（用于 system prompt 重建）。
-pub fn injected(hooks: &[EventHookConfig], event: HookEvent) -> Vec<String> {
-    hooks
-        .iter()
-        .filter(|hook| {
-            hook.enabled && hook.event == event && hook.action == HookAction::InjectContext
-        })
-        .map(|hook| hook.text.trim())
-        .filter(|text| !text.is_empty())
-        .map(str::to_owned)
-        .collect()
+/// 这个事件上 `inject_context` 的文本：`text` 原样；`path` 从 VFS 读取（最多
+/// [`MAX_INJECT_CHARS`] 字符，读不到就跳过并记日志）。读取不记作 agent 读过。
+pub fn injected(
+    hooks: &[EventHookConfig],
+    event: HookEvent,
+    chat: Option<ChatId>,
+    vfs: &crate::vfs::sqlite::VfsStore,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for hook in selected(hooks, event, chat).filter(|hook| hook.action == HookAction::InjectContext)
+    {
+        if !hook.text.trim().is_empty() {
+            out.push(hook.text.trim().to_owned());
+            continue;
+        }
+        let text = crate::vfs::VfsPath::parse(&hook.path)
+            .map_err(|error| error.to_string())
+            .and_then(|path| {
+                vfs.read_text_unrecorded(&path)
+                    .map_err(|error| error.to_string())
+            });
+        match text {
+            Ok(text) if !text.trim().is_empty() => {
+                let mut chars = text.chars();
+                let mut kept: String = chars.by_ref().take(MAX_INJECT_CHARS).collect();
+                if chars.next().is_some() {
+                    kept.push_str("\n[truncated]");
+                }
+                out.push(kept);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(path = %hook.path, %error, "inject_context hook cannot read its path")
+            }
+        }
+    }
+    out
 }

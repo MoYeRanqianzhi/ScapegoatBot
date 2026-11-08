@@ -42,12 +42,10 @@
   单回合 token/墙钟是硬停；每 chat 小时限额只统计成功发送；`guard_usd_per_day` 是
   估算值（Jev 固定单次成本，LLM 按约 3k 输入 + 100 输出估算），耗尽后分类器降级为
   规则层，规则仍生效。
-- **`[hooks.events]` 的边界**：所有事件都会触发 `log`/`block`/`inject_context`/`notify`，
-  但 `rewrite` 只在 BeforeSend 生效；`block` 只在 MessageReceived 能阻止内容进入上下文。
-  `inject_context` 的落点：SessionStart（system）、MessageReceived（回合内提示）、
-  Pre/PostCompact（摘要输入/新分段）、Stop（下一轮历史）、SessionEnd（清空后的新历史）、
-  ConfigChange（内存历史，需下一次压缩才落盘）。`notify` 只支持 `owner`/`master`，
-  且需要 NapCat 已连接。
+- **`[hooks.events]` 的边界**：每个事件只支持固定的几种动作（见
+  [配置参考](configuration.md) 的表格），其余组合启动时报错。`block` 只在
+  `message_received` 与 `before_send` 上有意义；`session_end` 在进程退出时最多等 5 秒，
+  `notify` 需要 NapCat 仍在线。
 - **`[tools].max_schema_tokens`**：超限时把过长描述压到 160 字符；若仅 schema 就超限，
   只告警、不删工具。
 - **monitor 的 `cc` / `on_missing`**：`cc` 在绑定子代理时抄送主代理；`on_missing`

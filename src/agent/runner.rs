@@ -345,24 +345,24 @@ impl Runner {
     }
 
     /// 重新读取 hooks 并重建 system 块（压缩成功后调用）。
-    /// 触发一个非 BeforeSend 事件；log/block/inject 由调用方处理，notify 直接私聊主人。
+    /// 触发一个非 BeforeSend 事件：`log` 由 [`crate::agent::hooks::fire`] 记录，`block`
+    /// 交给调用方，`notify` 在这里私聊 `master_qq` 一次（设了渠道、且 NapCat 在线时）。
+    /// 这条通知是运行时发出的，不经过 BeforeSend。
     async fn fire_hooks(
         &self,
         event: crate::config::HookEvent,
         chat: Option<ChatId>,
-        text: Option<&str>,
+        detail: Option<&str>,
     ) -> crate::agent::hooks::HookOutcome {
-        let outcome = crate::agent::hooks::fire(&self.config.event_hooks, event, chat, text, None);
-        for channel in &outcome.notify {
-            if !matches!(channel.as_str(), "owner" | "master") || self.config.master_qq == 0 {
-                continue;
-            }
-            let Some(qq) = &self.deps.qq else {
-                continue;
-            };
+        let outcome = crate::agent::hooks::fire(&self.config.event_hooks, event, chat);
+        if outcome.notify > 0
+            && self.config.master_qq != 0
+            && let Some(qq) = &self.deps.qq
+        {
             let body = format!(
                 "[hook {event:?}] {}",
-                text.unwrap_or("no detail")
+                detail
+                    .unwrap_or("no detail")
                     .chars()
                     .take(500)
                     .collect::<String>()
@@ -377,6 +377,22 @@ impl Runner {
         outcome
     }
 
+    /// 某个事件的 `inject_context` 文本（`path` 从 VFS 读取）。
+    fn hook_context(&self, event: crate::config::HookEvent, chat: Option<ChatId>) -> Vec<String> {
+        crate::agent::hooks::injected(&self.config.event_hooks, event, chat, &self.deps.vfs)
+    }
+
+    /// 进程退出前调用：触发 `SessionEnd`（`log` / `notify`）。
+    pub(crate) async fn end_session(&self) {
+        let _ = self
+            .fire_hooks(
+                crate::config::HookEvent::SessionEnd,
+                None,
+                Some("the daemon is shutting down"),
+            )
+            .await;
+    }
+
     fn rebuild_system(&self) {
         let mut system = vec![SystemBlock {
             text: prompt::render_static(self.config.mode),
@@ -388,10 +404,7 @@ impl Runner {
                 cache: false,
             });
         }
-        for text in crate::agent::hooks::injected(
-            &self.config.event_hooks,
-            crate::config::HookEvent::SessionStart,
-        ) {
+        for text in self.hook_context(crate::config::HookEvent::SessionStart, None) {
             system.push(SystemBlock { text, cache: false });
         }
         *self
@@ -571,7 +584,6 @@ impl Runner {
         // 1) 入站消息立即进入 transcript 与共享历史。
         let mut inbound = Vec::with_capacity(input.messages.len());
         let mut accepted_messages = Vec::new();
-        let mut hook_context = Vec::new();
         for message in &input.messages {
             let text = format::render_inbound(message);
             let hook = self
@@ -581,7 +593,6 @@ impl Runner {
                     Some(&text),
                 )
                 .await;
-            hook_context.extend(hook.injected);
             if let Some(reason) = hook.blocked {
                 warn!(chat = %chat, %reason, "MessageReceived hook dropped this message");
                 continue;
@@ -660,6 +671,15 @@ impl Runner {
         let mut prompts = vec![AgentMessage::user(
             self.runtime_context(chat, &sessions).render(),
         )];
+        // MessageReceived 的 inject_context：本回合的即时提示（不进 transcript），
+        // 只在有消息被接受时加入，每回合一次。
+        if !accepted_messages.is_empty() {
+            for text in self.hook_context(crate::config::HookEvent::MessageReceived, Some(chat)) {
+                prompts.push(AgentMessage::user(format!(
+                    "[hook context | MessageReceived]\n{text}"
+                )));
+            }
+        }
         if let Some(pending) = self.pending_history(chat, first_batch_id) {
             evidence.record_source(chat.to_string(), &pending);
             prompts.push(AgentMessage::user(pending));
@@ -785,6 +805,7 @@ impl Runner {
             }
         };
         // 用量已由计量 provider 逐请求记账（见 `providers::metered`）。
+        // `Stop` 只允许 `log`（设计 §7.5）。
         let _ = self
             .fire_hooks(
                 crate::config::HookEvent::Stop,
@@ -792,13 +813,6 @@ impl Runner {
                 Some(&format!("turn finished: {:?}", outcome.stop_reason)),
             )
             .await;
-        for text in
-            crate::agent::hooks::injected(&self.config.event_hooks, crate::config::HookEvent::Stop)
-        {
-            working.push(AgentMessage::System {
-                text: format!("[hook context | Stop]\n{text}"),
-            });
-        }
         (outcome, unanswered, journal)
     }
 
@@ -2106,7 +2120,7 @@ mod tests {
         one_turn(&runner, ChatId::Group(1)).await;
         assert!(gate.hold_active());
         let poisoned = runner.deps.sessions.current().unwrap().file;
-        assert!(!runner.history().lock().await.is_empty());
+        assert!(!runner.history.lock().await.is_empty());
 
         // 下一回合照常运行，但先换到新分段；旧分段留档。
         one_turn(&runner, ChatId::Group(1)).await;
@@ -2120,7 +2134,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let history = runner.history();
+        let history = Arc::clone(&runner.history);
         let history = history.lock().await;
         assert!(
             !history
@@ -2161,7 +2175,7 @@ mod tests {
                 .await
                 .expect_ok();
         }
-        let history_handle = runner.history();
+        let history_handle = Arc::clone(&runner.history);
         let history = history_handle.lock().await;
         assert!(!history.is_empty());
         assert!(

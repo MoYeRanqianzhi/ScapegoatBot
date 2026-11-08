@@ -203,10 +203,10 @@ prune_keep_turns = 3
 # 上下文注入不在配置里：/AGENTS.md、/USER.md、/MEMORY.md、风格档案与技能索引
 # 存在即注入；其余文件（例如人设 /SOUL.md）由 agent 自己列在 VFS 的 /hooks/context.toml。
 
+# 事件 hook：事件与动作的可用组合见 docs/guide/configuration.md。
 # [[hooks.events]]
 # event = "before_send"
 # action = "rewrite"
 # pattern = "secret"
 # replacement = "[redacted]"
-# scope = "all"
 # enabled = true

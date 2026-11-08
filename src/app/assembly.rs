@@ -702,7 +702,6 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
             }
         }
     };
-    let hook_qq = qq.clone();
     let runner = Runner::new_with_fallbacks(
         provider,
         fallbacks,
@@ -832,53 +831,13 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
                 MessageFilter::from_config(&config.filter);
             agent.queue.reload_config(config.queue.clone());
             info!("filter and queue settings reloaded from /config");
-            let injected = crate::agent::hooks::injected(
-                &config.hooks.events,
-                crate::config::HookEvent::ConfigChange,
-            );
-            if !injected.is_empty() {
-                let runner = Arc::clone(&agent.runner);
-                tokio::spawn(async move {
-                    let history_handle = runner.history();
-                    let mut history = history_handle.lock().await;
-                    for text in injected {
-                        history.push(crate::agent::AgentMessage::System {
-                            text: format!("[hook context | ConfigChange]\n{text}"),
-                        });
-                    }
-                });
-            }
         }
-        let outcome = crate::agent::hooks::fire(
+        // ConfigChange 只允许 `log`（设计 §7.5）；配置已经写入，没有可阻止或注入的东西。
+        let _ = crate::agent::hooks::fire(
             &config.hooks.events,
             crate::config::HookEvent::ConfigChange,
             None,
-            None,
-            None,
         );
-        if let Some(reason) = outcome.blocked {
-            warn!(%reason, "ConfigChange hook requested a block");
-        }
-        if let Some(client) = &hook_qq {
-            for channel in outcome.notify {
-                if !matches!(channel.as_str(), "owner" | "master") || master_qq == 0 {
-                    continue;
-                }
-                let client = Arc::clone(client);
-                tokio::spawn(async move {
-                    if let Err(error) = client
-                        .send_text(
-                            crate::qq::event::ChatId::Private(master_qq),
-                            "[hook ConfigChange] configuration reloaded",
-                            None,
-                        )
-                        .await
-                    {
-                        warn!(%error, "cannot deliver a ConfigChange hook notification");
-                    }
-                });
-            }
-        }
     }));
 
     Ok(Some(runtime))

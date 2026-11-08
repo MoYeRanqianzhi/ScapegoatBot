@@ -45,24 +45,17 @@ impl Runner {
 
     /// 清空上下文：轮转唯一 transcript，并清空内存历史。
     pub(crate) async fn clear_all_context(&self) -> Result<serde_json::Value> {
+        // 清空上下文结束当前会话；SessionEnd 只允许 `log` / `notify`（设计 §7.5）。
         let _ = self
-            .fire_hooks(crate::config::HookEvent::SessionEnd, None, None)
+            .fire_hooks(
+                crate::config::HookEvent::SessionEnd,
+                None,
+                Some("the context was cleared"),
+            )
             .await;
-        let session_end = crate::agent::hooks::injected(
-            &self.config.event_hooks,
-            crate::config::HookEvent::SessionEnd,
-        );
         let current = self.deps.sessions.current()?;
         let next = self.deps.sessions.rotate()?;
-        let mut history = self.history.lock().await;
-        history.clear();
-        for text in &session_end {
-            let message = AgentMessage::System {
-                text: format!("[hook context | SessionEnd]\n{text}"),
-            };
-            self.deps.sessions.append(std::slice::from_ref(&message))?;
-            history.push(message);
-        }
+        self.history.lock().await.clear();
         Ok(serde_json::json!({
             "cleared": true,
             "previous_session": current.file,
@@ -121,10 +114,7 @@ impl Runner {
             warn!(%error, "memory flush before compaction failed");
         }
         let mut input = crate::session::compaction::render_for_summary(&old, 80_000);
-        let pre_compact = crate::agent::hooks::injected(
-            &self.config.event_hooks,
-            crate::config::HookEvent::PreCompact,
-        );
+        let pre_compact = self.hook_context(crate::config::HookEvent::PreCompact, None);
         if !pre_compact.is_empty() {
             input.push_str("\n\n[hook context]\n");
             input.push_str(&pre_compact.join("\n"));
@@ -163,10 +153,7 @@ impl Runner {
             }
             message
         }));
-        for text in crate::agent::hooks::injected(
-            &self.config.event_hooks,
-            crate::config::HookEvent::PostCompact,
-        ) {
+        for text in self.hook_context(crate::config::HookEvent::PostCompact, None) {
             new_history.push(AgentMessage::System {
                 text: format!("[hook context | PostCompact]\n{text}"),
             });

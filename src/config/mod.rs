@@ -573,6 +573,48 @@ deliver = { to = "main", as = "prompt" }
     }
 
     #[test]
+    fn retired_hook_keys_and_bad_hook_fields_are_reported() {
+        let text = r#"
+version = 1
+[[hooks.events]]
+event = "before_send"
+action = "log"
+scope = "all"
+match = { tool_name = "API" }
+
+[[hooks.events]]
+event = "session_end"
+action = "notify"
+notify_channel = "email"
+
+[[hooks.events]]
+event = "session_start"
+action = "inject_context"
+path = "relative.md"
+"#;
+        let table: toml::Table = toml::from_str(text).unwrap();
+        let config: SbotConfig = toml::Value::Table(table).try_into().unwrap();
+        let errors = config.validate_shape().unwrap_err();
+        for field in [
+            "hooks.events[0].scope",
+            "hooks.events[0].match.tool_name",
+            "hooks.events[1].notify_channel",
+            "hooks.events[2].path",
+        ] {
+            assert!(
+                errors.0.iter().any(|e| e.field == field),
+                "{field}: {errors:?}"
+            );
+        }
+        // 序列化不会把退役的键写回去（`receive_scopes` 之类的同名子串不算）。
+        let written = toml::to_string(&config).unwrap();
+        assert!(
+            !written.contains("\nscope =") && !written.contains("tool_name"),
+            "{written}"
+        );
+    }
+
+    #[test]
     fn retired_memory_topics_fails_with_a_migration_hint() {
         let config: SbotConfig = toml::from_str("[memory]\ntopics = true\n").unwrap();
         let errors = config.validate_shape().unwrap_err();

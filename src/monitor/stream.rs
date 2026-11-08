@@ -350,11 +350,7 @@ mod tests {
         let deliveries = wait_for(&sink, 2).await;
         assert_eq!(deliveries.len(), 2, "{deliveries:?}");
         let event = deliveries.iter().find(|delivery| !delivery.system).unwrap();
-        assert_eq!(
-            event.text,
-            "[monitor ci | stream]
-deploy failed on prod"
-        );
+        assert_eq!(event.text, "[monitor ci | stream]\ndeploy failed on prod");
         let notice = deliveries.iter().find(|delivery| delivery.system).unwrap();
         assert!(notice.text.contains("lost its stream"), "{deliveries:?}");
 

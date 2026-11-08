@@ -253,6 +253,15 @@ impl Runtime {
             _ = tokio::signal::ctrl_c() => info!("received Ctrl-C, shutting down"),
             _ = terminate_signal() => info!("received termination signal, shutting down"),
         }
+        // SessionEnd hook：在关闭 IPC 与 QQ 管线之前触发，`notify` 还能发出去；最多等 5 秒。
+        let agent = runtime.agent.read().expect("agent lock poisoned").clone();
+        if let Some(agent) = agent {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                agent.runner.end_session(),
+            )
+            .await;
+        }
         let _ = runtime.shutdown.send(true);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
         info!("sbot stopped");

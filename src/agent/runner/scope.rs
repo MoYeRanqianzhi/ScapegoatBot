@@ -1,11 +1,6 @@
 use super::*;
 
 impl Runner {
-    /// 全局历史的句柄（供 runtime 注入与复盘）。
-    pub(crate) fn history(&self) -> Arc<Mutex<Vec<AgentMessage>>> {
-        Arc::clone(&self.history)
-    }
-
     /// 单会话：所有回合共用一把锁。
     pub(super) async fn turn_lock_for(&self, _chat: ChatId) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.turn_lock)

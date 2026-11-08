@@ -313,12 +313,31 @@ key 放 `auth.json`：
 - 上下文注入不在 `[hooks]` 里配置（0.2.0-alpha.37 移除了 `[[hooks.context]]`，旧配置会
   启动失败并提示迁移）：`/AGENTS.md`、`/USER.md`、`/MEMORY.md`、风格档案与技能索引存在即注入；
   其余文件由 agent 自己列在 VFS 的 `/hooks/context.toml`（见 [人设、记忆与技能](persona-memory.md)）。
-- `[hooks.events]`：所有事件都会触发 `log` / `block` / `inject_context` / `notify`；
-  `rewrite` 只在 `BeforeSend` 生效，`scope` 支持 `model`（默认）与 `all`。
-  `BeforeSend` 作用于消息、群公告与上传文件；`rewrite` 改写消息文本段与公告正文，
-  上传文件没有正文，只受 `block` / `log` 影响。
-  `inject_context` 的落点：SessionStart → system，MessageReceived → 回合内提示，
-  Pre/PostCompact → 摘要输入/新分段；`notify` 只支持 `owner`/`master`。
+- `[[hooks.events]]`：声明式规则，不执行脚本。事件与动作的组合只能是下表里的，写错了
+  启动报错：
+
+  | 事件 | 触发点 | 可用动作 | `inject_context` 落点 |
+  |------|--------|----------|------------------------|
+  | `session_start` | 启动、压缩后重建 system | `log`、`inject_context` | system 块 |
+  | `session_end` | 进程退出、清空上下文 | `log`、`notify` | — |
+  | `pre_compact` | 压缩前 | `log`、`inject_context` | 摘要的输入 |
+  | `post_compact` | 压缩后 | `log`、`inject_context` | 新分段的开头 |
+  | `message_received` | 消息进入回合前 | `log`、`block`、`inject_context` | 本回合的即时提示（不进 transcript） |
+  | `before_send` | `API` 发布动作前 | `log`、`block`、`rewrite` | — |
+  | `stop` | 回合结束 | `log` | — |
+  | `config_change` | `/config` 写入后 | `log` | — |
+
+  - `match = { group_id, user_id, message_type = "group" | "private" }` 精确匹配；设了
+    任一项的 hook 只在带 chat 的事件（`message_received`、`before_send`）上命中。
+  - `block` 需要 `reason`；`message_received` 上的 `block` 让这条消息不进入上下文。
+  - `rewrite` 用 `pattern`（正则）/ `replacement` 改写消息文本段与群公告正文；上传文件
+    没有正文，只受 `block` / `log` 影响。
+  - `inject_context` 需要 `text`，或 VFS 路径 `path`（读取时最多 8000 字符，读不到跳过并
+    记日志）。
+  - `notify` 默认只记日志；`notify_channel = "owner"`（或 `"master"`）才私聊 `master_qq`，
+    需要 NapCat 在线，这条通知不经过 `before_send`。
+  - `scope` 与 `match.tool_name` 已在 0.2.0-alpha.42 移除（从未改变过行为），旧配置启动
+    时提示删除。
 
 ## models.json
 
