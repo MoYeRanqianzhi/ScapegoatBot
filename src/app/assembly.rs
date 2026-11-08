@@ -667,10 +667,10 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
     let last_activity = Arc::new(std::sync::atomic::AtomicI64::new(
         chrono::Utc::now().timestamp(),
     ));
+    let memory_model = memory_review_model(&config.memory, models, auth, &meter);
     let memory_flush = if config.compaction.memory_flush {
         Some(Arc::new(crate::memory::MemoryFlusher::new(
-            Arc::clone(&provider),
-            model_ref.model.id.clone(),
+            memory_model.clone(),
             Arc::clone(&vfs),
             Some(Arc::clone(&db)),
             config.memory.clone(),
@@ -789,6 +789,7 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
     // 后台复盘：记忆候选 + 风格画像；`review = off` 时立即返回。
     crate::memory::spawn(crate::memory::ReviewerConfig {
         provider: runner.provider_slot(),
+        review_model: memory_model,
         history: Arc::clone(&history),
         vfs: Arc::clone(&vfs),
         db: Some(Arc::clone(&db)),
@@ -978,6 +979,32 @@ fn security_reviewer(
         model,
         std::time::Duration::from_secs(security.check_timeout_secs.max(1)),
     )))
+}
+
+/// `[memory].review_model` → 独立的计量 provider；不设或构造失败时返回 `None`
+/// （复盘与压缩前记忆提取跟随主模型，构造失败记警告）。
+fn memory_review_model(
+    memory: &crate::config::MemoryConfig,
+    models: &ModelsFile,
+    auth: &AuthFile,
+    meter: &Arc<dyn UsageSink>,
+) -> Option<crate::memory::ReviewModel> {
+    let reference = memory.review_model.trim();
+    if reference.is_empty() {
+        return None;
+    }
+    // 存在性已由 `validate_with_models` 保证；这里仍防御一次。
+    let found = models.find(reference)?;
+    match build_metered(models, auth, reference, meter) {
+        Ok(provider) => Some(crate::memory::ReviewModel {
+            provider,
+            model: found.model.id.clone(),
+        }),
+        Err(error) => {
+            warn!(%error, model = %reference, "cannot build the memory review provider; using the main model");
+            None
+        }
+    }
 }
 
 /// 显式配置优先；否则用模型声明的默认 effort；都没有则关闭 thinking。

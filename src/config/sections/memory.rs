@@ -26,8 +26,11 @@ pub struct MemoryConfig {
     pub review: MemoryReviewMode,
     pub idle_minutes: u32,
     pub review_interval_minutes: u32,
+    /// 后台复盘与压缩前记忆提取用的模型（`provider/id`）；空 = 跟随主模型。
     pub review_model: String,
-    pub topics: bool,
+    /// 已移除的 `topics`；只为给出明确的迁移提示而保留解析。
+    #[serde(skip_serializing)]
+    topics: Option<toml::Value>,
 }
 
 impl Default for MemoryConfig {
@@ -42,13 +45,21 @@ impl Default for MemoryConfig {
             idle_minutes: 10,
             review_interval_minutes: 60,
             review_model: String::new(),
-            topics: true,
+            topics: None,
         }
     }
 }
 
 impl MemoryConfig {
     pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
+        // `/memory/topics` 只是一个约定目录，模型可以自由使用；这个开关从未被读取。
+        if self.topics.is_some() {
+            errors.push(ConfigError::new(
+                "memory.topics",
+                "was removed in 0.2.0-alpha.42: it never had an effect (/memory/topics is an \
+                 ordinary directory); delete this key",
+            ));
+        }
         for (field, value) in [
             ("memory.max_entry_chars", self.max_entry_chars),
             ("memory.max_index_lines", self.max_index_lines),

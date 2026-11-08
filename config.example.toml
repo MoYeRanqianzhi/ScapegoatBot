@@ -122,8 +122,8 @@ user_max_chars = 4000
 review = "idle"
 idle_minutes = 10
 review_interval_minutes = 60
+# 复盘与压缩前记忆提取用的模型（provider/id）；空 = 跟随主模型。
 review_model = ""
-topics = true
 
 [skills]
 # 技能存放在 VFS 的 /skills，随数据库一起备份。

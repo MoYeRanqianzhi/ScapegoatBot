@@ -100,7 +100,9 @@ source: control:42
 | `every_turn` | 每 5 秒轮询；transcript 有新增且没有活跃回合就复盘 |
 
 复盘只追加候选、来源固定 `self`；不会删除已有记忆。压缩前若开启
-`[compaction].memory_flush`，会先静默跑一次同样的提取。
+`[compaction].memory_flush`，会先静默跑一次同样的提取。两者都用 `[memory].review_model`
+指定的模型（`provider/id`，计入预算）；不设时跟随主模型，`sbot model set` 热切换后立即
+生效。
 
 ### 写记忆
 

@@ -50,9 +50,36 @@ pub trait QueueActivity: Send + Sync {
     async fn running_turns(&self) -> usize;
 }
 
+/// `[memory].review_model` 指定的独立模型。
+///
+/// 不设时，后台复盘与压缩前的记忆提取都跟随主模型槽位（热切换后立即生效）。
+#[derive(Clone)]
+pub struct ReviewModel {
+    pub provider: Arc<dyn Provider>,
+    /// 发给 provider 的 API model id。
+    pub model: String,
+}
+
+/// 选出这次复盘用的 provider 与 API model id：独立模型优先，否则取主模型的当前快照。
+fn pick_model(
+    dedicated: Option<&ReviewModel>,
+    main: &SharedProviderSlot,
+) -> (Arc<dyn Provider>, String) {
+    match dedicated {
+        Some(review) => (Arc::clone(&review.provider), review.model.clone()),
+        None => {
+            let slot = main.read().expect("provider slot lock poisoned");
+            (Arc::clone(&slot.provider), slot.api_model.clone())
+        }
+    }
+}
+
 /// 复盘任务配置。
 pub struct ReviewerConfig {
+    /// 主模型槽位；没有 `review_model` 时用它。
     pub provider: SharedProviderSlot,
+    /// `[memory].review_model`；`None` 跟随主模型。
+    pub review_model: Option<ReviewModel>,
     pub history: Arc<Mutex<Vec<AgentMessage>>>,
     pub vfs: Arc<VfsStore>,
     pub db: Option<Arc<Database>>,
@@ -130,10 +157,10 @@ pub fn spawn(config: ReviewerConfig) {
 
 /// 压缩前的静默记忆提取器（`[compaction].memory_flush`）。
 ///
-/// 与后台复盘共用同一套解析与落盘逻辑，但不改 `/STYLE.md`。
+/// 与后台复盘共用同一套解析与落盘逻辑，但不改 `/STYLE.md`。模型选择与复盘一致：
+/// `[memory].review_model` 优先，否则用调用时主模型槽位的快照。
 pub struct MemoryFlusher {
-    provider: Arc<dyn Provider>,
-    model: String,
+    review_model: Option<ReviewModel>,
     vfs: Arc<VfsStore>,
     db: Option<Arc<Database>>,
     memory: MemoryConfig,
@@ -141,26 +168,29 @@ pub struct MemoryFlusher {
 
 impl MemoryFlusher {
     pub fn new(
-        provider: Arc<dyn Provider>,
-        model: impl Into<String>,
+        review_model: Option<ReviewModel>,
         vfs: Arc<VfsStore>,
         db: Option<Arc<Database>>,
         memory: MemoryConfig,
     ) -> Self {
         Self {
-            provider,
-            model: model.into(),
+            review_model,
             vfs,
             db,
             memory,
         }
     }
 
-    /// 从历史里提取并写入记忆，返回新增条数。
-    pub async fn flush(&self, history: &[AgentMessage]) -> Result<usize> {
+    /// 从历史里提取并写入记忆，返回新增条数。`main` 是主模型槽位。
+    pub async fn flush(
+        &self,
+        history: &[AgentMessage],
+        main: &SharedProviderSlot,
+    ) -> Result<usize> {
+        let (provider, model) = pick_model(self.review_model.as_ref(), main);
         run_review(
-            &self.provider,
-            &self.model,
+            &provider,
+            &model,
             &self.vfs,
             self.db.as_ref(),
             &self.memory,
@@ -173,14 +203,10 @@ impl MemoryFlusher {
 
 /// 执行一次复盘。
 async fn review_once(config: &ReviewerConfig, history: &[AgentMessage]) -> Result<()> {
-    let slot = config
-        .provider
-        .read()
-        .expect("provider slot lock poisoned")
-        .clone();
+    let (provider, model) = pick_model(config.review_model.as_ref(), &config.provider);
     run_review(
-        &slot.provider,
-        &slot.api_model,
+        &provider,
+        &model,
         &config.vfs,
         config.db.as_ref(),
         &config.memory,
@@ -295,4 +321,60 @@ async fn run_review(
         }
     }
     Ok(added)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::{EventReceiver, LlmRequest, ProviderError, ProviderSlot};
+
+    /// 只用来区分身份的 provider：复盘的模型选择不会真的发请求。
+    struct Named(&'static str);
+
+    #[async_trait::async_trait]
+    impl Provider for Named {
+        fn protocol(&self) -> crate::config::models::Protocol {
+            crate::config::models::Protocol::Anthropic
+        }
+        fn model_id(&self) -> &str {
+            self.0
+        }
+        async fn stream(&self, _request: LlmRequest) -> Result<EventReceiver, ProviderError> {
+            unreachable!("model selection never streams")
+        }
+    }
+
+    fn slot(name: &'static str) -> SharedProviderSlot {
+        Arc::new(std::sync::RwLock::new(ProviderSlot {
+            reference: format!("test/{name}"),
+            api_model: name.to_owned(),
+            provider: Arc::new(Named(name)),
+            max_tokens: 1024,
+            thinking: Default::default(),
+            context_window: 0,
+            supports_images: false,
+        }))
+    }
+
+    #[test]
+    fn review_model_overrides_the_main_slot_and_follows_hot_switches_otherwise() {
+        let main = slot("main-a");
+        // 没有 review_model：跟随主模型，热切换后取到新模型。
+        let (provider, model) = pick_model(None, &main);
+        assert_eq!((provider.model_id(), model.as_str()), ("main-a", "main-a"));
+        *main.write().unwrap() = slot("main-b").read().unwrap().clone();
+        let (provider, model) = pick_model(None, &main);
+        assert_eq!((provider.model_id(), model.as_str()), ("main-b", "main-b"));
+
+        // 配了 review_model：始终用它。
+        let review = ReviewModel {
+            provider: Arc::new(Named("cheap")),
+            model: "cheap-api-id".to_owned(),
+        };
+        let (provider, model) = pick_model(Some(&review), &main);
+        assert_eq!(
+            (provider.model_id(), model.as_str()),
+            ("cheap", "cheap-api-id")
+        );
+    }
 }

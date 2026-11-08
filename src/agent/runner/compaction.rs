@@ -116,7 +116,7 @@ impl Runner {
             .await;
         // 压缩前把 durable facts 静默写进记忆，避免摘要把它们吞掉。
         if let Some(flusher) = &self.config.memory_flush
-            && let Err(error) = flusher.flush(&snapshot).await
+            && let Err(error) = flusher.flush(&snapshot, &self.slot).await
         {
             warn!(%error, "memory flush before compaction failed");
         }

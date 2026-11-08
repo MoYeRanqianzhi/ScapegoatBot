@@ -525,6 +525,19 @@ deliver = { to = "main", as = "prompt" }
     }
 
     #[test]
+    fn retired_memory_topics_fails_with_a_migration_hint() {
+        let config: SbotConfig = toml::from_str("[memory]\ntopics = true\n").unwrap();
+        let errors = config.validate_shape().unwrap_err();
+        assert!(
+            errors
+                .0
+                .iter()
+                .any(|error| error.field == "memory.topics" && error.message.contains("removed"))
+        );
+        assert!(!toml::to_string(&config).unwrap().contains("topics"));
+    }
+
+    #[test]
     fn rewrite_hook_requires_valid_regex() {
         let mut hooks = HooksConfig::default();
         hooks.events.push(EventHookConfig {
