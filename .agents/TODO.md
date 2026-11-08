@@ -15,26 +15,16 @@
 
 ## 当前基线
 
-- `cargo test --locked --all-targets` = 452 passed，2 ignored；clippy / fmt 通过；
-  Linux `cargo check -D warnings` 通过（WSL Debian，脚本 `G:/sbot-wsl/check.sh`，
-  产物与 cargo 缓存都在 G:；WSL 工具链没有 clippy）。
-  当前 `0.2.0-alpha.40`（本地 tag）；每批升版本、打 tag，未验证前不 push。
+- `cargo test --locked --all-targets` = 485 passed，2 ignored；clippy / fmt 通过；
+  Linux `cargo check -D warnings` 与 `cargo test` 通过（486 passed，多一个 Unix 专属测试；
+  WSL Debian，脚本 `G:/sbot-wsl/check.sh check|test`，产物与 cargo 缓存都在 G:；
+  WSL 工具链没有 clippy）。
+  当前 `0.2.0-alpha.41`（本地 tag）；每批升版本、打 tag，未验证前不 push。
 - 服务器 `hw1` 的 `sbot.service` 仍停止；NapCat 未登录（2026-11-05 起 QR 登录失败）。
 
 ## 待用户确认
 
 - [ ] 是否授权 `git push origin main --tags`、GitHub release、部署 hw1。
-
-## 预算、定时与 provider（P1）
-
-- [ ] 预算缺口：子代理、压缩、记忆 flush、审查、门禁 LLM 不计入；cache token 丢弃；口径不一。
-- [ ] 每轮 token 上限把每次请求的完整 prompt 相加；预算耗尽后每次唤醒都重复压缩。
-- [ ] 热切换模型后 context_window / 图片能力 / 价格不更新。
-- [ ] 定时器：启动覆盖上次触发时间；`At` 只触发一次；DST；cron 补投窗口；日/周字段 AND。
-- [ ] Anthropic：server tool 参数未收集；空 content / 无签名 thinking 回放 400；只缓存静态前缀。
-- [ ] 未知停止原因当 EndTurn；408/504 不重试。
-- [ ] `/messages` 的 `offset` / `order` 被忽略；`Stat` 动态文件失败；`Read` 示例过滤语法不存在。
-- [ ] 资源放大：图片/下载整块驻留内存；无 `spawn_blocking`；`html_to_text` 可能二次方。
 
 ## 配置重构
 

@@ -99,21 +99,21 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
   `persist()` 重建 `sbot.toml` 时用默认权限。
 - `已修 alpha.40` VFS 回收站不计配额、`purge_trash` 运行时从不调用；从回收站恢复不检查配额。
 - `已修 alpha.40`（删除该键） `[skills].shared_dir` 宿主机路径模型可写，只有 `sbot backup` 使用。
-- `未核实` 预算缺口：子代理、压缩摘要、记忆 flush、审查、门禁 LLM 都不计入；
+- `已修 alpha.41` 预算缺口：子代理、压缩摘要、记忆 flush、审查、门禁 LLM 都不计入；
   `record_usage` 丢弃 cache token；各 provider 的 `input_tokens` 口径不一
   （openai/chat 含缓存，anthropic 不含）。
-- `未核实` 每轮 token 上限把每次请求的完整 prompt 相加，75k 以上上下文只能跑两次请求。
-- `未核实` 预算耗尽后每次唤醒都重复压缩（usage 沿用压缩前的值）。
-- `未核实` 热切换模型后 `RunnerConfig` 的 context_window / 图片能力 / 价格不更新。
-- `未核实` 定时器：启动时覆盖上次触发时间；`At` 只触发一次；DST 当天 `.single()` 结束
+- `已修 alpha.41` 每轮 token 上限把每次请求的完整 prompt 相加，75k 以上上下文只能跑两次请求。
+- `已修 alpha.41` 预算耗尽后每次唤醒都重复压缩（usage 沿用压缩前的值）。
+- `已修 alpha.41` 热切换模型后 `RunnerConfig` 的 context_window / 图片能力 / 价格不更新。
+- `已修 alpha.41` 定时器：启动时覆盖上次触发时间；`At` 只触发一次；DST 当天 `.single()` 结束
   任务；cron 补投只扫 1440 分钟；日/周字段按 AND 而非 OR；`0 0 30 2 *` 长时间空转。
-- `未核实` Anthropic：server tool 的查询参数没被收集；空 `content` 的 assistant、
+- `已修 alpha.41` Anthropic：server tool 的查询参数没被收集；空 `content` 的 assistant、
   无签名 thinking 会被原样回放导致 400；只缓存静态前缀。
 - `已修 alpha.40` 准入过滤只作用于消息；被忽略群的 notice/request 仍入库、进 inbox、进 monitor。
-- `未核实` 停止原因未知时当作 EndTurn；408/504 不重试。
-- `未核实` `/messages` 的 `offset` / `order` 被忽略；`Stat` 动态文件几乎总失败；
+- `已修 alpha.41` 停止原因未知时当作 EndTurn；408/504 不重试。
+- `已修 alpha.41` `/messages` 的 `offset` / `order` 被忽略；`Stat` 动态文件几乎总失败；
   `Read` 工具示例里的过滤语法不存在。
-- `未核实` 资源放大：图片转换、下载整块驻留内存；无 `spawn_blocking`；`html_to_text`
+- `已修 alpha.41` 资源放大：图片转换、下载整块驻留内存；无 `spawn_blocking`；`html_to_text`
   可能二次方。
 - `已修 alpha.40` Unix socket 回退到 `/tmp/<name>.sock` 无 uid；`napcat-link` 在 INFO 日志里打印
   带 access_token 的 URL；`auth.json` 解析错误会回显密钥值。

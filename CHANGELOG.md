@@ -7,6 +7,68 @@
 
 ## [Unreleased]
 
+## [0.2.0-alpha.41] - 2026-11-09
+
+审查 P1 的其余部分：预算口径、定时器、provider 停止原因与 Anthropic 回放、动态视图查询、
+资源放大。
+
+### 修复
+
+- 预算按每次模型请求各自的价格计量：`providers::metered` 包住运行时的每个 provider，
+  子代理、压缩、记忆 flush、安全审查与 LLM 门禁都计入，缓存 token 按缓存价计费。
+  `Usage` 在三种协议里口径一致：`input_tokens` 不含缓存输入（OpenAI / Chat 的计数拆开，
+  DeepSeek 的 `prompt_cache_hit_tokens` 生效）；`CostDef` 新增可选的 `cache_read` /
+  `cache_write` 价格，缺省按输入价。
+- 每轮 token 上限统计本轮新增的 token（输出 + prompt 增长），不再把每次重发的完整 prompt
+  相加；每日预算检查在自动压缩之前进行，保留下来的消息清掉压缩前的用量，预算耗尽后不再
+  每次唤醒都压缩一次。
+- 热切换模型同时更新上下文窗口、图片能力与价格（放进 provider slot）。
+- 定时器：配置校验、配置加载、Monitor 工具与 Agent 绑定共用一个解析器
+  （`monitor::timer::TimerSpec`），`at` 校验范围，`0 0 30 2 *` 这类永不触发的 cron 直接拒绝；
+  `at` 每天触发而不是只触发一次；cron 的日 / 周字段同时受限时按标准的“或”语义，逐日计算
+  下次运行；夏令时缺口顺延到下一个有效分钟、重叠只触发一次；上次触发时间只在真正触发时
+  写入，`every` 以它为锚，补投用 `next_after` 计数；休眠每次最多 60 秒并复核时钟。
+- 认不出的停止原因按失败处理并记日志，不再当成正常结束去执行可能被截断的工具调用；
+  覆盖 Anthropic SDK 的全部 `StopReason`（含 `model_context_window_exceeded`）与 DeepSeek 的
+  `insufficient_system_resource` / `aborted`。Responses 的 `incomplete` 若因 `content_filter`
+  是拒绝，截断的响应也报告用量；408 / 504 与 5xx 一样重试。
+- Anthropic：服务端工具（`server_tool_use`）的参数按 `input_json_delta` 拼好、在块结束时
+  发出，不再漏进普通工具调用的参数、回放成空输入；回放时跳过空白文本块和没有签名的
+  thinking 块（以及因此变空的消息），这些会被 API 以 400 拒绝；agent 循环在最后一个块上打
+  缓存断点，工具循环的每一步复用上一步的前缀，一次性请求不付写缓存的钱
+  （`LlmRequest.cache_history`）。
+- 动态视图查询：
+  - `filter` 在解析查询串时就解析成结构化条件（`vfs::filter`）：未知条件、不是数字的
+    `from:`、不存在的日期、没闭合的引号直接报错，不再悄悄匹配不到任何东西；`contains:`
+    支持引号、不区分大小写。
+  - `mentions_self` 指 @ 本账号或 @全体成员，不再是“任何数字 @”。
+  - `/inbox`、`/messages` 与日文件统一按 `filter` → `order` → `offset` → `limit` 截取，
+    并说明还剩多少没给出；以前 `offset` 与 `order` 被忽略。`/messages` 带 `filter` 时按条件数
+    各 chat 的未读；日文件可以按 `state:` 筛选。
+  - 单文档视图带查询串、动态视图上的按行 `offset` / `limit` 都报错；`LS` 的 `filter` 只认
+    `contains:` 并分页；`RM` 带查询串时只忽略这一页并报告剩余。
+  - `Stat` 对动态文件与目录都能用（以前把路径本身当目录列举，几乎总是失败）；`Grep` 扫描
+    整个文件，不再只搜每天的前 50 条。
+  - `Read` 工具描述里的示例改成真实存在的语法。
+- 资源放大：
+  - `Download` 边收边加密暂存（`vfs::sqlite::BlobStage`），内存里最多约 1 MiB，暂存与提交
+    在阻塞线程里做；失败或超限不留节点和暂存目录，崩溃遗留的暂存目录在启动时清理。
+  - 文本类下载（`text/*`、JSON、XML、JS）在文本上限内且是合法 UTF-8 时存成文本节点；
+    以前它们按二进制分块存成 kind 为 text 的节点，读不出来。`write_binary` 拒绝文本类型。
+  - `CP` 逐块复制二进制节点，不再把整个文件读进内存。
+  - 图片解码统一在 `src/media.rs`：64 MB 与单边 8192px 上限（以前 `Read` 看图与 MCP 截图
+    不限宽高），过大的图逐级缩小到放得下视觉上限为止；`Read`、`local.media.image.*`、MCP
+    截图的解码与编码都移到阻塞线程池。
+  - `WebFetch` 的 HTML → 文本改为单次线性扫描（正则 `replace_all` 最坏 O(m·n²)），实体只
+    解码一次（`&amp;lt;` 不再变成 `<`），支持数字实体；截断标记只在真的截断时出现；
+    搜索 / 抓取后端的响应体限 16 MiB。
+
+### 变更
+
+- `MessageStore::inbox_for_chat` 删除（与 `unread(Some(chat))` 相同）。
+- `ViewQuery.filter` 的类型从 `String` 变成 `ViewFilter`；新增 `PathError::BadFilter` /
+  `QueryNotSupported`。`Views::peek` 改名 `scan`（完整、不分页、不标记已读）。
+
 ## [0.2.0-alpha.40] - 2026-11-08
 
 安全审查 P1。
