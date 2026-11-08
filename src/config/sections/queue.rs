@@ -6,12 +6,16 @@ use super::{ConfigError, non_zero};
 // [queue]
 // ---------------------------------------------------------------------------
 
+/// 回合运行期间到达的新消息如何处理（`[queue].mode`），实现见 `agent::queue`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueMode {
+    /// 送进 steering 队列，当前回合在下一个模型边界就能看到。
     #[default]
     Steer,
+    /// 留到回合结束后，每条消息各开一个回合（按到达顺序）。
     Followup,
+    /// 留到回合结束后，再等一个 `debounce_ms`，把这段时间到达的消息合并成一个回合。
     Collect,
 }
 

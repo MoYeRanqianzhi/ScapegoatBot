@@ -58,7 +58,8 @@ ignore_patterns = []
 require_mention = false
 
 [queue]
-# steer：回合中到达的消息立即注入；followup / collect 留到下一回合。
+# steer：回合中到达的消息注入当前回合；followup：回合结束后逐条各开一个回合；
+# collect：回合结束后再等 debounce_ms，把期间的消息合并成一个回合。
 mode = "steer"
 max_concurrent = 4
 cap_messages = 200

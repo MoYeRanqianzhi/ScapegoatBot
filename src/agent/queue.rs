@@ -4,8 +4,11 @@
 //!
 //! 语义：
 //! - 同一 chat 的连发在 `debounce_ms` 窗口内合并成一个回合；不同 chat 各自计时。
-//! - 回合运行期间到达的消息：`steer` 直接进入 steering 队列；`followup` / `collect`
-//!   留在下一条待处理里，回合结束后再开新回合。
+//! - 回合运行期间到达的消息（`[queue].mode`）：
+//!   - `steer`：直接进入 steering 队列，当前回合在下一个模型边界看到它们；
+//!   - `followup`：留在待处理里，回合结束后**逐条**各开一个回合；
+//!   - `collect`：留在待处理里，回合结束后再等一个 `debounce_ms`，期间到达的一起合并成
+//!     **一个**回合。
 //! - steer 进去的消息若回合没有回应（回合提前结束、或被跳过），回合结束时按原顺序
 //!   放回待处理队首，再开一轮；一条消息不会“送进去了却没人回”。
 //! - 每 chat 限制待处理消息条数；溢出按 `summarize | old | new` 处理，
@@ -23,6 +26,9 @@ use tracing::{debug, warn};
 
 use crate::config::{DropPolicy, QueueConfig, QueueMode};
 use crate::qq::event::{ChatId, QqMessage};
+
+/// 回合结束后开下一个回合前的短暂间隔（毫秒）：让收尾时到达的消息赶上同一批。
+const FOLLOW_UP_DELAY_MS: u64 = 50;
 
 /// 一次回合的输入。
 #[derive(Debug, Clone)]
@@ -86,6 +92,15 @@ struct ChatState {
     token: u64,
     /// 已排队（含运行中）的批次数。
     pending_batches: usize,
+}
+
+/// 一次触发从待处理里取多少条。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Take {
+    /// 全部：去抖窗口里的连发、`steer` / `collect` 的后续批次。
+    All,
+    /// 只取最早的一条：`followup` 的后续回合逐条处理。
+    One,
 }
 
 /// 聊天队列。
@@ -158,7 +173,7 @@ impl ChatQueue {
                 state.pending_batches = 1;
             }
             drop(states);
-            self.schedule(chat, token, config.debounce_ms);
+            self.schedule(chat, token, config.debounce_ms, Take::All);
         }
     }
 
@@ -186,18 +201,18 @@ impl ChatQueue {
     }
 
     /// 启动去抖计时。
-    fn schedule(self: &Arc<Self>, chat: ChatId, token: u64, delay_ms: u64) {
+    fn schedule(self: &Arc<Self>, chat: ChatId, token: u64, delay_ms: u64, take: Take) {
         let queue = Arc::clone(self);
         tokio::spawn(async move {
             if delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
-            queue.fire(chat, token).await;
+            queue.fire(chat, token, take).await;
         });
     }
 
     /// 去抖窗口结束：取出一批并启动回合。
-    async fn fire(self: &Arc<Self>, chat: ChatId, token: u64) {
+    async fn fire(self: &Arc<Self>, chat: ChatId, token: u64, take: Take) {
         let (batch, steering_tx, steering_rx) = {
             let mut states = self.states.lock().await;
             let Some(state) = states.get_mut(&chat) else {
@@ -212,7 +227,11 @@ impl ChatQueue {
                 return;
             }
 
-            let messages: Vec<QqMessage> = state.pending.drain(..).collect();
+            let count = match take {
+                Take::All => state.pending.len(),
+                Take::One => 1,
+            };
+            let messages: Vec<QqMessage> = state.pending.drain(..count).collect();
             let dropped = std::mem::take(&mut state.dropped);
             let (steering_tx, steering_rx) = mpsc::unbounded_channel();
             state.active = Some(steering_tx.clone());
@@ -274,8 +293,15 @@ impl ChatQueue {
                     // 预约下一批；`fire` 接手后不再重复计数。
                     state.pending_batches += 1;
                     drop(states);
-                    // follow-up 不再等待完整去抖窗口，只留一个很小的合并窗口。
-                    queue.schedule(chat, token, 50);
+                    // 后续批次：`collect` 再等一个完整去抖窗口把这段时间的消息并成一批；
+                    // `followup` 逐条开回合；`steer` 只剩没送进去或没回应的几条，小窗口后一起处理。
+                    let config = queue.config();
+                    let (delay, take) = match config.mode {
+                        QueueMode::Collect => (config.debounce_ms, Take::All),
+                        QueueMode::Followup => (FOLLOW_UP_DELAY_MS, Take::One),
+                        QueueMode::Steer => (FOLLOW_UP_DELAY_MS, Take::All),
+                    };
+                    queue.schedule(chat, token, delay, take);
                 }
             }
         });
@@ -487,6 +513,47 @@ mod tests {
         assert!(state.active.is_none());
         assert_eq!(state.pending_batches, 0, "batch reservation leaked");
         assert!(state.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn followup_runs_queued_messages_one_turn_each_and_collect_merges_them() {
+        for (mode, expected) in [
+            (QueueMode::Followup, vec![vec![1], vec![2], vec![3]]),
+            (QueueMode::Collect, vec![vec![1], vec![2, 3]]),
+        ] {
+            let handler = Arc::new(RecordingHandler {
+                delay_ms: 80,
+                ..RecordingHandler::default()
+            });
+            let mut cfg = config();
+            cfg.debounce_ms = 20;
+            cfg.mode = mode;
+            let queue = ChatQueue::new(cfg, handler.clone());
+            let chat = ChatId::Group(1);
+
+            queue.ingest(msg(chat, 1)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            // 第一回合进行中到达两条。
+            queue.ingest(msg(chat, 2)).await;
+            queue.ingest(msg(chat, 3)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+            let calls = handler.calls.lock().unwrap();
+            let batches: Vec<Vec<i64>> = calls
+                .iter()
+                .map(|call| {
+                    call.messages
+                        .iter()
+                        .map(|message| message.message_id)
+                        .collect()
+                })
+                .collect();
+            assert_eq!(batches, expected, "{mode:?}");
+            assert!(
+                handler.steer.lock().unwrap().is_empty(),
+                "{mode:?} must not steer"
+            );
+        }
     }
 
     #[tokio::test]

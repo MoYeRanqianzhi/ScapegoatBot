@@ -93,7 +93,7 @@ access token 在 `auth.json`，不在这里。
 
 | 键 | 默认 | 说明 |
 |----|------|------|
-| `mode` | `steer` | 回合中到达的消息：`steer` 立即注入 / `followup` 下一回合 / `collect` 合并 |
+| `mode` | `steer` | 回合中到达的消息：`steer` 注入当前回合 / `followup` 回合结束后逐条各开一个回合 / `collect` 回合结束后再等 `debounce_ms`，合并成一个回合 |
 | `max_concurrent` | 4 | 队列同时派发的 handler 数；shared transcript 下主回合仍由 turn_lock 串行 |
 | `cap_messages` | 200 | 每 chat 待处理消息上限 |
 | `drop` | `summarize` | 溢出策略：`summarize` / `old` / `new` |
@@ -109,7 +109,7 @@ access token 在 `auth.json`，不在这里。
 | `encryption` | `xchacha20poly1305` | 内容加密；`none` 仅调试 |
 | `max_vfs_bytes` | 10 GiB | VFS 活跃配额；0 = 不限 |
 | `max_message_bytes` | 10 GiB | 消息归档配额 |
-| `max_session_bytes` | 2 GiB | transcript 配额 |
+| `max_session_bytes` | 2 GiB | transcript 配额；启动时与每次轮转后清理最旧的已关闭分段；0 = 不限 |
 | `max_blob_bytes` | 512 MiB | 单文件二进制上限 |
 | `message_retention_days` | 0 | 按天数清理旧消息；0 = 只按配额 |
 | `session_retention_days` | 0 | transcript 同理 |
