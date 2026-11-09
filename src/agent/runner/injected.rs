@@ -110,7 +110,7 @@ impl Runner {
             self.fallbacks.clone(),
             executor,
             Arc::clone(&self.deps.gate),
-            self.loop_config(),
+            self.loop_config(&slot),
         );
         let turn_id = new_turn_id();
         let mut journal = super::journal::TurnJournal::new(

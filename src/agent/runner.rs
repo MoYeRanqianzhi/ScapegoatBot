@@ -484,17 +484,16 @@ impl Runner {
             .clone()
     }
 
-    /// 主回合与注入回合共用的循环配置。
+    /// 主回合、注入回合与子代理共用的循环配置。
     ///
-    /// 模型字段取当前 provider 快照，其余取 `RunnerConfig`；集中一处后，
-    /// 热切换或新增字段时两个入口不会出现配置漂移。
-    fn loop_config(&self) -> LoopConfig {
-        let slot = self.provider_snapshot();
+    /// 模型 id、输出上限与 thinking 取自调用方的 `slot`：调用方用同一个快照里的 provider，
+    /// 中途热切换模型时两者也不会错配（以前这里另取一次快照，provider 是旧模型、id 是新的）。
+    fn loop_config(&self, slot: &ProviderSlot) -> LoopConfig {
         LoopConfig {
-            model: slot.api_model,
+            model: slot.api_model.clone(),
             system: self.system(),
             max_tokens: slot.max_tokens,
-            thinking: slot.thinking,
+            thinking: slot.thinking.clone(),
             server_tools: self.config.server_tools.clone(),
             max_steps: self.config.max_steps,
             retry: self.config.retry,
@@ -751,7 +750,7 @@ impl Runner {
             self.fallbacks.clone(),
             executor,
             Arc::clone(&self.deps.gate),
-            self.loop_config(),
+            self.loop_config(&slot),
         );
         let turn_id = journal.turn_id().to_owned();
         let (events_tx, mut events_rx) = mpsc::channel(256);
@@ -914,30 +913,12 @@ impl crate::swarm::SubagentRunner for Runner {
             self.fallbacks.clone(),
             tools,
             Arc::clone(&self.deps.gate),
+            // 子代理：自己的精简 system、没有服务端工具、步数来自定义；其余与主回合相同。
             LoopConfig {
-                model: slot.api_model,
                 system,
-                max_tokens: slot.max_tokens,
-                thinking: slot.thinking,
                 server_tools: Vec::new(),
                 max_steps: request.max_steps,
-                retry: self.config.retry,
-                max_state_chars: self.config.max_state_chars,
-                prune: self.config.prune,
-                prune_soft_limit: self.config.prune_soft_limit as usize,
-                prune_keep_turns: self.config.prune_keep_turns,
-                max_turn_tokens: self
-                    .config
-                    .budget
-                    .as_ref()
-                    .map(|budget| budget.turn_tokens())
-                    .unwrap_or(0),
-                max_wall_secs: self
-                    .config
-                    .budget
-                    .as_ref()
-                    .map(|budget| budget.wall_secs())
-                    .unwrap_or(0),
+                ..self.loop_config(&slot)
             },
         );
         let mut history = request.history;
