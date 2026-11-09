@@ -161,6 +161,9 @@ pub enum VfsError {
     RangeOutOfBounds,
     #[error("this view is unavailable while offline: {0}")]
     Offline(String),
+    /// `/trash` 只能经 `RM`（或 `MV` 进去）进入；直接写入会得到不受回收站规则管理的节点。
+    #[error("{0} is inside /trash: move it out with MV first, or write somewhere else")]
+    InTrash(String),
     #[error("storage error: {0}")]
     Storage(String),
 }

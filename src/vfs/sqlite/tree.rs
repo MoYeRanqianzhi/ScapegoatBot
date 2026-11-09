@@ -251,6 +251,7 @@ impl super::VfsStore {
         if from == to || to.starts_with(from) {
             return Err(VfsError::MoveIntoItself);
         }
+        self.reject_trash_target(to)?;
         let mut conn = self.db.lock();
         let tx = conn.transaction()?;
 

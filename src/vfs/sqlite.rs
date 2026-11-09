@@ -199,6 +199,15 @@ impl VfsStore {
         Ok(parent_id)
     }
 
+    /// 写入、编辑、复制、建目录都不能以 `/trash` 为目标：那里的节点由 `RM` / `MV` 标记为
+    /// 已回收、计入回收站上限并按期清理；直接写进去的节点会是“活跃”的，三条规则都管不到。
+    fn reject_trash_target(&self, path: &VfsPath) -> Result<(), VfsError> {
+        if path.starts_with(&self.trash_path()) {
+            return Err(VfsError::InTrash(path.to_string()));
+        }
+        Ok(())
+    }
+
     /// 确保父目录存在（缺失则创建）。
     fn ensure_parent(&self, conn: &Connection, path: &VfsPath, now: &str) -> Result<i64, VfsError> {
         let parent = path
@@ -443,6 +452,7 @@ impl VfsStore {
         content: &str,
         origin_chat: Option<&str>,
     ) -> Result<NodeMeta, VfsError> {
+        self.reject_trash_target(path)?;
         let len = content.len() as u64;
         self.quota.check_text(len)?;
         self.quota.check_disk(&self.storage)?;
@@ -590,6 +600,7 @@ impl VfsStore {
                 "{path} is a read-only dynamic view"
             )));
         }
+        self.reject_trash_target(path)?;
         self.quota.check_blob(len)?;
         self.quota.check_disk(&self.storage)?;
 
@@ -862,6 +873,7 @@ impl Vfs for VfsStore {
                 "{path} is a read-only dynamic view"
             )));
         }
+        self.reject_trash_target(path)?;
         let mut conn = self.db.lock();
         let tx = conn.transaction()?;
         let now = now();
@@ -1245,6 +1257,38 @@ mod tests {
             VfsError::QuotaExceeded { .. }
         ));
         assert!(store.stat(&path("/c.md")).is_err());
+    }
+
+    /// 只有 RM / MV 能把东西放进 /trash；直接写入、编辑、复制、建目录都拒绝。
+    #[test]
+    fn writes_cannot_target_the_trash() {
+        let (store, _dir) = store();
+        let file = VfsPath::parse("/docs/a.md").unwrap();
+        store.write_text(&file, "hello", None).unwrap();
+        for target in ["/trash/a.md", "/trash/sub/b.md"] {
+            let target = VfsPath::parse(target).unwrap();
+            assert!(matches!(
+                store.write_text(&target, "x", None),
+                Err(VfsError::InTrash(_))
+            ));
+            assert!(matches!(
+                store.write_binary(&target, b"x", NodeKind::Binary),
+                Err(VfsError::InTrash(_))
+            ));
+            assert!(matches!(
+                store.copy(&file, &target),
+                Err(VfsError::InTrash(_))
+            ));
+        }
+        assert!(matches!(
+            store.mkdir_all(&VfsPath::parse("/trash/dir").unwrap()),
+            Err(VfsError::InTrash(_))
+        ));
+        // RM 仍然把文件移进回收站，MV 仍然能把它取出来。
+        let outcome = store.remove(&file, false).unwrap();
+        let trashed = outcome.trashed_to.unwrap();
+        store.rename(&trashed, &file).unwrap();
+        assert!(store.stat(&file).is_ok());
     }
 
     #[test]
