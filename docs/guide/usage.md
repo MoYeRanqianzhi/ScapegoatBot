@@ -105,11 +105,12 @@ sbot effort set high
 
 ## 配置热更新
 
-通过 `/config` 写入（agent 自己改）或直接编辑文件后重启：
+agent 能通过 `/config` 写的只有 `[filter]`、`[queue]`、`[compaction]`、`[skills]`、`[style]`
+与 `[agent].available_models` / `thinking_level`；其余键对它只读。你直接编辑文件后要重启。
 
-- 立即生效：`[filter]`。
-- 下次启动生效：`[compaction]` 的预算、`[skills]`、`[style]`、`[agent]` 白名单键等。
-- 只读：凭据、安全策略、存储路径等。
+- `/config` 写入后立即生效：`[filter]`、`[queue]`（`max_concurrent` 除外，信号量要重启才变）。
+- 写入落盘、下次启动生效：`[compaction]`、`[skills]`、`[style]`、`[agent]` 的两个键
+  （运行中热切换模型与 effort 用 `sbot model set` / `sbot effort set`）。
 
 ## 备份与恢复
 
@@ -117,8 +118,8 @@ sbot effort set high
 sbot backup --output /backup/sbot-2026-11-04
 ```
 
-备份包含 `data.db` 快照、消息/会话/blob 文件与 **主密钥**。请按机密文件保管：
-拿到备份就能解密全部历史。
+备份包含 `data.db` 快照、消息/会话/blob 文件、**主密钥**与 **`auth.json`**（明文 API key）。
+请按机密文件保管：拿到备份就能解密全部历史，也能用你的 key。
 
 恢复：停进程，把备份内容放回 `~/.sbot`（或新的 `SBOT_HOME`），启动即可。
 

@@ -27,7 +27,7 @@
 | `paths.rs` | `~/.sbot` 布局、逻辑根解析 | `SbotPaths` |
 | `config/mod.rs` | 根结构、加载、环境变量覆盖、校验分派 | `SbotConfig::load` |
 | `config/sections/` | 分节 schema（agent/queue/security/monitor/hooks…），每节一个文件 | 各 `Config` 结构 |
-| `storage/` | 迁移 v1–v11、主密钥、消息归档 | `Database`、`MessageStore` |
+| `storage/` | 迁移（只追加，最新版本见 `MIGRATIONS` 末项，当前 v12）、主密钥、消息归档 | `Database`、`MessageStore` |
 | `vfs/` | VFS 路径、查询串与 `filter` 语法、SQLite 后端（`sqlite/stage.rs` 是分段写入）、配额 | `VfsStore`、`BlobStage`、`VfsPath`、`ViewQuery`、`ViewFilter` |
 | `media.rs` | 图片解码上限、缩图、阻塞线程池（`Read` / 图片动作 / MCP 共用） | `decode_limited`、`shrink_to_fit`、`blocking` |
 | `providers/` | 三种协议、SSE、回退 | `build_provider`、`AgentLoop::new_with_fallbacks` |
