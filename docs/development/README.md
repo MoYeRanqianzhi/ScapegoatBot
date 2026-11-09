@@ -45,7 +45,7 @@
 ## 结构约定
 
 - 单函数尽量 <200 行、单结构字段尽量 <20；超了就按职责拆（`tools/actions.rs`、
-  `config/sections/`、`tools/views/*`、`app::assembly::assemble_tools`、`ScopeCache` 是先例）。
+  `config/sections/`、`tools/views/*`、`app/assembly/`、`monitor/`、`ScopeCache` 是先例）。
 - 模型面文本（system prompt、工具描述、错误）保持英文；代码注释用中文。
 - 不要在文档或注释里承诺未实现的行为；未实现项集中写在
   [`../guide/limits.md`](../guide/limits.md)。
