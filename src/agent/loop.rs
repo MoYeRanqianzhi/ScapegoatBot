@@ -247,6 +247,108 @@ impl AgentLoop {
         }
     }
 
+    /// 下一步之前检查回合预算：墙钟时间、本回合 token、步数。超限时记日志（步数超限另发
+    /// 一条 `Error` 事件）并返回 `false`，调用方以 `Error` 结束回合。
+    async fn within_limits(
+        &self,
+        started: std::time::Instant,
+        meter: &TurnMeter,
+        step: u32,
+        events: &mpsc::Sender<AgentEvent>,
+    ) -> bool {
+        if self.config.max_wall_secs > 0 && started.elapsed().as_secs() >= self.config.max_wall_secs
+        {
+            warn!(
+                elapsed = started.elapsed().as_secs(),
+                limit = self.config.max_wall_secs,
+                "turn wall-clock budget exhausted"
+            );
+            return false;
+        }
+        if self.config.max_turn_tokens > 0 && meter.spent() >= self.config.max_turn_tokens {
+            warn!(
+                tokens = meter.spent(),
+                limit = self.config.max_turn_tokens,
+                "turn token budget exhausted"
+            );
+            return false;
+        }
+        if step > self.config.max_steps {
+            send(
+                events,
+                AgentEvent::Error {
+                    message: format!("step limit {} reached", self.config.max_steps),
+                },
+            )
+            .await;
+            return false;
+        }
+        true
+    }
+
+    /// 让内容闸检查 `delta`（以当前历史为背景），发出 `Security` 事件，返回是否放行。
+    async fn gate_passes(
+        &self,
+        checkpoint: Checkpoint,
+        history: &[AgentMessage],
+        delta: &str,
+        events: &mpsc::Sender<AgentEvent>,
+    ) -> bool {
+        let state = render_state(history, self.config.max_state_chars);
+        let decision = self.gate.check(checkpoint, &state, delta).await;
+        send(
+            events,
+            AgentEvent::Security {
+                checkpoint: match checkpoint {
+                    Checkpoint::Input => super::event::SecurityCheckpoint::Input,
+                    Checkpoint::Output => super::event::SecurityCheckpoint::Output,
+                },
+                allowed: decision.allowed,
+                reason: decision.reason.clone(),
+            },
+        )
+        .await;
+        decision.allowed
+    }
+
+    /// 发一次请求（含重试）；设了墙钟预算时只给剩余的时间，超时按网络错误处理。
+    async fn request_before_deadline(
+        &self,
+        request: &LlmRequest,
+        started: std::time::Instant,
+        events: &mpsc::Sender<AgentEvent>,
+    ) -> Result<AssistantMessage, ProviderError> {
+        if self.config.max_wall_secs == 0 {
+            return self.request_with_retry(request, events).await;
+        }
+        let elapsed = started.elapsed().as_secs();
+        let remaining = self.config.max_wall_secs.saturating_sub(elapsed).max(1);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(remaining),
+            self.request_with_retry(request, events),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(ProviderError::new(
+                crate::providers::ProviderErrorKind::Network,
+                "turn wall-clock budget exhausted during a request",
+            ))
+        })
+    }
+
+    /// provider 侧拒绝是安全事件：不重试、不换模型，直接 hold。
+    fn on_refusal(&self, assistant: &AssistantMessage) {
+        if let Some(refusal) = &assistant.refusal {
+            warn!(
+                category = %refusal.category,
+                explanation = %refusal.explanation,
+                "provider refused the request"
+            );
+        }
+        self.gate
+            .force_hold("provider returned stop_reason=refusal");
+    }
+
     /// 运行一次 agent。
     ///
     /// `history` 是可变的全量历史；`prompts` 是本次触发追加的消息；
@@ -293,55 +395,19 @@ impl AgentLoop {
 
             loop {
                 drain_incoming(steering, &mut incoming);
-                if self.config.max_wall_secs > 0
-                    && started.elapsed().as_secs() >= self.config.max_wall_secs
-                {
-                    warn!(
-                        elapsed = started.elapsed().as_secs(),
-                        limit = self.config.max_wall_secs,
-                        "turn wall-clock budget exhausted"
-                    );
-                    return conclude(events, total_usage, turns, StopReason::Error).await;
-                }
-                if self.config.max_turn_tokens > 0 && meter.spent() >= self.config.max_turn_tokens {
-                    warn!(
-                        tokens = meter.spent(),
-                        limit = self.config.max_turn_tokens,
-                        "turn token budget exhausted"
-                    );
-                    return conclude(events, total_usage, turns, StopReason::Error).await;
-                }
                 turns += 1;
-                if turns > self.config.max_steps {
-                    send(
-                        events,
-                        AgentEvent::Error {
-                            message: format!("step limit {} reached", self.config.max_steps),
-                        },
-                    )
-                    .await;
+                if !self.within_limits(started, &meter, turns, events).await {
                     return conclude(events, total_usage, turns, StopReason::Error).await;
                 }
                 send(events, AgentEvent::TurnStart { turn: turns }).await;
 
                 // 输入闸：检查这一步新进入上下文的 token。
                 if !input_delta.is_empty() {
-                    let state = render_state(history, self.config.max_state_chars);
-                    let decision = self
-                        .gate
-                        .check(Checkpoint::Input, &state, &input_delta)
+                    let allowed = self
+                        .gate_passes(Checkpoint::Input, history, &input_delta, events)
                         .await;
-                    send(
-                        events,
-                        AgentEvent::Security {
-                            checkpoint: super::event::SecurityCheckpoint::Input,
-                            allowed: decision.allowed,
-                            reason: decision.reason.clone(),
-                        },
-                    )
-                    .await;
                     input_delta.clear();
-                    if !decision.allowed {
+                    if !allowed {
                         return conclude(events, total_usage, turns, StopReason::Aborted).await;
                     }
                 }
@@ -359,25 +425,10 @@ impl AgentLoop {
                 };
                 send(events, AgentEvent::MessageStart).await;
 
-                let request_result = if self.config.max_wall_secs > 0 {
-                    let elapsed = started.elapsed().as_secs();
-                    let remaining = self.config.max_wall_secs.saturating_sub(elapsed).max(1);
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(remaining),
-                        self.request_with_retry(&request, events),
-                    )
+                let assistant = match self
+                    .request_before_deadline(&request, started, events)
                     .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => Err(ProviderError::new(
-                            crate::providers::ProviderErrorKind::Network,
-                            "turn wall-clock budget exhausted during a request",
-                        )),
-                    }
-                } else {
-                    self.request_with_retry(&request, events).await
-                };
-                let assistant = match request_result {
+                {
                     Ok(message) => message,
                     Err(error) => {
                         send(
@@ -393,18 +444,10 @@ impl AgentLoop {
 
                 // 输出闸：在任何副作用之前检查全部输出（文本、思考、工具参数）。
                 let output = render_assistant(&assistant);
-                let state = render_state(history, self.config.max_state_chars);
-                let decision = self.gate.check(Checkpoint::Output, &state, &output).await;
-                send(
-                    events,
-                    AgentEvent::Security {
-                        checkpoint: super::event::SecurityCheckpoint::Output,
-                        allowed: decision.allowed,
-                        reason: decision.reason.clone(),
-                    },
-                )
-                .await;
-                if !decision.allowed {
+                if !self
+                    .gate_passes(Checkpoint::Output, history, &output, events)
+                    .await
+                {
                     return conclude(events, total_usage, turns, StopReason::Aborted).await;
                 }
 
@@ -413,53 +456,24 @@ impl AgentLoop {
                 let stop_reason = assistant.stop_reason;
                 let has_calls = !assistant.tool_calls().is_empty();
 
-                // provider 侧拒绝是安全事件：不重试、不换模型，直接 hold。
-                if stop_reason == StopReason::Refusal {
-                    if let Some(refusal) = &assistant.refusal {
-                        warn!(
-                            category = %refusal.category,
-                            explanation = %refusal.explanation,
-                            "provider refused the request"
-                        );
+                // 拒绝、出错、带工具调用却被截断：这一步的工具一个都不执行，回合到此结束。
+                let interrupted = match stop_reason {
+                    StopReason::Refusal => {
+                        self.on_refusal(&assistant);
+                        Some("the provider refused the turn")
                     }
-                    self.gate
-                        .force_hold("provider returned stop_reason=refusal");
-                    let calls: Vec<ToolCall> =
-                        assistant.tool_calls().into_iter().cloned().collect();
-                    append(history, events, AgentMessage::Assistant(assistant)).await;
-                    append_interrupted(history, events, &calls, "the provider refused the turn")
-                        .await;
-                    return conclude(events, total_usage, turns, StopReason::Refusal).await;
-                }
-
-                if stop_reason == StopReason::Error {
-                    let calls: Vec<ToolCall> =
-                        assistant.tool_calls().into_iter().cloned().collect();
-                    append(history, events, AgentMessage::Assistant(assistant)).await;
-                    append_interrupted(history, events, &calls, "the provider returned an error")
-                        .await;
-                    return conclude(events, total_usage, turns, StopReason::Error).await;
-                }
-
-                if stop_reason == StopReason::MaxTokens && has_calls {
-                    // 工具参数可能被截断，全部调用都不执行。
-                    let calls: Vec<ToolCall> =
-                        assistant.tool_calls().into_iter().cloned().collect();
-                    append(history, events, AgentMessage::Assistant(assistant)).await;
-                    for call in calls {
-                        let result = ToolResultMessage {
-                            tool_call_id: call.id,
-                            tool_name: call.name,
-                            content: "Tool call was not executed because the response hit \
-                                      max_tokens; its arguments may be truncated."
-                                .to_owned(),
-                            is_error: true,
-                            images: Vec::new(),
-                        };
-                        input_delta.push_str(&render_message(&AgentMessage::Tool(result.clone())));
-                        append(history, events, AgentMessage::Tool(result)).await;
+                    StopReason::Error => Some("the provider returned an error"),
+                    StopReason::MaxTokens if has_calls => {
+                        Some("the response hit max_tokens, so its arguments may be truncated")
                     }
-                    return conclude(events, total_usage, turns, StopReason::MaxTokens).await;
+                    _ => None,
+                };
+                if let Some(reason) = interrupted {
+                    let calls: Vec<ToolCall> =
+                        assistant.tool_calls().into_iter().cloned().collect();
+                    append(history, events, AgentMessage::Assistant(assistant)).await;
+                    append_interrupted(history, events, &calls, reason).await;
+                    return conclude(events, total_usage, turns, stop_reason).await;
                 }
 
                 let calls: Vec<ToolCall> = assistant.tool_calls().into_iter().cloned().collect();
