@@ -326,8 +326,8 @@ pub trait Provider: Send + Sync {
 
 /// [`complete_text`] 的失败原因。
 ///
-/// 调用方各自把失败映射到自己的错误类型；保留这四种区别是为了不改变原有的
-/// 错误文案与超时语义（尤其是“请求失败”与“流内错误”在不同调用方的措辞）。
+/// 只需要一段错误文字的调用方用 `Display`（`?` / `to_string()`）；需要区分超时、断流的
+/// 调用方（内容闸、压缩摘要）按变体匹配。
 #[derive(Debug)]
 pub enum CompletionError {
     /// `Provider::stream` 调用本身失败（网络、鉴权、状态码等）。
@@ -339,6 +339,18 @@ pub enum CompletionError {
     /// 事件通道关闭，但没有收到 `Stop`。
     Ended,
 }
+
+impl std::fmt::Display for CompletionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(error) | Self::Stream(error) => write!(f, "{error}"),
+            Self::TimedOut => f.write_str("the completion timed out"),
+            Self::Ended => f.write_str("the stream ended without a stop event"),
+        }
+    }
+}
+
+impl std::error::Error for CompletionError {}
 
 /// 单轮纯文本补全：可选 system、单条 user 消息、无工具、默认思考配置。
 ///

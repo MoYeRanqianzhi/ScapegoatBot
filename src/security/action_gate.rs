@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::actions::ActionSpec;
 use crate::config::{GateConfig, GateMode};
-use crate::providers::{CompletionError, Provider, SystemBlock, complete_text, truncate_chars};
+use crate::providers::{Provider, SystemBlock, complete_text, truncate_chars};
 use crate::storage::Database;
 use crate::transcript::TurnEvidence;
 
@@ -422,7 +422,7 @@ impl ActionReviewer for LlmActionReviewer {
             evidence.owner_intent(),
             evidence.origin_chat.as_deref().unwrap_or("unknown")
         );
-        let text = match complete_text(
+        let text = complete_text(
             self.provider.as_ref(),
             &self.model,
             vec![SystemBlock {
@@ -434,14 +434,7 @@ impl ActionReviewer for LlmActionReviewer {
             Some(self.timeout),
         )
         .await
-        {
-            Ok(text) => text,
-            Err(CompletionError::Request(error) | CompletionError::Stream(error)) => {
-                return Err(error.to_string());
-            }
-            Err(CompletionError::TimedOut) => return Err("review timed out".to_owned()),
-            Err(CompletionError::Ended) => return Err("review stream ended".to_owned()),
-        };
+        .map_err(|error| format!("action review failed: {error}"))?;
         let parsed = parse_review(&text).ok_or_else(|| format!("unparseable review: {text}"))?;
         Ok(parsed)
     }

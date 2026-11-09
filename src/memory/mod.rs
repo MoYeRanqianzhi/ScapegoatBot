@@ -20,7 +20,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{MemoryConfig, MemoryReviewMode, StyleConfig};
 use crate::providers::SharedProviderSlot;
-use crate::providers::{CompletionError, Provider, SystemBlock, complete_text};
+use crate::providers::{Provider, SystemBlock, complete_text};
 use crate::storage::Database;
 use crate::tools::memory::{MemoryLimits, ReviewEntry, apply_review};
 use crate::transcript::AgentMessage;
@@ -229,7 +229,7 @@ async fn run_review(
 ) -> Result<usize> {
     let recent: Vec<AgentMessage> = history.iter().rev().take(80).rev().cloned().collect();
     let input = crate::session::compaction::render_for_summary(&recent, 60_000);
-    let text = match complete_text(
+    let text = complete_text(
         provider.as_ref(),
         model,
         vec![SystemBlock {
@@ -241,18 +241,7 @@ async fn run_review(
         None,
     )
     .await
-    {
-        Ok(text) => text,
-        Err(CompletionError::Request(error)) => {
-            return Err(anyhow::Error::new(error).context("review request failed"));
-        }
-        Err(CompletionError::Stream(error)) => {
-            return Err(anyhow::anyhow!("review provider error: {error}"));
-        }
-        Err(CompletionError::TimedOut | CompletionError::Ended) => {
-            anyhow::bail!("review request ended without a stop event");
-        }
-    };
+    .map_err(|error| anyhow::Error::new(error).context("memory review request failed"))?;
     let json = crate::providers::extract_json_object(&text).context("review output is not JSON")?;
     let value: Value = serde_json::from_str(json).context("review output is not valid JSON")?;
 

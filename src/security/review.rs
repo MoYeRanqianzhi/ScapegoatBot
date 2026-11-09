@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::providers::{CompletionError, Provider, SystemBlock, complete_text, truncate_chars};
+use crate::providers::{Provider, SystemBlock, complete_text, truncate_chars};
 
 /// 风险级别；`Ord` 用于比较。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -118,7 +118,7 @@ impl SecurityReviewer {
             "<transcript_window>\n{}\n</transcript_window>\n\nReview the window above.",
             truncate_chars(window, 60_000)
         );
-        let text = match complete_text(
+        let text = complete_text(
             self.provider.as_ref(),
             &self.model,
             system,
@@ -128,16 +128,7 @@ impl SecurityReviewer {
             Some(self.timeout),
         )
         .await
-        {
-            Ok(text) => text,
-            Err(CompletionError::Request(error) | CompletionError::Stream(error)) => {
-                return Err(error.to_string());
-            }
-            Err(CompletionError::TimedOut) => return Err("security review timed out".to_owned()),
-            Err(CompletionError::Ended) => {
-                return Err("security review stream ended".to_owned());
-            }
-        };
+        .map_err(|error| format!("security review failed: {error}"))?;
         parse_outcome(&text)
     }
 }
