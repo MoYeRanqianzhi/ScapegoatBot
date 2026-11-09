@@ -50,19 +50,12 @@ impl MessageStore {
         line_no: usize,
     ) -> Result<String> {
         let payload = serde_json::to_vec(message)?;
-        let (nonce, ciphertext) = match self.encryption {
-            EncryptionMode::XChaCha20Poly1305 => {
-                let aad = format!(
-                    "message:{scope}:{peer}:{}:{file_id}:{line_no}",
-                    message.message_id
-                );
-                envelope::seal(&self.key, "message", aad.as_bytes(), &payload)?
-            }
-            EncryptionMode::None => (
-                String::new(),
-                base64::engine::general_purpose::STANDARD.encode(payload),
-            ),
-        };
+        let aad = format!(
+            "message:{scope}:{peer}:{}:{file_id}:{line_no}",
+            message.message_id
+        );
+        let (nonce, ciphertext) =
+            envelope::seal_as(self.encryption, &self.key, "message", &aad, &payload)?;
 
         let line = json!({
             "v": LINE_VERSION,
@@ -131,20 +124,24 @@ impl MessageStore {
         }
         let ct_b64 = value.get("ct").and_then(Value::as_str).unwrap_or_default();
 
-        let plain = match file.encryption {
-            EncryptionMode::XChaCha20Poly1305 => {
-                let nonce_b64 = value
-                    .get("nonce")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let aad = format!(
+        let nonce_b64 = value
+            .get("nonce")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        // AAD 与写入时一致：作用域、对端、消息 id、文件 id 与行号。
+        let plain = envelope::open_as(
+            file.encryption,
+            &self.key,
+            "message",
+            || {
+                format!(
                     "message:{scope}:{peer}:{message_id}:{}:{line_no}",
                     file.file_id
-                );
-                envelope::open(&self.key, "message", aad.as_bytes(), nonce_b64, ct_b64)?
-            }
-            EncryptionMode::None => base64::engine::general_purpose::STANDARD.decode(ct_b64)?,
-        };
+                )
+            },
+            nonce_b64,
+            ct_b64,
+        )?;
         Ok(Some(serde_json::from_slice(&plain)?))
     }
 }

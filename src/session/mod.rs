@@ -505,16 +505,13 @@ impl SessionStore {
 
     fn encode_line(&self, message: &AgentMessage, file_id: &str, line_no: usize) -> Result<String> {
         let payload = serde_json::to_vec(message)?;
-        let (nonce, ct) = match self.encryption {
-            EncryptionMode::XChaCha20Poly1305 => {
-                let aad = format!("session:{file_id}:{line_no}");
-                envelope::seal(&self.key, "session", aad.as_bytes(), &payload)?
-            }
-            EncryptionMode::None => (
-                String::new(),
-                base64::engine::general_purpose::STANDARD.encode(payload),
-            ),
-        };
+        let (nonce, ct) = envelope::seal_as(
+            self.encryption,
+            &self.key,
+            "session",
+            &format!("session:{file_id}:{line_no}"),
+            &payload,
+        )?;
         Ok(format!(
             "{}\n",
             json!({"v": LINE_VERSION, "line": line_no, "nonce": nonce, "ct": ct})

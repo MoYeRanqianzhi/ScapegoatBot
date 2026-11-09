@@ -25,7 +25,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use base64::Engine;
 use chrono::{Datelike, Local, Utc};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
