@@ -59,6 +59,16 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 | `run_injected` 不检查 ESTOP（核实：monitor 回合检查；控制通道有意不受 ESTOP 限制，只受 `ai stop`） | 文档写明 | — |
 | `agent.quarantine` 重启失效 | 恢复上下文时按 `/quarantine/` 重放 | `runner::ops::quarantine_tests::quarantine_survives_a_restart` |
 
+## 2d. 0.2.0-alpha.42 已修（2026-11-10）
+
+配置重构、§5 文档 / 命名 / 工具描述漂移、P2 结构项全部处理，细节见 CHANGELOG 的 alpha.42 段。
+要点：不起作用的键全部实现或删除（`[memory].review_model`、`jitter_secs`、`internal` /
+`stream` 源、hooks 矩阵、`queue.mode`、会话配额、`sbot chat --scope`）；`config.example.toml`
+的值由测试锁定为代码默认值；子代理写保护 / 不能删除 / monitor 只投给自己；`/trash` 只能经
+RM / MV 进入；`Monitor add` 与配置同一套 schema；`wake-on-` 前缀改为显式的
+`deliver.as = "chat"` 与预设来源；`app/assembly`、`monitor`、`loop`、`doctor` 拆分；
+零引用函数与误导性命名清理。
+
 ## 3. 待修（按优先级）
 
 ### P0 / 高
@@ -118,7 +128,7 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 - `已修 alpha.40` Unix socket 回退到 `/tmp/<name>.sock` 无 uid；`napcat-link` 在 INFO 日志里打印
   带 access_token 的 URL；`auth.json` 解析错误会回显密钥值。
 
-### P2 / 结构与冗余（沿用 11-06 交接，未重新核实行号）
+### P2 / 结构与冗余（alpha.42 已处理，见 §2d；以下保留原始记录）
 
 - `app/assembly.rs`（约 1000 行）拆分：`open_stores`、`assemble_tools`、`build_agent` 分组；
   先补装配层测试。
@@ -137,7 +147,7 @@ agent 运行时正确性、协议与存储。另有一个文档/命名漂移审�
 
 - 是否 push / release / 部署 hw1（tag 本地自动打，见 [[release-workflow]]）。
 
-## 5. 文档与命名漂移（2026-11-07 审查，均为 `未核实`，除非另注）
+## 5. 文档与命名漂移（2026-11-07 审查；alpha.42 已逐条核实并处理，见 §2d）
 
 11-06 交接里的文档 P1 清单经复查**仍然存在**（记忆来源门控承诺、`sbot status` 输出、
 默认值 max_steps/retry_max_ms、热更新、迁移 v12、`compaction_model` 说明、工具数、

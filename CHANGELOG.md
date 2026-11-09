@@ -7,6 +7,87 @@
 
 ## [Unreleased]
 
+## [0.2.0-alpha.42] - 2026-11-10
+
+配置整改：每个配置键要么真的生效，要么删除并在启动时给出迁移提示；工具描述、文档与代码
+对齐；子代理边界落到代码里；结构拆分与去重。
+
+### 破坏性变更
+
+- 已删除的配置键在启动时报错并提示删除：`[memory].topics`、`[[hooks.events]].scope`、
+  `[[hooks.events]].match.tool_name`（都从未改变过行为）。
+- `[[hooks.events]]` 的事件 / 动作组合按文档的矩阵校验，不在矩阵里的组合启动报错。
+- `source = { qq = false }` 报错（以前被当成订阅 QQ 事件）；关掉 monitor 用 `enabled = false`。
+- `Monitor add` 的参数按 `[[monitor]]` 同一套 schema 严格解析：未知字段、`lifecycle.catch_up`、
+  `qq.backlog`、`stream` 源都报错；`internal` 源写成 `{"internal": {"kind": "security"}}`。
+- `Agent spawn` 不再接受（文档里从未出现的）`monitor` 参数；给子代理投递事件用
+  `Monitor add` 的 `deliver.to = "<子代理 id>"`。
+- `sbot ai restart` 删除（与 `ai start` 完全相同）。
+- `agent.compact` 不再接受 `chat`（只有一条 transcript，参数从未起作用）；`API` 对所有
+  命名空间（`agent.*`、`local.*` 也包括在内）拒绝未声明的参数。
+- 子代理不能写 `/config`、`/MEMORY.md`、`/memory`、`/USER.md`、`/AGENTS.md`、`/agents`、
+  `/hooks`，不能删除任何东西；`general` 子代理没有 `RM`，自定义子代理不能用 `Memory`。
+- 写入、编辑、复制、建目录都不能以 `/trash` 为目标（只有 `RM` / `MV` 能把东西放进去）。
+- 最低 Rust 版本是 1.89（`Cargo.toml` 的 `rust-version`；依赖 `nalgebra` / `uuid` 要求）。
+
+### 新增
+
+- `[memory].review_model`：后台复盘与压缩前的记忆提取用独立模型（计量计入预算）；不设时
+  跟随运行中的主模型（以前热切换后记忆提取仍用启动时的模型）。
+- `[[monitor]]` 定时器的 `jitter_secs`：每次触发随机推迟 `0..=n` 秒（最多 3600，`every` 时
+  短于周期）。
+- `internal` 源真的会收到事件：`security:hold` / `security:released`、`budget:exhausted`、
+  `agent:done` / `agent:failed`、`storage:quota` / `storage:disk`。
+- 配置文件里的 `stream` 源（WebSocket / SSE）会连接：断线指数退避重连，断开与恢复各一条
+  系统通知。
+- `[queue].mode`：`followup` 回合结束后逐条各开一个回合；`collect` 再等一个 `debounce_ms`
+  合并成一个回合（以前两者与 `steer` 的后续批次相同）。
+- `deliver.as = "chat"`：把 QQ 消息交给会话队列按普通会话回合处理；内置唤醒预设就是这种
+  形式，`Monitor list` 显示来源（`config` / `runtime` / `preset`）。
+- `sbot chat --scope group:<gid>|private:<qq>`：写进 `owner_context` 的 `scope` 属性；格式
+  错误时拒绝（以前只回显、不生效）。
+- `sbot model list` / `sbot effort list` 列出白名单模型（含 models.json 里没有的）与当前模型
+  支持的级别（以前打印整份 status）。
+
+### 修复
+
+- `[[hooks.events]]`：`inject_context` 的 `path` 会被读取；`message_received` 的注入进入本回合；
+  带 `match` 的 hook 只在有 chat 的事件上命中；`notify` 只在 `notify_channel = owner|master`
+  时私聊；`session_end` 在退出时触发（最多等 5 秒）。
+- `max_session_bytes` / `max_message_bytes` 在没有保留期时也会执行（默认 2 GiB 的
+  transcript 上限以前从不生效）。
+- `[budget].chat_sends_per_hour` 在 `trusted` 门禁下同样生效，纯图片 / 文件的发送也计数。
+- 入站图片：下载的图片也计入每批 4 张的上限；格式按内容识别，认不出的数据不再当成 JPEG
+  发给模型；过大或不支持的格式缩成 JPEG（与 `Read` 一致）；只从 QQ CDN 的 HTTPS 地址下载
+  （`http` 升级）。
+- 回合、注入回合与子代理的循环配置取自同一个 provider 快照：热切换模型时 provider 与
+  模型 id 不会错配。
+- 周期安全审查记为 `review`（以前混在 `input` 里）。
+- `turn completed` 是 info 级（排障文档让用户找的就是这一行）。
+
+### 删除
+
+- 零引用的函数与类型：`QqClient::group_list` / `friend_list`、`Segment::as_text`、
+  `format::render_batch` / `segment_to_napcat` / `scope_name`、`events::count_blocked`、
+  `turn_buffer::load_context`、`fs::read_static`、`vfs::dynamic::DynamicProvider`、
+  `tools::Permission`、`QqMessage::backfilled`（数据库列保留，恒为 0）、
+  `Runner::turn_lock_for` / `session_for` / `history_for`（忽略参数）、`~/.sbot/logs/`（从无写入者）。
+- `workspace/*.md`（0.1 模板，无代码读取）移到 `docs/archive/0.1/workspace/`。
+
+### 变更
+
+- `app/assembly.rs` 拆成 `assembly/{stores,providers,tools,qq}.rs`；`monitor/mod.rs` 拆出
+  `predicate`、`spec`、`delivery`；`agent::loop::run_with_steering`、`sbot doctor` 的检查拆成
+  具名步骤。
+- 去重：模型清单加载（`ModelsFile::embedded` / `with_overlay`）、存储行的封装
+  （`envelope::seal_as` / `open_as`）、VFS 用量查询、`edit_text`、`CompletionError` 的错误文字。
+- `tests/live_napcat.rs` 改名 `tests/onebot_mock_client.rs`（它对本地模拟服务端运行）；
+  README 的最小配置测试直接读 README 与入门指南里的代码块；`config.example.toml` 写出的值
+  必须等于代码默认值（有测试）。
+- 文档：MSRV、README 命令与目录树、备份包含 `auth.json`、`require_mention` 的语义、
+  `/config` 热更新范围、`Mkdir` 的 `parents`、工具描述（`MV` / `CP` / `Stat`、子代理边界、
+  Monitor 参数）。
+
 ## [0.2.0-alpha.41] - 2026-11-09
 
 审查 P1 的其余部分：预算口径、定时器、provider 停止原因与 Anthropic 回放、动态视图查询、

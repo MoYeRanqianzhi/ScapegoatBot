@@ -15,39 +15,27 @@
 
 ## 当前基线
 
-- `cargo test --locked --all-targets` = 485 passed，2 ignored；clippy / fmt 通过；
-  Linux `cargo check -D warnings` 与 `cargo test` 通过（486 passed，多一个 Unix 专属测试；
-  WSL Debian，脚本 `G:/sbot-wsl/check.sh check|test`，产物与 cargo 缓存都在 G:；
-  WSL 工具链没有 clippy）。
-  当前 `0.2.0-alpha.41`（本地 tag）；每批升版本、打 tag，未验证前不 push。
+- `cargo test --locked --all-targets` = 498 lib + 16 集成测试通过，2 ignored；clippy / fmt 通过；
+  Linux（WSL Debian，`G:/sbot-wsl/check.sh check|test`）`cargo check` 与 `cargo test` 通过。
+  当前 `0.2.0-alpha.42`（本地 tag）；每批升版本、打 tag，未验证前不 push。
 - 服务器 `hw1` 的 `sbot.service` 仍停止；NapCat 未登录（2026-11-05 起 QR 登录失败）。
 
 ## 待用户确认
 
 - [ ] 是否授权 `git push origin main --tags`、GitHub release、部署 hw1。
+- [ ] `G:\sbot-e2e-lists`（alpha.42 实机验证 `model list` 用的临时 SBOT_HOME）没能删除
+      （安全检查拦下了 `rm -rf`），需要用户手动删。
 
-## 配置重构
+## 已知的剩余结构项（不阻塞）
 
-- [ ] 实现或删除不起作用的键：`[memory].review_model/topics`、
-      `[[monitor]].jitter_secs`、`source = stream|internal`、`[[hooks.events]].when/inject`、
-      `[queue].mode = collect`、默认保留下的 `max_session_bytes`、`sbot chat --scope`。
-- [ ] hooks 事件/动作矩阵与文档不一致（文档说所有事件支持 log/block/inject/notify）。
-- [ ] `config.example.toml` 默认值与代码不一致处。
-
-## 文档、命名与结构
-
-- [ ] 文档漂移（计划 §5）：MSRV 1.88、README 命令/目录树、各 guide 的若干条、
-      `workspace/*.md` 0.1 遗留模板。
-- [ ] 工具描述漂移：`fs.rs` 过滤语法与 mount 承诺、monitor `internal`/`catch_up`、
-      swarm general 子代理“不能改 /MEMORY.md”。
-- [ ] 误导性命名：`tests/live_napcat.rs`、`QqMessage::backfilled`、`Permission`、
-      `DynamicProvider`、忽略参数的函数、`wake-on-` 前缀决定投递路径。
-- [ ] P2 结构：`app/assembly.rs` 拆分、runner 重复、monitor 拆分、Monitor spec 三处解析、
-      vfs/sqlite 重复、零引用 `pub fn`。
+- `app::assembly::build_agent` 约 208 行、`assemble_tools` 约 140 行：剩下的主要是按顺序
+  接线，再拆只会把十几个句柄来回传。
+- `providers/anthropic.rs` 的 `handle`（约 200 行）按事件类型分支，协议本身就这么多分支。
 
 ## 外部验证（需 NapCat 登录）
 
-- [ ] 真实 `get_image`、QQ CDN 入站图片下载、`get_msg` / `get_forward_msg`。
+- [ ] 真实 `get_image`、QQ CDN 入站图片下载（alpha.42 起 `http://` 的 CDN 地址升级为
+      `https://` 再下载，未在真实 NapCat 上验证）、`get_msg` / `get_forward_msg`。
 - [ ] 发出媒体：`base64://` 在真实 NapCat 上可发；私聊回声带 `target_id`。
 - [ ] 发送账本：真实 `message_sent` 回声的形状与到达时序（先于/后于响应）。
 - [ ] `local.media.image.text` / `.fonts` 只在 Windows 验证过；Linux 服务器无系统字体。
