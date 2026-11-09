@@ -1,11 +1,20 @@
 use super::*;
 use futures_util::StreamExt;
 
+/// 一批消息最多附带的图片数（含回复 / 转发引用里的）。
+const MAX_IMAGES_PER_BATCH: usize = 4;
+/// 单张入站图片最多下载 / 解码的字节数；超过视觉上限的会先缩小（见 [`vision_attachment`]）。
+const MAX_INBOUND_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+/// 视觉输入接受的格式；其余格式先转成 JPEG。
+const VISION_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
 impl Runner {
-    /// 把本批入站消息里的 QQ 图片转成 image prompt。
+    /// 把本批入站消息（及其回复 / 转发引用）里的 QQ 图片转成 image prompt。
     ///
-    /// NapCat 的 image segment 有 `url`、`file`（文件路径/URL/base64）和 `path`。
-    /// `url` 为空时先用 `file` 直接判断；容器内路径再调用 `get_image` 解析成 URL。
+    /// 每张图片：选出引用（`url` → `file` → `path`）→ 容器内路径经 `get_image` 解析 →
+    /// 取得字节（`base64://` 直接解码，QQ CDN 地址经 HTTPS 下载）→ [`vision_attachment`]
+    /// 按格式与大小整理。任何一步失败只跳过这张图并记日志；一批最多
+    /// [`MAX_IMAGES_PER_BATCH`] 张。
     pub(super) async fn inbound_image_prompts(
         &self,
         messages: &[crate::qq::event::QqMessage],
@@ -14,18 +23,7 @@ impl Runner {
         if !self.provider_snapshot().supports_images {
             return Vec::new();
         }
-        use base64::Engine as _;
-        let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if is_qq_image_url(attempt.url()) {
-                    attempt.follow()
-                } else {
-                    attempt.stop()
-                }
-            }))
-            .build()
-        {
+        let client = match image_client() {
             Ok(client) => client,
             Err(error) => {
                 warn!(%error, "cannot build the image download client");
@@ -35,7 +33,7 @@ impl Runner {
         // 回复/转发引用里的图片不在当前 segment 里；把引用消息里的 image segment
         // 追加成一条合成消息，后面的解析与下载逻辑保持不变。
         let mut effective: Vec<crate::qq::event::QqMessage> = messages.to_vec();
-        let mut quoted_budget = 4usize;
+        let mut quoted_budget = MAX_IMAGES_PER_BATCH;
         for message in messages {
             if quoted_budget == 0 {
                 break;
@@ -50,157 +48,140 @@ impl Runner {
             }
         }
         let mut prompts = Vec::new();
-        let mut image_count = 0usize;
         for message in &effective {
             for segment in &message.segments {
-                if image_count >= 4 {
-                    warn!("more than 4 images in one batch; extra images were not attached");
-                    break;
-                }
                 let crate::qq::event::Segment::Image { url, file, path } = segment else {
                     continue;
                 };
-                let mut reference = if !url.is_empty() {
-                    url.clone()
-                } else if !file.is_empty() {
-                    file.clone()
-                } else {
-                    path.clone()
-                };
-                if reference.starts_with("base64://") {
-                    let payload = reference.trim_start_matches("base64://");
-                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(payload)
-                        && bytes.len() <= crate::media::VISION_MAX_BYTES
-                    {
-                        let mime = mime_for_bytes(&bytes);
-                        image_count += 1;
-                        prompts.push(AgentMessage::user_with_images(
-                            format!("[image from {}]", message.chat),
-                            vec![crate::agent::message::ImageAttachment {
-                                mime,
-                                data_base64: payload.to_owned(),
-                            }],
-                        ));
-                    }
-                    continue;
+                if prompts.len() >= MAX_IMAGES_PER_BATCH {
+                    warn!("too many images in one batch; the rest were not attached");
+                    return prompts;
                 }
-                if !reference.starts_with("http") {
-                    let Some(qq) = &self.deps.qq else {
-                        continue;
-                    };
-                    match qq
-                        .call("get_image", serde_json::json!({"file": file}))
-                        .await
-                    {
-                        Ok(value) => {
-                            if let Some(data) = value
-                                .get("base64")
-                                .or_else(|| value.pointer("/data/base64"))
-                                .and_then(serde_json::Value::as_str)
-                            {
-                                reference = format!("base64://{data}");
-                            } else {
-                                reference = value
-                                    .get("url")
-                                    .or_else(|| value.pointer("/data/url"))
-                                    .or_else(|| value.get("file"))
-                                    .or_else(|| value.pointer("/data/file"))
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_owned();
-                            }
-                        }
-                        Err(error) => {
-                            warn!(%error, "cannot resolve a QQ image reference");
-                            continue;
-                        }
-                    }
-                }
-                if reference.starts_with("base64://")
-                    && let Ok(value) = base64::engine::general_purpose::STANDARD
-                        .decode(reference.trim_start_matches("base64://"))
-                    && value.len() <= crate::media::VISION_MAX_BYTES
-                    && matches!(
-                        mime_for_bytes(&value).as_str(),
-                        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-                    )
-                {
-                    let mime = mime_for_bytes(&value);
-                    image_count += 1;
-                    prompts.push(AgentMessage::user_with_images(
-                        format!("[image from {}]", message.chat),
-                        vec![crate::agent::message::ImageAttachment {
-                            mime,
-                            data_base64: base64::engine::general_purpose::STANDARD.encode(&value),
-                        }],
-                    ));
-                    continue;
-                }
-                let Ok(parsed) = reqwest::Url::parse(&reference) else {
+                let Some(reference) = self.resolve_image_reference(url, file, path).await else {
                     continue;
                 };
-                if !matches!(parsed.scheme(), "http" | "https") {
-                    continue;
-                }
-                let Some(host) = parsed.host_str() else {
-                    continue;
-                };
-                if !(host.ends_with(".qq.com.cn")
-                    || host.ends_with(".qpic.cn")
-                    || host.ends_with(".qq.com"))
-                {
-                    continue;
-                }
-                let response = match client.get(parsed).send().await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        warn!(%error, "cannot download a QQ image");
-                        continue;
-                    }
-                };
-                let header_mime = response
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("")
-                    .split(';')
-                    .next()
-                    .unwrap_or("")
-                    .to_owned();
-                let bytes = match read_capped(response, crate::media::VISION_MAX_BYTES).await {
+                let bytes = match fetch_image(&client, &reference).await {
                     Ok(bytes) => bytes,
                     Err(error) => {
-                        warn!(%error, "cannot read a QQ image");
+                        warn!(%error, "cannot fetch a QQ image");
                         continue;
                     }
                 };
-                let mime = if matches!(
-                    header_mime.as_str(),
-                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-                ) {
-                    header_mime
-                } else {
-                    mime_for_bytes(&bytes)
-                };
-                if !matches!(
-                    mime.as_str(),
-                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-                ) {
-                    continue;
+                match vision_attachment(bytes).await {
+                    Ok(attachment) => prompts.push(AgentMessage::user_with_images(
+                        format!("[image from {}]", message.chat),
+                        vec![attachment],
+                    )),
+                    Err(error) => warn!(%error, "a QQ image was not attached"),
                 }
-                prompts.push(AgentMessage::user_with_images(
-                    format!("[image from {}]", message.chat),
-                    vec![crate::agent::message::ImageAttachment {
-                        mime,
-                        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-                    }],
-                ));
             }
         }
         prompts
     }
+
+    /// 选出 image segment 的引用；不是 `base64://` 也不是 http(s) 的（容器内路径、文件名）
+    /// 经 NapCat `get_image` 解析成 base64 或 URL。解析不了返回 `None`。
+    async fn resolve_image_reference(&self, url: &str, file: &str, path: &str) -> Option<String> {
+        let reference = [url, file, path]
+            .into_iter()
+            .find(|candidate| !candidate.is_empty())?;
+        if reference.starts_with("base64://") || reference.starts_with("http") {
+            return Some(reference.to_owned());
+        }
+        let qq = self.deps.qq.as_ref()?;
+        let value = match qq
+            .call("get_image", serde_json::json!({"file": file}))
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(%error, "cannot resolve a QQ image reference");
+                return None;
+            }
+        };
+        let field = |name: &str| {
+            value
+                .get(name)
+                .or_else(|| value.pointer(&format!("/data/{name}")))
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+        };
+        if let Some(data) = field("base64") {
+            return Some(format!("base64://{data}"));
+        }
+        field("url").or_else(|| field("file")).map(str::to_owned)
+    }
 }
 
+/// QQ 图片下载客户端：20 秒超时，重定向只跟到 QQ 的 HTTPS 地址。
+fn image_client() -> reqwest::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if is_qq_image_url(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
+}
+
+/// 取得一张图片的字节：`base64://` 直接解码；QQ CDN 地址（`http` 升级为 `https`）下载，
+/// 最多 [`MAX_INBOUND_IMAGE_BYTES`]。其余地址拒绝：入站图片只从 QQ 自己的 CDN 取。
+async fn fetch_image(client: &reqwest::Client, reference: &str) -> anyhow::Result<Vec<u8>> {
+    use base64::Engine as _;
+    if let Some(payload) = reference.strip_prefix("base64://") {
+        // base64 长度约为字节数的 4/3：先按长度拒绝，不为超大的内联数据分配内存。
+        if payload.len() / 4 * 3 > MAX_INBOUND_IMAGE_BYTES {
+            anyhow::bail!("inline image exceeds {MAX_INBOUND_IMAGE_BYTES} bytes");
+        }
+        return Ok(base64::engine::general_purpose::STANDARD.decode(payload)?);
+    }
+    let mut url = reqwest::Url::parse(reference)?;
+    if url.scheme() == "http" {
+        // QQ 的图片 CDN 都提供 HTTPS；明文地址升级后再走同一条校验。
+        let _ = url.set_scheme("https");
+    }
+    if !is_qq_image_url(&url) {
+        anyhow::bail!("not a QQ image URL: {}", url.host_str().unwrap_or_default());
+    }
+    let response = client.get(url).send().await?.error_for_status()?;
+    read_capped(response, MAX_INBOUND_IMAGE_BYTES).await
+}
+
+/// 按内容（不看文件名或响应头）识别格式，整理成视觉输入：受支持的格式且不超过
+/// [`crate::media::VISION_MAX_BYTES`] 时原样附带，否则在阻塞线程池里缩成 JPEG
+/// （与 `Read` 看图同一套规则）。认不出的数据报错，不会被当成 JPEG 发给模型。
+async fn vision_attachment(
+    bytes: Vec<u8>,
+) -> Result<crate::agent::message::ImageAttachment, String> {
+    use base64::Engine as _;
+    let mime = image::guess_format(&bytes)
+        .map(|format| format.to_mime_type().to_owned())
+        .map_err(|_| "the data is not a recognised image".to_owned())?;
+    let (mime, bytes) =
+        if VISION_MIMES.contains(&mime.as_str()) && bytes.len() <= crate::media::VISION_MAX_BYTES {
+            (mime, bytes)
+        } else {
+            let shrunk = crate::media::blocking(move || {
+                crate::media::shrink_to_fit(
+                    &bytes,
+                    crate::media::VISION_MAX_SIDE,
+                    crate::media::VISION_MAX_BYTES,
+                )
+            })
+            .await
+            .and_then(|result| result)?;
+            ("image/jpeg".to_owned(), shrunk)
+        };
+    Ok(crate::agent::message::ImageAttachment {
+        mime,
+        data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+    })
+}
+
+/// QQ 图片 CDN 的 HTTPS 地址（`*.qq.com`、`*.qq.com.cn`、`*.qpic.cn`）。
 fn is_qq_image_url(url: &reqwest::Url) -> bool {
     url.scheme() == "https"
         && url.host_str().is_some_and(|host| {
@@ -208,6 +189,7 @@ fn is_qq_image_url(url: &reqwest::Url) -> bool {
         })
 }
 
+/// 读取响应体，超过 `limit` 字节立即报错（不先整块缓冲）。
 async fn read_capped(response: reqwest::Response, limit: usize) -> anyhow::Result<Vec<u8>> {
     let mut stream = response.bytes_stream();
     let mut out = Vec::new();
@@ -219,13 +201,6 @@ async fn read_capped(response: reqwest::Response, limit: usize) -> anyhow::Resul
         out.extend_from_slice(&chunk);
     }
     Ok(out)
-}
-
-/// 从图片字节猜 MIME；只用于 QQ 图片附件。
-fn mime_for_bytes(bytes: &[u8]) -> String {
-    image::guess_format(bytes)
-        .map(|format| format.to_mime_type().to_owned())
-        .unwrap_or_else(|_| "image/jpeg".to_owned())
 }
 
 impl Runner {
@@ -383,23 +358,54 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mime_sniffs_known_formats_and_falls_back() {
-        let mut png = Vec::new();
-        image::DynamicImage::ImageRgb8(image::RgbImage::new(1, 1))
-            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+    fn encoded(format: image::ImageFormat, side: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(side, side))
+            .write_to(&mut std::io::Cursor::new(&mut out), format)
             .unwrap();
-        assert_eq!(mime_for_bytes(&png), "image/png");
+        out
+    }
 
-        let mut jpeg = Vec::new();
-        image::DynamicImage::ImageRgb8(image::RgbImage::new(1, 1))
-            .write_to(
-                &mut std::io::Cursor::new(&mut jpeg),
-                image::ImageFormat::Jpeg,
-            )
+    /// 格式按内容识别：认不出的数据不附带（以前回退成 image/jpeg，会被 API 以 400 拒绝）；
+    /// 视觉不支持的格式转成 JPEG。
+    #[tokio::test]
+    async fn vision_attachments_sniff_the_format_and_convert_unsupported_ones() {
+        let png = vision_attachment(encoded(image::ImageFormat::Png, 1))
+            .await
             .unwrap();
-        assert_eq!(mime_for_bytes(&jpeg), "image/jpeg");
-        assert_eq!(mime_for_bytes(b"not an image"), "image/jpeg");
+        assert_eq!(png.mime, "image/png");
+        let bmp = vision_attachment(encoded(image::ImageFormat::Bmp, 4))
+            .await
+            .unwrap();
+        assert_eq!(bmp.mime, "image/jpeg");
+        assert!(vision_attachment(b"not an image".to_vec()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn only_qq_image_urls_are_fetched_and_http_is_upgraded() {
+        let client = image_client().unwrap();
+        for reference in [
+            "https://example.com/a.png",
+            "http://evilqq.com/a.png",
+            "ftp://gchat.qpic.cn/a",
+        ] {
+            let error = fetch_image(&client, reference).await.unwrap_err();
+            assert!(
+                error.to_string().contains("not a QQ image URL"),
+                "{reference}: {error}"
+            );
+        }
+        // 超长的内联数据在解码之前就被拒绝。
+        let huge = format!(
+            "base64://{}",
+            "A".repeat(MAX_INBOUND_IMAGE_BYTES / 3 * 4 + 8)
+        );
+        assert!(fetch_image(&client, &huge).await.is_err());
+        let inline = format!(
+            "base64://{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"abc")
+        );
+        assert_eq!(fetch_image(&client, &inline).await.unwrap(), b"abc");
     }
 
     #[test]

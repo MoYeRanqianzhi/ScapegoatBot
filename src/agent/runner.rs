@@ -190,6 +190,20 @@ impl crate::agent::ToolExecutor for TurnExecutor {
     }
 }
 
+/// 预算跳过回合时，本批图片仍写进 transcript 与历史：消息已经入库，预算恢复后的回合
+/// 不能丢掉这些视觉上下文（图片只在这一刻下载得到）。
+async fn keep_images(
+    sessions: &SessionStore,
+    history: &Mutex<Vec<AgentMessage>>,
+    image_prompts: Vec<AgentMessage>,
+) -> Result<()> {
+    if !image_prompts.is_empty() {
+        sessions.append(&image_prompts)?;
+        history.lock().await.extend(image_prompts);
+    }
+    Ok(())
+}
+
 struct ActiveTurnGuard<'a>(&'a std::sync::atomic::AtomicUsize);
 impl Drop for ActiveTurnGuard<'_> {
     fn drop(&mut self) {
@@ -625,11 +639,7 @@ impl Runner {
         if let Some(budget) = &self.config.budget {
             if let Some(reason) = budget.check_daily().await {
                 warn!(chat = %chat, %reason, "skipping this turn");
-                if !image_prompts.is_empty() {
-                    sessions.append(&image_prompts)?;
-                    history.lock().await.extend(image_prompts.clone());
-                }
-                return Ok(());
+                return keep_images(&sessions, &history, image_prompts).await;
             }
             let limit = budget.chat_turns_per_hour();
             if limit > 0 {
@@ -647,11 +657,7 @@ impl Runner {
                         limit,
                         "chat turn budget exhausted; skipping this turn"
                     );
-                    if !image_prompts.is_empty() {
-                        sessions.append(&image_prompts)?;
-                        history.lock().await.extend(image_prompts.clone());
-                    }
-                    return Ok(());
+                    return keep_images(&sessions, &history, image_prompts).await;
                 }
                 queue.push_back(Instant::now());
             }
