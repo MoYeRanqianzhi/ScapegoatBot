@@ -42,7 +42,6 @@ mod injected;
 mod journal;
 mod ops;
 mod review;
-mod scope;
 
 pub use ops::RuntimeOps;
 
@@ -567,12 +566,12 @@ impl Runner {
             return Ok(());
         }
         let chat = input.chat;
-        let turn_lock = self.turn_lock_for(chat).await;
+        let turn_lock = Arc::clone(&self.turn_lock);
         let _turn_guard = turn_lock.lock().await;
         self.discard_context_if_flagged().await;
         let inbound_messages = input.messages.clone();
-        let sessions = self.session_for(chat).await;
-        let history = self.history_for(chat).await;
+        let sessions = Arc::clone(&self.deps.sessions);
+        let history = Arc::clone(&self.history);
         let turn_id = new_turn_id();
         let first_batch_id = input.messages.first().map(|message| message.message_id);
 
@@ -880,7 +879,12 @@ impl crate::swarm::SubagentRunner for Runner {
         let mut incoming = request.incoming;
         let shared_history = request.shared_history.clone();
         let slot = self.provider_snapshot();
-        let mut tools = self.deps.tools.filtered(&request.tools);
+        // 以实例身份调用工具：写保护与 monitor 归属都看这个身份。
+        let mut tools = self
+            .deps
+            .tools
+            .filtered(&request.tools)
+            .for_subagent(request.id.clone());
         if request.read_only {
             tools = tools.read_only();
         }
@@ -1089,7 +1093,7 @@ mod tests {
         ) -> Result<serde_json::Value, String> {
             Ok(json!({}))
         }
-        async fn compact(&self, _chat: Option<ChatId>) -> Result<serde_json::Value, String> {
+        async fn compact(&self) -> Result<serde_json::Value, String> {
             Ok(json!({}))
         }
         async fn clear_context(&self) -> Result<serde_json::Value, String> {
@@ -1485,7 +1489,7 @@ mod tests {
 
         // 被跳过的回合不回应 steering 消息：交还队列重新排队，自己什么都不写。
         assert_eq!(unanswered, 1);
-        let sessions = runner.session_for(chat).await;
+        let sessions = Arc::clone(&runner.deps.sessions);
         let current = sessions.current().unwrap();
         let transcript = sessions.read_segment(&current.file).unwrap();
         assert!(
@@ -1495,7 +1499,7 @@ mod tests {
             )),
             "a skipped turn must not write the steering message: {transcript:?}"
         );
-        let history = runner.history_for(chat).await;
+        let history = Arc::clone(&runner.history);
         let history = history.lock().await;
         assert!(
             !history.iter().any(|message| matches!(
@@ -1581,7 +1585,7 @@ mod tests {
             .await
             .expect_ok();
         assert_eq!(unanswered, 1);
-        let history = runner.history_for(chat).await;
+        let history = Arc::clone(&runner.history);
         let history = history.lock().await;
         assert!(
             !history.iter().any(|message| matches!(

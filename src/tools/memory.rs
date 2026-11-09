@@ -21,7 +21,7 @@ use crate::transcript::ToolResult;
 use crate::vfs::sqlite::VfsStore;
 use crate::vfs::{Vfs, VfsPath};
 
-use super::{Permission, Tool, ToolContext, arg_opt_str, arg_str, object_schema};
+use super::{Tool, ToolContext, arg_opt_str, arg_str, object_schema};
 
 /// 记忆类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -589,10 +589,6 @@ impl Tool for MemoryTool {
             }),
             &["target", "action"],
         )
-    }
-
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Write]
     }
 
     fn execution_mode(&self) -> crate::tools::ExecutionMode {

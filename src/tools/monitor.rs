@@ -88,7 +88,7 @@ impl Tool for MonitorTool {
         )
     }
 
-    async fn execute(&self, _ctx: &ToolContext, args: Value) -> ToolResult {
+    async fn execute(&self, ctx: &ToolContext, args: Value) -> ToolResult {
         let op = match arg_str(&args, "op") {
             Ok(op) => op,
             Err(error) => return error,
@@ -119,7 +119,7 @@ impl Tool for MonitorTool {
                     Err(error) => ToolResult::error(error.to_string()),
                 }
             }
-            "add" => self.add(&args).await,
+            "add" => self.add(ctx, &args).await,
             other => ToolResult::error(format!(
                 "Unknown op {other:?}; use add, remove, list or fire."
             )),
@@ -130,7 +130,10 @@ impl Tool for MonitorTool {
 impl MonitorTool {
     /// `add`：除 `op` / `name` 外的参数就是一份 `[[monitor]]`，按配置文件的同一套 schema 与
     /// 校验解析（见 `monitor::spec`），只是默认值更保守。
-    async fn add(&self, args: &Value) -> ToolResult {
+    ///
+    /// 子代理创建的 monitor 只投给它自己：`deliver.to` 必须省略或写它自己的 id，否则它可以
+    /// 借 monitor 往主上下文或别的子代理里注入内容。
+    async fn add(&self, ctx: &ToolContext, args: &Value) -> ToolResult {
         let name = match arg_str(args, "name") {
             Ok(name) => name,
             Err(error) => return error,
@@ -138,10 +141,21 @@ impl MonitorTool {
         let mut fields = args.as_object().cloned().unwrap_or_default();
         fields.remove("op");
         fields.remove("name");
-        let config = match runtime_config(name, Value::Object(fields)) {
+        let mut config = match runtime_config(name, Value::Object(fields)) {
             Ok(config) => config,
             Err(error) => return ToolResult::error(error),
         };
+        if let Some(id) = &ctx.subagent {
+            let explicit = args.pointer("/deliver/to").and_then(Value::as_str);
+            if explicit.is_some_and(|to| to != id) {
+                return ToolResult::error(format!(
+                    "A subagent's monitor delivers only to itself; omit deliver.to or set it to \
+                     {id:?}."
+                ));
+            }
+            config.deliver.to = id.clone();
+            config.deliver.cc = false;
+        }
         let spec = match MonitorSpec::from_config(&config, MonitorOrigin::Runtime) {
             Ok(spec) => spec,
             Err(error) => return ToolResult::error(error.to_string()),
@@ -253,6 +267,33 @@ mod tests {
             "{}",
             listed.content
         );
+    }
+
+    /// 子代理的 monitor 只投给它自己，不能借它把事件塞进主上下文。
+    #[tokio::test]
+    async fn a_subagent_monitor_delivers_only_to_that_subagent() {
+        let (tool, _sink) = tool();
+        let sub = ctx().with_subagent("sa-7");
+        let result = tool
+            .execute(
+                &sub,
+                json!({"op": "add", "name": "mine", "source": {"qq": true}}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        let listed = run(&tool, json!({"op": "list"})).await;
+        assert!(listed.content.contains("sa-7"), "{}", listed.content);
+
+        for to in ["main", "sa-8", "agent:helper"] {
+            let result = tool
+                .execute(
+                    &sub,
+                    json!({"op": "add", "name": format!("x-{to}"), "source": {"qq": true},
+                           "deliver": {"to": to}}),
+                )
+                .await;
+            assert!(result.is_error, "{to}: {}", result.content);
+        }
     }
 
     #[tokio::test]

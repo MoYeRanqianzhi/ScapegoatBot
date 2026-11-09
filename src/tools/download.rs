@@ -23,7 +23,7 @@ use super::net::{LimitedBody, NetPolicy};
 
 /// 交给暂存线程的批量大小：与 VFS 分块一致，每个分块切一次线程。
 const STAGE_BATCH_BYTES: usize = 1024 * 1024;
-use super::{Permission, Tool, ToolContext, arg_opt_u64, arg_str, object_schema};
+use super::{Tool, ToolContext, arg_opt_u64, arg_str, object_schema};
 
 /// `Download` 工具。
 pub struct DownloadTool {
@@ -85,11 +85,7 @@ impl Tool for DownloadTool {
         )
     }
 
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Network, Permission::Write]
-    }
-
-    async fn execute(&self, _ctx: &ToolContext, args: Value) -> ToolResult {
+    async fn execute(&self, ctx: &ToolContext, args: Value) -> ToolResult {
         let raw_url = match arg_str(&args, "url") {
             Ok(url) => url,
             Err(error) => return error,
@@ -102,6 +98,9 @@ impl Tool for DownloadTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error.to_string()),
         };
+        if let Some(denied) = crate::tools::subagent_write_denied(ctx, &path) {
+            return denied;
+        }
         let limit = match arg_opt_u64(&args, "max_bytes") {
             Ok(value) => value
                 .unwrap_or(self.policy.max_bytes)

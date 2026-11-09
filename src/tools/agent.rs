@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{Permission, Tool, ToolContext, arg_opt_str, arg_str, object_schema};
+use super::{Tool, ToolContext, arg_opt_str, arg_str, object_schema};
 use crate::swarm::{AgentHub, AgentType};
 use crate::transcript::ToolResult;
 
@@ -71,10 +71,6 @@ impl Tool for AgentTool {
             }),
             &["action"],
         )
-    }
-
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Read]
     }
 
     async fn execute(&self, ctx: &ToolContext, args: serde_json::Value) -> ToolResult {

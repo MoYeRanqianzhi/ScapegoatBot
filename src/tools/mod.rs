@@ -1,12 +1,12 @@
-//! 工具层：注册表、权限标记与参数解析。
+//! 工具层：注册表与参数解析。
 //!
 //! 设计依据：设计 §5.1 / §5.4 / §10。
 //!
 //! 没有 Bash：文件能力由独立的工具补齐；QQ 操作合并为一个 `API` 工具。
 //! 本模块只定义契约与注册表，具体工具在 `fs` / `api` / `monitor` 等子模块。
 //!
-//! 权限标记（[`Permission`]）是**声明**，不是执行点：真正的门禁与 `hold`
-//! 检查在 runtime（API 工具与安全闸）；声明用于审计与策略表。
+//! 工具本身不声明权限：门禁与 `hold` 检查在 runtime（`API` 工具、动作门禁与安全闸），
+//! 子代理的工具集按名字裁剪（`swarm`）。
 
 /// `hold` 生效期间拒绝 QQ 操作（`napcat.*`）的统一文案。
 pub(crate) const HOLD_DISABLED: &str = "Disabled during hold";
@@ -69,17 +69,6 @@ pub trait ToolExecutor: Send + Sync {
     async fn execute(&self, call: &ToolCall) -> ToolResult;
 }
 
-/// 工具声明的权限。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Permission {
-    Read,
-    Write,
-    Delete,
-    Network,
-    Send,
-    Admin,
-}
-
 /// 工具执行上下文。
 #[derive(Clone)]
 pub struct ToolContext {
@@ -91,6 +80,10 @@ pub struct ToolContext {
     pub gate: Option<Arc<crate::security::gate::Gate>>,
     /// 本回合的运行时证据（owner intent / origin_chat）；门禁只消费它。
     pub evidence: crate::transcript::TurnEvidence,
+    /// 调用者：`None` 是主代理，`Some(id)` 是子代理实例（`sa-…`）。子代理不能改配置、
+    /// 记忆与其他代理的指令，不能删除数据（[`subagent_write_denied`]），它的 monitor 只投给
+    /// 它自己（`Monitor` 工具）。
+    pub subagent: Option<String>,
 }
 
 impl ToolContext {
@@ -100,7 +93,15 @@ impl ToolContext {
             views,
             gate: None,
             evidence: crate::transcript::TurnEvidence::default(),
+            subagent: None,
         }
+    }
+
+    /// 以子代理身份调用（测试用；运行时由 [`ToolRegistry::for_subagent`] 设置）。
+    #[cfg(test)]
+    pub(crate) fn with_subagent(mut self, id: &str) -> Self {
+        self.subagent = Some(id.to_owned());
+        self
     }
 
     /// 注入回合证据；`API` 的 owner intent 检查读取它。
@@ -111,6 +112,40 @@ impl ToolContext {
     }
 }
 
+/// 子代理不能写的路径：配置、长期记忆与主人档案，以及主代理与其他子代理的指令
+/// （`/AGENTS.md`、`/agents/*.md` 能给子代理开 `allow_send`、`/hooks/context.toml` 决定主代理
+/// 的上下文注入）。前缀按路径段匹配：`/memory` 覆盖 `/memory/**`。
+const SUBAGENT_PROTECTED: &[&str] = &[
+    "/config",
+    "/config.toml",
+    "/MEMORY.md",
+    "/memory",
+    "/USER.md",
+    "/AGENTS.md",
+    "/agents",
+    "/hooks",
+];
+
+/// 子代理写 `path` 时返回拒绝结果；主代理与不受保护的路径返回 `None`。
+pub(crate) fn subagent_write_denied(ctx: &ToolContext, path: &VfsPath) -> Option<ToolResult> {
+    ctx.subagent.as_ref()?;
+    let protected = SUBAGENT_PROTECTED
+        .iter()
+        .find(|prefix| VfsPath::parse(prefix).is_ok_and(|prefix| path.starts_with(&prefix)))?;
+    Some(ToolResult::error(format!(
+        "Subagents cannot modify {protected}: configuration, memory and agent instructions \
+         belong to the main agent. Report what should change in your result instead."
+    )))
+}
+
+/// 子代理删除数据（`RM`、`MV` 进 `/trash`）时返回拒绝结果；主代理返回 `None`。
+pub(crate) fn subagent_delete_denied(ctx: &ToolContext) -> Option<ToolResult> {
+    ctx.subagent.as_ref()?;
+    Some(ToolResult::error(
+        "Subagents cannot delete data. Report what should be removed in your result instead.",
+    ))
+}
+
 /// 工具接口。
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -119,9 +154,6 @@ pub trait Tool: Send + Sync {
     fn parameters(&self) -> Value;
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Parallel
-    }
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Read]
     }
     async fn execute(&self, ctx: &ToolContext, args: Value) -> ToolResult;
 }
@@ -137,6 +169,8 @@ pub struct ToolRegistry {
     gate: Option<Arc<crate::security::gate::Gate>>,
     /// 只读 `API` 的替身；docs 等子代理用。
     read_only_api: Option<Arc<dyn Tool>>,
+    /// 调用者身份，原样放进每次调用的 [`ToolContext::subagent`]；`None` = 主代理。
+    subagent: Option<String>,
     /// 单次工具结果的字节上限；0 = 不限制。
     max_result_bytes: usize,
     /// 全部工具 schema 的近似 token 预算；0 = 不限制。
@@ -152,6 +186,7 @@ impl ToolRegistry {
             views,
             gate: None,
             read_only_api: None,
+            subagent: None,
             max_result_bytes: 0,
             max_schema_tokens: 0,
         }
@@ -202,6 +237,12 @@ impl ToolRegistry {
         self.tools.get(name)
     }
 
+    /// 标记这份注册表属于子代理实例 `id`：之后的每次调用都带上这个身份。
+    pub(crate) fn for_subagent(mut self, id: String) -> Self {
+        self.subagent = Some(id);
+        self
+    }
+
     /// 复制注册表，只保留 `allowed` 中的工具；上下文（VFS/视图）沿用。
     ///
     /// 子代理用它实现“工具集是父代理的子集”。
@@ -218,6 +259,7 @@ impl ToolRegistry {
             views: self.views.clone(),
             gate: self.gate.clone(),
             read_only_api: self.read_only_api.clone(),
+            subagent: self.subagent.clone(),
             max_result_bytes: self.max_result_bytes,
             max_schema_tokens: self.max_schema_tokens,
         }
@@ -279,6 +321,7 @@ impl ToolRegistry {
         let mut context = ToolContext::new(vfs, self.views.clone());
         context.gate = self.gate.clone();
         context.evidence = evidence;
+        context.subagent = self.subagent.clone();
         let result = tool.execute(&context, call.arguments.clone()).await;
         if let Some((chat, text)) = context_source_for(&call.name, &call.arguments, &result.content)
         {

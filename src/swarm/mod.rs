@@ -73,7 +73,6 @@ impl AgentType {
                 tools.extend([
                     "Write",
                     "Edit",
-                    "RM",
                     "MV",
                     "CP",
                     "Mkdir",
@@ -95,8 +94,11 @@ impl AgentType {
         match self {
             Self::General => {
                 "You are a general-purpose subagent. Complete the task, then report a concise \
-                 result. You cannot modify configuration, credentials, /MEMORY.md, /USER.md or \
-                 delete data. Your work is not saved as long-term memory."
+                 result. You can read the VFS and write your own files, but you cannot change \
+                 /config, /MEMORY.md, /memory, /USER.md, /AGENTS.md, /agents or /hooks, and you \
+                 cannot delete anything: say in your result what should change and the parent \
+                 agent decides. Monitors you add deliver only to you. Your work is not saved as \
+                 long-term memory."
             }
             Self::Explore => {
                 "You are an exploration subagent. Read and search only; you cannot write, send \
@@ -117,6 +119,8 @@ impl AgentType {
 
 /// 子代理请求。
 pub struct SubagentRequest {
+    /// 实例 id（`sa-…`）；工具调用以它为身份（见 `ToolContext::subagent`）。
+    pub id: String,
     /// 完整 system prompt（公共子代理提示 + 定义正文）。
     pub system: String,
     pub task: String,
@@ -225,7 +229,8 @@ impl AgentDefinition {
     fn system_prompt(&self) -> String {
         format!(
             "{}\n\n# Your role\n{}\n\n# Task\nFollow the task from the parent agent. \
-             You cannot change configuration, credentials, /MEMORY.md or /USER.md.",
+             You cannot change /config, /MEMORY.md, /memory, /USER.md, /AGENTS.md, /agents or \
+             /hooks, and you cannot delete anything; monitors you add deliver only to you.",
             SUBAGENT_COMMON, self.body
         )
     }
@@ -480,6 +485,7 @@ impl AgentHub {
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
         *instance.incoming.lock().await = Some(incoming_tx);
         let request = SubagentRequest {
+            id: id.clone(),
             system,
             task,
             tools,
@@ -573,6 +579,7 @@ impl AgentHub {
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
         *instance.incoming.lock().await = Some(incoming_tx);
         let request = SubagentRequest {
+            id: id.to_owned(),
             system,
             task: text,
             tools: instance.tools.clone(),
@@ -770,7 +777,7 @@ fn known_tool(name: &str) -> Option<&'static str> {
         "Glob",
         "Grep",
         "API",
-        "Memory",
+        // `Memory` 不在其中：它只写 /MEMORY.md 与 /USER.md，子代理不能改长期记忆。
         "Skill",
         "Download",
         "WebSearch",

@@ -25,7 +25,7 @@ mod html;
 
 /// 搜索 / 抓取后端单个响应的字节上限。
 const MAX_BACKEND_BYTES: u64 = 16 * 1024 * 1024;
-use super::{Permission, Tool, ToolContext, arg_opt_u64, arg_str, object_schema};
+use super::{Tool, ToolContext, arg_opt_u64, arg_str, object_schema};
 
 /// 工具后端。
 #[derive(Clone)]
@@ -118,10 +118,6 @@ impl Tool for WebSearchTool {
             }),
             &["query"],
         )
-    }
-
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Network]
     }
 
     async fn execute(&self, _ctx: &ToolContext, args: Value) -> ToolResult {
@@ -291,10 +287,6 @@ impl Tool for WebFetchTool {
             }),
             &["url"],
         )
-    }
-
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Network]
     }
 
     async fn execute(&self, _ctx: &ToolContext, args: Value) -> ToolResult {

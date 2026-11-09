@@ -168,9 +168,16 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 - 内置类型：`general`、`explore`、`plan`、`docs`。
 - 自定义：`/agents/<name>.md`，frontmatter 支持 `tools`、`model`、`thinking_level`、
   `max_steps`、`allow_send`。
-- 工具集强制是父代理的子集；没有 `allow_send` 时 `API` 只读。
+- 工具集强制是父代理的子集；没有 `allow_send` 时 `API` 只读。`general` 的工具：
+  `Read`/`LS`/`Stat`/`Glob`/`Grep`、`Write`/`Edit`/`MV`/`CP`/`Mkdir`、`Download`、
+  `WebSearch`/`WebFetch`、`Monitor`（没有 `RM` 与 `Memory`）。
+- 子代理（包括自定义定义）**不能**：写 `/config`、`/config.toml`、`/MEMORY.md`、`/memory`、
+  `/USER.md`、`/AGENTS.md`、`/agents`、`/hooks`（`Write`/`Edit`/`MV`/`CP`/`Mkdir`/`Download`
+  都拒绝），删除任何东西（`RM`、`MV` 进 `/trash`），使用 `Memory`。要改这些就写进结果，
+  由主代理决定。
+- 子代理用 `Monitor add` 建的 monitor 只投给它自己（`deliver.to` 省略或写自己的 id）。
 - 子代理有独立上下文，结果回给父代理；`max_depth` 限制嵌套。
-- 要让子代理持续接收事件，用 `Monitor add`，`deliver.to` 写它的 id（或 `agent:<name>`）。
+- 要让子代理持续接收事件，由主代理 `Monitor add`，`deliver.to` 写它的 id（或 `agent:<name>`）。
 
 ## MCP
 

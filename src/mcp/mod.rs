@@ -24,7 +24,7 @@ use tracing::{info, warn};
 
 use crate::agent::ToolResult;
 use crate::config::{McpConfig, McpServerConfig};
-use crate::tools::{Permission, Tool, ToolContext};
+use crate::tools::{Tool, ToolContext};
 
 /// 单个请求的超时。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -463,10 +463,6 @@ impl Tool for McpTool {
             },
             "required": []
         })
-    }
-
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Network]
     }
 
     async fn execute(&self, _ctx: &ToolContext, args: Value) -> ToolResult {

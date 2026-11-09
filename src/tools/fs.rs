@@ -22,8 +22,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use super::{
-    Permission, Tool, ToolContext, arg_opt_bool, arg_opt_str, arg_opt_u64, arg_str, object_schema,
-    parse_path, parse_target, render_content, vfs_error, views,
+    Tool, ToolContext, arg_opt_bool, arg_opt_str, arg_opt_u64, arg_str, object_schema, parse_path,
+    parse_target, render_content, vfs_error, views,
 };
 
 /// 单次 Grep 的文件上限（每个直接子目录）。
@@ -206,10 +206,6 @@ impl Tool for WriteTool {
         )
     }
 
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Write]
-    }
-
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Sequential
     }
@@ -222,6 +218,9 @@ impl Tool for WriteTool {
         let Ok(content) = arg_str(&args, "content") else {
             return ToolResult::error("Missing required parameter \"content\" (string).");
         };
+        if let Some(denied) = crate::tools::subagent_write_denied(ctx, &path) {
+            return denied;
+        }
         // `/config/**` 与 `/config.toml` 走受限写入：白名单 + 校验 + 原子写回。
         if views::Views::is_config_path(&path) {
             let Some(views) = &ctx.views else {
@@ -281,10 +280,6 @@ impl Tool for EditTool {
         )
     }
 
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Write]
-    }
-
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Sequential
     }
@@ -302,6 +297,9 @@ impl Tool for EditTool {
             Ok(value) => value,
             Err(error) => return error,
         };
+        if let Some(denied) = crate::tools::subagent_write_denied(ctx, &path) {
+            return denied;
+        }
         // 配置叶子：读取当前值、做精确替换，再走受限写入。
         if views::Views::is_config_path(&path) {
             let Some(views) = &ctx.views else {
@@ -748,10 +746,6 @@ impl Tool for RmTool {
         )
     }
 
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Delete]
-    }
-
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Sequential
     }
@@ -769,6 +763,9 @@ impl Tool for RmTool {
             Ok(value) => value,
             Err(error) => return error,
         };
+        if let Some(denied) = crate::tools::subagent_delete_denied(ctx) {
+            return denied;
+        }
 
         if target
             .path
@@ -840,8 +837,10 @@ impl Tool for MvTool {
     }
 
     fn description(&self) -> &'static str {
-        "Move or rename a VFS file or directory. `from` and `to` are absolute VFS paths; both \
-         mounts must be writable. Directories move recursively. Returns the new path."
+        "Move or rename a VFS file or directory. `from` and `to` are absolute VFS paths; the \
+         target must not exist. Directories move recursively. Moving something out of /trash \
+         restores it (checked against the quota); dynamic views cannot be moved. Returns the \
+         new path."
     }
 
     fn parameters(&self) -> Value {
@@ -852,10 +851,6 @@ impl Tool for MvTool {
             }),
             &["from", "to"],
         )
-    }
-
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Write]
     }
 
     fn execution_mode(&self) -> ExecutionMode {
@@ -871,6 +866,17 @@ impl Tool for MvTool {
         };
         if views::Views::handles(&from) || views::Views::handles(&to) {
             return ToolResult::error(crate::tools::DYNAMIC_READ_ONLY);
+        }
+        // 移动会改动两端：受保护的源不能被挪走，受保护的目标不能被写入；移进 `/trash` 是删除。
+        if let Some(denied) = crate::tools::subagent_write_denied(ctx, &from)
+            .or_else(|| crate::tools::subagent_write_denied(ctx, &to))
+        {
+            return denied;
+        }
+        if to.starts_with(&VfsPath::parse("/trash").expect("valid path"))
+            && let Some(denied) = crate::tools::subagent_delete_denied(ctx)
+        {
+            return denied;
         }
         match ctx.vfs.rename(&from, &to) {
             Ok(()) => ToolResult::ok(format!("Moved {from} to {to}.")),
@@ -889,8 +895,10 @@ impl Tool for CpTool {
     }
 
     fn description(&self) -> &'static str {
-        "Copy a VFS file or directory. Directories require `recursive: true`. Checks source \
-         readability, target mount, and quota. Returns target path and bytes copied."
+        "Copy a VFS file or directory. Directories require `recursive: true`; the target must \
+         not exist and must not be inside /trash. The copy counts against the quota. Dynamic \
+         views cannot be copied: Read them and Write the part you need. Returns target path and \
+         bytes copied."
     }
 
     fn parameters(&self) -> Value {
@@ -902,10 +910,6 @@ impl Tool for CpTool {
             }),
             &["from", "to"],
         )
-    }
-
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Write]
     }
 
     fn execution_mode(&self) -> ExecutionMode {
@@ -925,6 +929,9 @@ impl Tool for CpTool {
         };
         if views::Views::handles(&from) || views::Views::handles(&to) {
             return ToolResult::error(crate::tools::DYNAMIC_READ_ONLY);
+        }
+        if let Some(denied) = crate::tools::subagent_write_denied(ctx, &to) {
+            return denied;
         }
         match ctx.vfs.stat(&from) {
             Ok(meta) if meta.kind == NodeKind::Dir && !recursive => {
@@ -967,10 +974,6 @@ impl Tool for MkdirTool {
         )
     }
 
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Write]
-    }
-
     async fn execute(&self, ctx: &ToolContext, args: Value) -> ToolResult {
         let path = match parse_path(arg_str(&args, "path").unwrap_or_default()) {
             Ok(path) => path,
@@ -978,6 +981,9 @@ impl Tool for MkdirTool {
         };
         if views::Views::handles(&path) {
             return ToolResult::error(crate::tools::DYNAMIC_READ_ONLY);
+        }
+        if let Some(denied) = crate::tools::subagent_write_denied(ctx, &path) {
+            return denied;
         }
         let parents = match arg_opt_bool(&args, "parents") {
             Ok(value) => value,
@@ -1009,8 +1015,9 @@ impl Tool for StatTool {
     }
 
     fn description(&self) -> &'static str {
-        "Return VFS metadata: type, size, mtime, version, content hash, child count, mount, and \
-         permissions. Does not read content."
+        "Return VFS metadata: type, size, mime, version, created and updated time, content hash \
+         and child count. Dynamic views (/messages, /inbox, ...) report type, size and mtime and \
+         are read-only. Does not read content."
     }
 
     fn parameters(&self) -> Value {
@@ -1031,7 +1038,7 @@ impl Tool for StatTool {
             };
             return match views.stat(&path).await {
                 Ok(entry) => ToolResult::ok(format!(
-                    "path: {}\ntype: {}\nsize: {}\nmtime: {}",
+                    "path: {}\ntype: {}\nsize: {}\nmtime: {}\nread-only: dynamic view",
                     entry.path, entry.kind, entry.size, entry.mtime
                 )),
                 Err(error) => vfs_error(error),
@@ -1045,7 +1052,7 @@ impl Tool for StatTool {
                     0
                 };
                 ToolResult::ok(format!(
-                    "path: {}\ntype: {}\nsize: {}\nmime: {}\nversion: {}\ncreated: {}\nupdated: {}\nhash: {}\nchildren: {}\npermissions: rw",
+                    "path: {}\ntype: {}\nsize: {}\nmime: {}\nversion: {}\ncreated: {}\nupdated: {}\nhash: {}\nchildren: {}",
                     meta.path,
                     meta.kind.as_str(),
                     meta.size,
@@ -1293,6 +1300,75 @@ mod tests {
         )
         .await;
         assert!(miss.is_error);
+    }
+
+    /// 子代理不能改配置、记忆与代理指令，也不能删除；普通路径照常可写。主代理不受影响。
+    /// 走真实接线：`filtered` → `for_subagent` → 每次调用的 `ToolContext::subagent`。
+    #[tokio::test]
+    async fn subagents_cannot_touch_protected_paths_or_delete() {
+        let (main, _vfs, _dir) = setup();
+        let sub = main.filtered(&main.names()).for_subagent("sa-1".to_owned());
+        let write = |path: &str| json!({"path": path, "content": "x"});
+
+        // 主代理先建好文件（/MEMORY.md 是种子文件，已存在）。
+        for path in ["/notes/a.md", "/memory/fact.md", "/agents/helper.md"] {
+            let result = run(&main, "Write", write(path)).await;
+            assert!(!result.is_error, "{path}: {}", result.content);
+        }
+
+        let result = run(&sub, "Write", write("/notes/b.md")).await;
+        assert!(!result.is_error, "{}", result.content);
+        for path in [
+            "/MEMORY.md",
+            "/memory/fact.md",
+            "/USER.md",
+            "/AGENTS.md",
+            "/agents/helper.md",
+            "/hooks/context.toml",
+            "/config/filter/ignore_users",
+        ] {
+            let result = run(&sub, "Write", write(path)).await;
+            assert!(result.is_error, "{path}");
+            assert!(
+                result.content.contains("Subagents cannot modify"),
+                "{}",
+                result.content
+            );
+        }
+        for (tool, args) in [
+            (
+                "MV",
+                json!({"from": "/agents/helper.md", "to": "/notes/h.md"}),
+            ),
+            (
+                "MV",
+                json!({"from": "/notes/b.md", "to": "/agents/evil.md"}),
+            ),
+            ("MV", json!({"from": "/notes/b.md", "to": "/trash/b.md"})),
+            ("CP", json!({"from": "/notes/b.md", "to": "/memory/x.md"})),
+            ("Mkdir", json!({"path": "/hooks/x"})),
+            ("RM", json!({"path": "/notes/b.md"})),
+            (
+                "Edit",
+                json!({"path": "/MEMORY.md", "old_text": "x", "new_text": "y"}),
+            ),
+        ] {
+            let result = run(&sub, tool, args.clone()).await;
+            assert!(result.is_error, "{tool} {args}: {}", result.content);
+        }
+        // 只读照常可以；子代理的 MV 在普通路径之间也可以。
+        let result = run(&sub, "Read", json!({"path": "/MEMORY.md"})).await;
+        assert!(!result.is_error, "{}", result.content);
+        let result = run(
+            &sub,
+            "MV",
+            json!({"from": "/notes/b.md", "to": "/notes/c.md"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        // 主代理可以删。
+        let result = run(&main, "RM", json!({"path": "/notes/c.md"})).await;
+        assert!(!result.is_error, "{}", result.content);
     }
 
     #[tokio::test]

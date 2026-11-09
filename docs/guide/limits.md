@@ -54,7 +54,8 @@
 ## 已知行为细节
 
 - 只有一条 transcript：跨 chat 上下文互相可见，这是替身场景的设计。
-- 子代理嵌套受 `max_depth`（默认 8）限制。投给子代理的 monitor（`deliver.to = "<id>"`）
+- 子代理嵌套受 `max_depth`（默认 8）限制。子代理的写保护按路径前缀判断（见
+  [工具与 VFS](tools-and-vfs.md#子代理)），它仍能写其他任何普通路径。投给子代理的 monitor（`deliver.to = "<id>"`）
   不会随子代理结束删除（结束的子代理仍可续聊），由 `expires` / `max_events` 收尾。
 - 压缩失败连续达到 `[compaction].max_failures` 后，自动压缩停止尝试，直到重启或
   一次手动 `agent.compact` 成功。
