@@ -66,20 +66,13 @@ impl Runner {
     /// 立即压缩：摘要旧消息，轮转新分段，写入摘要与保留窗口。
     ///
     /// 设计 §8.1：摘要块固定包含 `previous_session`，当前分段的路径由 runtime 注入。
-    #[cfg(test)]
     pub(crate) async fn compact_now(&self, reason: &str) -> Result<serde_json::Value> {
-        self.compact_chat(reason, ChatId::Private(self.config.owner_qq))
-            .await
-    }
-
-    pub(crate) async fn compact_chat(
-        &self,
-        reason: &str,
-        chat: ChatId,
-    ) -> Result<serde_json::Value> {
-        let history = self.history_for(chat).await;
-        let sessions = self.session_for(chat).await;
-        self.compact_scope(reason, history, sessions).await
+        self.compact_scope(
+            reason,
+            Arc::clone(&self.history),
+            Arc::clone(&self.deps.sessions),
+        )
+        .await
     }
 
     /// 在指定链上压缩。

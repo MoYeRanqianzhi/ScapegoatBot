@@ -564,7 +564,8 @@ fn specs_agent(list: &mut Vec<ActionSpec>) {
         ),
         (
             "agent.compact",
-            "Run compaction now; `chat` chooses the session to compact.",
+            "Run compaction now: summarise older context into a new segment. There is one \
+             transcript for every chat, so it takes no parameters.",
         ),
         (
             "agent.clear_context",
@@ -579,9 +580,6 @@ fn specs_agent(list: &mut Vec<ActionSpec>) {
                 "agent.quarantine" => json!({
                     "text": {"type": "string"},
                     "reason": {"type": "string"}
-                }),
-                "agent.compact" => json!({
-                    "chat": {"type": "string"}
                 }),
                 _ => json!({}),
             },

@@ -58,7 +58,7 @@ impl Runner {
         owner_intent: bool,
     ) -> Result<LoopOutcome> {
         let chat = ChatId::Private(self.config.owner_qq);
-        let turn_lock = self.turn_lock_for(chat).await;
+        let turn_lock = Arc::clone(&self.turn_lock);
         let _turn_guard = turn_lock.lock().await;
         self.discard_context_if_flagged().await;
         self.active_turns
@@ -74,8 +74,8 @@ impl Runner {
                 turns: 0,
             });
         }
-        let sessions = self.session_for(chat).await;
-        let history = self.history_for(chat).await;
+        let sessions = Arc::clone(&self.deps.sessions);
+        let history = Arc::clone(&self.history);
         {
             let mut history = history.lock().await;
             history.push(message.clone());

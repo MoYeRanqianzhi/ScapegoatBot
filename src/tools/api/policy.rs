@@ -4,7 +4,8 @@
 //! 任何一步的拒绝都发生在 `gateway.call` 之前：
 //!
 //! 1. [`ApiTool::declared_params`]：只接受注册表声明过的参数，未声明字段
-//!    （例如 `send_group_notice` 的 `image`）不能借道到 NapCat；
+//!    （例如 `send_group_notice` 的 `image`）不能借道到 NapCat；这一步在 `ApiTool::execute`
+//!    分派之前做，对 `agent.*` 与 `local.*` 同样生效；
 //! 2. [`ApiTool::check_target`]：admin/destructive 动作的目标若是 owner/master，恒拒绝；
 //! 3. hold：所有 QQ 动作拒绝；
 //! 4. [`ApiTool::check_receive_scope`]：查询只能读 `receive_scopes` 内的 chat；
@@ -30,11 +31,7 @@ impl ApiTool {
         params: Value,
         ctx: &ToolContext,
     ) -> ToolResult {
-        // 1. 参数只能是注册表声明过的字段。
-        let params = match Self::declared_params(spec, params) {
-            Ok(params) => params,
-            Err(error) => return ToolResult::error(error),
-        };
+        // 1. 参数只能是注册表声明过的字段：`execute` 在分派前已经检查过（所有命名空间）。
         // 2. owner/master 保护。
         if let Err(error) = self.check_target(spec, &params) {
             return ToolResult::error(error);
@@ -79,7 +76,7 @@ impl ApiTool {
     ///
     /// NapCat 会读取很多未在注册表里声明的字段（例如 `send_group_notice` 的
     /// `image` 会被当成文件引用读取）；只放行声明过的字段，注册表才是唯一事实来源。
-    fn declared_params(spec: &ActionSpec, params: Value) -> Result<Value, String> {
+    pub(super) fn declared_params(spec: &ActionSpec, params: Value) -> Result<Value, String> {
         let Value::Object(map) = params else {
             return Err(format!("{} params must be a JSON object", spec.action));
         };

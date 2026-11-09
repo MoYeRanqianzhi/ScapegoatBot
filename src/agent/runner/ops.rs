@@ -134,14 +134,13 @@ impl crate::tools::api::AgentOps for RuntimeOps {
         }))
     }
 
-    async fn compact(&self, chat: Option<ChatId>) -> Result<serde_json::Value, String> {
+    async fn compact(&self) -> Result<serde_json::Value, String> {
         let runner = self
             .runner
             .get()
             .ok_or_else(|| "the runner is not ready yet".to_owned())?;
-        let chat = chat.unwrap_or(ChatId::Private(self.owner_qq));
         runner
-            .compact_chat("manual", chat)
+            .compact_now("manual")
             .await
             .map_err(|error| error.to_string())
     }

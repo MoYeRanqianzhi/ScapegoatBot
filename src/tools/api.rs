@@ -30,7 +30,7 @@ use crate::storage::messages::MessageStore;
 use crate::tools::net::NetPolicy;
 use crate::transcript::ToolResult;
 
-use super::{Permission, Tool, ToolContext, arg_str, object_schema};
+use super::{Tool, ToolContext, arg_str, object_schema};
 use crate::actions::{ActionSpec, Category, qq_number, specs};
 
 mod image_ops;
@@ -58,8 +58,8 @@ pub trait AgentOps: Send + Sync {
     async fn status(&self) -> Result<Value, String>;
     async fn resume(&self) -> Result<Value, String>;
     async fn quarantine(&self, params: &Value) -> Result<Value, String>;
-    /// 压缩指定 chat；`None` 时由 runtime 选择默认会话。
-    async fn compact(&self, chat: Option<crate::qq::event::ChatId>) -> Result<Value, String>;
+    /// 立即压缩（只有一条 transcript）。
+    async fn compact(&self) -> Result<Value, String>;
     async fn clear_context(&self) -> Result<Value, String>;
 }
 
@@ -277,10 +277,6 @@ impl Tool for ApiTool {
         )
     }
 
-    fn permissions(&self) -> &'static [Permission] {
-        &[Permission::Send, Permission::Admin]
-    }
-
     fn execution_mode(&self) -> ExecutionMode {
         ExecutionMode::Sequential
     }
@@ -317,8 +313,13 @@ impl Tool for ApiTool {
             ));
         };
 
+        // 参数只能是注册表声明过的字段（所有命名空间）：拼错或多写的字段报错，不会被悄悄忽略。
+        let params = match Self::declared_params(spec, params) {
+            Ok(params) => params,
+            Err(error) => return ToolResult::error(error),
+        };
         match spec.namespace() {
-            "agent" => self.run_agent(spec, &params, ctx).await,
+            "agent" => self.run_agent(spec, &params).await,
             // 本地工具：目前只有 `local.media.image.*`，全部只读写 VFS。
             "local" => self.run_image(spec, &params, ctx).await,
             // napcat 的策略链顺序集中在本模块的 `policy` 子模块里。
@@ -409,7 +410,7 @@ impl ApiTool {
         )
     }
 
-    async fn run_agent(&self, spec: &ActionSpec, params: &Value, ctx: &ToolContext) -> ToolResult {
+    async fn run_agent(&self, spec: &ActionSpec, params: &Value) -> ToolResult {
         let Some(ops) = &self.agent_ops else {
             return ToolResult::error("Agent operations are not available in this runtime.");
         };
@@ -417,15 +418,7 @@ impl ApiTool {
             "agent.status" => ops.status().await,
             "agent.resume" => ops.resume().await,
             "agent.quarantine" => ops.quarantine(params).await,
-            "agent.compact" => {
-                // `chat` 优先；否则用完当前回合的会话；都没有则交给 runtime 的默认值。
-                let chat = params
-                    .get("chat")
-                    .and_then(Value::as_str)
-                    .and_then(ChatId::parse)
-                    .or_else(|| ctx.evidence.origin_chat.as_deref().and_then(ChatId::parse));
-                ops.compact(chat).await
-            }
+            "agent.compact" => ops.compact().await,
             "agent.clear_context" => ops.clear_context().await,
             other => Err(format!("{other} is not implemented by this runtime")),
         };
@@ -516,7 +509,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeOps {
-        compacted: Mutex<Vec<Option<crate::qq::event::ChatId>>>,
+        compacted: Mutex<usize>,
     }
 
     #[async_trait]
@@ -530,8 +523,8 @@ mod tests {
         async fn quarantine(&self, params: &Value) -> Result<Value, String> {
             Ok(json!({"quarantined": params}))
         }
-        async fn compact(&self, chat: Option<crate::qq::event::ChatId>) -> Result<Value, String> {
-            self.compacted.lock().unwrap().push(chat);
+        async fn compact(&self) -> Result<Value, String> {
+            *self.compacted.lock().unwrap() += 1;
             Ok(json!({"compacted": true}))
         }
         async fn clear_context(&self) -> Result<Value, String> {
@@ -675,10 +668,10 @@ mod tests {
         assert_eq!(value["scope_field"], "group_id");
         assert_eq!(value["params"]["user_id"]["type"], "number");
 
-        let result = call(&tool, "api.help", json!({"action": "agent.compact"})).await;
+        let result = call(&tool, "api.help", json!({"action": "agent.quarantine"})).await;
         assert!(!result.is_error);
         let value: Value = serde_json::from_str(&result.content).unwrap();
-        assert_eq!(value["params"]["chat"]["type"], "string");
+        assert_eq!(value["params"]["text"]["type"], "string");
     }
 
     #[tokio::test]
@@ -1474,8 +1467,9 @@ mod tests {
         assert!(bad.content.contains("RRGGBB"), "{}", bad.content);
     }
 
+    /// 只有一条 transcript：`agent.compact` 不接受 `chat`（以前接受但不起作用）。
     #[tokio::test]
-    async fn agent_compact_prefers_chat_then_origin() {
+    async fn agent_compact_takes_no_parameters() {
         let ops = Arc::new(FakeOps::default());
         let tool = ApiTool::new(
             None,
@@ -1486,31 +1480,11 @@ mod tests {
             Vec::new(),
             None,
         );
-        let ctx = intent_ctx("group:1");
-
-        for params in [
-            json!({"chat": "group:2"}),
-            json!({"chat": "not-a-chat"}),
-            json!({}),
-        ] {
-            let result = tool
-                .execute(&ctx, json!({"action": "agent.compact", "params": params}))
-                .await;
-            assert!(!result.is_error, "{}", result.content);
-        }
-        // 没有 params.chat、也没有 origin_chat 时传 None。
         let result = call(&tool, "agent.compact", json!({})).await;
         assert!(!result.is_error, "{}", result.content);
-
-        assert_eq!(
-            *ops.compacted.lock().unwrap(),
-            vec![
-                Some(ChatId::Group(2)),
-                Some(ChatId::Group(1)),
-                Some(ChatId::Group(1)),
-                None,
-            ]
-        );
+        let result = call(&tool, "agent.compact", json!({"chat": "group:2"})).await;
+        assert!(result.is_error, "{}", result.content);
+        assert_eq!(*ops.compacted.lock().unwrap(), 1);
     }
 
     #[test]
