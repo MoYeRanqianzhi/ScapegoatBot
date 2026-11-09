@@ -152,6 +152,7 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         line_no     INTEGER NOT NULL,
         reply_to    INTEGER,
         is_self     INTEGER NOT NULL,
+        -- 已废弃：断线补消息在 0.2 删除，列保留只因迁移不能改；新行恒为默认值 0。
         backfilled  INTEGER NOT NULL DEFAULT 0,
         recalled    INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (chat, message_id)

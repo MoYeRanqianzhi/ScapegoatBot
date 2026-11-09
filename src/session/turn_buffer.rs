@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use base64::Engine;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -301,13 +301,6 @@ pub fn new_turn_id() -> String {
         chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     )
-}
-
-/// 包装成上下文错误的读取，便于调用方补上下文。
-pub fn load_context(turn_id: &str, store: &TurnBufferStore) -> Result<Vec<(u64, AgentMessage)>> {
-    store
-        .load(turn_id)
-        .with_context(|| format!("cannot load turn buffer {turn_id}"))
 }
 
 #[cfg(test)]

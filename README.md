@@ -108,7 +108,7 @@ url = "ws://127.0.0.1:3001"
 | `sbot start` | 前台运行守护进程 |
 | `sbot stop` / `restart` | 停止 / 重启 |
 | `sbot status` | 运行状态、模型、hold、用量 |
-| `sbot ai start\|stop\|restart` | 只控制 LLM 调用；消息接收与存储不中断 |
+| `sbot ai start\|stop` | 只控制 LLM 调用；消息接收与存储不中断 |
 | `sbot chat "<text>" [--scope group:<gid>\|private:<qq>]` | 从控制通道给 agent 一句话；`--scope` 指明针对的会话 |
 | `sbot pause` / `resume` | 写 / 删除 `ESTOP`，暂停新回合 |
 | `sbot security status\|resume` | 查看 hold 与最近安全事件 / 重新过闸 |
@@ -173,8 +173,10 @@ SBOT_LIVE_BASE_URL=... SBOT_LIVE_API_KEY=... SBOT_LIVE_MODEL=... \
   cargo test --test live_providers -- --ignored
 ```
 
-`SBOT_LIVE_JEV_BASE_URL` / `SBOT_LIVE_JEV_API_KEY` 用于真实 Jev 分类器测试；
-`tests/live_napcat.rs` 需要真实 NapCat。
+`SBOT_LIVE_JEV_BASE_URL` / `SBOT_LIVE_JEV_API_KEY` 用于真实 Jev 分类器测试。
+`tests/onebot_mock_client.rs` 与 `tests/napcat_api.rs` 对本地模拟的 OneBot 服务端运行，
+不需要 NapCat，随 `cargo test` 一起跑；真实 NapCat 的验证步骤见
+[docs/development/live-testing.md](docs/development/live-testing.md)。
 
 ## 目录
 

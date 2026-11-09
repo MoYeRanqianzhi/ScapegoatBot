@@ -129,7 +129,6 @@ mod tests {
             }],
             reply_to: None,
             is_self,
-            backfilled: false,
             raw: serde_json::Value::Null,
         }
     }

@@ -89,7 +89,6 @@ pub enum RequestBody {
 pub enum AiAction {
     Start,
     Stop,
-    Restart,
 }
 
 /// 一次 IPC 响应。

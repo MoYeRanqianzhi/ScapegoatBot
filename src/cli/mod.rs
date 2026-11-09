@@ -100,8 +100,6 @@ pub enum AiCommand {
     Start,
     /// 停止调用 LLM。
     Stop,
-    /// 重启 LLM 调用。
-    Restart,
 }
 
 #[derive(Debug, Subcommand)]
@@ -180,7 +178,6 @@ async fn run_remote(command: Command, paths: &SbotPaths, config: Option<PathBuf>
             let action = match action {
                 AiCommand::Start => AiAction::Start,
                 AiCommand::Stop => AiAction::Stop,
-                AiCommand::Restart => AiAction::Restart,
             };
             request(&endpoint, Request::new(RequestBody::Ai { action })).await
         }

@@ -224,7 +224,7 @@ async fn handle_qq_event(
     match event {
         QqEvent::Message(message) => match messages.append(&message) {
             Ok(true) => {
-                if !message.is_self && !message.backfilled {
+                if !message.is_self {
                     agent.monitors.on_qq_event(&QqEvent::Message(message)).await;
                 }
             }

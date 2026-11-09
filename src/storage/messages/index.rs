@@ -132,8 +132,8 @@ impl MessageStore {
                 let conn = self.db.lock();
                 conn.execute(
                     "INSERT INTO messages
-                        (chat, message_id, sender, ts, day, file_path, line_no, reply_to, is_self, backfilled)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                        (chat, message_id, sender, ts, day, file_path, line_no, reply_to, is_self)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         chat.to_string(),
                         message_id,
@@ -143,8 +143,7 @@ impl MessageStore {
                         relative,
                         line_no as i64,
                         message.reply_to,
-                        message.is_self as i32,
-                        message.backfilled as i32
+                        message.is_self as i32
                     ],
                 )?;
                 repaired += 1;

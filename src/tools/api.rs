@@ -479,7 +479,6 @@ fn self_message_from_params(chat: ChatId, params: &Value, message_id: Option<i64
         segments,
         reply_to,
         is_self: true,
-        backfilled: false,
         raw: Value::Null,
     }
 }
@@ -970,7 +969,6 @@ mod tests {
                 }],
                 reply_to: None,
                 is_self: false,
-                backfilled: false,
                 raw: Value::Null,
             };
             messages.append(&message).unwrap();

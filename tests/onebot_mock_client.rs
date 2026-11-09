@@ -1,4 +1,4 @@
-//! 真实 OneBot 11 WebSocket 集成测试。
+//! OneBot 11 客户端对本地模拟服务端的集成测试（随 `cargo test` 运行，不需要 NapCat）。
 //!
 //! 不依赖 QQ 账号或 NapCat 安装：测试内启动一个本地 WebSocket 服务端，
 //! 使用 NapCatLink 的真实客户端完成连接、`get_login_info`、发送消息和接收事件。

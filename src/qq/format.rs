@@ -12,7 +12,7 @@
 use chrono::Local;
 use napcat_link::MessageSegment;
 
-use super::event::{ChatId, QqMessage, Segment};
+use super::event::QqMessage;
 
 /// 渲染单条入站消息。
 pub fn render_inbound(message: &QqMessage) -> String {
@@ -29,21 +29,9 @@ pub fn render_inbound(message: &QqMessage) -> String {
     if let Some(reply_to) = message.reply_to {
         header.push_str(&format!(" | reply_to: {reply_to}"));
     }
-    if message.backfilled {
-        header.push_str(" | backfill");
-    }
     header.push(']');
 
     format!("{header}\n{}", message.plain_text())
-}
-
-/// 渲染一批消息（同一回合内合并注入）。
-pub fn render_batch(messages: &[QqMessage]) -> String {
-    messages
-        .iter()
-        .map(render_inbound)
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// 内部注入标签；发送前必须从模型输出里剥离（设计 §7.1 / §13）。
@@ -105,50 +93,10 @@ pub fn to_segments(reply_to: Option<i64>, text: &str) -> Vec<MessageSegment> {
     segments
 }
 
-/// 把内部消息段转成 NapCat 段（发送文件、图片等 action 用）。
-pub fn segment_to_napcat(segment: &Segment) -> Option<MessageSegment> {
-    Some(match segment {
-        Segment::Text { text } => MessageSegment::Text { text: text.clone() },
-        Segment::At { qq } => MessageSegment::At {
-            qq: qq.clone(),
-            name: None,
-        },
-        Segment::Face { id } => MessageSegment::Face {
-            id: id.clone(),
-            result_id: None,
-            chain_count: None,
-        },
-        Segment::Image { url, file, path } => MessageSegment::Image {
-            file: if url.is_empty() {
-                file.clone()
-            } else {
-                url.clone()
-            },
-            summary: None,
-            sub_type: None,
-            url: None,
-            name: None,
-            path: if path.is_empty() {
-                None
-            } else {
-                Some(path.clone())
-            },
-            thumb: None,
-        },
-        // 其余段类型差异大，统一交给 `API` 工具按原始 JSON 透传。
-        _ => return None,
-    })
-}
-
-/// 会话类型用于统计与路径。
-pub fn scope_name(chat: ChatId) -> &'static str {
-    if chat.is_group() { "group" } else { "private" }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qq::event::Sender;
+    use crate::qq::event::{ChatId, Segment, Sender};
     use chrono::TimeZone;
 
     fn message() -> QqMessage {
@@ -170,7 +118,6 @@ mod tests {
             }],
             reply_to: Some(98765),
             is_self: false,
-            backfilled: false,
             raw: serde_json::Value::Null,
         }
     }
@@ -181,13 +128,6 @@ mod tests {
         assert!(rendered.starts_with("[group:123 | "));
         assert!(rendered.contains("| 10001 (nickname) | id: 55555 | reply_to: 98765]"));
         assert!(rendered.ends_with("\nhello"));
-    }
-
-    #[test]
-    fn backfill_is_marked() {
-        let mut message = message();
-        message.backfilled = true;
-        assert!(render_inbound(&message).contains("| backfill]"));
     }
 
     #[test]

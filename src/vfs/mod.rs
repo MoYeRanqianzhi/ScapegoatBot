@@ -13,7 +13,6 @@
 
 use serde::{Deserialize, Serialize};
 
-pub mod dynamic;
 pub mod filter;
 pub mod path;
 pub mod quota;

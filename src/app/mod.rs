@@ -454,10 +454,6 @@ impl Runtime {
                     self.ai_enabled.store(false, Ordering::Relaxed);
                     Response::ok(id, json!({ "ai_enabled": false }))
                 }
-                AiAction::Restart => {
-                    self.ai_enabled.store(true, Ordering::Relaxed);
-                    Response::ok(id, json!({ "ai_enabled": true, "restarted": true }))
-                }
             },
             RequestBody::Chat { message, scope } => {
                 if message.trim().is_empty() {

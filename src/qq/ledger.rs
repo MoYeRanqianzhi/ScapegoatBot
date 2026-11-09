@@ -279,7 +279,6 @@ mod tests {
             segments,
             reply_to: None,
             is_self: true,
-            backfilled: false,
             raw: Value::Null,
         }
     }

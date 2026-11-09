@@ -10,7 +10,7 @@
 | `sbot stop` | 停止守护进程 |
 | `sbot restart` | 停止后重新拉起 |
 | `sbot status` | 运行状态、模型、hold、ESTOP、用量 |
-| `sbot ai start\|stop\|restart` | 只控制 LLM 调用；消息接收与存储不中断 |
+| `sbot ai start\|stop` | 只控制 LLM 调用；消息接收与存储不中断 |
 | `sbot chat "<text>" [--scope group:<gid>\|private:<qq>]` | 通过控制通道给 agent 一句话；`--scope` 告诉它这句话针对哪个会话 |
 | `sbot pause` / `resume` | 写/删 `ESTOP`，暂停或恢复新回合 |
 | `sbot security status` | hold 状态与最近安全事件 |

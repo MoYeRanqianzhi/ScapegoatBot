@@ -90,7 +90,7 @@ mark_group_msg_as_read {"group_id":42}
 这验证了 WebSocket 连接、登录信息、入站事件归一化、准入过滤、按 chat 队列、
 真实模型回合、`API` 发送、发送账本与已读标记的完整链路。
 
-同时 `tests/live_napcat.rs` 以真实 WebSocket 服务端验证：
+同时 `tests/onebot_mock_client.rs` 以本地模拟的 WebSocket 服务端验证（随 `cargo test` 运行）：
 `get_login_info` → `send_group_msg`（参数与 message_id 校验）→ 收到群消息事件
 并通过 `normalize` 得到 `ChatId::Group(42)`、发送者 10001、文本 `hello`。
 

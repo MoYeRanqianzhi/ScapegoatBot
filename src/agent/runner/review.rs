@@ -71,9 +71,7 @@ impl Runner {
                     crate::security::review::Risk::High | crate::security::review::Risk::Critical
                 ) && (outcome.complied
                     || outcome.risk == crate::security::review::Risk::Critical);
-                self.deps
-                    .gate
-                    .record_event(!blocked, score, "review", &reason);
+                self.deps.gate.record_review(!blocked, score, &reason);
                 match outcome.risk {
                     crate::security::review::Risk::Low => debug!(%reason, "security review"),
                     crate::security::review::Risk::Medium => {

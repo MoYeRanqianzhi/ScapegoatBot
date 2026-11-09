@@ -118,7 +118,7 @@ impl Views {
                         out.push_str(&format!(
                             "- {} {:?} allowed={} score={:.2} {}\n",
                             event.created_at,
-                            event.checkpoint,
+                            event.source,
                             event.allowed,
                             event.score,
                             event.reason

@@ -307,8 +307,10 @@ async fn direct_websocket_handshake_is_accepted() {
     assert_eq!(value["data"]["user_id"], 10000);
 }
 
+/// approve 模式：待批动作经 OneBot 私聊通知 `master_qq`，通知里带确认码；确认码批准后
+/// 同样的调用放行。主人回复确认码的那一段在 `app::events` 的单元测试里。
 #[tokio::test]
-async fn approve_mode_nonce_round_trip_over_napcat() {
+async fn approve_mode_notifies_with_a_nonce_and_the_nonce_approves() {
     let records: Records = Arc::new(Mutex::new(Vec::new()));
     let url = spawn_mock_napcat(Arc::clone(&records), false).await;
     let client = connect(&url).await;

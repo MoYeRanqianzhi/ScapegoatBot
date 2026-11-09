@@ -159,15 +159,6 @@ impl QqClient {
         };
         Ok(())
     }
-
-    /// 群列表 / 好友列表，供动态视图使用。
-    pub async fn group_list(&self) -> Result<Value> {
-        self.call("get_group_list", Value::Null).await
-    }
-
-    pub async fn friend_list(&self) -> Result<Value> {
-        self.call("get_friend_list", Value::Null).await
-    }
 }
 
 /// 在途发送的守卫：正常返回时带响应结束；被丢弃时按“没有响应”结束。

@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use super::ExecutionMode;
 use crate::transcript::ToolResult;
-use crate::vfs::{FileContent, NodeKind, Vfs, VfsError, VfsPath};
+use crate::vfs::{NodeKind, Vfs, VfsPath};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -1086,15 +1086,6 @@ pub fn register(registry: &mut super::ToolRegistry) {
     registry.register(Arc::new(CpTool));
     registry.register(Arc::new(MkdirTool));
     registry.register(Arc::new(StatTool));
-}
-
-/// 供测试或其他模块使用：解析并读取一个静态文本。
-pub async fn read_static(ctx: &ToolContext, raw_path: &str) -> Result<String, VfsError> {
-    let path = VfsPath::parse(raw_path)?;
-    match ctx.vfs.read_lines(&path, None, None)? {
-        FileContent::Text { text, .. } => Ok(text),
-        FileContent::Metadata(meta) => Ok(format!("{} {}", meta.path, meta.kind.as_str())),
-    }
 }
 
 #[cfg(test)]

@@ -24,7 +24,7 @@ use crate::providers::{CompletionError, Provider, SystemBlock, complete_text, tr
 use crate::storage::Database;
 use crate::transcript::TurnEvidence;
 
-use super::events::{self, Checkpoint};
+use super::events::{self, EventSource};
 
 /// 待确认请求的存活时间。
 const APPROVAL_TTL: Duration = Duration::from_secs(60);
@@ -556,7 +556,7 @@ impl ActionGate {
         if let Some(db) = &self.db
             && let Err(error) = events::record(
                 db,
-                Checkpoint::Gate,
+                EventSource::Gate,
                 allowed,
                 0.0,
                 "gate",

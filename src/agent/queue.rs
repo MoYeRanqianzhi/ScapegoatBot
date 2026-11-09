@@ -405,7 +405,6 @@ mod tests {
             }],
             reply_to: None,
             is_self: false,
-            backfilled: false,
             raw: Value::Null,
         }
     }

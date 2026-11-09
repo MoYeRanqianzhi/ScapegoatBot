@@ -228,8 +228,8 @@ impl MessageStore {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO messages
-                (chat, message_id, sender, ts, day, file_path, line_no, reply_to, is_self, backfilled)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                (chat, message_id, sender, ts, day, file_path, line_no, reply_to, is_self)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(chat, message_id) DO NOTHING",
             params![
                 message.chat.to_string(),
@@ -240,8 +240,7 @@ impl MessageStore {
                 relative,
                 line_no,
                 message.reply_to,
-                message.is_self as i32,
-                message.backfilled as i32
+                message.is_self as i32
             ],
         )?;
         // 自身消息不进收件箱；其它消息默认未读。
@@ -628,7 +627,6 @@ mod tests {
             }],
             reply_to: None,
             is_self: false,
-            backfilled: false,
             raw: Value::Null,
         }
     }

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage::Database;
 
-/// 闸位置。
+/// 内容闸的位置：分类器只在这两处被询问。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Checkpoint {
@@ -21,16 +21,39 @@ pub enum Checkpoint {
     Input,
     /// 模型输出后、副作用前。
     Output,
-    /// 单次 `napcat.*` 调用的门禁（`[gate]`）。
-    Gate,
 }
 
-impl Checkpoint {
+/// 一条安全事件的来源：内容闸的两个位置，加上动作门禁与周期审查。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventSource {
+    /// 内容闸：模型输入前。
+    Input,
+    /// 内容闸：模型输出后、副作用前。
+    Output,
+    /// 单次 `napcat.*` 调用的门禁（`[gate]`）。
+    Gate,
+    /// 周期安全审查（`[security].check_every_tokens`）。
+    Review,
+}
+
+impl EventSource {
+    /// 写进 `security_events.checkpoint` 列的值。
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Input => "input",
             Self::Output => "output",
             Self::Gate => "gate",
+            Self::Review => "review",
+        }
+    }
+}
+
+impl From<Checkpoint> for EventSource {
+    fn from(checkpoint: Checkpoint) -> Self {
+        match checkpoint {
+            Checkpoint::Input => Self::Input,
+            Checkpoint::Output => Self::Output,
         }
     }
 }
@@ -39,7 +62,7 @@ impl Checkpoint {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SecurityEvent {
     pub id: i64,
-    pub checkpoint: Checkpoint,
+    pub source: EventSource,
     pub allowed: bool,
     pub score: f32,
     pub backend: String,
@@ -50,7 +73,7 @@ pub struct SecurityEvent {
 /// 追加一条事件，返回自增 id。
 pub fn record(
     db: &Arc<Database>,
-    checkpoint: Checkpoint,
+    source: EventSource,
     allowed: bool,
     score: f32,
     backend: &str,
@@ -62,7 +85,7 @@ pub fn record(
             (checkpoint, allowed, score, backend, reason, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
-            checkpoint.as_str(),
+            source.as_str(),
             allowed as i32,
             score,
             backend,
@@ -82,13 +105,15 @@ pub fn recent(db: &Arc<Database>, limit: u32) -> anyhow::Result<Vec<SecurityEven
     )?;
     let rows = statement
         .query_map(params![limit], |row| {
-            let checkpoint: String = row.get(1)?;
+            let source: String = row.get(1)?;
             Ok(SecurityEvent {
                 id: row.get(0)?,
-                checkpoint: match checkpoint.as_str() {
-                    "output" => Checkpoint::Output,
-                    "gate" => Checkpoint::Gate,
-                    _ => Checkpoint::Input,
+                // 0.2.0-alpha.42 之前周期审查记成了 `input`；那些旧行仍按 input 显示。
+                source: match source.as_str() {
+                    "output" => EventSource::Output,
+                    "gate" => EventSource::Gate,
+                    "review" => EventSource::Review,
+                    _ => EventSource::Input,
                 },
                 allowed: row.get::<_, i32>(2)? != 0,
                 score: row.get::<_, f64>(3)? as f32,
@@ -99,15 +124,4 @@ pub fn recent(db: &Arc<Database>, limit: u32) -> anyhow::Result<Vec<SecurityEven
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
-}
-
-/// 危险判定的条数（用于 `sbot security status` 与校准）。
-pub fn count_blocked(db: &Arc<Database>) -> anyhow::Result<u64> {
-    let conn = db.lock();
-    let count: u64 = conn.query_row(
-        "SELECT COUNT(*) FROM security_events WHERE allowed = 0",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(count)
 }

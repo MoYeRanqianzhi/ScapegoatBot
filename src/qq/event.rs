@@ -134,16 +134,6 @@ pub enum Segment {
     },
 }
 
-impl Segment {
-    /// 是否为纯文本（用于过滤与摘要）。
-    pub fn as_text(&self) -> Option<&str> {
-        match self {
-            Self::Text { text } => Some(text),
-            _ => None,
-        }
-    }
-}
-
 /// 一条归一化消息。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QqMessage {
@@ -158,8 +148,6 @@ pub struct QqMessage {
     /// 解析时凡是本账号的消息（`message_sent` 回声或 `self_id` 匹配）都先记为 `true`；
     /// 事件循环再用发送账本复核，不是本进程发出的改成手打（[`Self::mark_typed_by_hand`]）。
     pub is_self: bool,
-    /// 历史字段：断线补消息已删除，生产路径恒为 false；仅为旧记录兼容保留。
-    pub backfilled: bool,
     /// 原始事件，保留供审计。
     pub raw: Value,
 }
@@ -389,7 +377,6 @@ fn parse_message(data: &Value, sent_event: bool) -> Option<QqMessage> {
         segments,
         reply_to,
         is_self: from_self,
-        backfilled: false,
         raw: data.clone(),
     })
 }
@@ -519,7 +506,6 @@ impl QqNotice {
             segments: vec![Segment::Text { text }],
             reply_to: None,
             is_self: false,
-            backfilled: false,
             raw: self.raw.clone(),
         })
     }
@@ -564,7 +550,6 @@ impl QqRequest {
             }],
             reply_to: None,
             is_self: false,
-            backfilled: false,
             raw: self.raw.clone(),
         })
     }
@@ -597,7 +582,6 @@ pub fn unknown_to_inbox_message(name: &str, data: &Value) -> Option<QqMessage> {
         }],
         reply_to: None,
         is_self: false,
-        backfilled: false,
         raw: data.clone(),
     })
 }
