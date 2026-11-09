@@ -70,7 +70,6 @@ NapCat 没连上时守护进程照常启动，只是 QQ 动作会失败；日志
     messages/         加密的消息 JSONL
     sessions/         加密的 transcript 分段
     blobs/            加密的二进制分块
-  logs/
   run/                单实例锁与 PID
 ```
 

@@ -74,4 +74,4 @@ url = "ws://127.0.0.1:3001"
 2. 用 `sbot start` 启动守护进程，确认 `sbot status` 显示模型可用。
 3. 先在私聊或小号群里试，观察 `/inbox` 与日志。
 4. 配好 `[filter]` 与 `send_scopes`，再接到真实群。
-5. 定期 `sbot backup --output <目录>`；备份包含主密钥，按机密文件保管。
+5. 定期 `sbot backup --output <目录>`；备份包含主密钥与 `auth.json`，按机密文件保管。

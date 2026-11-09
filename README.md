@@ -115,7 +115,7 @@ url = "ws://127.0.0.1:3001"
 | `sbot gate pending\|approve\|reject` | `approve` 模式的待确认动作与裁决 |
 | `sbot model set <provider/id>` / `list` | 热切换主模型（下一回合生效）/ 列出白名单模型与是否已定义 |
 | `sbot effort set <level>` / `list` | 热切换 effort / 列出当前模型支持的级别 |
-| `sbot backup [--output DIR]` | SQLite 快照 + 文件归档；**包含主密钥** |
+| `sbot backup [--output DIR]` | SQLite 快照 + 文件归档；**包含主密钥与 `auth.json`（明文 API key）** |
 | `sbot doctor` | 只读诊断，不修复数据 |
 
 `--config <PATH>` 可指定另一份 `sbot.toml`；`backup` / `doctor` / `start` 直接读本地

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::agent::queue::{TurnHandler, TurnInput, TurnReport};
 use crate::agent::{
@@ -711,7 +711,8 @@ impl Runner {
             prompt_tokens,
         )
         .await?;
-        debug!(
+        // 每个回合一行 info：排障文档让用户找的就是这一行。
+        info!(
             chat = %chat,
             stop = ?outcome.stop_reason,
             turns = outcome.turns,

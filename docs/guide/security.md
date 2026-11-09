@@ -227,7 +227,8 @@ action 只接受注册表声明过的参数（`api.help` 可查），未声明�
 - 消息 JSONL、transcript、blob 内容用 XChaCha20-Poly1305；不同用途的密钥由
   HKDF 从主密钥派生。
 - 文件头记录算法；改 `[storage].encryption` 不会让旧历史失效。
-- `~/.sbot/key` 是唯一秘密，权限 0600；`sbot backup` **包含它**。
+- `~/.sbot/key`（主密钥，权限 0600）与 `auth.json`（明文 API key / token）是两份秘密；
+  `sbot backup` **两份都包含**，备份目录按机密文件保管（Unix 下权限 0700）。
 - 日志写出前遮蔽 `access_token=…` 与 `Bearer …`（NapCat 连接地址会带 token）；`auth.json`
   解析失败只报错误类别与行列，不引用原文。
 - 控制通道：Windows 命名管道带只允许当前用户的安全描述符；Unix 套接字放在只有当前用户

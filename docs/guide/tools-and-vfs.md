@@ -98,7 +98,7 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 | `Glob` | 按 glob 找文件 | `pattern`、`path` |
 | `RM` | 移入 `/trash`（或 `permanent: true` 彻底删；目录需 `recursive`） | `path`、`recursive`、`permanent` |
 | `MV` / `CP` | 移动 / 复制（复制受配额约束） | `from`、`to` |
-| `Mkdir` | 递归建目录 | `path` |
+| `Mkdir` | 建目录；父目录不存在时需要 `parents: true` | `path`、`parents` |
 | `Stat` | 类型、大小、版本、hash、子节点数 | `path` |
 
 其余工具：
@@ -106,7 +106,7 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 | 工具 | 说明 |
 |------|------|
 | `API` | 唯一的 QQ 动作入口；`api.list` / `api.help` 查表 |
-| `Memory` | `/USER.md`、`/memory/*`、`/MEMORY.md` 的唯一写入口 |
+| `Memory` | `/USER.md`、`/memory/*`、`/MEMORY.md` 的结构化写入（检查格式与预算、原子批量）；`Write` / `Edit` 也能直接改这些文件，但不做这些检查 |
 | `Skill` | 加载 `/skills/<name>/SKILL.md` 与资源清单 |
 | `Download` | HTTP(S) 下载到 VFS，带 SSRF/域名/大小限制；边收边加密暂存，不把整个文件留在内存里。文本类型（`text/*`、JSON、XML、JS）且不超过文本上限、是合法 UTF-8 时存成文本节点，否则存成二进制 |
 | `WebSearch` / `WebFetch` | 搜索 / 抓取；由服务端工具或你配置的后端执行 |
@@ -161,7 +161,7 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 {"action": "spawn", "task": "...", "agent": "explore"}
 {"action": "message", "id": "sa-1", "text": "..."}
 {"action": "check", "id": "sa-1"}
-{"action": "wait", "id": ["sa-1"], "timeout_secs": 60}
+{"action": "wait", "id": "sa-1", "timeout_secs": 60}
 {"action": "list"}
 ```
 

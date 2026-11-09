@@ -87,7 +87,7 @@ access token 在 `auth.json`，不在这里。
 | `ignore_groups` | `[]` | 群号列表；这些群的消息直接丢弃 |
 | `ignore_users` | `[]` | QQ 号列表 |
 | `ignore_patterns` | `[]` | 正则；命中即拒收 |
-| `require_mention` | false | 群里只有 @ 自己或回复自己时才接收 |
+| `require_mention` | false | 群里只接收 @ 了本账号（或 @全体成员）的消息；只回复本账号、没有 @ 的不算 |
 
 ### `[queue]`（普通消息只进 inbox；唤醒预设走队列）
 

@@ -70,11 +70,6 @@ impl SbotPaths {
         self.run_dir().join("instance.lock")
     }
 
-    /// 日志目录。
-    pub fn logs_dir(&self) -> PathBuf {
-        self.home.join("logs")
-    }
-
     /// ESTOP 哨兵：存在即暂停新回合（设计 §2.3）。
     pub fn estop_file(&self) -> PathBuf {
         self.home.join("ESTOP")
@@ -90,12 +85,7 @@ impl SbotPaths {
     /// 只创建目录，不创建文件：配置、密钥、数据库由各自模块负责，
     /// 避免“先创建空文件再判断是否首次初始化”这类歧义。
     pub fn ensure_layout(&self) -> Result<()> {
-        for dir in [
-            self.home.clone(),
-            self.data_dir(),
-            self.run_dir(),
-            self.logs_dir(),
-        ] {
+        for dir in [self.home.clone(), self.data_dir(), self.run_dir()] {
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("cannot create directory {}", dir.display()))?;
         }
