@@ -584,6 +584,26 @@ impl ActionGate {
         true
     }
 
+    /// 每 chat 每小时的发送上限；纯媒体（没有文本）的发送同样计数。
+    fn chat_budget(&self, chat: &str) -> Result<(), String> {
+        if self.chat_send_limit == 0 {
+            return Ok(());
+        }
+        let sends = self.sends.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let count = sends
+            .iter()
+            .filter(|record| record.chat == chat && now.duration_since(record.at) <= SEND_HISTORY)
+            .count();
+        if count >= self.chat_send_limit as usize {
+            return Err(format!(
+                "chat send limit of {} per hour reached for {chat}",
+                self.chat_send_limit
+            ));
+        }
+        Ok(())
+    }
+
     /// 发送规则：同 chat 重复、跨群同文、@全体。
     fn send_rule(&self, params: &Value, evidence: &TurnEvidence, chat: &str) -> Result<(), String> {
         if contains_at_all(params) && !evidence.owner_intent() {
@@ -598,22 +618,7 @@ impl ActionGate {
         let content_short = content.chars().count() < 12;
         let mut sends = self.sends.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
-        sends.retain(|record| now.duration_since(record.at) <= Duration::from_secs(3600));
-        if self.chat_send_limit > 0 {
-            let count = sends
-                .iter()
-                .filter(|record| {
-                    record.chat == chat
-                        && now.duration_since(record.at) <= Duration::from_secs(3600)
-                })
-                .count();
-            if count >= self.chat_send_limit as usize {
-                return Err(format!(
-                    "chat send limit of {} per hour reached for {chat}",
-                    self.chat_send_limit
-                ));
-            }
-        }
+        sends.retain(|record| now.duration_since(record.at) <= SEND_HISTORY);
         if !content_short
             && sends.iter().any(|record| {
                 record.chat == chat
@@ -713,11 +718,11 @@ impl ActionGate {
 
     /// 记录一次**成功**的发送；失败/超时不应触发重复与跨群规则，
     /// 否则一次临时错误会让重试被自己的记录挡住。
+    ///
+    /// 没有文本的发送（纯图片、文件）也记一条：它们计入每小时上限；重复与跨群规则只比较
+    /// 非空、足够长的文本，空内容不会误伤。
     pub(crate) fn note_send(&self, params: &Value, chat: &str) {
         let content = message_content(params);
-        if content.trim().is_empty() {
-            return;
-        }
         let mut sends = self.sends.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         sends.retain(|record| now.duration_since(record.at) <= SEND_HISTORY);
@@ -735,7 +740,19 @@ impl ActionGate {
         params: &Value,
         evidence: &TurnEvidence,
     ) -> ActionDecision {
-        if self.mode == GateMode::Trusted || spec.namespace() != "napcat" {
+        if spec.namespace() != "napcat" {
+            return ActionDecision::Allow;
+        }
+        // `[budget].chat_sends_per_hour` 是预算，不是审查：任何门禁模式下都生效
+        // （以前 `trusted` 与已批准的动作都会跳过它）。
+        if crate::actions::published_view(spec, params).is_some()
+            && let Some(chat) = crate::actions::chat_of(spec, params)
+            && let Err(reason) = self.chat_budget(&chat.to_string())
+        {
+            self.record_audit(spec.action, false, &reason);
+            return ActionDecision::Block(reason);
+        }
+        if self.mode == GateMode::Trusted {
             return ActionDecision::Allow;
         }
         if !self.rate_ok() {
@@ -1071,6 +1088,43 @@ mod tests {
         ));
         assert_eq!(reloaded.pending().len(), 1);
         assert_ne!(reloaded.pending()[0]["id"], id);
+    }
+
+    /// 预算在 `trusted` 下同样生效，纯图片发送也计数。
+    #[tokio::test]
+    async fn the_hourly_send_budget_applies_in_trusted_mode_and_counts_media() {
+        let gate = ActionGate::new(
+            &GateConfig {
+                mode: GateMode::Trusted,
+                max_per_minute: 60,
+                llm_review: false,
+            },
+            ApprovalQueue::new(),
+        )
+        .with_chat_send_limit(1);
+        let evidence = TurnEvidence::default();
+        let image = json!({
+            "group_id": 1,
+            "message": [{"type": "image", "data": {"file": "base64://AAAA"}}]
+        });
+        assert!(
+            gate.check(spec("napcat.send_group_msg"), &image, &evidence)
+                .await
+                .is_allowed()
+        );
+        gate.note_send(&image, "group:1");
+        let text = json!({"group_id": 1, "message": "a long enough message"});
+        assert!(matches!(
+            gate.check(spec("napcat.send_group_msg"), &text, &evidence).await,
+            ActionDecision::Block(reason) if reason.contains("send limit")
+        ));
+        // 其他 chat 不受影响。
+        let other = json!({"group_id": 2, "message": "a long enough message"});
+        assert!(
+            gate.check(spec("napcat.send_group_msg"), &other, &evidence)
+                .await
+                .is_allowed()
+        );
     }
 
     #[tokio::test]

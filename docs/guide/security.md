@@ -140,7 +140,7 @@ owner intent 由 runtime 核实，不接受模型自报或聊天里的“主人�
 
 | 模式 | 行为 |
 |------|------|
-| `trusted` | 直接放行，只统计速率 |
+| `trusted` | 直接放行：不做发送规则检查，不受 `max_per_minute` 限制；`[budget].chat_sends_per_hour` 仍然生效 |
 | `auto`（默认） | 速率限制 + 发送规则 + 可选 LLM 审查 |
 | `approve` | 变更类动作需要主人通过 IPC 确认 |
 
