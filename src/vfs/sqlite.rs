@@ -433,15 +433,9 @@ impl VfsStore {
     // 写入
     // ---------------------------------------------------------------------
 
-    /// 活跃用量。
+    /// 活跃用量：`(文件字节数, 节点数)`，不含回收站。
     fn active_usage(&self, conn: &Connection) -> Result<(u64, u64), VfsError> {
-        let (bytes, nodes): (u64, u64) = conn.query_row(
-            "SELECT COALESCE(SUM(CASE WHEN kind != 'dir' THEN size ELSE 0 END), 0), COUNT(*)
-             FROM vfs_nodes WHERE trashed_at IS NULL",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        Ok((bytes, nodes))
+        usage_where(conn, false)
     }
 
     /// 文本写入的核心逻辑，要求调用方已持有连接锁与事务。
@@ -821,37 +815,8 @@ impl Vfs for VfsStore {
         new_text: &str,
         replace_all: bool,
     ) -> Result<NodeMeta, VfsError> {
-        if old_text.is_empty() {
-            return Err(VfsError::EditNotFound);
-        }
-        let mut conn = self.db.lock();
-        let tx = conn.transaction()?;
-
-        let row = self
-            .lookup(&tx, path)?
-            .ok_or_else(|| VfsError::NotFound(path.to_string()))?;
-        if row.kind != NodeKind::Text {
-            return Err(VfsError::Storage(format!("{path} is not a text file")));
-        }
-        self.check_read_before_edit(&tx, &row)?;
-
-        let current = self.open_text(&row)?;
-        let count = current.matches(old_text).count();
-        if count == 0 {
-            return Err(VfsError::EditNotFound);
-        }
-        if count > 1 && !replace_all {
-            return Err(VfsError::EditNotUnique { count });
-        }
-        let updated = if replace_all {
-            current.replace(old_text, new_text)
-        } else {
-            current.replacen(old_text, new_text, 1)
-        };
-
-        let meta = self.write_text_tx(&tx, path, &updated, None)?;
-        tx.commit()?;
-        Ok(meta)
+        self.edit_text_count(path, old_text, new_text, replace_all)
+            .map(|(meta, _)| meta)
     }
 
     fn write_binary(
@@ -896,18 +861,8 @@ impl Vfs for VfsStore {
 
     fn usage(&self) -> Result<Usage, VfsError> {
         let conn = self.db.lock();
-        let (active_bytes, nodes): (u64, u64) = conn.query_row(
-            "SELECT COALESCE(SUM(CASE WHEN kind != 'dir' THEN size ELSE 0 END), 0), COUNT(*)
-             FROM vfs_nodes WHERE trashed_at IS NULL",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let (trash_bytes, trash_nodes): (u64, u64) = conn.query_row(
-            "SELECT COALESCE(SUM(CASE WHEN kind != 'dir' THEN size ELSE 0 END), 0), COUNT(*)
-             FROM vfs_nodes WHERE trashed_at IS NOT NULL",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        let (active_bytes, nodes) = usage_where(&conn, false)?;
+        let (trash_bytes, trash_nodes) = usage_where(&conn, true)?;
         Ok(Usage {
             active_bytes,
             trash_bytes,
@@ -919,6 +874,16 @@ impl Vfs for VfsStore {
     fn purge_trash(&self) -> Result<u64, VfsError> {
         self.purge_trash_entries()
     }
+}
+
+/// 活跃（`trashed = false`）或回收站里（`true`）的 `(文件字节数, 节点数)`；目录不计字节。
+fn usage_where(conn: &Connection, trashed: bool) -> Result<(u64, u64), VfsError> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(SUM(CASE WHEN kind != 'dir' THEN size ELSE 0 END), 0), COUNT(*)
+         FROM vfs_nodes WHERE (trashed_at IS NOT NULL) = ?1",
+        [trashed],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?)
 }
 
 /// 只读解密节点文本，供 `sbot doctor` 对账使用。

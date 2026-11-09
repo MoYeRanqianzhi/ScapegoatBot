@@ -425,12 +425,7 @@ impl super::VfsStore {
                 .collect::<Result<Vec<_>, _>>()?
         };
 
-        let (trash_bytes, trash_nodes): (u64, u64) = tx.query_row(
-            "SELECT COALESCE(SUM(CASE WHEN kind != 'dir' THEN size ELSE 0 END), 0), COUNT(*)
-             FROM vfs_nodes WHERE trashed_at IS NOT NULL",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+        let (trash_bytes, trash_nodes) = super::usage_where(tx, true)?;
 
         // 0 表示对应的上限不启用。
         let byte_cap = self.quota.max_total_bytes() / 10;
