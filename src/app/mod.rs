@@ -398,6 +398,46 @@ impl Runtime {
         }))
     }
 
+    /// `sbot model list`：白名单里的每个模型，是否在 models.json 里定义，以及关键能力。
+    fn model_list(&self) -> serde_json::Value {
+        let loaded = self.config();
+        let config = &loaded.config;
+        let models: Vec<serde_json::Value> = config
+            .agent
+            .available_models
+            .iter()
+            .map(|name| match self.models.find(name) {
+                Some(reference) => json!({
+                    "model": name,
+                    "defined": true,
+                    "context_window": reference.model.context_window,
+                    "images": reference.model.input.iter().any(|kind| kind == "image"),
+                    "thinking_levels": reference.model.thinking_levels,
+                }),
+                // 白名单里有、清单里没有：切换会失败，列出来让用户看到。
+                None => json!({"model": name, "defined": false}),
+            })
+            .collect();
+        json!({"current": config.agent.model, "available": models})
+    }
+
+    /// `sbot effort list`：当前模型支持的 effort 级别与当前值。
+    fn effort_list(&self) -> Result<serde_json::Value> {
+        let loaded = self.config();
+        let config = &loaded.config;
+        let model_name = &config.agent.model;
+        let Some(reference) = self.models.find(model_name) else {
+            anyhow::bail!("current model {model_name:?} is not defined in models.json");
+        };
+        Ok(json!({
+            "model": model_name,
+            "current": config.agent.thinking_level,
+            "reasoning": reference.model.reasoning,
+            // 空表示该模型不区分级别，任何值都会被接受（不推理的模型不发送 effort）。
+            "levels": reference.model.thinking_levels,
+        }))
+    }
+
     fn set_effort(&self, level: &str) -> Result<serde_json::Value> {
         let mut loaded = self.config.write().expect("config lock poisoned");
         let config = &mut loaded.config;
@@ -437,6 +477,11 @@ impl Runtime {
         let id = request.id.clone();
         match request.body {
             RequestBody::Status => Response::ok(id, self.status_payload()),
+            RequestBody::ModelList => Response::ok(id, self.model_list()),
+            RequestBody::EffortList => match self.effort_list() {
+                Ok(payload) => Response::ok(id, payload),
+                Err(error) => Response::error(id, "invalid_model", error.to_string()),
+            },
             RequestBody::Shutdown => {
                 let shutdown = self.shutdown.clone();
                 tokio::spawn(async move {

@@ -55,7 +55,7 @@ pub enum RequestBody {
     Status,
     /// 优雅退出守护进程。
     Shutdown,
-    /// 暂停 / 恢复 / 重启 LLM 调用（消息接收与存储继续）。
+    /// 暂停 / 恢复 LLM 调用（消息接收与存储继续）。
     Ai { action: AiAction },
     /// 从 CLI 注入一句话给 agent。
     Chat {
@@ -63,6 +63,10 @@ pub enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope: Option<String>,
     },
+    /// 列出白名单里的模型与当前模型。
+    ModelList,
+    /// 列出当前模型支持的 effort 与当前值。
+    EffortList,
     /// 热切换主模型。
     SetModel { model: String },
     /// 热切换 effort。

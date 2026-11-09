@@ -2,6 +2,7 @@
 name = "scapegoat-bot"
 version = "0.2.0-alpha.41"
 edition = "2024"
+rust-version = "1.89"
 description = "ScapegoatBot - 一个 QQ Agent，代替用户像真人一样回复消息"
 license = "MIT"
 repository = "https://github.com/MoYeRanqianzhi/ScapegoatBot"

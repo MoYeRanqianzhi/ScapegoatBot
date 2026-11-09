@@ -37,7 +37,7 @@ QQ 消息，用可配置的 LLM 生成回复，并把所有状态集中在本机
 
 ## 快速开始
 
-前置：Rust 1.85+（edition 2024）、NapCatQQ（OneBot 11 WebSocket）、一个兼容的 LLM API。
+前置：Rust 1.89+（edition 2024；`Cargo.toml` 的 `rust-version`）、NapCatQQ（OneBot 11 WebSocket）、一个兼容的 LLM API。
 
 ```bash
 cargo build --release
@@ -113,8 +113,8 @@ url = "ws://127.0.0.1:3001"
 | `sbot pause` / `resume` | 写 / 删除 `ESTOP`，暂停新回合 |
 | `sbot security status\|resume` | 查看 hold 与最近安全事件 / 重新过闸 |
 | `sbot gate pending\|approve\|reject` | `approve` 模式的待确认动作与裁决 |
-| `sbot model set <provider/id>` / `list` | 热切换主模型（下一回合生效） |
-| `sbot effort set <level>` / `list` | 热切换 effort |
+| `sbot model set <provider/id>` / `list` | 热切换主模型（下一回合生效）/ 列出白名单模型与是否已定义 |
+| `sbot effort set <level>` / `list` | 热切换 effort / 列出当前模型支持的级别 |
 | `sbot backup [--output DIR]` | SQLite 快照 + 文件归档；**包含主密钥** |
 | `sbot doctor` | 只读诊断，不修复数据 |
 
@@ -129,8 +129,8 @@ url = "ws://127.0.0.1:3001"
   或显式 `backend = "off"`。
 - **动作门禁**：`trusted` / `auto` / `approve`；`auto` 拦截速率超限、同 chat 重复、
   跨群同文与无 owner intent 的 @全体；`approve` 通过 `sbot gate` 一次性批准。
-- **恢复**：`agent.resume` / `sbot security resume` 用真实被判内容重新过闸，通过才解除；
-  没有超时与自动恢复。
+- **恢复**：`agent.resume` / `sbot security resume` 复核当前上下文，干净才解除；被判的
+  原文可以先 `agent.quarantine` 隔离。没有超时与自动恢复。
 - **主人保护**：针对 `owner_qq` / `master_qq` 的踢人、禁言等 destructive action
   无条件拒绝（目标 QQ 接受数字或字符串）。
 - **refusal 不重试**：provider 返回 `stop_reason = refusal` 时进入 hold，不换模型、不重发。
@@ -183,17 +183,26 @@ SBOT_LIVE_BASE_URL=... SBOT_LIVE_API_KEY=... SBOT_LIVE_MODEL=... \
 ```text
 src/
   main.rs          薄入口
-  app.rs           守护进程装配、IPC、QQ 管线、工具装配
+  app/             守护进程装配（assembly）、IPC 处理、QQ 管线（events）、后台维护
   agent/           循环、消息/事件、回合队列、runner
-  providers/       Anthropic / Chat / Responses、SSE、fallback
+  providers/       Anthropic / Chat / Responses、SSE、fallback、计量
+  llm/             与协议无关的用量与停止原因
   security/        内容闸、Jev/llm 分类器、周期检查、动作门禁、hold、审计
-  qq/              事件归一化、格式、过滤、重连
+  qq/              事件归一化、格式、过滤、发送账本、重连
   session/         分段、turn buffer、压缩
-  vfs/             路径、SQLite 后端、配额、动态视图契约
-  tools/           Tool trait、actions 注册表、文件/API/记忆/技能/下载/Web/Monitor
+  vfs/             路径、查询串与 filter、SQLite 后端、配额
+  tools/           Tool trait、文件/API/记忆/技能/下载/Web/Monitor/Agent
   tools/views/     动态视图：messages/inbox/sessions/contacts/config/system
+  actions.rs       API action 注册表
   storage/         迁移、加密、消息归档
-  monitor/         事件源、cron、投递
+  monitor/         when 谓词、配置 → 规格、投递、timer/stream/internal 源
+  swarm/           子代理（内置类型与 /agents 自定义定义）
+  prompt/          系统提示与上下文注入
+  memory/          记忆复盘
+  hooks.rs         [[hooks.events]] 求值
+  budget.rs        每日 / 每回合预算
+  mcp/             MCP stdio 客户端
+  media.rs         图片解码上限与缩图
   ipc/             命名管道 / UDS
   cli/             命令、备份、诊断
   config/          根结构 + sections/ 分节 schema

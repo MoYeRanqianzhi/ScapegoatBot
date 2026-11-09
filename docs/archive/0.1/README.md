@@ -4,8 +4,12 @@
 
 - `llm.example.toml`：0.1 的模型与提供方配置（`[[models]]` + 内联 key）。
   0.2 改用 `models.json` + `auth.json`。
-- `prompt.md`：0.1 的系统提示词。0.2 使用
-  `assets/system_prompt_v4.template.txt`。
+- `prompt.md`：0.1 的系统提示词。0.2 使用 `assets/system_prompt_v5.txt`。
+- `workspace/`：0.1 的工作区模板（`SOUL.md`、`AGENTS.md` 等）。0.2 不读取宿主机上的
+  这些文件：人设与规则写在 VFS 里（`/AGENTS.md`、`/USER.md`、`/MEMORY.md`，其余文件由
+  agent 列在 `/hooks/context.toml`），见 [人设、记忆与技能](../../guide/persona-memory.md)。
+  格式也不兼容：0.2 的 `/MEMORY.md` 是一行一条的索引，条目在 `/memory/` 下（由 `Memory`
+  工具维护），不是这里按章节手写的样子；不要直接拷进 VFS。
 
 现行配置样例在仓库根目录的 `config.example.toml`；使用说明见
 [../../guide/](../../guide/README.md)。

@@ -11,11 +11,9 @@ config.toml
 .env.*
 
 # ---- 运行时用户数据（聊天记录、AI 记忆等）----
-# workspace/ 下的模板文件（*.md）由项目提供，作为初始工作区结构
-# 但运行时产生的子目录必须排除
-workspace/messages/
-workspace/temp/
-workspace/logs/
+# 0.1 的工作区目录：模板已移到 docs/archive/0.1/workspace/，0.2 不再使用这里；
+# 旧 checkout 里遗留的运行数据仍然不能提交。
+workspace/
 
 # ---- 密钥和证书 ----
 *.pem

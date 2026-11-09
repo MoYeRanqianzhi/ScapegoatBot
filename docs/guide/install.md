@@ -4,7 +4,7 @@
 
 | 依赖 | 要求 | 说明 |
 |------|------|------|
-| Rust | 1.85+（edition 2024） | 用 `rustup` 安装 stable 即可 |
+| Rust | 1.89+（edition 2024） | 用 `rustup` 安装 stable 即可；最低版本见 `Cargo.toml` 的 `rust-version` |
 | NapCatQQ | 支持 OneBot 11 的版本 | 提供 WebSocket 接口 |
 | LLM API | Anthropic Messages / OpenAI Chat Completions / OpenAI Responses 兼容 | 见 `models.json` |
 

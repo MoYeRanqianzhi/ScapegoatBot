@@ -17,8 +17,8 @@
 | `sbot security resume` | 用当前上下文重新过闸，尝试解除 hold |
 | `sbot gate pending` | 列出 `approve` 模式待确认的动作 |
 | `sbot gate approve <id>` / `reject <id>` | 批准（120 秒内可重试一次）/ 拒绝 |
-| `sbot model set <provider/id>` / `list` | 热切换主模型，下一回合生效 |
-| `sbot effort set <level>` / `list` | 热切换 effort |
+| `sbot model set <provider/id>` / `list` | 热切换主模型，下一回合生效 / 列出白名单模型（`defined: false` 表示 models.json 里没有，切换会失败） |
+| `sbot effort set <level>` / `list` | 热切换 effort / 列出当前模型支持的级别与当前值 |
 | `sbot backup [--output DIR]` | 在线一致性备份（含主密钥） |
 | `sbot doctor` | 只读诊断，不修复数据 |
 

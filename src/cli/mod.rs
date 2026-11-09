@@ -228,9 +228,9 @@ async fn run_remote(command: Command, paths: &SbotPaths, config: Option<PathBuf>
                 request_with_retry(&endpoint, request.with_idempotency(key)).await
             }
             ModelAction::List => {
-                // 列表不经过 IPC：模型清单是静态配置，读文件即可。
-                let status = request_payload(&endpoint, Request::new(RequestBody::Status)).await?;
-                print_value(&status)?;
+                // 经守护进程查询：它持有合并后的模型清单与热切换后的当前模型。
+                let list = request_payload(&endpoint, Request::new(RequestBody::ModelList)).await?;
+                print_value(&list)?;
                 Ok(())
             }
         },
@@ -242,8 +242,9 @@ async fn run_remote(command: Command, paths: &SbotPaths, config: Option<PathBuf>
                 request_with_retry(&endpoint, request.with_idempotency(key)).await
             }
             EffortAction::List => {
-                let status = request_payload(&endpoint, Request::new(RequestBody::Status)).await?;
-                print_value(&status)?;
+                let list =
+                    request_payload(&endpoint, Request::new(RequestBody::EffortList)).await?;
+                print_value(&list)?;
                 Ok(())
             }
         },
