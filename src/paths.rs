@@ -80,6 +80,11 @@ impl SbotPaths {
         self.home.join("SECURITY_HOLD")
     }
 
+    /// `sbot backup` 不带 `--output` 时的归档目录（归档含主密钥，`sbot doctor` 检查其权限）。
+    pub fn backups_dir(&self) -> PathBuf {
+        self.home.join("backups")
+    }
+
     /// 创建布局所需的目录。
     ///
     /// 只创建目录，不创建文件：配置、密钥、数据库由各自模块负责，

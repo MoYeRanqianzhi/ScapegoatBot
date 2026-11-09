@@ -634,7 +634,7 @@ mod tests {
             path,
             dir: dir.path().to_path_buf(),
         }));
-        let models = ModelsFile::parse(include_str!("../../assets/models.default.json")).unwrap();
+        let models = ModelsFile::embedded().unwrap();
         let views = Views::new(vfs, messages, sessions, None).with_context(ViewContext {
             config: Some(handle),
             models: Some(models),

@@ -15,11 +15,9 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::config::models::ModelsFile;
-use crate::config::{AuthFile, SbotConfig};
+use crate::config::{AuthFile, LoadedConfig, SbotConfig};
 use crate::paths::SbotPaths;
 use crate::storage::crypto::MasterKey;
-
-const EMBEDDED_MODELS: &str = include_str!("../../assets/models.default.json");
 
 /// 诊断报告。
 #[derive(Default)]
@@ -53,7 +51,7 @@ pub fn run(config_path: Option<PathBuf>) -> Result<()> {
     }
 }
 
-/// 收集全部检查结果；不打印、不退出，便于测试。
+/// 收集全部检查结果；不打印、不退出，便于测试。配置读不出来时其余检查都没有意义，直接返回。
 fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
     let config_path = config_path.unwrap_or_else(|| paths.config_file());
     let mut report = Report::default();
@@ -72,31 +70,30 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
             return report;
         }
     };
+    check_models(paths, &loaded, &mut report);
+    check_auth(paths, &loaded, &mut report);
+    let key = check_key(paths, &mut report);
+    check_database(paths, &loaded, key.as_ref(), &mut report);
+    check_backups(paths, &mut report);
+    check_settings(paths, &loaded, &mut report);
+    report
+}
 
-    // models.json：内置 + 用户覆盖。
-    let models = match ModelsFile::parse(EMBEDDED_MODELS) {
-        Ok(mut models) => {
-            let user_path = paths.resolve(&loaded.config.models_file, &loaded.dir);
-            if user_path.exists() {
-                match ModelsFile::load(&user_path) {
-                    Ok(overlay) => {
-                        models.merge(overlay);
-                        report.ok(format!(
-                            "models: {} (+ {})",
-                            "embedded",
-                            user_path.display()
-                        ));
-                    }
-                    Err(error) => report.error(format!("models: {error}")),
-                }
-            } else {
-                report.ok("models: embedded defaults only");
-            }
+/// models.json：内置 + 用户覆盖，与守护进程同一条加载规则，再按配置引用校验。
+fn check_models(paths: &SbotPaths, loaded: &LoadedConfig, report: &mut Report) {
+    let user_path = paths.resolve(&loaded.config.models_file, &loaded.dir);
+    let models = match ModelsFile::with_overlay(&user_path) {
+        Ok((models, true)) => {
+            report.ok(format!("models: embedded (+ {})", user_path.display()));
+            models
+        }
+        Ok((models, false)) => {
+            report.ok("models: embedded defaults only");
             models
         }
         Err(error) => {
-            report.error(format!("embedded models are invalid: {error}"));
-            ModelsFile::default()
+            report.error(format!("models: {error}"));
+            return;
         }
     };
     if let Err(errors) = models.validate() {
@@ -109,8 +106,10 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
             report.error(format!("config: {error}"));
         }
     }
+}
 
-    // auth.json：只检查引用到的 provider。
+/// auth.json：只检查引用到的 provider，以及内容闸分类器的凭据。
+fn check_auth(paths: &SbotPaths, loaded: &LoadedConfig, report: &mut Report) {
     let auth_path = paths.resolve(&loaded.config.auth_file, &loaded.dir);
     match AuthFile::load_optional(&auth_path) {
         Ok(auth) => {
@@ -159,8 +158,10 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
         }
         Err(error) => report.error(format!("auth: {error}")),
     }
+}
 
-    // key 与数据库。
+/// 主密钥是否存在、可读，Unix 下权限是否 0600。
+fn check_key(paths: &SbotPaths, report: &mut Report) -> Option<MasterKey> {
     let key_path = paths.key_file();
     let key = match MasterKey::load_existing(&key_path) {
         Ok(key) => {
@@ -187,7 +188,16 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
             Err(error) => report.error(format!("key metadata: {error}")),
         }
     }
+    key
+}
 
+/// 数据库：canary 与主密钥是否匹配、schema 版本，以及索引 / blob / 记忆的一致性。
+fn check_database(
+    paths: &SbotPaths,
+    loaded: &LoadedConfig,
+    key: Option<&MasterKey>,
+    report: &mut Report,
+) {
     let data_dir = paths.resolve(&loaded.config.storage.path, &loaded.dir);
     let db_path = data_dir.join("data.db");
     if !db_path.exists() {
@@ -196,7 +206,7 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
         match open_readonly(&db_path) {
             Ok(conn) => {
                 // canary 需要密钥；没有密钥时仍继续检查其余结构。
-                match &key {
+                match key {
                     None => report.warn("database: cannot verify the canary without a key"),
                     Some(key) => {
                         let canary: Option<Vec<u8>> = conn
@@ -225,26 +235,28 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
                     )
                     .unwrap_or(0);
                 report.ok(format!("database: schema v{version}"));
-                check_indexes(&conn, &data_dir, &mut report);
-                check_blobs(&conn, &data_dir, &mut report);
-                if let Some(key) = &key {
-                    check_memory(&conn, key, &mut report);
+                check_indexes(&conn, &data_dir, report);
+                check_blobs(&conn, &data_dir, report);
+                if let Some(key) = key {
+                    check_memory(&conn, key, report);
                 }
             }
             Err(error) => report.error(format!("database: {error}")),
         }
     }
+}
 
-    // 备份目录权限：默认位于 `~/.sbot/backups`，归档含主密钥。
+/// 默认备份目录的权限：归档含主密钥与 auth.json，只能本人可读。
+fn check_backups(paths: &SbotPaths, report: &mut Report) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let backups = paths.home().join("backups");
+        let backups = paths.backups_dir();
         if let Ok(metadata) = std::fs::metadata(&backups) {
             let mode = metadata.permissions().mode() & 0o777;
             if mode & 0o077 != 0 {
                 report.warn(format!(
-                    "backups: {} has permissions {mode:o}; archives contain the master key and should be 0700",
+                    "backups: {} has permissions {mode:o}; archives contain the master key and auth.json and should be 0700",
                     backups.display()
                 ));
             } else {
@@ -252,7 +264,13 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
             }
         }
     }
+    // Windows 没有可检查的权限位。
+    #[cfg(not(unix))]
+    let _ = (paths, report);
+}
 
+/// 账号设置、根目录之外的路径与不安全的开关。
+fn check_settings(paths: &SbotPaths, loaded: &LoadedConfig, report: &mut Report) {
     // 主账号：`agent.owner_qq` 为 0 时，stand_in 依赖登录账号、companion 无法识别主人。
     if loaded.config.agent.mode == crate::config::AgentMode::Companion
         && loaded.config.agent.owner_qq == 0
@@ -294,8 +312,6 @@ fn collect(paths: &SbotPaths, config_path: Option<PathBuf>) -> Report {
     if !loaded.config.security.guard.enabled {
         report.warn("security.guard.enabled = false: no input/output classifier");
     }
-
-    report
 }
 
 fn open_readonly(path: &std::path::Path) -> Result<Connection> {

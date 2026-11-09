@@ -13,8 +13,7 @@ fn config_example_is_valid() {
         .validate_shape()
         .unwrap_or_else(|errors| panic!("config.example.toml failed validation:\n{errors}"));
 
-    let models =
-        ModelsFile::parse(include_str!("../assets/models.default.json")).expect("default models");
+    let models = ModelsFile::embedded().expect("default models");
     loaded
         .config
         .validate_with_models(&models)
@@ -34,8 +33,7 @@ fn default_config_passes_shape_validation() {
 fn readme_minimal_configs_are_valid() {
     // README 与入门指南里“最小配置”的 toml 代码块必须真的能启动：直接从文档里抽出来测，
     // 不再维护一份内联副本（副本会和文档各自漂移）。
-    let models =
-        ModelsFile::parse(include_str!("../assets/models.default.json")).expect("default models");
+    let models = ModelsFile::embedded().expect("default models");
     for doc in ["README.md", "docs/guide/README.md"] {
         let text = std::fs::read_to_string(doc).unwrap();
         let blocks = toml_blocks(&text);

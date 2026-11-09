@@ -44,8 +44,7 @@ fn run_with_paths(
 
     let output = output.unwrap_or_else(|| {
         paths
-            .home()
-            .join("backups")
+            .backups_dir()
             .join(chrono::Local::now().format("%Y%m%dT%H%M%S").to_string())
     });
     // 归档目录不能落在被复制的目录里，否则复制会递归包含正在写入的归档。

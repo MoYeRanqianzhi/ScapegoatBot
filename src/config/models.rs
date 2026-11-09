@@ -12,6 +12,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+/// 内置模型清单：随二进制发布，用户 `models.json` 覆盖 / 追加（设计 §9.3）。
+const EMBEDDED: &str = include_str!("../../assets/models.default.json");
+
 /// `models.json` 根结构。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -144,6 +147,24 @@ pub struct ModelRef<'a> {
 }
 
 impl ModelsFile {
+    /// 内置清单。解析失败是构建产物的错误（测试 `embedded_models_are_valid` 守着），不是
+    /// 用户能修的问题，所以直接报出去。
+    pub fn embedded() -> Result<Self, serde_json::Error> {
+        Self::parse(EMBEDDED)
+    }
+
+    /// 守护进程与 `sbot doctor` 共用的加载规则：内置清单打底，`user_path` 存在时按
+    /// provider + id 覆盖 / 追加。返回合并结果，以及用户文件是否参与了合并。不做 [`Self::validate`]。
+    pub fn with_overlay(user_path: &Path) -> anyhow::Result<(Self, bool)> {
+        let mut models = Self::embedded()
+            .map_err(|error| anyhow::anyhow!("embedded models.default.json is invalid: {error}"))?;
+        if !user_path.exists() {
+            return Ok((models, false));
+        }
+        models.merge(Self::load(user_path)?);
+        Ok((models, true))
+    }
+
     /// 从磁盘读取并解析。
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let path = path.as_ref();
@@ -244,6 +265,12 @@ impl ModelsFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_models_are_valid() {
+        let models = ModelsFile::embedded().expect("embedded models parse");
+        models.validate().expect("embedded models validate");
+    }
 
     fn sample() -> ModelsFile {
         ModelsFile::parse(

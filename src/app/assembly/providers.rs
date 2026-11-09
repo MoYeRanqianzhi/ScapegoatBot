@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tracing::warn;
 
 use crate::config::{AuthFile, LoadedConfig, ModelsFile, SbotConfig};
@@ -12,9 +12,6 @@ use crate::providers::metered::UsageSink;
 use crate::providers::{Provider, ThinkingOptions, build_metered};
 use crate::security::gate::Gate;
 use crate::storage::Database;
-
-/// 内置模型清单：随二进制发布，用户 `models.json` 覆盖/追加（设计 §9.3）。
-const EMBEDDED_MODELS: &str = include_str!("../../../assets/models.default.json");
 
 /// 主模型、回退链与 thinking 选项；所有 provider 都经同一个预算计量。
 pub(super) struct Providers {
@@ -228,12 +225,8 @@ fn thinking_effort(configured: &str, model: &crate::config::models::ModelDef) ->
 
 /// 读取模型清单：内置清单打底，用户 `models.json` 按 provider + id 覆盖 / 追加，再整体校验。
 pub(in crate::app) fn load_models(paths: &SbotPaths, loaded: &LoadedConfig) -> Result<ModelsFile> {
-    let mut models =
-        ModelsFile::parse(EMBEDDED_MODELS).context("embedded models.default.json is invalid")?;
-    let user_path = paths.resolve(&loaded.config.models_file, &loaded.dir);
-    if user_path.exists() {
-        models.merge(ModelsFile::load(&user_path)?);
-    }
+    let (models, _) =
+        ModelsFile::with_overlay(&paths.resolve(&loaded.config.models_file, &loaded.dir))?;
     if let Err(errors) = models.validate() {
         anyhow::bail!(
             "models.json validation failed:\n  - {}",
