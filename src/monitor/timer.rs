@@ -1,7 +1,7 @@
 //! 定时源：`every` / `at` / `cron` 的解析、下一次触发时间与重启补投。
 //!
-//! - 三种写法与抖动只在 [`Timer::parse`] 解析一次：配置校验、配置加载、`Monitor` 工具与
-//!   `Agent` 工具的 monitor 绑定都调用它，写错在添加时就报错，不会到运行时才静默停摆。
+//! - 三种写法与抖动只在 [`Timer::parse`] 解析一次：配置校验与 [`Timer::from_source`]（配置
+//!   加载、`Monitor add` 共用）都调用它，写错在添加时就报错，不会到运行时才静默停摆。
 //! - 时间按本地时区的“墙上时间”计算。夏令时跳过的时刻顺延到之后第一个有效分钟，
 //!   回拨造成的重复时刻只取较早的一次（[`resolve_local`]）。
 //! - cron 是标准 5 字段语义：日与周两个字段**都**受限时取“或”，任一以 `*` 开头时只看
@@ -47,7 +47,7 @@ impl Timer {
     /// 解析 `cron` / `every` / `at` 三选一与可选的 `jitter_secs`。
     ///
     /// 抖动最多 [`MAX_JITTER_SECS`] 秒；`every` 的抖动必须短于周期，否则两次触发会颠倒。
-    pub fn parse(
+    fn parse(
         cron: Option<&str>,
         every: Option<&str>,
         at: Option<&str>,
@@ -71,34 +71,15 @@ impl Timer {
         })
     }
 
-    /// 从工具参数 `{"cron"|"every"|"at": "...", "jitter_secs"?: n}` 解析。
-    ///
-    /// 字段类型不对、或出现这几个以外的键都报错：拼错的键不能被悄悄忽略。
-    pub fn from_json(value: &serde_json::Value) -> Result<Self, String> {
-        let object = value
-            .as_object()
-            .ok_or_else(|| "timer must be an object".to_owned())?;
-        if let Some(unknown) = object
-            .keys()
-            .find(|key| !matches!(key.as_str(), "cron" | "every" | "at" | "jitter_secs"))
-        {
-            return Err(format!(
-                "unknown timer field {unknown:?}; use cron, every or at, and optionally jitter_secs"
-            ));
-        }
-        let field = |key: &str| match object.get(key) {
-            None => Ok(None),
-            Some(serde_json::Value::String(text)) => Ok(Some(text.as_str())),
-            Some(_) => Err(format!("timer.{key} must be a string")),
-        };
-        let jitter =
-            match object.get("jitter_secs") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(value) => Some(value.as_u64().ok_or_else(|| {
-                    "timer.jitter_secs must be a non-negative integer".to_owned()
-                })?),
-            };
-        Self::parse(field("cron")?, field("every")?, field("at")?, jitter)
+    /// 从 `[[monitor]].source.timer`（配置文件或 `Monitor add` 经 serde 解析后的同一个结构）
+    /// 构造定时器；未知键、类型错误已经在反序列化时报错。
+    pub fn from_source(source: &crate::config::TimerSource) -> Result<Self, String> {
+        Self::parse(
+            source.cron.as_deref(),
+            source.every.as_deref(),
+            source.at.as_deref(),
+            source.jitter_secs,
+        )
     }
 
     /// 这一次触发的随机推迟；随机源失败时准点触发。
@@ -559,23 +540,31 @@ mod tests {
         assert!(TimerSpec::parse(None, None, None).is_err());
     }
 
+    /// 与 `Monitor add` 同一条路径：JSON → `TimerSource`（serde，拒绝未知键）→ `from_source`。
+    fn from_json(value: serde_json::Value) -> Result<Timer, String> {
+        let source: crate::config::TimerSource =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        Timer::from_source(&source)
+    }
+
     #[test]
     fn jitter_is_bounded_and_unknown_fields_are_rejected() {
-        let ok = Timer::from_json(&serde_json::json!({"every": "10m", "jitter_secs": 60})).unwrap();
+        let ok = from_json(serde_json::json!({"every": "10m", "jitter_secs": 60})).unwrap();
         assert_eq!(ok.jitter, Duration::from_secs(60));
         for _ in 0..50 {
             assert!(ok.draw_delay() <= Duration::from_secs(60));
         }
-        let exact = Timer::from_json(&serde_json::json!({"at": "09:00"})).unwrap();
+        let exact = from_json(serde_json::json!({"at": "09:00"})).unwrap();
         assert_eq!(exact.draw_delay(), Duration::ZERO);
         for bad in [
             serde_json::json!({"every": "2m", "jitter_secs": 120}),
             serde_json::json!({"cron": "0 9 * * *", "jitter_secs": 3601}),
             serde_json::json!({"every": "10m", "jitter_secs": -1}),
             serde_json::json!({"every": "10m", "jitter": 5}),
+            serde_json::json!({"every": 600}),
             serde_json::json!("10m"),
         ] {
-            assert!(Timer::from_json(&bad).is_err(), "{bad}");
+            assert!(from_json(bad.clone()).is_err(), "{bad}");
         }
     }
 

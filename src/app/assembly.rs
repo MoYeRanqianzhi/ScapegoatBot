@@ -15,7 +15,7 @@ use crate::agent::queue::ChatQueue;
 use crate::agent::runner::{Runner, RunnerConfig, RuntimeOps};
 use crate::config::{AgentMode, AuthFile, EncryptionMode, LoadedConfig, ModelsFile, SbotConfig};
 use crate::mcp::{McpManager, McpTool};
-use crate::monitor::{MonitorManager, MonitorSink, MonitorSpec};
+use crate::monitor::{MonitorManager, MonitorOrigin, MonitorSink, MonitorSpec};
 use crate::paths::SbotPaths;
 use crate::providers::metered::UsageSink;
 use crate::providers::{Provider, ServerToolKind, ThinkingOptions, build_metered};
@@ -215,9 +215,7 @@ async fn assemble_tools(
     // Agent 工具先注册；hub 需要 runner，稍后注入。
     let hub_handle = Arc::new(HubHandle::new());
     if config.swarm.enabled {
-        tools.register(Arc::new(
-            AgentTool::new(Arc::clone(&hub_handle), 0).with_monitors(Arc::clone(&monitors)),
-        ));
+        tools.register(Arc::new(AgentTool::new(Arc::clone(&hub_handle), 0)));
     }
     if config.mcp.enabled {
         let manager = Arc::new(McpManager::connect(&config.mcp).await);
@@ -401,8 +399,8 @@ async fn assemble_tools(
 /// 本账号上手打的）都进 inbox，唤醒与否完全由 monitor 决定。agent 可以改写或删除
 /// 这些预设——哪怕是不想看主人的消息，也是它自己的选择。
 ///
-/// 预设命中时并不使用这里的 prompt：`RunnerSink` 会把原始消息交给 ChatQueue，
-/// 按普通 chat 回合处理（见 `app::events`）。prompt 只在消息缺失时兜底。
+/// 预设是 `deliver.as = "chat"`：命中时 `RunnerSink` 把原始消息交给 ChatQueue，按普通
+/// 会话回合处理（见 `app::events`）；来源是 `Preset`，删除会被记住。
 async fn install_wake_presets(monitors: &Arc<MonitorManager>, db: &Arc<Database>, owner_qq: u64) {
     let presets = [
         (
@@ -410,20 +408,13 @@ async fn install_wake_presets(monitors: &Arc<MonitorManager>, db: &Arc<Database>
             format!(
                 "event.type == 'message' and event.mentions_self and event.sender != '{owner_qq}'"
             ),
-            "You were mentioned in {{event.chat}}: {{event.text}}\n\
-             Read /inbox if you need the surrounding conversation. Reply only if appropriate; \
-             otherwise end the turn."
-                .to_owned(),
         ),
         (
             "wake-on-owner",
             format!("event.type == 'message' and event.sender == '{owner_qq}'"),
-            "The owner wrote in {{event.chat}}: {{event.text}}\n\
-             Read /inbox if needed, then decide whether to respond."
-                .to_owned(),
         ),
     ];
-    for (name, when, prompt) in presets {
+    for (name, when) in presets {
         if name == "wake-on-owner" && owner_qq == 0 {
             continue;
         }
@@ -437,8 +428,8 @@ async fn install_wake_presets(monitors: &Arc<MonitorManager>, db: &Arc<Database>
                 source: "qq".to_owned(),
                 timer: None,
                 when: Some(when),
-                prompt: Some(prompt),
-                as_prompt: true,
+                prompt: None,
+                deliver_as: crate::config::DeliverAs::Chat,
                 max_events: 1_000_000,
                 expires: None,
                 one_shot: false,
@@ -449,6 +440,7 @@ async fn install_wake_presets(monitors: &Arc<MonitorManager>, db: &Arc<Database>
                 catch_up: crate::config::CatchUp::Coalesce,
                 cc: false,
                 on_missing: crate::config::OnMissing::Queue,
+                origin: MonitorOrigin::Preset,
             })
             .await
         {

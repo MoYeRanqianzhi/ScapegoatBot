@@ -90,7 +90,9 @@ impl MonitorSink for RunnerSink {
             }
             return;
         }
-        if delivery.name.starts_with("wake-on-")
+        // `deliver.as = "chat"`（内置唤醒预设就是这种）：原始消息交给 ChatQueue，按普通会话
+        // 回合处理；没有消息（例如手动 `fire`）时退回 monitor 回合。
+        if delivery.deliver_as == crate::config::DeliverAs::Chat
             && let Some(message) = delivery.message.clone()
             && let Some(queue) = self.queue.get()
         {

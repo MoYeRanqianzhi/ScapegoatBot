@@ -39,7 +39,7 @@
 | `tools/api.rs` | `API` 工具的执行、作用域、hold、发送账本 | `ApiTool` |
 | `tools/` | Tool trait、文件/记忆/技能/下载/Web/Monitor；`web/html.rs` 是线性的 HTML → 文本 | `ToolRegistry` |
 | `tools/views/` | 动态视图：messages/inbox/sessions/contacts/config/system；`filter.rs` 是条件求值与分页 | `Views`、`Page` |
-| `monitor/` | qq/timer/internal 源、cron、投递 | `MonitorManager` |
+| `monitor/` | `predicate.rs`（`when`）、`spec.rs`（配置与 `Monitor add` 参数 → `MonitorSpec` 的唯一转换）、`delivery.rs`（批处理与投递）、`timer.rs` / `stream.rs` / `internal.rs`（三种非 QQ 源） | `MonitorManager`、`MonitorSpec::from_config` |
 | `ipc/` | 命名管道 / UDS、帧协议 | `Endpoint`、`Client` |
 
 ## 结构约定

@@ -158,7 +158,7 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 `Agent` 工具的动作：
 
 ```json
-{"action": "spawn", "task": "...", "agent": "explore", "monitor": "at-me"}
+{"action": "spawn", "task": "...", "agent": "explore"}
 {"action": "message", "id": "sa-1", "text": "..."}
 {"action": "check", "id": "sa-1"}
 {"action": "wait", "id": ["sa-1"], "timeout_secs": 60}
@@ -170,6 +170,7 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
   `max_steps`、`allow_send`。
 - 工具集强制是父代理的子集；没有 `allow_send` 时 `API` 只读。
 - 子代理有独立上下文，结果回给父代理；`max_depth` 限制嵌套。
+- 要让子代理持续接收事件，用 `Monitor add`，`deliver.to` 写它的 id（或 `agent:<name>`）。
 
 ## MCP
 

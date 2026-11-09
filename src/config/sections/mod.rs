@@ -45,6 +45,8 @@ pub use style::StyleConfig;
 pub use swarm::SwarmConfig;
 pub use tools::{DownloadConfig, ToolsConfig, WebBackend, WebFetchConfig, WebSearchConfig};
 
+/// 运行时创建的 monitor（`Monitor add`）复用同一套校验。
+pub(crate) use monitor::check_monitor;
 pub(in crate::config) use monitor::validate_monitors;
 
 use super::{ConfigError, ModelsFile};

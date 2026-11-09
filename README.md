@@ -146,8 +146,8 @@ url = "ws://127.0.0.1:3001"
 - 只有一条 transcript：整个 QQ 号一份，跨聊天上下文会互相可见。
 - **后台复盘**：空闲时从 transcript 提取记忆候选（只追加、来源固定 `self`）并更新
   `/STYLE.md`；技能 curator 定期把长期未用技能归档到 `/skills/.archive/`，不删除。
-- 子代理支持嵌套 spawn（受 `[swarm].max_depth` 限制）；`Agent spawn` 的 `monitor`
-  参数可把事件绑定到该子代理实例。
+- 子代理支持嵌套 spawn（受 `[swarm].max_depth` 限制）；`Monitor add` 的
+  `deliver.to = "<子代理 id>"` 可把事件投给该子代理实例。
 - `/config` 写入支持白名单键（`[filter]`、`[agent].available_models` /
   `thinking_level`、`[compaction]`、`[skills]`、`[queue]`、`[style]`），其余键只读；
   写入会校验并原子落盘，但只有 `[filter]` 与 `[queue]` 立即热更新

@@ -41,11 +41,11 @@ SBOT__NAPCAT__URL=ws://127.0.0.1:3002
 | `thinking_level` | `high` | 与模型声明的 `thinking_levels` 校验 |
 | `compaction_model` | 空 | 摘要模型；空 = 主模型 |
 | `max_output_tokens` | 8192 | 单次回复上限 |
-| `max_steps` | 48 | 单回合工具循环上限 |
+| `max_steps` | 64 | 单回合工具循环上限 |
 | `master` | `self` | 报告与审批通知的目标：`self`（登录账号）或 QQ 号 |
 | `receive_scopes` | `["*"]` | 允许读的 chat 列表 |
 | `send_scopes` | `["*"]` | 允许发的 chat 列表；空 = 禁止一切发送 |
-| `retry_attempts` / `retry_base_ms` / `retry_max_ms` | 3 / 400 / 8000 | provider 重试次数、基础间隔、上限 |
+| `retry_attempts` / `retry_base_ms` / `retry_max_ms` | 3 / 400 / 30000 | provider 重试次数、基础间隔、上限 |
 | `retry_mode` | `stepped` | `stepped` 阶梯退避（base、2×base…封顶 max）；`fixed` 固定 base |
 
 `mode` 启动时固定，修改需重启。
@@ -211,25 +211,40 @@ lifecycle = { idle_only = false, max_events = 1000 }
 
 `when` 是用 `and` 连接的谓词：`event.type == '…'`、`event.chat == '…'`、
 `event.sender == '…'` / `!=`、`event.text contains '…'`、`event.mentions_self`，
-任一项前加 `not` 取反。写错的表达式会作为系统通知投递，不会静默失效。
+任一项前加 `not` 取反。每一项在加载（或 `Monitor add`）时都会校验，写错直接报错。
+
+`deliver.as` 决定投递形式：
+
+- `event`（默认）：`[monitor 名字 | source | chat]` 信封加事件文本，跑一个 monitor 回合；
+- `prompt`：投递 `deliver.prompt` 模板（`{{event.text}}`、`{{event.chat}}`、`{{count}}`）；
+- `chat`：只用于 `qq` 源且 `to = "main"`，把原始消息交给会话队列，按普通会话回合处理
+  （`[queue]` 的去抖与 `mode` 生效，`batch_window_ms` 不生效）。
+
+`source = { qq = false }` 会报错：关掉一个 monitor 用 `enabled = false`。
 
 默认所有 QQ 消息只写入 `/inbox` / transcript，**不逐条唤醒 agent**。内置两个可删除的
-唤醒预设：
+唤醒预设，都是 `deliver.as = "chat"`：
 
 | 名称 | 条件 | 行为 |
 |------|------|------|
-| `wake-on-mention` | 非主人的 `@` 消息 | 唤醒主代理处理 |
-| `wake-on-owner` | `owner_qq` 的消息（含 stand_in 下主人手打的，见上文“主人的消息”） | 唤醒主代理处理 |
+| `wake-on-mention` | 非主人的 `@` 消息 | 交给会话队列，跑一个普通会话回合 |
+| `wake-on-owner` | `owner_qq` 的消息（含 stand_in 下主人手打的，见上文“主人的消息”） | 同上 |
 
 拍一拍、撤回等 QQ notice，以及好友/群请求、带 `group_id`/`user_id` 的未知事件，
 都会以 `[poke]` / `[recall]` / `[request]` / `[unknown]` 伪消息写入 inbox；
 正文带一行摘要和压缩原始 JSON（截断到 1200 字符），原始字段同时保留在消息的 `raw`。
 它们不会自动唤醒 agent，除非另建 monitor 订阅对应事件。
 
-用 `Monitor` 工具的 `remove` 删除后，会在数据库记录一条禁用标记；重启不会自动恢复。
-需要恢复时用 `Monitor add` 同名重新添加即可；其他消息仍留在 `/inbox`，可主动读取。
+用 `Monitor` 工具的 `remove` 删除预设后，会在数据库记录一条禁用标记；重启不会自动恢复。
+需要恢复时用 `Monitor add` 同名重新添加即可（标记随之清除，下次启动预设回来）；其他消息
+仍留在 `/inbox`，可主动读取。是否记住删除只看来源（预设），与名字无关。
 
-`deliver.cc = true` 会在投递给子代理时把同一内容抄送主代理。绑定目标不存在时，
+`Monitor add` 的参数与 `[[monitor]]` 同一套 schema 与校验（未知字段报错），区别只有：
+默认 `idle_only = true`、`max_events = 50`、`expires = "2h"`；不接受 `stream` 源、
+`qq.backlog` 与 `lifecycle.catch_up`；重启即消失。
+
+`deliver.to` 可以是 `main`、子代理实例 id 或 `agent:<名字>`。
+`deliver.cc = true` 会在投递给子代理时把同一内容抄送主代理。目标不存在时，
 `on_missing` 决定 `drop`（丢弃并告警）、`queue`（最多等 60 秒）或 `spawn`
 （新建 general 子代理处理）。
 
@@ -301,7 +316,8 @@ key 放 `auth.json`：
   - 每 chat 每小时只统计成功发送/已开始的回合；
   - `guard_usd_per_day` 用估算成本，耗尽后分类器降级为规则层。
 - `[gate]`：每次 `napcat.*` 调用都过门禁。
-  - `trusted`：直接放行，只统计速率。
+  - `trusted`：直接放行，不做发送规则检查，也不受 `max_per_minute` 限制（`[budget]`
+    的每 chat 每小时发送上限仍然生效）。
   - `auto`（默认）：每分钟调用上限 `max_per_minute`；发送规则拦截 30 秒内同 chat 重复、
     2 分钟内同内容发到 3 个以上 chat、10 分钟内跨 chat 的 5-gram 重叠、跨 chat 转发媒体、
     无 owner intent 的 @全体；

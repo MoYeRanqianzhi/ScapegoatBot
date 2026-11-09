@@ -50,7 +50,7 @@ pub struct TimerSource {
     pub cron: Option<String>,
     /// 固定间隔，最小 60s。
     pub every: Option<String>,
-    /// 一次性本地时间（`YYYY-MM-DD HH:MM:SS`）。
+    /// 每天的本地时刻（`HH:MM`）；一次性提醒配合 `lifecycle.one_shot = true`。
     pub at: Option<String>,
     /// 每次触发随机推迟的上限（秒）；不设或 0 = 准点。最多 3600，`every` 时必须短于周期。
     pub jitter_secs: Option<u64>,
@@ -135,11 +135,14 @@ pub enum OnMissing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliverAs {
-    /// 原样投递事件。
+    /// 原样投递事件（`[monitor 名字 | source | chat]` 信封），跑一个 monitor 回合。
     #[default]
     Event,
-    /// 投递渲染后的指令（`prompt` 字段）。
+    /// 投递渲染后的指令（`prompt` 字段），跑一个 monitor 回合。
     Prompt,
+    /// 把原始 QQ 消息交给 ChatQueue，按普通会话回合处理（去抖、并发、`[queue].mode` 都
+    /// 生效）；只用于 `qq` 源，`batch_window_ms` 不生效。内置唤醒预设就是这种形式。
+    Chat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,112 +241,151 @@ pub(in crate::config) fn validate_monitors(
     let mut names = HashSet::new();
     for (index, monitor) in monitors.iter().enumerate() {
         let field = format!("monitor[{index}]");
-
-        non_empty(errors, format!("{field}.name"), &monitor.name);
         if !monitor.name.trim().is_empty() && !names.insert(monitor.name.as_str()) {
             errors.push(ConfigError::new(
                 format!("{field}.name"),
                 format!("duplicate monitor name {:?}", monitor.name),
             ));
         }
+        validate_monitor(&field, monitor, errors);
+    }
+}
 
-        let Some(kind) = monitor.source.kind() else {
-            errors.push(ConfigError::new(
-                format!("{field}.source"),
-                "must set exactly one of \"qq\", \"timer\", \"stream\" or \"internal\"",
-            ));
-            continue;
+/// 校验运行时创建的单个 monitor（`Monitor add`）：与配置文件同一套规则，错误合成一段文字。
+pub(crate) fn check_monitor(monitor: &MonitorConfig) -> Result<(), String> {
+    let mut errors = Vec::new();
+    validate_monitor("monitor", monitor, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; "))
+    }
+}
+
+/// 校验一个 monitor；`field` 是错误信息里的位置前缀。
+fn validate_monitor(field: &str, monitor: &MonitorConfig, errors: &mut Vec<ConfigError>) {
+    non_empty(errors, format!("{field}.name"), &monitor.name);
+
+    let Some(kind) = monitor.source.kind() else {
+        errors.push(ConfigError::new(
+            format!("{field}.source"),
+            "must set exactly one of \"qq\", \"timer\", \"stream\" or \"internal\"",
+        ));
+        return;
+    };
+
+    // `qq = false` 以前会被当成“已设置 qq 源”而照常订阅；关掉 monitor 用 `enabled = false`。
+    if matches!(monitor.source.qq, Some(QqSource::Enabled(false))) {
+        errors.push(ConfigError::new(
+            format!("{field}.source.qq"),
+            "qq = false is not a source; use enabled = false to turn the monitor off",
+        ));
+    }
+
+    // 与运行时同一个解析器：`at` 的时分范围、cron 的语法与“永远不会匹配”都在这里报错。
+    if let Some(timer) = &monitor.source.timer
+        && let Err(error) = crate::monitor::Timer::from_source(timer)
+    {
+        errors.push(ConfigError::new(format!("{field}.source.timer"), error));
+    }
+
+    // WebSocket 只接受 ws(s)://，SSE 只接受 http(s)://：写反了连接会一直失败。
+    if let Some(stream) = &monitor.source.stream {
+        let (schemes, expected) = match stream.kind {
+            StreamKind::Websocket => (["ws://", "wss://"], "a ws:// or wss:// URL"),
+            StreamKind::Sse => (["http://", "https://"], "an http:// or https:// URL"),
         };
-
-        // 与运行时同一个解析器：`at` 的时分范围、cron 的语法与“永远不会匹配”都在这里报错。
-        if let Some(timer) = &monitor.source.timer
-            && let Err(error) = crate::monitor::Timer::parse(
-                timer.cron.as_deref(),
-                timer.every.as_deref(),
-                timer.at.as_deref(),
-                timer.jitter_secs,
-            )
-        {
-            errors.push(ConfigError::new(format!("{field}.source.timer"), error));
-        }
-
-        // WebSocket 只接受 ws(s)://，SSE 只接受 http(s)://：写反了连接会一直失败。
-        if let Some(stream) = &monitor.source.stream {
-            let (schemes, expected) = match stream.kind {
-                StreamKind::Websocket => (["ws://", "wss://"], "a ws:// or wss:// URL"),
-                StreamKind::Sse => (["http://", "https://"], "an http:// or https:// URL"),
-            };
-            if !schemes.iter().any(|scheme| stream.url.starts_with(scheme)) {
-                errors.push(ConfigError::new(
-                    format!("{field}.source.stream.url"),
-                    format!("must be {expected} for kind = {:?}", stream.kind),
-                ));
-            }
-        }
-
-        if let Some(internal) = &monitor.source.internal
-            && crate::monitor::InternalKind::parse(&internal.kind).is_none()
-        {
+        if !schemes.iter().any(|scheme| stream.url.starts_with(scheme)) {
             errors.push(ConfigError::new(
-                format!("{field}.source.internal.kind"),
-                "must be one of \"agent\", \"security\", \"budget\" or \"storage\"",
+                format!("{field}.source.stream.url"),
+                format!("must be {expected} for kind = {:?}", stream.kind),
             ));
         }
+    }
 
-        if let Some(when) = &monitor.when {
-            if when.trim().is_empty() {
-                errors.push(ConfigError::new(
-                    format!("{field}.when"),
-                    "must not be empty; omit the field to match everything",
-                ));
-            } else if let Err(error) = crate::monitor::validate_when(when) {
-                errors.push(ConfigError::new(format!("{field}.when"), error));
-            }
-        }
+    if let Some(internal) = &monitor.source.internal
+        && crate::monitor::InternalKind::parse(&internal.kind).is_none()
+    {
+        errors.push(ConfigError::new(
+            format!("{field}.source.internal.kind"),
+            "must be one of \"agent\", \"security\", \"budget\" or \"storage\"",
+        ));
+    }
 
-        non_empty(errors, format!("{field}.deliver.to"), &monitor.deliver.to);
-        if monitor.deliver.to != "main"
-            && let Some(name) = monitor.deliver.to.strip_prefix("agent:")
-            && name.is_empty()
-        {
+    if let Some(when) = &monitor.when {
+        if when.trim().is_empty() {
             errors.push(ConfigError::new(
-                format!("{field}.deliver.to"),
-                "\"agent:\" requires a name",
+                format!("{field}.when"),
+                "must not be empty; omit the field to match everything",
+            ));
+        } else if let Err(error) = crate::monitor::validate_when(when) {
+            errors.push(ConfigError::new(format!("{field}.when"), error));
+        }
+    }
+
+    non_empty(errors, format!("{field}.deliver.to"), &monitor.deliver.to);
+    if monitor.deliver.to != "main"
+        && let Some(name) = monitor.deliver.to.strip_prefix("agent:")
+        && name.is_empty()
+    {
+        errors.push(ConfigError::new(
+            format!("{field}.deliver.to"),
+            "\"agent:\" requires a name",
+        ));
+    }
+
+    if monitor.deliver.as_ == DeliverAs::Prompt && monitor.deliver.prompt.trim().is_empty() {
+        errors.push(ConfigError::new(
+            format!("{field}.deliver.prompt"),
+            "is required when deliver.as = \"prompt\"",
+        ));
+    }
+
+    non_zero(
+        errors,
+        format!("{field}.deliver.batch_window_ms"),
+        monitor.deliver.batch_window_ms,
+    );
+
+    match parse_duration_secs(&monitor.lifecycle.expires) {
+        Some(_) => {}
+        None => errors.push(ConfigError::new(
+            format!("{field}.lifecycle.expires"),
+            format!("invalid duration {:?}", monitor.lifecycle.expires),
+        )),
+    }
+
+    if monitor.lifecycle.one_shot && kind != "timer" {
+        errors.push(ConfigError::new(
+            format!("{field}.lifecycle.one_shot"),
+            "one_shot requires a timer source",
+        ));
+    }
+
+    non_zero(
+        errors,
+        format!("{field}.lifecycle.max_events"),
+        monitor.lifecycle.max_events,
+    );
+
+    // `as = "chat"` 把原始 QQ 消息交给主代理的 ChatQueue：其他源没有消息可交，
+    // 投给子代理时也没有会话队列可用。
+    if monitor.deliver.as_ == DeliverAs::Chat {
+        if kind != "qq" {
+            errors.push(ConfigError::new(
+                format!("{field}.deliver.as"),
+                "\"chat\" requires a qq source",
             ));
         }
-
-        if monitor.deliver.as_ == DeliverAs::Prompt && monitor.deliver.prompt.trim().is_empty() {
+        if monitor.deliver.to != "main" {
             errors.push(ConfigError::new(
-                format!("{field}.deliver.prompt"),
-                "is required when deliver.as = \"prompt\"",
+                format!("{field}.deliver.as"),
+                "\"chat\" requires deliver.to = \"main\"",
             ));
         }
-
-        non_zero(
-            errors,
-            format!("{field}.deliver.batch_window_ms"),
-            monitor.deliver.batch_window_ms,
-        );
-
-        match parse_duration_secs(&monitor.lifecycle.expires) {
-            Some(_) => {}
-            None => errors.push(ConfigError::new(
-                format!("{field}.lifecycle.expires"),
-                format!("invalid duration {:?}", monitor.lifecycle.expires),
-            )),
-        }
-
-        if monitor.lifecycle.one_shot && kind != "timer" {
-            errors.push(ConfigError::new(
-                format!("{field}.lifecycle.one_shot"),
-                "one_shot requires a timer source",
-            ));
-        }
-
-        non_zero(
-            errors,
-            format!("{field}.lifecycle.max_events"),
-            monitor.lifecycle.max_events,
-        );
     }
 }

@@ -48,21 +48,23 @@
   `notify` 需要 NapCat 仍在线。
 - **`[tools].max_schema_tokens`**：超限时把过长描述压到 160 字符；若仅 schema 就超限，
   只告警、不删工具。
-- **monitor 的 `cc` / `on_missing`**：`cc` 在绑定子代理时抄送主代理；`on_missing`
+- **monitor 的 `cc` / `on_missing`**：`cc` 在投给子代理时抄送主代理；`on_missing`
   支持 `drop`、`queue`（最多等 60 秒）与 `spawn`（新建 general 子代理处理）。
 
 ## 已知行为细节
 
 - 只有一条 transcript：跨 chat 上下文互相可见，这是替身场景的设计。
-- 子代理嵌套受 `max_depth`（默认 8）限制；`monitor` 绑定随子代理结束删除。
+- 子代理嵌套受 `max_depth`（默认 8）限制。投给子代理的 monitor（`deliver.to = "<id>"`）
+  不会随子代理结束删除（结束的子代理仍可续聊），由 `expires` / `max_events` 收尾。
 - 压缩失败连续达到 `[compaction].max_failures` 后，自动压缩停止尝试，直到重启或
   一次手动 `agent.compact` 成功。
 - `[compaction].post_compact_recall` 注入的是 `/MEMORY.md` 索引，不是按语义检索
   的相关条目；预算 8000 字符。
 - `[memory].review = every_turn` 实际是每 5 秒轮询一次并检查 transcript 是否有新增，
   不是严格“回合结束即触发”。
-- `[monitor.lifecycle].catch_up` 只支持 `coalesce` 与 `skip`；补投只针对定时源，
-  运行时创建的 monitor 不参与；长停机后的补投次数有上限。
+- `[monitor.lifecycle].catch_up` 只支持 `coalesce` 与 `skip`；补投只针对配置文件里的
+  定时源（`Monitor add` 不接受 `catch_up`：运行时 monitor 重启即消失）；长停机后的补投
+  次数有上限。
 - `sbot doctor` 是只读的：它发现的问题需要你按提示手工修复。
 
 ## 测试相关

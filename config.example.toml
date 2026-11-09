@@ -2,7 +2,8 @@
 #
 # 严格 schema：未知字段会让启动失败；`version` 必须为 1。
 # 完整说明见 docs/guide/configuration.md。
-# 本文件由 tests/config_example.rs 校验：改坏了会让测试失败。
+# 本文件由 tests/config_example.rs 校验：改坏了会让测试失败；写出的值必须等于代码默认值
+# （示例 monitor 除外），想改就在自己的配置里改。
 
 version = 1
 
@@ -26,12 +27,13 @@ model = "anthropic/claude-opus-5-5"
 available_models = [
     "anthropic/claude-opus-5-5",
     "anthropic/claude-haiku-5-5",
+    "deepseek/deepseek-chat",
 ]
 fallback_models = []
 # 与 models.json 的 thinking_levels 校验。
 thinking_level = "high"
 max_output_tokens = 8192
-max_steps = 48
+max_steps = 64
 # owner 通知目标：self 或 QQ 号。
 master = "self"
 # 允许读/发的 chat：group:<gid> / private:<qq> / *；空 = 禁止。
@@ -39,10 +41,10 @@ receive_scopes = ["*"]
 send_scopes = ["*"]
 retry_attempts = 3
 retry_base_ms = 400
-retry_max_ms = 8000
+retry_max_ms = 30000
 # stepped：400/800/1600…（默认）；fixed：每次固定 retry_base_ms。
 retry_mode = "stepped"
-# 摘要模型；当前版本未使用（摘要走主模型）。
+# 压缩摘要用的模型（provider/id）；空 = 主模型。
 compaction_model = ""
 
 [napcat]
@@ -80,20 +82,20 @@ message_retention_days = 0
 session_retention_days = 0
 
 [tools]
-max_result_bytes = 262144
-max_schema_tokens = 8000
+max_result_bytes = 32768
+max_schema_tokens = 12000
 
 [tools.web_search]
 # auto / server / tool；Chat 协议只能用 tool。
 backend = "auto"
 # tool 后端必须配置；key 放 auth.json 的 tools.web_search.api_key。
 base_url = ""
-count = 5
+count = 10
 
 [tools.web_fetch]
 backend = "auto"
 base_url = ""
-max_content_tokens = 8000
+max_content_tokens = 20000
 # true = 本地抓取（逐跳校验、HTML 转文本），不经过 base_url。
 local = false
 
@@ -145,6 +147,7 @@ agents_dir = "~/.sbot/agents"
 default_max_steps = 32
 
 # 长期常驻的 monitor；运行时也能用 Monitor 工具增删（重启即消失）。
+# deliver.as：event（默认）/ prompt（投递 deliver.prompt）/ chat（qq 源，交给会话队列）。
 [[monitor]]
 name = "at-me"
 enabled = false

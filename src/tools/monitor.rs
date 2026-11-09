@@ -3,20 +3,21 @@
 //! 设计依据：设计 §5.11 与提示词清单 §3「Monitor」。
 //!
 //! - `add` / `remove` / `list` / `fire`；
-//! - 运行时创建默认有界：`expires = 2h`、`max_events = 50`、`idle_only = true`；
-//! - 拒绝 `stream` 源（外部网络只能由主人写进配置文件）；
-//! - `deliver.to` 支持 `main`、`<spawn_id>` 与 `agent:<name>`；绑定随子代理结束删除。
+//! - `add` 的参数与配置文件的 `[[monitor]]` 同一套 schema 与校验（`monitor::spec`）；
+//!   运行时创建默认有界：`expires = 2h`、`max_events = 50`、`idle_only = true`，没有 `catch_up`；
+//! - 拒绝 `stream` 源与 `qq.backlog`（只能由主人写进配置文件）；
+//! - `deliver.to` 支持 `main`、`<spawn_id>` 与 `agent:<name>`；子代理结束后绑定不会自动删除
+//!   （结束的子代理仍可被续聊），到期或达到上限时停用。
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::monitor::{InternalKind, MonitorManager, MonitorSpec, Timer};
+use crate::monitor::{MonitorManager, MonitorOrigin, MonitorSpec, runtime_config};
 use crate::transcript::ToolResult;
 
-use super::{Tool, ToolContext, arg_opt_str, arg_str, object_schema};
+use super::{Tool, ToolContext, arg_str, object_schema};
 
 /// `Monitor` 工具。
 pub struct MonitorTool {
@@ -38,30 +39,38 @@ impl Tool for MonitorTool {
     fn description(&self) -> &'static str {
         "Subscribe to an event source; each event, or a prompt you write, arrives as a message in \
          this conversation so you do not have to wait for a turn.\n\n\
-         Params: op (add, remove, list, fire), name, and for add: source, optional when, deliver, \
-         optional lifecycle.\n\n\
+         Params: op (add, remove, list, fire), name, and for add the fields of a [[monitor]] in \
+         the config file: source, optional when, deliver, lifecycle and on_missing. Unknown \
+         fields are rejected.\n\n\
          source — exactly one kind: {\"qq\": true} for inbound QQ events; \
          {\"timer\": {\"every\": \"10m\"}} or {\"timer\": {\"cron\": \"7 9 * * 1-5\"}} or \
          {\"timer\": {\"at\": \"09:07\"}} every day, all in local time (every needs at least \
          60s; when a cron restricts both day and weekday, either one matching is enough); add \
          \"jitter_secs\": n to a timer to delay each run by a random 0..n seconds (at most \
          3600, shorter than every); \
-         {\"internal\": \"security\" | \"budget\" | \"agent\" | \"storage\"} for runtime state \
-         changes; event.type is security:hold, security:released, budget:exhausted, agent:done, \
-         agent:failed, storage:quota or storage:disk. A stream source is config-file only; add \
-         rejects it.\n\n\
+         {\"internal\": {\"kind\": \"security\" | \"budget\" | \"agent\" | \"storage\"}} for \
+         runtime state changes; event.type is security:hold, security:released, \
+         budget:exhausted, agent:done, agent:failed, storage:quota or storage:disk. Stream \
+         sources and qq backlog are config-file only.\n\n\
          when — optional expression over event.*, e.g. event.mentions_self, \
          event.sender == \"10001\", event.text contains \"报名\", event.chat == \"group:123\"; \
-         join terms with and, negate one with not. A broken expression is \
-         reported, never silently ignored.\n\n\
-         deliver — {\"to\": \"main\", \"as\": \"event\" | \"prompt\", \"prompt\"?: \"...\"}. \
-         as: prompt sends an instruction you write; {{event.text}} and {{count}} are substituted.\n\n\
-         lifecycle — {idle_only?, min_interval_secs?, max_events?, expires?, one_shot?, \
-         catch_up?}. Runtime adds are bounded: expires defaults to 2h, max_events to 50.\n\n\
+         join terms with and, negate one with not. A broken expression is rejected when you \
+         add it.\n\n\
+         deliver — {\"to\": \"main\" | \"<subagent id>\" | \"agent:<name>\", \
+         \"as\": \"event\" | \"prompt\" | \"chat\", \"prompt\"?, \"batch_window_ms\"?, \"cc\"?}. \
+         as: prompt sends an instruction you write; {{event.text}}, {{event.chat}} and \
+         {{count}} are substituted. as: chat (qq source, to main) hands each message to the \
+         normal chat queue, like the built-in wake-on-mention and wake-on-owner presets. cc \
+         copies a subagent delivery to you. on_missing — queue (default, waits up to 60s), \
+         drop or spawn when the target subagent does not exist.\n\n\
+         lifecycle — {idle_only?, min_interval_secs?, max_events?, expires?, one_shot?}. A \
+         monitor you add lives in memory and is gone after a restart; by default it delivers \
+         only when you are idle, expires after 2h (\"0\" = never) and stops after 50 events.\n\n\
          Silence is not success. Before adding one, ask: if the thing I am watching failed right \
          now, would this monitor deliver anything? If not, widen when. A monitor delivers \
-         messages; it never executes anything on its own. list shows name, source, remaining \
-         quota and expiry; fire triggers one delivery (idle_only may wait)."
+         messages; it never executes anything on its own. list shows name, source, target, \
+         origin (config, runtime or preset), deliveries and expiry; removing a preset is \
+         remembered across restarts. fire triggers one delivery (idle_only may wait)."
     }
 
     fn parameters(&self) -> Value {
@@ -72,7 +81,8 @@ impl Tool for MonitorTool {
                 "source": {"type": "object"},
                 "when": {"type": "string"},
                 "deliver": {"type": "object"},
-                "lifecycle": {"type": "object"}
+                "lifecycle": {"type": "object"},
+                "on_missing": {"type": "string", "enum": ["queue", "drop", "spawn"]}
             }),
             &["op"],
         )
@@ -118,115 +128,26 @@ impl Tool for MonitorTool {
 }
 
 impl MonitorTool {
+    /// `add`：除 `op` / `name` 外的参数就是一份 `[[monitor]]`，按配置文件的同一套 schema 与
+    /// 校验解析（见 `monitor::spec`），只是默认值更保守。
     async fn add(&self, args: &Value) -> ToolResult {
         let name = match arg_str(args, "name") {
             Ok(name) => name,
             Err(error) => return error,
         };
-        let Some(source) = args.get("source") else {
-            return ToolResult::error("add requires \"source\".");
+        let mut fields = args.as_object().cloned().unwrap_or_default();
+        fields.remove("op");
+        fields.remove("name");
+        let config = match runtime_config(name, Value::Object(fields)) {
+            Ok(config) => config,
+            Err(error) => return ToolResult::error(error),
         };
-
-        let (source_kind, timer) = if source.get("stream").is_some() {
-            return ToolResult::error(
-                "A stream source is config-file only; `Monitor add` refuses external network sources.",
-            );
-        } else if source.get("qq").is_some() {
-            ("qq".to_owned(), None)
-        } else if let Some(timer) = source.get("timer") {
-            match Timer::from_json(timer) {
-                Ok(spec) => ("timer".to_owned(), Some(spec)),
-                Err(error) => return ToolResult::error(error),
-            }
-        } else if let Some(internal) = source.get("internal").and_then(Value::as_str) {
-            match InternalKind::parse(internal) {
-                Some(kind) => (kind.source(), None),
-                None => return ToolResult::error(InternalKind::expected()),
-            }
-        } else {
-            return ToolResult::error(
-                "source must set exactly one of qq, timer, internal (stream is rejected here).",
-            );
+        let spec = match MonitorSpec::from_config(&config, MonitorOrigin::Runtime) {
+            Ok(spec) => spec,
+            Err(error) => return ToolResult::error(error.to_string()),
         };
-
-        let when = arg_opt_str(args, "when").map(str::to_owned);
-        let deliver = args.get("deliver").cloned().unwrap_or_else(|| json!({}));
-        let to = deliver.get("to").and_then(Value::as_str).unwrap_or("main");
-        // `main` / `<spawn_id>` / `agent:<name>`；目标不存在时由 runtime 告警。
-        let target = if to == "main" {
-            None
-        } else {
-            Some(to.to_owned())
-        };
-        let as_prompt = deliver.get("as").and_then(Value::as_str) == Some("prompt");
-        let prompt = deliver
-            .get("prompt")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        if as_prompt && prompt.is_none() {
-            return ToolResult::error("deliver.as = \"prompt\" requires deliver.prompt.");
-        }
-
-        let lifecycle = args.get("lifecycle").cloned().unwrap_or_else(|| json!({}));
-        let max_events = lifecycle
-            .get("max_events")
-            .and_then(Value::as_u64)
-            .unwrap_or(50);
-        let min_interval = Duration::from_secs(
-            lifecycle
-                .get("min_interval_secs")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        );
-        let one_shot = lifecycle
-            .get("one_shot")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        // 运行时创建默认只在空闲时投递，避免与正在进行的回合抢上下文。
-        let idle_only = lifecycle
-            .get("idle_only")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        let batch_window = Duration::from_millis(
-            deliver
-                .get("batch_window_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(200),
-        );
-        let expires = match lifecycle.get("expires").and_then(Value::as_str) {
-            None => Some(Duration::from_secs(2 * 3600)),
-            Some("0") => None,
-            Some(raw) => match crate::config::parse_duration_secs(raw) {
-                Some(seconds) => Some(Duration::from_secs(seconds)),
-                None => return ToolResult::error(format!("invalid expires {raw:?}")),
-            },
-        };
-        if one_shot && timer.is_none() {
-            return ToolResult::error("one_shot requires a timer source.");
-        }
-
-        match self
-            .manager
-            .add(MonitorSpec {
-                name: name.to_owned(),
-                source: source_kind,
-                timer,
-                when,
-                prompt,
-                as_prompt,
-                max_events,
-                expires,
-                one_shot,
-                min_interval,
-                idle_only,
-                batch_window,
-                target,
-                catch_up: crate::config::CatchUp::Coalesce,
-                cc: false,
-                on_missing: crate::config::OnMissing::Queue,
-            })
-            .await
-        {
+        let max_events = spec.max_events;
+        match self.manager.add(spec).await {
             Ok(()) => ToolResult::ok(json!({"added": name, "max_events": max_events}).to_string()),
             Err(error) => ToolResult::error(error.to_string()),
         }
