@@ -23,7 +23,7 @@
 | `cli/mod.rs` | 子命令、IPC 客户端、重启 | `run()` |
 | `cli/backup.rs` | 在线 SQLite 快照 + 文件归档 | `run()` / `run_with_paths()` |
 | `cli/doctor.rs` | 只读诊断 | `run()` / `collect()` |
-| `app/` | 运行时装配、IPC handler、QQ 管线 | `Runtime::start`、`assembly::build_agent`、`assembly::assemble_tools` |
+| `app/` | 运行时、IPC handler、QQ 管线（`events.rs`）、后台维护；`assembly/` 按职责拆成 `stores`（存储与启动对账）、`providers`（模型清单与各模型的计量 provider）、`tools`（工具表与唤醒预设）、`qq`（NapCat 连接与 owner/master），`mod.rs` 的 `build_agent` 只负责按顺序接起来 | `Runtime::start`、`assembly::build_agent` |
 | `paths.rs` | `~/.sbot` 布局、逻辑根解析 | `SbotPaths` |
 | `config/mod.rs` | 根结构、加载、环境变量覆盖、校验分派 | `SbotConfig::load` |
 | `config/sections/` | 分节 schema（agent/queue/security/monitor/hooks…），每节一个文件 | 各 `Config` 结构 |
