@@ -109,7 +109,7 @@ url = "ws://127.0.0.1:3001"
 | `sbot stop` / `restart` | 停止 / 重启 |
 | `sbot status` | 运行状态、模型、hold、用量 |
 | `sbot ai start\|stop\|restart` | 只控制 LLM 调用；消息接收与存储不中断 |
-| `sbot chat "<text>" [--scope ...]` | 从控制通道给 agent 一句话 |
+| `sbot chat "<text>" [--scope group:<gid>\|private:<qq>]` | 从控制通道给 agent 一句话；`--scope` 指明针对的会话 |
 | `sbot pause` / `resume` | 写 / 删除 `ESTOP`，暂停新回合 |
 | `sbot security status\|resume` | 查看 hold 与最近安全事件 / 重新过闸 |
 | `sbot gate pending\|approve\|reject` | `approve` 模式的待确认动作与裁决 |

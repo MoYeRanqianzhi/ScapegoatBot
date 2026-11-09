@@ -463,6 +463,26 @@ impl Runtime {
                 if message.trim().is_empty() {
                     return Response::error(id, "bad_request", "message must not be empty");
                 }
+                // `--scope` 在落库与启动回合之前校验，写错了直接拒绝，不会悄悄忽略。
+                let scope = match scope
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|raw| !raw.is_empty())
+                {
+                    None => None,
+                    Some(raw) => match crate::qq::event::ChatId::parse(raw) {
+                        Some(chat) => Some(chat),
+                        None => {
+                            return Response::error(
+                                id,
+                                "bad_request",
+                                format!(
+                                    "scope {raw:?} must be \"group:<gid>\" or \"private:<qq>\""
+                                ),
+                            );
+                        }
+                    },
+                };
                 let sealed =
                     match self
                         .key
@@ -497,7 +517,7 @@ impl Runtime {
                 };
                 let runner = Arc::clone(&agent.runner);
                 tokio::spawn(async move {
-                    match runner.run_control(&message, control_id).await {
+                    match runner.run_control(&message, control_id, scope).await {
                         Ok(outcome) => info!(
                             stop = ?outcome.stop_reason,
                             turns = outcome.turns,
@@ -508,7 +528,11 @@ impl Runtime {
                 });
                 Response::ok(
                     id,
-                    json!({ "accepted": true, "control_id": control_id, "scope": scope }),
+                    json!({
+                        "accepted": true,
+                        "control_id": control_id,
+                        "scope": scope.map(|chat| chat.to_string()),
+                    }),
                 )
             }
             RequestBody::SetModel { model } => match self.set_model(&model) {

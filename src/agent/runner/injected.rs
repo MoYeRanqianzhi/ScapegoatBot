@@ -2,7 +2,15 @@ use super::*;
 
 impl Runner {
     /// 控制通道回合；主代理不受并发配额限制，串行化由 turn_lock 负责。
-    pub(crate) async fn run_control(&self, text: &str, control_id: i64) -> Result<LoopOutcome> {
+    ///
+    /// `scope` 是 `sbot chat --scope` 指定的目标会话：写进 `owner_context` 的 `scope`
+    /// 属性，告诉模型这句话针对哪个群 / 私聊；省略时由模型自己判断。
+    pub(crate) async fn run_control(
+        &self,
+        text: &str,
+        control_id: i64,
+        scope: Option<ChatId>,
+    ) -> Result<LoopOutcome> {
         if !self
             .deps
             .ai_enabled
@@ -10,9 +18,7 @@ impl Runner {
         {
             anyhow::bail!("AI calls are stopped; run `sbot ai start` first");
         }
-        let message = AgentMessage::user(format!(
-            "<owner_context source=\"control:{control_id}\">\n{text}\n</owner_context>"
-        ));
+        let message = AgentMessage::user(control_envelope(text, control_id, scope));
         self.run_injected("control", message, true).await
     }
 
@@ -151,5 +157,31 @@ impl Runner {
         );
         self.maybe_security_review(&history).await;
         Ok(outcome)
+    }
+}
+
+/// 控制输入的信封：`<owner_context source="control:<id>" [scope="group:<gid>"]>`。
+fn control_envelope(text: &str, control_id: i64, scope: Option<ChatId>) -> String {
+    // 目标会话只是 `group:<n>` / `private:<n>`，不含引号或尖括号，可以直接放进属性。
+    let scope = scope
+        .map(|chat| format!(" scope=\"{chat}\""))
+        .unwrap_or_default();
+    format!("<owner_context source=\"control:{control_id}\"{scope}>\n{text}\n</owner_context>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_envelope_names_the_target_chat_only_when_given() {
+        assert_eq!(
+            control_envelope("hi", 7, None),
+            "<owner_context source=\"control:7\">\nhi\n</owner_context>"
+        );
+        assert_eq!(
+            control_envelope("hi", 7, Some(ChatId::Group(123))),
+            "<owner_context source=\"control:7\" scope=\"group:123\">\nhi\n</owner_context>"
+        );
     }
 }

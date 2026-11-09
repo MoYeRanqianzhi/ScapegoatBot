@@ -55,7 +55,8 @@ pub enum Command {
     Chat {
         /// 消息内容。
         message: String,
-        /// 指定作用域（`group:<gid>` / `private:<qq>`），省略则由 agent 判断。
+        /// 这句话针对的会话（`group:<gid>` / `private:<qq>`），写进 `owner_context` 的
+        /// `scope` 属性；省略则由 agent 判断。格式错误时守护进程拒绝请求。
         #[arg(long)]
         scope: Option<String>,
     },
