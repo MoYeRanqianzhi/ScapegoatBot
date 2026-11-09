@@ -134,8 +134,73 @@ pub(super) async fn assemble_tools(
         Err(error) => warn!(%error, "cannot register Download"),
     }
 
-    // Web 工具：服务端工具由 provider 声明；本地工具后端只在用户配置了
-    // base_url 与 key 时注册，不假定官方地址。
+    let server_tools = register_web_tools(&mut tools, config, auth, model_ref, download_policy);
+
+    let gateway: Option<Arc<dyn NapcatGateway>> = qq
+        .as_ref()
+        .map(|client| Arc::clone(client) as Arc<dyn NapcatGateway>);
+
+    // `[gate]`：所有 napcat.* 调用都过这里；llm_review 用主 provider。
+    let approvals = crate::security::action_gate::ApprovalQueue::with_db(Arc::clone(&db));
+    let mut action_gate =
+        crate::security::action_gate::ActionGate::new(&config.gate, Arc::clone(&approvals))
+            .with_db(Arc::clone(&db))
+            .with_chat_send_limit(chat_sends_per_hour);
+    if config.gate.llm_review {
+        action_gate = action_gate.with_reviewer(Arc::new(
+            crate::security::action_gate::LlmActionReviewer::new(
+                Arc::clone(&provider),
+                api_model,
+                std::time::Duration::from_secs(10),
+            ),
+        ));
+    }
+    let action_gate = Arc::new(action_gate);
+
+    tools.register(Arc::new(
+        ApiTool::new(
+            gateway.clone(),
+            Some(ops.clone() as Arc<dyn AgentOps>),
+            owner_qq,
+            master_qq,
+            Some(Arc::clone(&gate)),
+            config.agent.send_scopes.clone(),
+            Some(Arc::clone(&messages)),
+        )
+        .with_account(account_qq)
+        .with_action_gate(Arc::clone(&action_gate))
+        .with_receive_scopes(config.agent.receive_scopes.clone())
+        .with_event_hooks(config.hooks.events.clone()),
+    ));
+    // 子代理（docs、未开 allow_send 的自定义定义）拿到的是只读副本：
+    // 同一个工具名，但只允许 api.list / api.help。
+    let read_only_api = Arc::new(
+        ApiTool::new(
+            gateway,
+            Some(ops.clone() as Arc<dyn AgentOps>),
+            owner_qq,
+            master_qq,
+            Some(Arc::clone(&gate)),
+            Vec::new(),
+            Some(Arc::clone(&messages)),
+        )
+        .read_only(),
+    );
+    let tools = Arc::new(tools.with_read_only_api(read_only_api));
+
+    (tools, server_tools, hub_handle, approvals)
+}
+
+/// Web 搜索 / 抓取。服务端工具由 provider 声明（Chat 协议没有），返回给 runner 放进请求；
+/// 本地工具后端只在用户配置了 `base_url` 与 key 时注册，不假定官方地址；`web_fetch.local`
+/// 直接抓取，不需要后端。
+fn register_web_tools(
+    tools: &mut ToolRegistry,
+    config: &SbotConfig,
+    auth: &AuthFile,
+    model_ref: crate::config::models::ModelRef<'_>,
+    download_policy: NetPolicy,
+) -> Vec<ServerToolKind> {
     let protocol = model_ref.provider.api;
     let mut server_tools: Vec<ServerToolKind> = Vec::new();
     let mut add_server =
@@ -220,60 +285,7 @@ pub(super) async fn assemble_tools(
             Err(error) => warn!(%error, "cannot register WebFetch"),
         }
     }
-
-    let gateway: Option<Arc<dyn NapcatGateway>> = qq
-        .as_ref()
-        .map(|client| Arc::clone(client) as Arc<dyn NapcatGateway>);
-
-    // `[gate]`：所有 napcat.* 调用都过这里；llm_review 用主 provider。
-    let approvals = crate::security::action_gate::ApprovalQueue::with_db(Arc::clone(&db));
-    let mut action_gate =
-        crate::security::action_gate::ActionGate::new(&config.gate, Arc::clone(&approvals))
-            .with_db(Arc::clone(&db))
-            .with_chat_send_limit(chat_sends_per_hour);
-    if config.gate.llm_review {
-        action_gate = action_gate.with_reviewer(Arc::new(
-            crate::security::action_gate::LlmActionReviewer::new(
-                Arc::clone(&provider),
-                api_model,
-                std::time::Duration::from_secs(10),
-            ),
-        ));
-    }
-    let action_gate = Arc::new(action_gate);
-
-    tools.register(Arc::new(
-        ApiTool::new(
-            gateway.clone(),
-            Some(ops.clone() as Arc<dyn AgentOps>),
-            owner_qq,
-            master_qq,
-            Some(Arc::clone(&gate)),
-            config.agent.send_scopes.clone(),
-            Some(Arc::clone(&messages)),
-        )
-        .with_account(account_qq)
-        .with_action_gate(Arc::clone(&action_gate))
-        .with_receive_scopes(config.agent.receive_scopes.clone())
-        .with_event_hooks(config.hooks.events.clone()),
-    ));
-    // 子代理（docs、未开 allow_send 的自定义定义）拿到的是只读副本：
-    // 同一个工具名，但只允许 api.list / api.help。
-    let read_only_api = Arc::new(
-        ApiTool::new(
-            gateway,
-            Some(ops.clone() as Arc<dyn AgentOps>),
-            owner_qq,
-            master_qq,
-            Some(Arc::clone(&gate)),
-            Vec::new(),
-            Some(Arc::clone(&messages)),
-        )
-        .read_only(),
-    );
-    let tools = Arc::new(tools.with_read_only_api(read_only_api));
-
-    (tools, server_tools, hub_handle, approvals)
+    server_tools
 }
 
 /// 内置唤醒预设：对 `@` 与主人的消息唤醒；删除后会记录到 meta，重启不再恢复。
