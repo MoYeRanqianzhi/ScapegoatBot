@@ -92,7 +92,7 @@ fn image_transform(params: &Value, ctx: &ToolContext) -> ToolResult {
         Ok(value) => value,
         Err(error) => return ToolResult::error(error),
     };
-    let (out, out_path, ext) = match output_path(params) {
+    let (out, out_path, ext) = match output_path(params, ctx) {
         Ok(value) => value,
         Err(error) => return ToolResult::error(error),
     };
@@ -183,7 +183,7 @@ fn image_convert(params: &Value, ctx: &ToolContext) -> ToolResult {
         Ok(value) => value,
         Err(error) => return ToolResult::error(error),
     };
-    let (out, out_path, ext) = match output_path(params) {
+    let (out, out_path, ext) = match output_path(params, ctx) {
         Ok(value) => value,
         Err(error) => return ToolResult::error(error),
     };
@@ -195,7 +195,7 @@ fn image_text(params: &Value, ctx: &ToolContext) -> ToolResult {
         Ok(value) => value,
         Err(error) => return ToolResult::error(error),
     };
-    let (out, out_path, ext) = match output_path(params) {
+    let (out, out_path, ext) = match output_path(params, ctx) {
         Ok(value) => value,
         Err(error) => return ToolResult::error(error),
     };
@@ -340,10 +340,23 @@ fn read_image(
 /// `local.media.image.text` 一次最多绘制的字符数。
 const MAX_TEXT_CHARS: usize = 1000;
 
-fn output_path(params: &Value) -> Result<(String, crate::vfs::VfsPath, String), String> {
+/// 解析并检查输出路径：`out` 必须是合法 VFS 路径、扩展名是支持的图片格式。
+///
+/// 开了 `allow_send` 的自定义子代理拿到完整的 `API`，也能调用这里（`docs` 的 `API` 只读，
+/// 到不了这一步），所以与 `Write` 一样经过
+/// [`crate::tools::subagent_write_denied`]：不能把图片写进 `/memory`、`/config` 等受保护路径。
+/// `/trash` 由 VFS 写入层拒绝，这里不重复。
+fn output_path(
+    params: &Value,
+    ctx: &ToolContext,
+) -> Result<(String, crate::vfs::VfsPath, String), String> {
     let out = arg_str(params, "out").map_err(|error| error.content)?;
     let path = crate::vfs::path::VfsPath::parse(out)
         .map_err(|error| format!("invalid output path: {error}"))?;
+    // 受保护路径对子代理只读；主代理返回 None，照常写。
+    if let Some(denied) = crate::tools::subagent_write_denied(ctx, &path) {
+        return Err(denied.content);
+    }
     let ext = out.to_ascii_lowercase();
     if !(ext.ends_with(".png")
         || ext.ends_with(".jpg")

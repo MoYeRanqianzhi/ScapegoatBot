@@ -1353,6 +1353,43 @@ mod tests {
         assert!(empty.content.contains("no transform"), "{}", empty.content);
     }
 
+    /// 子代理经 `API` 的图片操作同样不能写受保护路径（与 `Write` 一致）；普通路径照常写。
+    #[tokio::test]
+    async fn subagent_image_output_respects_protected_paths() {
+        let vfs = media_vfs();
+        seed_image(&vfs, "/tmp/src.png", 4, 4);
+        let tool = tool(None, None);
+        let ctx = ToolContext::new(Arc::clone(&vfs), None).with_subagent("sa-1");
+
+        for out in ["/memory/x.png", "/config/x.png", "/agents/x.png"] {
+            let result = run_image(
+                &tool,
+                &ctx,
+                "local.media.image.convert",
+                json!({"path": "/tmp/src.png", "out": out}),
+            )
+            .await;
+            assert!(result.is_error, "{out}: {}", result.content);
+            assert!(
+                result.content.contains("Subagents cannot modify"),
+                "{}",
+                result.content
+            );
+            let path = crate::vfs::path::VfsPath::parse(out).unwrap();
+            assert!(vfs.stat(&path).is_err(), "{out} must not be written");
+        }
+
+        let result = run_image(
+            &tool,
+            &ctx,
+            "local.media.image.convert",
+            json!({"path": "/tmp/src.png", "out": "/tmp/out.png"}),
+        )
+        .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(load_output(&vfs, "/tmp/out.png").dimensions(), (4, 4));
+    }
+
     /// 解压炸弹：文件很小、声明尺寸巨大的图在解码阶段就被拒绝，不分配像素。
     #[tokio::test]
     async fn images_beyond_the_side_limit_are_not_decoded() {
