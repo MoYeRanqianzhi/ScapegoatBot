@@ -58,8 +58,10 @@ impl AgentType {
 
     /// 允许的工具；这是硬约束，模型不能通过参数扩大。
     ///
-    /// `general` 默认不含 `API`（发送能力）；自定义定义显式 `allow_send = true` 时才加入。
-    pub fn tools(self, allow_send: bool) -> Vec<&'static str> {
+    /// 内置类型的 `API` 都是不能做 QQ 操作的副本（`local.*` 与 `api.*`）：`docs` 用它查
+    /// 注册表，`general` 用它下载、处理图片。`explore` / `plan` 只读，没有 `API`
+    /// （`local.*` 会写 VFS）。发送能力只来自自定义定义的 `allow_send = true`。
+    pub fn tools(self) -> Vec<&'static str> {
         let read = ["Read", "LS", "Stat", "Glob", "Grep"];
         match self {
             Self::Explore | Self::Plan => read.to_vec(),
@@ -76,14 +78,11 @@ impl AgentType {
                     "MV",
                     "CP",
                     "Mkdir",
-                    "Download",
+                    "API",
                     "WebSearch",
                     "WebFetch",
                     "Monitor",
                 ]);
-                if allow_send {
-                    tools.push("API");
-                }
                 tools
             }
         }
@@ -97,8 +96,9 @@ impl AgentType {
                  result. You can read the VFS and write your own files, but you cannot change \
                  /config, /MEMORY.md, /memory, /USER.md, /AGENTS.md, /agents or /hooks, and you \
                  cannot delete anything: say in your result what should change and the parent \
-                 agent decides. Monitors you add deliver only to you. Your work is not saved as \
-                 long-term memory."
+                 agent decides. Your API has only local.* (download a URL, work on images) and \
+                 api.*; you cannot send or do anything else on QQ. Monitors you add deliver only \
+                 to you. Your work is not saved as long-term memory."
             }
             Self::Explore => {
                 "You are an exploration subagent. Read and search only; you cannot write, send \
@@ -133,8 +133,9 @@ pub struct SubagentRequest {
     pub depth: u32,
     /// 允许的最大深度。
     pub max_depth: u32,
-    /// 只读：`API` 只保留 `api.*` 查询（docs 与不可发送的自定义子代理）。
-    pub read_only: bool,
+    /// `API` 换成不能做 QQ 操作的副本（只有 `local.*` / `api.*`）：内置类型与没开
+    /// `allow_send` 的自定义子代理。
+    pub local_only: bool,
     /// 继承自 spawn 调用方的回合证据；跨 chat 发送与 owner intent 检查依赖它。
     pub evidence: crate::transcript::TurnEvidence,
     /// 运行中注入的消息（`Agent message`）；在回合边界排空。
@@ -271,8 +272,8 @@ pub struct AgentInstance {
     /// 续聊时复用，避免自定义定义在第二轮丢失。
     system: String,
     tools: Vec<&'static str>,
-    /// 该实例的 `API` 是否是只读视图；续聊时保持一致。
-    read_only: bool,
+    /// 该实例的 `API` 是否是不能做 QQ 操作的副本；续聊时保持一致。
+    local_only: bool,
     /// spawn 时继承的回合证据。续聊（重启）用的是续聊那一回合的证据，不沿用这里。
     evidence: crate::transcript::TurnEvidence,
     max_steps: u32,
@@ -409,7 +410,7 @@ impl AgentHub {
             );
         }
 
-        let (label, system, tools, max_steps, read_only) = if let Some(agent_name) = agent {
+        let (label, system, tools, max_steps, local_only) = if let Some(agent_name) = agent {
             let definitions = self.definitions().await;
             let definition = definitions
                 .iter()
@@ -437,7 +438,7 @@ impl AgentHub {
                 definition
                     .max_steps
                     .unwrap_or(self.config.default_max_steps),
-                // 自定义定义没开 allow_send 时，`tools = [API]` 也只能查询。
+                // 自定义定义没开 allow_send 时，`tools = [API]` 也不能做 QQ 操作。
                 !definition.allow_send,
             )
         } else {
@@ -448,9 +449,10 @@ impl AgentHub {
             (
                 kind.as_str().to_owned(),
                 system,
-                kind.tools(false),
+                kind.tools(),
                 self.config.default_max_steps,
-                matches!(kind, AgentType::Docs),
+                // 内置类型没有发送权限。
+                true,
             )
         };
 
@@ -465,7 +467,7 @@ impl AgentHub {
             created_at: Utc::now(),
             system: system.clone(),
             tools: tools.clone(),
-            read_only,
+            local_only,
             evidence: evidence.clone(),
             max_steps,
             depth,
@@ -493,7 +495,7 @@ impl AgentHub {
             max_steps,
             depth,
             max_depth: self.config.max_depth,
-            read_only,
+            local_only,
             evidence,
             incoming: Some(incoming_rx),
             shared_history: Some(Arc::clone(&instance.history)),
@@ -587,7 +589,7 @@ impl AgentHub {
             max_steps: instance.max_steps,
             depth: instance.depth,
             max_depth: self.config.max_depth,
-            read_only: instance.read_only,
+            local_only: instance.local_only,
             evidence,
             incoming: Some(incoming_rx),
             shared_history: Some(Arc::clone(&instance.history)),
@@ -777,9 +779,7 @@ fn known_tool(name: &str) -> Option<&'static str> {
         "Glob",
         "Grep",
         "API",
-        // `Memory` 不在其中：它只写 /MEMORY.md 与 /USER.md，子代理不能改长期记忆。
         "Skill",
-        "Download",
         "WebSearch",
         "WebFetch",
         "Monitor",
@@ -824,6 +824,96 @@ mod tests {
         // 只保留路径；数据目录需要活过整个测试。
         let _ = dir.keep();
         AgentHub::new(runner, SwarmConfig::default(), vfs, host)
+    }
+
+    /// 记下每次运行拿到的工具集与 `local_only`。
+    #[derive(Default)]
+    struct Recorder {
+        seen: Mutex<Vec<(Vec<&'static str>, bool)>>,
+    }
+
+    #[async_trait]
+    impl SubagentRunner for Recorder {
+        async fn run_subagent(&self, request: SubagentRequest) -> Result<String> {
+            self.seen
+                .lock()
+                .await
+                .push((request.tools.clone(), request.local_only));
+            Ok("done".to_owned())
+        }
+    }
+
+    /// 内置类型没有独立的下载工具，也都不能做 QQ 操作：`general` / `docs` 的 `API` 是
+    /// `local_only` 副本，`explore` / `plan` 根本没有 `API`（`local.*` 会写 VFS）。
+    #[tokio::test]
+    async fn builtin_types_never_get_a_sending_api() {
+        for kind in [
+            AgentType::General,
+            AgentType::Explore,
+            AgentType::Plan,
+            AgentType::Docs,
+        ] {
+            let tools = kind.tools();
+            assert!(!tools.contains(&"Download"), "{kind:?}: {tools:?}");
+            assert!(!tools.contains(&"RM"), "{kind:?}: {tools:?}");
+            assert_eq!(
+                tools.contains(&"API"),
+                matches!(kind, AgentType::General | AgentType::Docs),
+                "{kind:?}: {tools:?}"
+            );
+        }
+        assert!(known_tool("Download").is_none());
+        assert!(known_tool("Memory").is_none());
+
+        let recorder = Arc::new(Recorder::default());
+        let hub = hub(recorder.clone());
+        for kind in ["general", "docs", "explore"] {
+            let spawned = hub
+                .spawn(Some(kind), None, "task".to_owned(), 0, Default::default())
+                .await
+                .unwrap();
+            let id = spawned["id"].as_str().unwrap().to_owned();
+            hub.wait(&id, std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
+        }
+        let seen = recorder.seen.lock().await;
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|(_, local_only)| *local_only), "{seen:?}");
+    }
+
+    /// 自定义定义：`allow_send = true` 才拿到完整的 `API`；否则即使 `tools` 里写了 `API`
+    /// 也是 `local_only` 副本。
+    #[tokio::test]
+    async fn only_allow_send_definitions_get_the_full_api() {
+        let recorder = Arc::new(Recorder::default());
+        let hub = hub(recorder.clone());
+        for (name, allow_send) in [("quiet", false), ("sender", true)] {
+            let path = VfsPath::parse(&format!("/agents/{name}.md")).unwrap();
+            hub.vfs
+                .write_text(
+                    &path,
+                    &format!(
+                        "---\nname: {name}\ndescription: test\ntools: Read, API\n\
+                         allow_send: {allow_send}\n---\nDo the task."
+                    ),
+                    None,
+                )
+                .unwrap();
+            let spawned = hub
+                .spawn(None, Some(name), "task".to_owned(), 0, Default::default())
+                .await
+                .unwrap();
+            let id = spawned["id"].as_str().unwrap().to_owned();
+            hub.wait(&id, std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
+        }
+        let seen = recorder.seen.lock().await;
+        assert_eq!(
+            *seen,
+            vec![(vec!["Read", "API"], true), (vec!["Read", "API"], false)]
+        );
     }
 
     #[test]

@@ -192,8 +192,8 @@ impl Tool for WriteTool {
     fn description(&self) -> &'static str {
         "Create or overwrite a UTF-8 text file in the VFS. Parent directories are created. \
          Overwriting an existing file requires a full prior `Read`; creating a new file does not. \
-         Returns path, bytes, and version. Use `Download` for binary files; use `Edit` for small \
-         changes."
+         Returns path, bytes, and version. To save a file from a URL, use `API` \
+         local.net.download; use `Edit` for small changes."
     }
 
     fn parameters(&self) -> Value {

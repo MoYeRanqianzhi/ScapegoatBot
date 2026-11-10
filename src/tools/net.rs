@@ -1,6 +1,6 @@
 //! 网络工具的共享策略：SSRF 防护、域名允许/阻止、大小限制。
 //!
-//! 设计依据：设计 §5.2 `Download` / `WebFetch`。
+//! 使用者：`API` 的 `local.net.download`、发送前的媒体下载与 `WebFetch`。
 //!
 //! 防护顺序：
 //! 1. 协议只允许 http/https；

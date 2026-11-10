@@ -891,8 +891,8 @@ impl crate::swarm::SubagentRunner for Runner {
             .tools
             .filtered(&request.tools)
             .for_subagent(request.id.clone());
-        if request.read_only {
-            tools = tools.read_only();
+        if request.local_only {
+            tools = tools.without_qq();
         }
         // 嵌套 spawn：只有未到 max_depth 且 hub 已注入时，才给子代理 Agent 工具。
         if request.depth + 1 < request.max_depth

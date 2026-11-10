@@ -21,7 +21,6 @@ pub(crate) const DYNAMIC_UNAVAILABLE: &str = "Dynamic views are not available in
 pub use crate::actions;
 pub mod agent;
 pub mod api;
-pub mod download;
 pub mod fs;
 pub mod memory;
 pub mod monitor;
@@ -167,8 +166,8 @@ pub struct ToolRegistry {
     views: Option<Arc<views::Views>>,
     /// 安全闸；`hold` 期间 API 的 `napcat.*` 分支与 `/config` 写入拒绝。
     gate: Option<Arc<crate::security::gate::Gate>>,
-    /// 只读 `API` 的替身；docs 等子代理用。
-    read_only_api: Option<Arc<dyn Tool>>,
+    /// 不能做 QQ 操作的 `API` 副本（只有 `local.*` / `api.*`）；没有发送权限的子代理用。
+    local_api: Option<Arc<dyn Tool>>,
     /// 调用者身份，原样放进每次调用的 [`ToolContext::subagent`]；`None` = 主代理。
     subagent: Option<String>,
     /// 单次工具结果的字节上限；0 = 不限制。
@@ -185,7 +184,7 @@ impl ToolRegistry {
             vfs: Some(vfs),
             views,
             gate: None,
-            read_only_api: None,
+            local_api: None,
             subagent: None,
             max_result_bytes: 0,
             max_schema_tokens: 0,
@@ -204,21 +203,32 @@ impl ToolRegistry {
         self
     }
 
-    /// 提供只读 `API` 实例；`read_only()` 会用它替换完整版本。
-    pub(crate) fn with_read_only_api(mut self, tool: Arc<dyn Tool>) -> Self {
-        self.read_only_api = Some(tool);
+    /// 提供不能做 QQ 操作的 `API` 副本；[`Self::without_qq`] 用它替换完整版本。
+    pub(crate) fn with_local_api(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.local_api = Some(tool);
         self
     }
 
-    /// 把 `API` 换成只允许 `api.*` 的实例。
-    pub(crate) fn read_only(mut self) -> Self {
-        if let Some(api) = &self.read_only_api {
-            self.tools.insert("API", Arc::clone(api));
+    /// 把 `API` 换成只允许 `local.*` / `api.*` 的副本（没有发送权限的子代理）。
+    ///
+    /// 这份注册表里没有 `API`（子代理的工具集不含它）时什么都不做；有 `API` 却没有副本可换
+    /// 时把 `API` 去掉：宁可少一个工具，也不能把完整的发送能力留给不该有它的子代理。
+    pub(crate) fn without_qq(mut self) -> Self {
+        if !self.tools.contains_key("API") {
+            return self;
+        }
+        match &self.local_api {
+            Some(api) => {
+                self.tools.insert("API", Arc::clone(api));
+            }
+            None => {
+                self.tools.remove("API");
+            }
         }
         self
     }
 
-    /// 注入安全闸；hold 由 API 的 `napcat.*` 分支与 `/config` 写入执行，Download/Web/MCP 不受影响。
+    /// 注入安全闸；hold 由 API 的 `napcat.*` 分支与 `/config` 写入执行，`local.*`、Web、MCP 不受影响。
     pub(crate) fn with_gate(mut self, gate: Arc<crate::security::gate::Gate>) -> Self {
         self.gate = Some(gate);
         self
@@ -258,7 +268,7 @@ impl ToolRegistry {
             vfs: self.vfs.clone(),
             views: self.views.clone(),
             gate: self.gate.clone(),
-            read_only_api: self.read_only_api.clone(),
+            local_api: self.local_api.clone(),
             subagent: self.subagent.clone(),
             max_result_bytes: self.max_result_bytes,
             max_schema_tokens: self.max_schema_tokens,
@@ -562,6 +572,54 @@ mod tests {
         // 未超限时原样返回。
         let small = truncate_result(ToolResult::ok("ok"), 10);
         assert_eq!(small.content, "ok");
+    }
+
+    /// 只有名字与描述的工具替身：描述用来区分“完整的 API”与“子代理副本”。
+    struct Named(&'static str, &'static str);
+
+    #[async_trait]
+    impl Tool for Named {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &'static str {
+            self.1
+        }
+        fn parameters(&self) -> Value {
+            object_schema(json!({}), &[])
+        }
+        async fn execute(&self, _ctx: &ToolContext, _args: Value) -> ToolResult {
+            ToolResult::ok(self.1)
+        }
+    }
+
+    /// `without_qq`：有副本就换成副本；没有副本就去掉 `API`（不能把完整的发送能力留下）；
+    /// 工具集里本来没有 `API` 时不凭空加进去。
+    #[test]
+    fn without_qq_swaps_or_drops_the_api_tool() {
+        let full = || -> Arc<dyn Tool> { Arc::new(Named("API", "full")) };
+        let local = || -> Arc<dyn Tool> { Arc::new(Named("API", "local")) };
+        let read = || -> Arc<dyn Tool> { Arc::new(Named("Read", "read")) };
+
+        let mut registry = ToolRegistry::default();
+        registry.register(full());
+        registry.register(read());
+        let registry = registry.with_local_api(local());
+
+        let swapped = registry.filtered(&["API", "Read"]).without_qq();
+        assert_eq!(swapped.names(), vec!["API", "Read"]);
+        assert_eq!(swapped.get("API").unwrap().description(), "local");
+        // 没有调用 `without_qq` 的（allow_send 的自定义子代理）保留完整版本。
+        let kept = registry.filtered(&["API", "Read"]);
+        assert_eq!(kept.get("API").unwrap().description(), "full");
+
+        let no_api = registry.filtered(&["Read"]).without_qq();
+        assert_eq!(no_api.names(), vec!["Read"]);
+
+        let mut bare = ToolRegistry::default();
+        bare.register(full());
+        bare.register(read());
+        assert_eq!(bare.without_qq().names(), vec!["Read"]);
     }
 
     #[test]

@@ -4,18 +4,21 @@
 //!
 //! 四个命名空间：
 //! - `napcat.*`：转发 OneBot action（全部 QQ 操作），策略链见 `policy` 子模块；
-//! - `agent.*`：对 agent 自己的操作（status / resume / quarantine / compact /
+//! - `local.*`：只读写 VFS 的本地工具，不访问 QQ：`local.media.image.*`（`image_ops`
+//!   子模块）与 `local.net.download`（`download` 子模块）；
+//! - `agent.*`：主代理对自己的操作（status / resume / quarantine / compact /
 //!   clear_context），不产生对外影响；
-//! - `image.*`：VFS 图片处理（`image_ops` 子模块），不访问 QQ；
 //! - `api.*`：对注册表本身的查询（list / help）。
 //!
 //! 安全边界：
 //! - `hold` 期间 **所有** `napcat.*` 返回 `Disabled during hold`，包括拉黑、禁言、
-//!   踢人；`agent.*`、`image.*` 与 `api.*` 照常可用。
+//!   踢人；`local.*`、`agent.*` 与 `api.*` 照常可用。
 //! - 目标为 `owner_qq` / `master_qq` 的 admin/destructive action 在任何模式下都拒绝。
 //! - 对外动作受 `[agent].send_scopes` 限制（fail-closed）。
 //! - NapCat 只会收到 `base64://` 形式的文件内容（`outbound` 子模块），
 //!   宿主机路径与内网 URL 永远不会交给它。
+//! - 子代理：`agent.*` 一律拒绝（上下文与 hold 属于主代理）；没有发送权限的子代理拿到的是
+//!   `local_only` 副本，`napcat.*` 也拒绝。
 
 use std::sync::Arc;
 
@@ -33,9 +36,12 @@ use crate::transcript::ToolResult;
 use super::{Tool, ToolContext, arg_str, object_schema};
 use crate::actions::{ActionSpec, Category, qq_number, specs};
 
+mod download;
 mod image_ops;
 mod outbound;
 mod policy;
+
+pub(crate) use download::Downloader;
 
 /// NapCat 网关抽象；真实实现是 [`QqClient`]，测试用 fake。
 #[async_trait]
@@ -79,8 +85,8 @@ pub struct ApiTool {
     messages: Option<Arc<MessageStore>>,
     /// 发送账本 id 的进程内序号。
     counter: std::sync::atomic::AtomicU64,
-    /// 只读模式：只允许 `api.*` 查询。docs 子代理使用。
-    read_only: bool,
+    /// 给没有发送权限的子代理的副本：只允许 `local.*` 与 `api.*`，`napcat.*` 拒绝。
+    local_only: bool,
     /// `[gate]`：每次 napcat.* 调用的门禁；`None` 只用于测试。
     action_gate: Option<Arc<crate::security::action_gate::ActionGate>>,
     /// 允许读取的 chat；`None` = 不限制（测试/旧路径），`["*"]` = 全部。
@@ -89,6 +95,8 @@ pub struct ApiTool {
     event_hooks: Vec<crate::config::EventHookConfig>,
     /// 发送前下载 http(s) 媒体用的网络策略（只连公网）。
     media_net: NetPolicy,
+    /// `local.net.download` 的客户端与策略（`[tools.download]`）；`None` 时该动作报不可用。
+    downloader: Option<Arc<Downloader>>,
 }
 
 impl ApiTool {
@@ -111,11 +119,12 @@ impl ApiTool {
             send_scopes,
             messages,
             counter: std::sync::atomic::AtomicU64::new(0),
-            read_only: false,
+            local_only: false,
             action_gate: None,
             receive_scopes: None,
             event_hooks: Vec::new(),
             media_net: outbound::media_net_policy(),
+            downloader: None,
         }
     }
 
@@ -157,9 +166,15 @@ impl ApiTool {
         self
     }
 
-    /// 只读副本：只暴露 `api.list` / `api.help`，不能发送或执行 QQ 动作。
-    pub(crate) fn read_only(mut self) -> Self {
-        self.read_only = true;
+    /// 接入 `local.net.download`。主代理的副本与 `local_only` 副本共用同一个下载器。
+    pub(crate) fn with_downloader(mut self, downloader: Arc<Downloader>) -> Self {
+        self.downloader = Some(downloader);
+        self
+    }
+
+    /// 给没有发送权限的子代理的副本：`local.*` 与 `api.*` 照常，`napcat.*` 拒绝。
+    pub(crate) fn local_only(mut self) -> Self {
+        self.local_only = true;
         self
     }
 
@@ -259,9 +274,11 @@ impl Tool for ApiTool {
          Do not write CQ codes. Media segments take `file`: a VFS path, a public http(s) URL, or \
          base64:// data. During a hold every napcat.* call returns `Disabled during hold`.\n\n\
          local.* — local tools that only touch the VFS. local.media.image.* inspects, transforms, \
-         re-encodes and draws text on images (system fonts only).\n\n\
-         agent.* — operations on yourself; these never reach QQ and are always available: \
-         status, resume, quarantine, compact, clear_context.\n\n\
+         re-encodes and draws text on images (system fonts only). local.net.download saves an \
+         http(s) URL into the VFS (public hosts only).\n\n\
+         agent.* — operations on yourself; these never reach QQ and are always available to the \
+         main agent: status, resume, quarantine, compact, clear_context. Subagents cannot call \
+         them.\n\n\
          api.* — read-only registry queries: api.list (namespace prefix such as `local.media`, \
          category, query, offset, limit) and api.help (action).\n\n\
          Sends return a message_id. Do not retry a send without checking whether it went out."
@@ -286,11 +303,6 @@ impl Tool for ApiTool {
             Ok(action) => action,
             Err(error) => return error,
         };
-        if self.read_only && !action.starts_with("api.") {
-            return ToolResult::error(
-                "This subagent is read-only: only api.list and api.help are available.",
-            );
-        }
         let params = args.get("params").cloned().unwrap_or_else(|| json!({}));
 
         // `api.*` 是元查询，直接返回，不进入 action 分派。
@@ -319,9 +331,18 @@ impl Tool for ApiTool {
             Err(error) => return ToolResult::error(error),
         };
         match spec.namespace() {
+            // 上下文、压缩与 hold 属于主代理：任何子代理都不能替它清空、压缩或解除。
+            "agent" if ctx.subagent.is_some() => ToolResult::error(
+                "agent.* acts on the main agent's context and hold; subagents cannot call it. \
+                 Report what you found in your result instead.",
+            ),
             "agent" => self.run_agent(spec, &params).await,
-            // 本地工具：目前只有 `local.media.image.*`，全部只读写 VFS。
-            "local" => self.run_image(spec, &params, ctx).await,
+            // 本地工具只读写 VFS；按第二段再分。
+            "local" => self.run_local(spec, &params, ctx).await,
+            "napcat" if self.local_only => ToolResult::error(
+                "This subagent cannot perform QQ operations: only local.* and api.* are \
+                 available to it.",
+            ),
             // napcat 的策略链顺序集中在本模块的 `policy` 子模块里。
             "napcat" => self.run_napcat(spec, params, ctx).await,
             _ => ToolResult::error(format!("Unsupported namespace in {}", spec.action)),
@@ -408,6 +429,20 @@ impl ApiTool {
             }))
             .unwrap_or_default(),
         )
+    }
+
+    /// `local.*` 按第二段分派：`local.media.*` 是图片处理，`local.net.*` 是下载。
+    async fn run_local(&self, spec: &ActionSpec, params: &Value, ctx: &ToolContext) -> ToolResult {
+        if spec.in_namespace("local.media") {
+            self.run_image(spec, params, ctx).await
+        } else if spec.in_namespace("local.net") {
+            self.run_download(params, ctx).await
+        } else {
+            ToolResult::error(format!(
+                "{} is not implemented by this runtime",
+                spec.action
+            ))
+        }
     }
 
     async fn run_agent(&self, spec: &ActionSpec, params: &Value) -> ToolResult {
@@ -645,10 +680,15 @@ mod tests {
     #[tokio::test]
     async fn api_list_namespace_is_a_hierarchical_prefix() {
         let tool = tool(None, None);
-        for prefix in ["local", "local.media", "local.media.image"] {
+        for (prefix, total) in [
+            ("local", 6),
+            ("local.media", 5),
+            ("local.media.image", 5),
+            ("local.net", 1),
+        ] {
             let result = call(&tool, "api.list", json!({"namespace": prefix, "limit": 50})).await;
             let value: Value = serde_json::from_str(&result.content).unwrap();
-            assert_eq!(value["total"], 5, "{prefix}: {}", result.content);
+            assert_eq!(value["total"], total, "{prefix}: {}", result.content);
         }
         for prefix in ["image", "local.med"] {
             let result = call(&tool, "api.list", json!({"namespace": prefix})).await;
@@ -1258,8 +1298,9 @@ mod tests {
         assert!(gateway.calls.lock().unwrap().is_empty());
     }
 
+    /// 子代理的 `local_only` 副本：`napcat.*` 拒绝（查询也不行），`local.*` 与 `api.*` 可用。
     #[tokio::test]
-    async fn read_only_api_cannot_send() {
+    async fn local_only_api_cannot_reach_qq() {
         let gateway = Arc::new(FakeGateway::default());
         let tool = ApiTool::new(
             Some(gateway.clone()),
@@ -1270,20 +1311,81 @@ mod tests {
             vec!["*".to_owned()],
             None,
         )
-        .read_only();
+        .local_only();
 
-        let result = call(
-            &tool,
-            "napcat.send_group_msg",
-            json!({"group_id": 1, "message": "hi"}),
-        )
-        .await;
-        assert!(result.is_error);
-        assert!(result.content.contains("read-only"));
+        for (action, params) in [
+            (
+                "napcat.send_group_msg",
+                json!({"group_id": 1, "message": "hi"}),
+            ),
+            ("napcat.get_group_list", json!({})),
+        ] {
+            let result = call(&tool, action, params).await;
+            assert!(result.is_error, "{action}: {}", result.content);
+            assert!(
+                result.content.contains("cannot perform QQ operations"),
+                "{action}: {}",
+                result.content
+            );
+        }
         assert!(gateway.calls.lock().unwrap().is_empty());
 
         let result = call(&tool, "api.list", json!({})).await;
         assert!(!result.is_error, "{}", result.content);
+        // `local.*` 走到自己的参数检查，说明没有被 local_only 挡住。
+        let result = call(
+            &tool,
+            "local.media.image.info",
+            json!({"path": "/tmp/none.png"}),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(
+            !result.content.contains("cannot perform QQ operations"),
+            "{}",
+            result.content
+        );
+    }
+
+    /// `agent.*` 属于主代理：子代理（即使拿到完整 `API`）不能清空、压缩上下文或解除 hold。
+    #[tokio::test]
+    async fn subagents_cannot_call_agent_actions() {
+        let ops = Arc::new(FakeOps::default());
+        let tool = ApiTool::new(
+            None,
+            Some(ops.clone()),
+            10000,
+            10000,
+            None,
+            vec!["*".to_owned()],
+            None,
+        );
+        let ctx = ToolContext::new(media_vfs(), None).with_subagent("sa-1");
+        for action in [
+            "agent.status",
+            "agent.resume",
+            "agent.compact",
+            "agent.clear_context",
+        ] {
+            let result = tool
+                .execute(&ctx, json!({"action": action, "params": {}}))
+                .await;
+            assert!(result.is_error, "{action}: {}", result.content);
+            assert!(
+                result.content.contains("subagents cannot call it"),
+                "{action}: {}",
+                result.content
+            );
+        }
+        assert_eq!(*ops.compacted.lock().unwrap(), 0);
+
+        // 主代理照常。
+        let main = ToolContext::new(media_vfs(), None);
+        let result = tool
+            .execute(&main, json!({"action": "agent.compact", "params": {}}))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(*ops.compacted.lock().unwrap(), 1);
     }
 
     #[tokio::test]

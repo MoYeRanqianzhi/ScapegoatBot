@@ -105,10 +105,9 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 
 | 工具 | 说明 |
 |------|------|
-| `API` | 唯一的 QQ 动作入口；`api.list` / `api.help` 查表 |
+| `API` | 唯一的 QQ 动作入口，也是下载、图片处理等本地动作的入口；`api.list` / `api.help` 查表 |
 | `Memory` | `/USER.md`、`/memory/*`、`/MEMORY.md` 的结构化写入（检查格式与预算、原子批量）；`Write` / `Edit` 也能直接改这些文件，但不做这些检查 |
 | `Skill` | 加载 `/skills/<name>/SKILL.md` 与资源清单 |
-| `Download` | HTTP(S) 下载到 VFS，带 SSRF/域名/大小限制；边收边加密暂存，不把整个文件留在内存里。文本类型（`text/*`、JSON、XML、JS）且不超过文本上限、是合法 UTF-8 时存成文本节点，否则存成二进制 |
 | `WebSearch` / `WebFetch` | 搜索 / 抓取；由服务端工具或你配置的后端执行 |
 | `Monitor` | 增删查事件订阅，手动触发一次 |
 | `Agent` | 生成/续聊/查询/等待子代理 |
@@ -117,11 +116,17 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 `API` 的 action 名是分层的，第一段说明效果落在哪里：
 
 - `napcat.*`：QQ 操作，唯一会被别人看到的动作。hold 期间全部拒绝。
-- `local.*`：只读写 VFS 的本地工具。目前是 `local.media.image.*`（本地工具 → 媒体 → 图片）：
-  `info`、`transform`（裁剪/任意角度旋转/缩放/缩略）、`convert`（PNG/JPEG/WebP，quality
-  只作用于 JPEG）、`text`（字体、位置、颜色、透明度）、`fonts`（列出系统字体）。不内置字体，
-  `text` 使用系统安装的字体；没有字体时 `fonts` 返回空列表，`text` 返回明确错误。
-- `agent.*`：`status`、`resume`、`quarantine`、`compact`、`clear_context`。
+- `local.*`：只读写 VFS 的本地工具，hold 期间照常可用。
+  - `local.media.image.*`（本地工具 → 媒体 → 图片）：`info`、`transform`（裁剪/任意角度
+    旋转/缩放/缩略）、`convert`（PNG/JPEG/WebP，quality 只作用于 JPEG）、`text`（字体、
+    位置、颜色、透明度）、`fonts`（列出系统字体）。不内置字体，`text` 使用系统安装的字体；
+    没有字体时 `fonts` 返回空列表，`text` 返回明确错误。
+  - `local.net.download`：`{url, path, max_bytes?}`，把 HTTP(S) 内容下载到 VFS。只连公网
+    地址（SSRF 防护、域名允许/阻止、重定向逐跳校验），大小受 `[tools.download].max_bytes`
+    限制；边收边加密暂存，不把整个文件留在内存里。文本类型（`text/*`、JSON、XML、JS）且
+    不超过文本上限、是合法 UTF-8 时存成文本节点，否则存成二进制。
+- `agent.*`：`status`、`resume`、`quarantine`、`compact`、`clear_context`。只有主代理能用
+  （上下文与 hold 属于主代理，子代理调用会被拒绝）。
 - `api.*`：`list`（`namespace` 按层级前缀过滤，如 `local.media`；另有分类/关键词/分页）、
   `help`（单个 action 的 schema）。
 
@@ -168,12 +173,14 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 - 内置类型：`general`、`explore`、`plan`、`docs`。
 - 自定义：`/agents/<name>.md`，frontmatter 支持 `tools`、`model`、`thinking_level`、
   `max_steps`、`allow_send`。
-- 工具集强制是父代理的子集；没有 `allow_send` 时 `API` 只读。`general` 的工具：
-  `Read`/`LS`/`Stat`/`Glob`/`Grep`、`Write`/`Edit`/`MV`/`CP`/`Mkdir`、`Download`、
-  `WebSearch`/`WebFetch`、`Monitor`（没有 `RM` 与 `Memory`）。
+- 工具集强制是父代理的子集。子代理的 `API` 默认只有 `local.*` 与 `api.*`，不能做任何 QQ
+  操作（`napcat.*` 的查询也不行）；只有自定义定义写了 `allow_send: true` 才拿到完整的
+  `API`。`agent.*` 对任何子代理都拒绝。`general` 的工具：`Read`/`LS`/`Stat`/`Glob`/`Grep`、
+  `Write`/`Edit`/`MV`/`CP`/`Mkdir`、`API`、`WebSearch`/`WebFetch`、`Monitor`（没有 `RM`）；
+  `docs` 是只读文件工具加 `API`；`explore` / `plan` 只有只读文件工具。
 - 子代理（包括自定义定义）**不能**：写 `/config`、`/config.toml`、`/MEMORY.md`、`/memory`、
-  `/USER.md`、`/AGENTS.md`、`/agents`、`/hooks`（`Write`/`Edit`/`MV`/`CP`/`Mkdir`/`Download`
-  与 `API` 的 `local.media.image.*` 输出都拒绝），删除任何东西（`RM`、`MV` 进 `/trash`），使用 `Memory`。要改这些就写进结果，
+  `/USER.md`、`/AGENTS.md`、`/agents`、`/hooks`（`Write`/`Edit`/`MV`/`CP`/`Mkdir` 与 `API`
+  的 `local.*` 输出都拒绝），删除任何东西（`RM`、`MV` 进 `/trash`）。要改这些就写进结果，
   由主代理决定。
 - 子代理用 `Monitor add` 建的 monitor 只投给它自己（`deliver.to` 省略或写自己的 id）。
 - 子代理有独立上下文，结果回给父代理；`max_depth` 限制嵌套。

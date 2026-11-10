@@ -361,7 +361,7 @@ impl VfsStore {
         Ok(result)
     }
 
-    /// 读取某个二进制分块（供 `Download` 与发送文件流式使用）。
+    /// 读取某个二进制分块；[`Vfs::read_bytes`] 逐块拼出整个文件。
     pub fn read_blob_chunk(&self, path: &VfsPath, idx: u64) -> Result<Vec<u8>, VfsError> {
         let conn = self.db.lock();
         let row = self

@@ -16,8 +16,7 @@ use crate::storage::Database;
 use crate::storage::messages::MessageStore;
 use crate::tools::ToolRegistry;
 use crate::tools::agent::{AgentTool, HubHandle};
-use crate::tools::api::{AgentOps, ApiTool, NapcatGateway};
-use crate::tools::download::DownloadTool;
+use crate::tools::api::{AgentOps, ApiTool, Downloader, NapcatGateway};
 use crate::tools::memory::MemoryTool;
 use crate::tools::monitor::MonitorTool;
 use crate::tools::net::NetPolicy;
@@ -50,7 +49,7 @@ pub(super) struct ToolAssembly<'a> {
 
 /// [`assemble_tools`] 的产物。
 pub(super) struct ToolSet {
-    /// 主代理的工具表（含给子代理用的只读 `API` 副本）。
+    /// 主代理的工具表（含给子代理用的、不能做 QQ 操作的 `API` 副本）。
     pub(super) tools: Arc<ToolRegistry>,
     /// provider 侧声明的服务端工具，随每个请求发送。
     pub(super) server_tools: Vec<ServerToolKind>,
@@ -98,17 +97,21 @@ pub(super) async fn assemble_tools(assembly: ToolAssembly<'_>) -> ToolSet {
             .with_db(Arc::clone(db)),
         ));
     }
-    // 下载与 WebFetch 共用同一套域名 / 体积限制。
+    // `local.net.download` 与 WebFetch 共用同一套域名 / 体积限制。
     let download_policy = NetPolicy {
         allowed_domains: config.tools.download.allowed_domains.clone(),
         blocked_domains: config.tools.download.blocked_domains.clone(),
         max_bytes: config.tools.download.max_bytes,
         ..NetPolicy::default()
     };
-    match DownloadTool::new(Arc::clone(vfs), download_policy.clone()) {
-        Ok(tool) => tools.register(Arc::new(tool)),
-        Err(error) => warn!(%error, "cannot register Download"),
-    }
+    // 建不出 HTTP 客户端时只是没有下载：`local.net.download` 会报不可用，其余照常。
+    let downloader = match Downloader::new(download_policy.clone()) {
+        Ok(downloader) => Some(Arc::new(downloader)),
+        Err(error) => {
+            warn!(%error, "downloads are unavailable: cannot build the HTTP client");
+            None
+        }
+    };
     let server_tools = register_web_tools(
         &mut tools,
         config,
@@ -119,7 +122,7 @@ pub(super) async fn assemble_tools(assembly: ToolAssembly<'_>) -> ToolSet {
 
     let approvals = ApprovalQueue::with_db(Arc::clone(db));
     let action_gate = build_action_gate(&assembly, &approvals);
-    let tools = register_api(tools, &assembly, action_gate);
+    let tools = register_api(tools, &assembly, action_gate, downloader);
     ToolSet {
         tools,
         server_tools,
@@ -162,23 +165,24 @@ fn build_action_gate(
     Arc::new(action_gate)
 }
 
-/// 注册主代理的 `API`，并给工具表挂上子代理用的只读副本，返回最终的工具表。
+/// 注册主代理的 `API`，并给工具表挂上子代理用的副本，返回最终的工具表。
 ///
-/// 只读副本给 `docs` 与没开 `allow_send` 的自定义子代理：同一个工具名，但只允许
-/// `api.list` / `api.help`，也没有发送范围。
+/// 副本给内置类型与没开 `allow_send` 的自定义子代理：同一个工具名，但只有 `local.*`
+/// （下载、图片）与 `api.*`，`napcat.*` 拒绝，也没有发送范围。
 fn register_api(
     mut tools: ToolRegistry,
     assembly: &ToolAssembly<'_>,
     action_gate: Arc<ActionGate>,
+    downloader: Option<Arc<Downloader>>,
 ) -> Arc<ToolRegistry> {
     let config = assembly.config;
     let gateway: Option<Arc<dyn NapcatGateway>> = assembly
         .qq
         .as_ref()
         .map(|client| Arc::clone(client) as Arc<dyn NapcatGateway>);
-    // 两个副本共用的构造参数；只有发送范围不同（只读副本为空）。
+    // 两个副本共用的构造参数与下载器；只有发送范围不同（子代理副本为空）。
     let api = |send_scopes: Vec<String>| {
-        ApiTool::new(
+        let tool = ApiTool::new(
             gateway.clone(),
             Some(Arc::clone(&assembly.ops) as Arc<dyn AgentOps>),
             assembly.owner_qq,
@@ -186,7 +190,11 @@ fn register_api(
             Some(Arc::clone(&assembly.gate)),
             send_scopes,
             Some(Arc::clone(&assembly.messages)),
-        )
+        );
+        match &downloader {
+            Some(downloader) => tool.with_downloader(Arc::clone(downloader)),
+            None => tool,
+        }
     };
     tools.register(Arc::new(
         api(config.agent.send_scopes.clone())
@@ -195,8 +203,8 @@ fn register_api(
             .with_receive_scopes(config.agent.receive_scopes.clone())
             .with_event_hooks(config.hooks.events.clone()),
     ));
-    let read_only_api = Arc::new(api(Vec::new()).read_only());
-    Arc::new(tools.with_read_only_api(read_only_api))
+    let local_api = Arc::new(api(Vec::new()).local_only());
+    Arc::new(tools.with_local_api(local_api))
 }
 
 /// Web 搜索 / 抓取。服务端工具由 provider 声明（Chat 协议没有），返回给 runner 放进请求；

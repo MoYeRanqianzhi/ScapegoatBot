@@ -27,7 +27,7 @@ API {"action": "napcat.send_private_msg", "params": {"user_id": 10001, "message"
 - `message` is a plain string or an array of segments: `text {text}`, `reply {id}` (quotes a message; put it first), `at {qq}`, `face {id}`, `image {file}`, `record {file}`, `video {file}`. Never write CQ codes.
 - A media `file` is a VFS path such as `/tmp/card.png`, a public http(s) URL, or `base64://…`. To make or change an image, use `local.media.image.*` first, then send the result.
 - A send returns a `message_id`. It is the handle for quoting, reacting (`napcat.set_msg_emoji_like`) and recalling (`napcat.delete_msg`, which QQ only allows shortly after sending).
-- To look at an image someone sent: it may already be attached to your turn; otherwise `Download` its URL into `/tmp/` and `Read` the file.
+- To look at an image someone sent: it may already be attached to your turn; otherwise save its URL with `local.net.download` (`{"url": …, "path": "/tmp/pic.jpg"}`) and `Read` the file.
 - Everything else — group management, requests, profiles, history — lives in the registry. `api.list` with a prefix such as `napcat` or `local.media` shows what exists; `api.help` gives one action's exact parameters. Look it up rather than guessing: undeclared parameters are rejected.
 - If a send fails or times out, find out whether it went out — the tool result, the chat in `/messages` — before you try again. A duplicate is worse than a late message.
 

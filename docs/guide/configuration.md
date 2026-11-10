@@ -118,7 +118,8 @@ access token 在 `auth.json`，不在这里。
 
 ### `[tools]`
 
-- `download`：`allowed_domains` / `blocked_domains` / `max_bytes`
+- `download`：`allowed_domains` / `blocked_domains` / `max_bytes`，约束 `API` 的
+  `local.net.download`（同一套域名与体积限制也用于 `WebFetch` 的本地抓取）
 - `web_search` / `web_fetch`：`backend = "auto" | "server" | "tool"`、
   `base_url`、`count` / `max_content_tokens`；`web_fetch.local = true` 时直接抓取
   （逐跳校验重定向 + HTML 转文本），不需要后端与 key

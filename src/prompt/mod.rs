@@ -145,6 +145,9 @@ mod tests {
         assert!(!prompt.contains("cannot write `/AGENTS.md`"));
         assert!(!prompt.contains("a standing instruction in `/AGENTS.md`"));
         assert!(prompt.contains("You may edit it"));
+        // 没有独立的下载工具：下载是 `API` 的 `local.net.download`。
+        assert!(!prompt.contains("`Download`"));
+        assert!(prompt.contains("local.net.download"));
     }
 
     #[test]

@@ -4,7 +4,8 @@
 //! `tools/api.rs`；拆开是为了让 action 表与门禁/发送逻辑各自可读。
 //!
 //! 命名是分层的，第一段说明效果落在哪里：`napcat.*`（QQ）、`local.*`（只碰 VFS 的本地
-//! 工具，例如 `local.media.image.*`）、`agent.*`（对自己）、`api.*`（查注册表）。
+//! 工具：`local.media.image.*`、`local.net.download`）、`agent.*`（对自己）、`api.*`
+//! （查注册表）。
 //!
 //! `specs()` 是唯一事实来源：`api.list` / `api.help`、发送范围校验与
 //! owner 保护都从这张表推导。
@@ -145,6 +146,7 @@ pub fn specs() -> &'static [ActionSpec] {
         specs_napcat_profile(&mut list);
         specs_agent(&mut list);
         specs_local_media_image(&mut list);
+        specs_local_net(&mut list);
         specs_api(&mut list);
         list
     })
@@ -663,6 +665,31 @@ fn specs_local_media_image(list: &mut Vec<ActionSpec>) {
             examples: vec![example],
         });
     }
+}
+
+fn specs_local_net(list: &mut Vec<ActionSpec>) {
+    // ---- local.net ----
+    // 类别是 `Media`：它和图片工具一样只在 VFS 里产生文件，不是会影响 QQ 的 `File`
+    // （`File` 属于对外动作，会进门禁与发送范围检查）。
+    list.push(ActionSpec {
+        action: "local.net.download",
+        category: Category::Media,
+        summary: "Download an http(s) URL into the VFS. Public hosts only: private and loopback \
+                  addresses are refused, redirects are re-checked, and the size is capped. \
+                  Small UTF-8 text is stored as a text file, everything else as binary. It does \
+                  not send anything; use a napcat.* send for that.",
+        params: json!({
+            "url": {"type": "string"},
+            "path": {"type": "string", "description": "Absolute VFS path to write."},
+            "max_bytes": {"type": "number", "description": "Optional lower size limit."}
+        }),
+        returns: "JSON with path, bytes, mime, kind and hash.",
+        requires_owner_intent: false,
+        scope_field: None,
+        target_field: None,
+        destructive: false,
+        examples: vec![r#"{"url":"https://example.com/a.png","path":"/tmp/a.png"}"#],
+    });
 }
 
 fn specs_api(list: &mut Vec<ActionSpec>) {

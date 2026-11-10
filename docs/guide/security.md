@@ -99,8 +99,9 @@ timeout_ms = 800
 - 写 `~/.sbot/SECURITY_HOLD`（重启仍然有效；只记原因，不记被判危险的原文）；
 - 所有 `napcat.*` 动作返回 `Disabled during hold`，包括拉黑、禁言、踢人；
 - `/config` 与 `/config.toml` 只读：上下文可能已被注入，此时改配置会把一次注入变成持久设置；
-- 其余工具（文件、记忆、`WebSearch`、`WebFetch`、`MCP`、`Download`）不受影响；
-- 回合照常运行：`agent.*` 与 `api.*` 仍可用，agent 可以看状态、隔离可疑内容、自查。
+- 其余工具（文件、`WebSearch`、`WebFetch`、`MCP`）不受影响；
+- 回合照常运行：`API` 的 `local.*`（下载、图片）、`agent.*` 与 `api.*` 仍可用，agent 可以
+  看状态、隔离可疑内容、自查。
 
 hold **没有超时**，但**由 agent 自己解除**：这个 agent 无人值守，不会有人来替它解开。
 
@@ -216,8 +217,8 @@ action 只接受注册表声明过的参数（`api.help` 可查），未声明�
 
 ## 网络
 
-- `Download` / `WebFetch` 在请求前校验协议、域名与解析后的公网地址；
-- `Download` 的 DNS 解析在连接层过滤非公网地址（防 rebinding），重定向逐跳校验；
+- `local.net.download` / `WebFetch` 在请求前校验协议、域名与解析后的公网地址；
+- `local.net.download` 的 DNS 解析在连接层过滤非公网地址（防 rebinding），重定向逐跳校验；
 - `WebFetch` 默认由你配置的后端执行抓取，返回前复核 `final_url`；设置
   `[tools.web_fetch].local = true` 后改为本地逐跳校验并直接抓取（HTML 转文本、
   2 MiB/字符上限）。敏感目标优先用 local。
