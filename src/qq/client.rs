@@ -7,14 +7,27 @@
 //! - 提供统一的 action 调用（`API` 工具直接复用）；
 //! - 把发送结果解析成消息 id，并在发送账本里登记（见 [`super::ledger`]）。
 //!
-//! 断线重连由 NapCatLink 内置的退避策略负责。
+//! 断线重连分两层：NapCatLink 内置的退避策略先试（最多 10 次，约 7 分钟），它放弃之后
+//! 由 [`QqClient::keep_connected`] 接手，一直重试到连上为止。这个 agent 无人值守，
+//! “重连几次就不再试”等于永久失联。
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use napcat_link::{EventSubscription, MessageSegment, NapLink};
+use napcat_link::{ConnectionState, EventSubscription, MessageSegment, NapLink};
 use serde_json::Value;
+use tokio::sync::watch;
+use tracing::{info, warn};
 
 use super::event::ChatId;
 use super::ledger::{OutboundLedger, produces_message};
+
+/// [`QqClient::keep_connected`] 多久看一次连接状态。
+const CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// 重连失败后的最短 / 最长等待；每次失败翻倍。
+const RETRY_MIN: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(300);
 
 /// 登录信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +65,92 @@ impl QqClient {
             .connect()
             .await
             .context("cannot connect to NapCat")
+    }
+
+    /// 连接是否处于“已连接”。
+    pub fn is_connected(&self) -> bool {
+        self.link.state() == ConnectionState::Connected
+    }
+
+    /// 看着连接，直到 `shutdown` 变为 `true`：NapCatLink 放弃之后接着重连，永不放弃。
+    ///
+    /// NapCatLink 自己会重连，但有三种情况会停下并把状态留在 `Disconnected`：重连次数用尽、
+    /// 服务端正常关闭（NapCat 重启时常见）、连上后连续几次立刻被断开（token 不对时）。
+    /// 停下之后没有任何东西会再调用 `connect()`，守护进程就此与 QQ 失联到被人重启为止。
+    ///
+    /// 这里每隔 [`CHECK_INTERVAL`] 看一次状态，只在 `Disconnected`（SDK 已经停手）时出手；
+    /// `Connecting` / `Reconnecting` 是 SDK 正在处理，不去打扰（它的 actor 在重连期间
+    /// 不处理新命令，排进去的 `connect()` 只会在它完成后收到一条“已连接”的拒绝）。
+    /// 连不上时按 [`RETRY_MIN`]…[`RETRY_MAX`] 指数退避；连上后退避归零。
+    ///
+    /// 只负责“恢复已经建立过的连接”：启动时就没连上的情况不走这里（那时账号还不知道，
+    /// 见 `app::assembly::connect_qq`）。
+    pub fn keep_connected(self: &Arc<Self>, shutdown: watch::Receiver<bool>) {
+        self.keep_connected_every(CHECK_INTERVAL, RETRY_MIN, shutdown);
+    }
+
+    /// [`Self::keep_connected`] 的实现；检查间隔与最短重试等待可以指定（集成测试用很短的值，
+    /// 不必真的等上几秒）。
+    pub fn keep_connected_every(
+        self: &Arc<Self>,
+        check_interval: Duration,
+        retry_min: Duration,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
+        let client = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut delay = retry_min;
+            // 上一次看到的是不是“已连接”：只在变化时记日志，断线期间不刷屏。
+            let mut was_connected = client.is_connected();
+            loop {
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        // 发送端没了（进程在退出）或明确要求停止。
+                        if changed.is_err() || *shutdown.borrow() {
+                            return;
+                        }
+                        continue;
+                    }
+                    _ = tokio::time::sleep(check_interval) => {}
+                }
+                let state = client.link.state();
+                let connected = state == ConnectionState::Connected;
+                if connected != was_connected {
+                    if connected {
+                        info!("NapCat connection restored");
+                    } else {
+                        warn!("NapCat connection lost; QQ actions fail until it is back");
+                    }
+                    was_connected = connected;
+                }
+                if state != ConnectionState::Disconnected {
+                    // 已连接，或 SDK 正在连接 / 重连。
+                    if connected {
+                        delay = retry_min;
+                    }
+                    continue;
+                }
+                match client.connect().await {
+                    Ok(()) => {
+                        info!("reconnected to NapCat");
+                        was_connected = true;
+                        delay = retry_min;
+                    }
+                    Err(error) => {
+                        warn!(%error, retry_in_secs = delay.as_secs(), "cannot reconnect to NapCat");
+                        tokio::select! {
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    return;
+                                }
+                            }
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                        delay = (delay * 2).min(RETRY_MAX);
+                    }
+                }
+            }
+        });
     }
 
     /// 订阅事件流。

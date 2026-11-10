@@ -241,17 +241,30 @@ impl Runtime {
             ipc::Endpoint::resolve(&paths, &config.config.ipc)
         };
         info!(endpoint = %endpoint.display(), "starting IPC server");
-        let server = tokio::spawn({
+        let mut server = tokio::spawn({
             let handler: Arc<dyn Handler> = runtime.clone();
             let endpoint = endpoint.clone();
             async move { ipc::serve(&endpoint, handler, shutdown_rx).await }
         });
 
         let mut wait_shutdown = runtime.shutdown.subscribe();
+        // `ipc::serve` 只在收到关闭信号时正常返回；在那之前返回说明控制通道建不起来
+        // （套接字目录不安全、绑定失败、管道被占用）。没有控制通道的守护进程既查不了
+        // 状态也停不下来，所以报错退出，而不是悄悄继续跑。
+        let mut ipc_failure: Option<anyhow::Error> = None;
         tokio::select! {
             _ = wait_shutdown.changed() => {}
             _ = tokio::signal::ctrl_c() => info!("received Ctrl-C, shutting down"),
             _ = terminate_signal() => info!("received termination signal, shutting down"),
+            result = &mut server => {
+                let error = match result {
+                    Ok(Ok(())) => anyhow::anyhow!("the IPC server stopped unexpectedly"),
+                    Ok(Err(error)) => error.context("the IPC server failed"),
+                    Err(error) => anyhow::anyhow!("the IPC server task failed: {error}"),
+                };
+                tracing::error!(error = %format!("{error:#}"), "no control channel; shutting down");
+                ipc_failure = Some(error);
+            }
         }
         // SessionEnd hook：在关闭 IPC 与 QQ 管线之前触发，`notify` 还能发出去；最多等 5 秒。
         let agent = runtime.agent.read().expect("agent lock poisoned").clone();
@@ -263,9 +276,15 @@ impl Runtime {
             .await;
         }
         let _ = runtime.shutdown.send(true);
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+        // 已经结束的任务不能再等一次。
+        if ipc_failure.is_none() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+        }
         info!("sbot stopped");
-        Ok(())
+        match ipc_failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn config(&self) -> std::sync::RwLockReadGuard<'_, LoadedConfig> {

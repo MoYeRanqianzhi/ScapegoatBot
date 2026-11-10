@@ -11,7 +11,6 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use anyhow::Context;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::watch;
 use tracing::{debug, warn};
@@ -104,7 +103,12 @@ pub async fn serve(
 
         tokio::select! {
             result = server.connect() => {
-                result.context("named pipe connect failed")?;
+                // 一次连接失败（客户端在握手中退出等）不该让控制通道永久消失：换下一个实例。
+                if let Err(error) = result {
+                    warn!(%error, "named pipe connect failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {

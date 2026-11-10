@@ -102,11 +102,20 @@ async fn accept_loop(
 
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _addr) = accepted.context("unix socket accept failed")?;
-                let handler = Arc::clone(&handler);
-                tokio::spawn(async move {
-                    super::handle_connection(stream, handler).await;
-                });
+                match accepted {
+                    Ok((stream, _addr)) => {
+                        let handler = Arc::clone(&handler);
+                        tokio::spawn(async move {
+                            super::handle_connection(stream, handler).await;
+                        });
+                    }
+                    // 瞬时错误（文件描述符用尽、对端在握手中断开）：控制通道不能因为一次
+                    // accept 失败就永久消失，稍等再接受。
+                    Err(error) => {
+                        warn!(%error, "unix socket accept failed; retrying");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
