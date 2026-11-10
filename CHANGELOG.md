@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+### 修复
+
+- 消息索引重建：一行解不开（损坏、篡改、换了密钥）或一个文件读不出时只记警告并跳过，
+  其余消息照常补回。以前整个重建直接失败，后续文件补不上索引，下次启动再次触发、再次失败。
+
+### 变更
+
+- 拆分过长的函数：`app::assembly::build_agent`（208 → 120 行，`runtime_ops` /
+  `build_views` / `build_runner` / `spawn_maintenance`）、`assemble_tools`（返回具名的
+  `ToolSet`；`register_mcp` / `build_action_gate` / `register_api`）、`register_web_tools`
+  （search / fetch 共用 `tool_backend`）、Anthropic 流解码的 `handle`（按事件类型拆成方法，
+  `Stop` 只发一次的逻辑合一）、`MessageStore::rebuild_index`（文件头解析、逐行补索引、
+  文件表同步分开；文件头的加密方式解析与读取路径共用 `header_encryption`）。
+
 ## [0.2.0-alpha.43] - 2026-11-10
 
 ### 修复

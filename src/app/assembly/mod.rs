@@ -10,7 +10,7 @@
 //! - 本文件：[`build_agent`] 按顺序把它们接起来。
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
@@ -50,7 +50,7 @@ use providers::{
     Providers, build_providers, compaction_model, install_llm_judge, memory_review_model,
     security_reviewer,
 };
-use tools::{ToolAssembly, assemble_tools, install_wake_presets};
+use tools::{ToolAssembly, ToolSet, assemble_tools, install_wake_presets};
 
 /// `build_agent` 的全部输入；参数太多，打包成结构体。
 ///
@@ -95,151 +95,73 @@ pub(super) struct AgentInputs<'a> {
     pub agents_dir: PathBuf,
 }
 
+/// 回合之间共享的对话历史：runner、`RuntimeOps`（手动压缩）与后台复盘读写同一份。
+type SharedHistory = Arc<Mutex<Vec<crate::agent::AgentMessage>>>;
+
+/// 按顺序装配 agent：provider → 视图 / monitor → 工具表 → runner → 队列与后台任务。
+///
+/// 主模型不在模型清单里、或 provider 建不起来时返回 `Ok(None)`（已记日志），调用方
+/// 以“只连 QQ、不跑 agent”的方式继续；恢复 transcript 失败等真正的错误才返回 `Err`。
 pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<AgentRuntime>>> {
-    let AgentInputs {
-        loaded,
-        config_handle,
-        models,
-        auth,
-        db,
-        key,
-        vfs,
-        messages,
-        sessions,
-        turn_buffer,
-        gate,
-        qq,
-        self_id,
-        owner_qq,
-        master_qq,
-        ai_enabled,
-        estop_file,
-        agents_dir,
-    } = input;
-    let config = &loaded.config;
-    let Some(model_ref) = models.find(&config.agent.model) else {
+    let config = &input.loaded.config;
+    let Some(model_ref) = input.models.find(&config.agent.model) else {
         warn!(model = %config.agent.model, "the primary model is not defined in models.json");
         return Ok(None);
     };
     // 预算先于任何 provider：所有模型请求都经 `build_metered` 记进这里。
-    let Some(Providers {
-        provider,
-        fallbacks,
-        thinking,
-        budget,
-        meter,
-    }) = build_providers(config, models, auth, &db, model_ref)
+    let Some(providers) = build_providers(config, input.models, input.auth, &input.db, model_ref)
     else {
         return Ok(None);
     };
-    install_llm_judge(config, &gate, &provider, model_ref);
+    install_llm_judge(config, &input.gate, &providers.provider, model_ref);
 
-    let history = Arc::new(Mutex::new(Vec::new()));
-    let ops = Arc::new(RuntimeOps {
-        runner: std::sync::OnceLock::new(),
-        gate: Arc::clone(&gate),
-        vfs: Arc::clone(&vfs),
-        sessions: Arc::clone(&sessions),
-        messages: Arc::clone(&messages),
-        db: Some(Arc::clone(&db)),
-        history: Arc::clone(&history),
-        model: Arc::new(std::sync::RwLock::new(config.agent.model.clone())),
-        owner_qq,
-        master_qq,
-        receive_scopes: config.agent.receive_scopes.clone(),
-        send_scopes: config.agent.send_scopes.clone(),
-        estop_file: estop_file.clone(),
-    });
-
-    let views = Arc::new(
-        Views::new(
-            Arc::clone(&vfs),
-            Arc::clone(&messages),
-            Arc::clone(&sessions),
-            qq.clone()
-                .map(|client| client as Arc<dyn crate::tools::api::NapcatGateway>),
-        )
-        .with_context(ViewContext {
-            config: Some(Arc::clone(&config_handle)),
-            models: Some(models.clone()),
-            gate: Some(Arc::clone(&gate)),
-            ai_enabled: Some(Arc::clone(&ai_enabled)),
-            estop_file: Some(estop_file.clone()),
-            started_at: Some(chrono::Utc::now()),
-            db: Some(Arc::clone(&db)),
-            key: Some(Arc::clone(&key)),
-            receive_scopes: config.agent.receive_scopes.clone(),
-            self_id,
-        }),
+    let history: SharedHistory = Arc::new(Mutex::new(Vec::new()));
+    let ops = runtime_ops(&input, &history);
+    let views = build_views(&input);
+    let (sink, monitors, internal) = start_monitors(
+        &input.db,
+        &input.vfs,
+        &input.gate,
+        &providers.budget,
+        input.self_id,
+        input.owner_qq,
     );
-    let (sink, monitors, internal) = start_monitors(&db, &vfs, &gate, &budget, self_id, owner_qq);
-    gate.set_budget(Arc::clone(&budget));
+    input.gate.set_budget(Arc::clone(&providers.budget));
+    spawn_maintenance(config, &input.vfs, &input.db);
 
-    let (tools, server_tools, hub_handle, approvals) = assemble_tools(ToolAssembly {
+    let tool_set = assemble_tools(ToolAssembly {
         config,
-        auth,
+        auth: input.auth,
         model_ref,
-        db: Arc::clone(&db),
-        vfs: Arc::clone(&vfs),
-        messages: Arc::clone(&messages),
-        gate: Arc::clone(&gate),
+        db: Arc::clone(&input.db),
+        vfs: Arc::clone(&input.vfs),
+        messages: Arc::clone(&input.messages),
+        gate: Arc::clone(&input.gate),
         views: Arc::clone(&views),
         monitors: Arc::clone(&monitors),
         ops: Arc::clone(&ops),
-        qq: qq.clone(),
-        account_qq: self_id,
-        owner_qq,
-        master_qq,
-        provider: Arc::clone(&provider),
+        qq: input.qq.clone(),
+        account_qq: input.self_id,
+        owner_qq: input.owner_qq,
+        master_qq: input.master_qq,
+        provider: Arc::clone(&providers.provider),
         api_model: model_ref.model.id.clone(),
-        chat_sends_per_hour: budget.chat_sends_per_hour(),
+        chat_sends_per_hour: providers.budget.chat_sends_per_hour(),
     })
     .await;
 
-    let security_review =
-        security_reviewer(&config.security, models, auth, &provider, model_ref, &meter);
-    let last_activity = Arc::new(std::sync::atomic::AtomicI64::new(
-        chrono::Utc::now().timestamp(),
-    ));
-    let memory_model = memory_review_model(&config.memory, models, auth, &meter);
-    let memory_flush = config.compaction.memory_flush.then(|| {
-        Arc::new(crate::memory::MemoryFlusher::new(
-            memory_model.clone(),
-            Arc::clone(&vfs),
-            Some(Arc::clone(&db)),
-            config.memory.clone(),
-        ))
-    });
-    let compaction = compaction_model(config, models, auth, &meter);
-    let runner = Runner::new_with_fallbacks(
-        provider,
-        fallbacks,
-        tools,
-        Arc::clone(&gate),
-        Arc::clone(&vfs),
-        Arc::clone(&messages),
-        Arc::clone(&sessions),
-        turn_buffer,
-        qq,
-        runner_config(
-            config,
-            model_ref,
-            RunnerParts {
-                account_qq: self_id,
-                owner_qq,
-                master_qq,
-                thinking,
-                server_tools,
-                security_review,
-                memory_flush,
-                compaction,
-                last_activity: Arc::clone(&last_activity),
-                budget: Arc::clone(&budget),
-            },
-        ),
-        Arc::clone(&history),
-        Arc::clone(&ai_enabled),
-        estop_file,
+    // 后台复盘据此判断空闲；runner 每个回合更新它。
+    let last_activity = Arc::new(AtomicI64::new(chrono::Utc::now().timestamp()));
+    let memory_model =
+        memory_review_model(&config.memory, input.models, input.auth, &providers.meter);
+    let runner = build_runner(
+        &input,
+        model_ref,
+        providers,
+        &tool_set,
+        &history,
+        memory_model.clone(),
+        &last_activity,
     )
     .await?;
 
@@ -250,17 +172,16 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
         attach_swarm(
             config,
             &runner,
-            &vfs,
-            agents_dir,
-            &hub_handle,
+            &input.vfs,
+            input.agents_dir.clone(),
+            &tool_set.hub_handle,
             &sink,
             &internal,
         );
     }
-    crate::monitor::load_config_monitors(&monitors, &config.monitor, Some(&messages)).await?;
-    install_wake_presets(&monitors, &db, owner_qq).await;
+    crate::monitor::load_config_monitors(&monitors, &config.monitor, Some(&input.messages)).await?;
+    install_wake_presets(&monitors, &input.db, input.owner_qq).await;
 
-    let filter = MessageFilter::from_config(&config.filter);
     let queue = ChatQueue::new(
         config.queue.clone(),
         Arc::clone(&runner) as Arc<dyn crate::agent::queue::TurnHandler>,
@@ -273,12 +194,12 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
         provider: runner.provider_slot(),
         review_model: memory_model,
         history: Arc::clone(&history),
-        vfs: Arc::clone(&vfs),
-        db: Some(Arc::clone(&db)),
+        vfs: Arc::clone(&input.vfs),
+        db: Some(Arc::clone(&input.db)),
         queue: Arc::clone(&queue) as Arc<dyn crate::memory::QueueActivity>,
         memory: config.memory.clone(),
         style: config.style.clone(),
-        ai_enabled: Arc::clone(&ai_enabled),
+        ai_enabled: Arc::clone(&input.ai_enabled),
         last_activity,
     });
 
@@ -287,21 +208,149 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
         queue,
         ops,
         monitors,
-        self_id,
-        filter: Arc::new(RwLock::new(filter)),
+        self_id: input.self_id,
+        filter: Arc::new(RwLock::new(MessageFilter::from_config(&config.filter))),
         filtered: AtomicU64::new(0),
-        approvals,
-        owner_qq,
-        master_qq,
+        approvals: tool_set.approvals,
+        owner_qq: input.owner_qq,
+        master_qq: input.master_qq,
         audit: EventAudit {
-            db: Arc::clone(&db),
-            key: Arc::clone(&key),
+            db: Arc::clone(&input.db),
+            key: Arc::clone(&input.key),
         },
     });
-
     install_hot_reload(&views, &runtime);
-
     Ok(Some(runtime))
+}
+
+/// `API` 的 `agent.*` 命名空间背后的运行时操作。`runner` 留空，runner 建好后再填。
+fn runtime_ops(input: &AgentInputs<'_>, history: &SharedHistory) -> Arc<RuntimeOps> {
+    let config = &input.loaded.config;
+    Arc::new(RuntimeOps {
+        runner: std::sync::OnceLock::new(),
+        gate: Arc::clone(&input.gate),
+        vfs: Arc::clone(&input.vfs),
+        sessions: Arc::clone(&input.sessions),
+        messages: Arc::clone(&input.messages),
+        db: Some(Arc::clone(&input.db)),
+        history: Arc::clone(history),
+        model: Arc::new(RwLock::new(config.agent.model.clone())),
+        owner_qq: input.owner_qq,
+        master_qq: input.master_qq,
+        receive_scopes: config.agent.receive_scopes.clone(),
+        send_scopes: config.agent.send_scopes.clone(),
+        estop_file: input.estop_file.clone(),
+    })
+}
+
+/// VFS 里的动态视图（`/config`、`/status`、`/qq` 等）及其读取的运行时句柄。
+fn build_views(input: &AgentInputs<'_>) -> Arc<Views> {
+    Arc::new(
+        Views::new(
+            Arc::clone(&input.vfs),
+            Arc::clone(&input.messages),
+            Arc::clone(&input.sessions),
+            input
+                .qq
+                .clone()
+                .map(|client| client as Arc<dyn crate::tools::api::NapcatGateway>),
+        )
+        .with_context(ViewContext {
+            config: Some(Arc::clone(&input.config_handle)),
+            models: Some(input.models.clone()),
+            gate: Some(Arc::clone(&input.gate)),
+            ai_enabled: Some(Arc::clone(&input.ai_enabled)),
+            estop_file: Some(input.estop_file.clone()),
+            started_at: Some(chrono::Utc::now()),
+            db: Some(Arc::clone(&input.db)),
+            key: Some(Arc::clone(&input.key)),
+            receive_scopes: input.loaded.config.agent.receive_scopes.clone(),
+            self_id: input.self_id,
+        }),
+    )
+}
+
+/// 后台维护：技能 curator（`[skills].curator` 可关）与回收站清理（总是开启）。
+fn spawn_maintenance(config: &SbotConfig, vfs: &Arc<VfsStore>, db: &Arc<Database>) {
+    if config.skills.curator {
+        crate::app::maintenance::spawn_skill_curator(
+            Arc::clone(vfs),
+            Arc::clone(db),
+            config.skills.clone(),
+        );
+    }
+    crate::app::maintenance::spawn_trash_purge(Arc::clone(vfs));
+}
+
+/// 建 runner：主模型与回退链来自 `providers`，辅助组件（周期安全审查、压缩前的记忆
+/// 提取、独立压缩模型）在这里按配置建好，经 [`runner_config`] 放进 [`RunnerConfig`]。
+///
+/// `Runner::new_with_fallbacks` 会先恢复崩溃前未提交的回合，失败时返回 `Err`。
+async fn build_runner(
+    input: &AgentInputs<'_>,
+    model_ref: crate::config::models::ModelRef<'_>,
+    providers: Providers,
+    tool_set: &ToolSet,
+    history: &SharedHistory,
+    memory_model: Option<crate::memory::ReviewModel>,
+    last_activity: &Arc<AtomicI64>,
+) -> Result<Arc<Runner>> {
+    let config = &input.loaded.config;
+    let Providers {
+        provider,
+        fallbacks,
+        thinking,
+        budget,
+        meter,
+    } = providers;
+    let security_review = security_reviewer(
+        &config.security,
+        input.models,
+        input.auth,
+        &provider,
+        model_ref,
+        &meter,
+    );
+    let memory_flush = config.compaction.memory_flush.then(|| {
+        Arc::new(crate::memory::MemoryFlusher::new(
+            memory_model,
+            Arc::clone(&input.vfs),
+            Some(Arc::clone(&input.db)),
+            config.memory.clone(),
+        ))
+    });
+    let compaction = compaction_model(config, input.models, input.auth, &meter);
+    Runner::new_with_fallbacks(
+        provider,
+        fallbacks,
+        Arc::clone(&tool_set.tools),
+        Arc::clone(&input.gate),
+        Arc::clone(&input.vfs),
+        Arc::clone(&input.messages),
+        Arc::clone(&input.sessions),
+        Arc::clone(&input.turn_buffer),
+        input.qq.clone(),
+        runner_config(
+            config,
+            model_ref,
+            RunnerParts {
+                account_qq: input.self_id,
+                owner_qq: input.owner_qq,
+                master_qq: input.master_qq,
+                thinking,
+                server_tools: tool_set.server_tools.clone(),
+                security_review,
+                memory_flush,
+                compaction,
+                last_activity: Arc::clone(last_activity),
+                budget,
+            },
+        ),
+        Arc::clone(history),
+        Arc::clone(&input.ai_enabled),
+        input.estop_file.clone(),
+    )
+    .await
 }
 
 /// 建 monitor 管理器与内部事件总线，并接上会发事件的组件（安全闸、预算、存储巡检）。

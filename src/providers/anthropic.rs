@@ -245,27 +245,18 @@ impl PendingServerTool {
 
 impl StreamState {
     /// 处理一个 SSE 事件，返回要发送给上层的事件。
+    ///
+    /// 事件名优先取 SSE 的 `event:` 行，没有时用 payload 的 `type` 字段；非 JSON 的
+    /// `data`（例如 `[DONE]`）与 `ping` 等未知事件不产生输出。
     fn handle(&mut self, event: super::sse::SseEvent) -> Vec<ProviderEvent> {
         let mut out = Vec::new();
-        let payload: Value = match serde_json::from_str(&event.data) {
-            Ok(value) => value,
-            Err(_) => {
-                // 非 JSON 的 data（例如 `[DONE]`）直接忽略。
-                return out;
-            }
+        let Ok(payload) = serde_json::from_str::<Value>(&event.data) else {
+            return out;
         };
-
         let kind = event
             .event
-            .clone()
-            .or_else(|| {
-                payload
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
+            .or_else(|| str_field(&payload, "type").map(str::to_owned))
             .unwrap_or_default();
-
         match kind.as_str() {
             "message_start" => {
                 if let Some(usage) = payload.pointer("/message/usage") {
@@ -273,178 +264,184 @@ impl StreamState {
                     out.push(ProviderEvent::Usage(self.usage));
                 }
             }
-            "content_block_start" => {
-                let block = &payload["content_block"];
-                let block_index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
-                let block_type = block
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                match block_type {
-                    "text" => {
-                        if let Some(text) = block.get("text").and_then(Value::as_str)
-                            && !text.is_empty()
-                        {
-                            out.push(ProviderEvent::TextDelta(text.to_owned()));
-                        }
-                    }
-                    "thinking" => {
-                        if let Some(text) = block.get("thinking").and_then(Value::as_str)
-                            && !text.is_empty()
-                        {
-                            out.push(ProviderEvent::ThinkingDelta(text.to_owned()));
-                        }
-                        if let Some(signature) = block.get("signature").and_then(Value::as_str)
-                            && !signature.is_empty()
-                        {
-                            out.push(ProviderEvent::ThinkingSignature(signature.to_owned()));
-                        }
-                    }
-                    "tool_use" => {
-                        out.push(ProviderEvent::ToolCallStart {
-                            index: block_index,
-                            id: block["id"].as_str().unwrap_or_default().to_owned(),
-                            name: block["name"].as_str().unwrap_or_default().to_owned(),
-                        });
-                    }
-                    "server_tool_use" => {
-                        // 上一个没有收到结束事件的调用先发出去，不丢。
-                        if let Some(previous) = self.server_tool.take() {
-                            out.push(previous.into_event());
-                        }
-                        self.server_tool = Some(PendingServerTool {
-                            index: block_index,
-                            id: block["id"].as_str().unwrap_or_default().to_owned(),
-                            name: block["name"].as_str().unwrap_or_default().to_owned(),
-                            initial: block.get("input").cloned().unwrap_or(Value::Null),
-                            json: String::new(),
-                        });
-                    }
-                    "web_search_tool_result" | "web_fetch_tool_result" => {
-                        if let Some((tool_use_id, content)) =
-                            server_tools::normalize_anthropic_result(block)
-                        {
-                            out.push(ProviderEvent::ServerToolResult {
-                                tool_use_id,
-                                content,
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            "content_block_delta" => {
-                let delta = &payload["delta"];
-                let block_index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
-                let delta_type = delta
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                match delta_type {
-                    "text_delta" => {
-                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                            out.push(ProviderEvent::TextDelta(text.to_owned()));
-                        }
-                    }
-                    "thinking_delta" => {
-                        if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
-                            out.push(ProviderEvent::ThinkingDelta(text.to_owned()));
-                        }
-                    }
-                    "signature_delta" => {
-                        if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
-                            out.push(ProviderEvent::ThinkingSignature(signature.to_owned()));
-                        }
-                    }
-                    "input_json_delta" => {
-                        if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
-                            match &mut self.server_tool {
-                                // 服务端工具的参数留在这里拼，不当成普通工具调用的参数。
-                                Some(pending) if pending.index == block_index => {
-                                    pending.json.push_str(partial);
-                                }
-                                _ => out.push(ProviderEvent::ToolCallArgumentsDelta {
-                                    index: block_index,
-                                    delta: partial.to_owned(),
-                                }),
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            "content_block_start" => self.block_start(&payload, &mut out),
+            "content_block_delta" => self.block_delta(&payload, &mut out),
             "content_block_stop" => {
-                let block_index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let index = block_index(&payload);
                 if self
                     .server_tool
                     .as_ref()
-                    .is_some_and(|pending| pending.index == block_index)
+                    .is_some_and(|pending| pending.index == index)
                     && let Some(pending) = self.server_tool.take()
                 {
                     out.push(pending.into_event());
                 }
             }
-            "message_delta" => {
-                if let Some(usage) = payload.get("usage") {
-                    let output = usage
-                        .get("output_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(self.usage.output_tokens);
-                    self.usage.output_tokens = output;
-                    out.push(ProviderEvent::Usage(self.usage));
-                }
-                if let Some(reason) = payload
-                    .pointer("/delta/stop_reason")
-                    .and_then(Value::as_str)
-                {
-                    self.stop_reason = Some(map_stop_reason(reason));
-                }
-                // `stop_details` 可能出现在 delta 或顶层，两处都兼容。
-                let details = payload
-                    .pointer("/delta/stop_details")
-                    .or_else(|| payload.get("stop_details"));
-                if let Some(details) = details {
-                    self.refusal = Some(refusal_from(details));
-                }
-                if let Some(reason) = self.stop_reason
-                    && reason == StopReason::Refusal
-                    && self.refusal.is_none()
-                {
-                    self.refusal = Some(RefusalDetails::default());
-                }
-            }
+            "message_delta" => self.message_delta(&payload, &mut out),
             "message_stop" => {
-                if !self.stop_sent {
-                    self.stop_sent = true;
-                    out.push(ProviderEvent::Stop {
-                        reason: self.stop_reason.unwrap_or(StopReason::EndTurn),
-                        refusal: self.refusal.take(),
-                    });
-                }
+                let reason = self.stop_reason.unwrap_or(StopReason::EndTurn);
+                let refusal = self.refusal.take();
+                self.push_stop(reason, refusal, &mut out);
             }
             "error" => {
                 let message = payload
                     .pointer("/error/message")
                     .and_then(Value::as_str)
-                    .unwrap_or("provider reported an error")
-                    .to_owned();
+                    .unwrap_or("provider reported an error");
                 out.push(ProviderEvent::Error(ProviderError::new(
                     super::ProviderErrorKind::Server,
-                    message,
+                    message.to_owned(),
                 )));
-                if !self.stop_sent {
-                    self.stop_sent = true;
-                    out.push(ProviderEvent::Stop {
-                        reason: StopReason::Error,
-                        refusal: None,
-                    });
-                }
+                self.push_stop(StopReason::Error, None, &mut out);
             }
-            // ping 与其它事件不产生输出。
             _ => {}
         }
         out
     }
+
+    /// `content_block_start`：文字与 thinking 块可能自带开头内容；`tool_use` 开始一个工具
+    /// 调用；`server_tool_use` 的参数要等分段到齐，先挂起；服务端工具的结果块原样转交。
+    fn block_start(&mut self, payload: &Value, out: &mut Vec<ProviderEvent>) {
+        let block = &payload["content_block"];
+        let index = block_index(payload);
+        match str_field(block, "type").unwrap_or_default() {
+            "text" => {
+                if let Some(text) = non_empty(block, "text") {
+                    out.push(ProviderEvent::TextDelta(text.to_owned()));
+                }
+            }
+            "thinking" => {
+                if let Some(text) = non_empty(block, "thinking") {
+                    out.push(ProviderEvent::ThinkingDelta(text.to_owned()));
+                }
+                if let Some(signature) = non_empty(block, "signature") {
+                    out.push(ProviderEvent::ThinkingSignature(signature.to_owned()));
+                }
+            }
+            "tool_use" => out.push(ProviderEvent::ToolCallStart {
+                index,
+                id: str_field(block, "id").unwrap_or_default().to_owned(),
+                name: str_field(block, "name").unwrap_or_default().to_owned(),
+            }),
+            "server_tool_use" => {
+                // 上一个没有收到结束事件的调用先发出去，不丢。
+                if let Some(previous) = self.server_tool.take() {
+                    out.push(previous.into_event());
+                }
+                self.server_tool = Some(PendingServerTool {
+                    index,
+                    id: str_field(block, "id").unwrap_or_default().to_owned(),
+                    name: str_field(block, "name").unwrap_or_default().to_owned(),
+                    initial: block.get("input").cloned().unwrap_or(Value::Null),
+                    json: String::new(),
+                });
+            }
+            "web_search_tool_result" | "web_fetch_tool_result" => {
+                if let Some((tool_use_id, content)) =
+                    server_tools::normalize_anthropic_result(block)
+                {
+                    out.push(ProviderEvent::ServerToolResult {
+                        tool_use_id,
+                        content,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `content_block_delta`：文字 / thinking / 签名分段直接转发；`input_json_delta` 属于
+    /// 挂起的服务端工具时留在这里拼接，否则是普通工具调用的参数分段。
+    fn block_delta(&mut self, payload: &Value, out: &mut Vec<ProviderEvent>) {
+        let delta = &payload["delta"];
+        let index = block_index(payload);
+        match str_field(delta, "type").unwrap_or_default() {
+            "text_delta" => {
+                if let Some(text) = str_field(delta, "text") {
+                    out.push(ProviderEvent::TextDelta(text.to_owned()));
+                }
+            }
+            "thinking_delta" => {
+                if let Some(text) = str_field(delta, "thinking") {
+                    out.push(ProviderEvent::ThinkingDelta(text.to_owned()));
+                }
+            }
+            "signature_delta" => {
+                if let Some(signature) = str_field(delta, "signature") {
+                    out.push(ProviderEvent::ThinkingSignature(signature.to_owned()));
+                }
+            }
+            "input_json_delta" => {
+                let Some(partial) = str_field(delta, "partial_json") else {
+                    return;
+                };
+                match &mut self.server_tool {
+                    Some(pending) if pending.index == index => pending.json.push_str(partial),
+                    _ => out.push(ProviderEvent::ToolCallArgumentsDelta {
+                        index,
+                        delta: partial.to_owned(),
+                    }),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `message_delta`：更新输出 token 数，记下停止原因与拒绝详情（`Stop` 在
+    /// `message_stop` 时才发出）。
+    fn message_delta(&mut self, payload: &Value, out: &mut Vec<ProviderEvent>) {
+        if let Some(usage) = payload.get("usage") {
+            if let Some(output) = usage.get("output_tokens").and_then(Value::as_u64) {
+                self.usage.output_tokens = output;
+            }
+            out.push(ProviderEvent::Usage(self.usage));
+        }
+        if let Some(reason) = payload
+            .pointer("/delta/stop_reason")
+            .and_then(Value::as_str)
+        {
+            self.stop_reason = Some(map_stop_reason(reason));
+        }
+        // `stop_details` 可能出现在 delta 或顶层，两处都兼容。
+        let details = payload
+            .pointer("/delta/stop_details")
+            .or_else(|| payload.get("stop_details"));
+        if let Some(details) = details {
+            self.refusal = Some(refusal_from(details));
+        }
+        // 拒绝但没有详情时也给一个空的详情，上层据此区分拒绝与普通结束。
+        if self.stop_reason == Some(StopReason::Refusal) && self.refusal.is_none() {
+            self.refusal = Some(RefusalDetails::default());
+        }
+    }
+
+    /// 发出 `Stop`；一个流只发一次（`error` 之后的 `message_stop` 不再重复）。
+    fn push_stop(
+        &mut self,
+        reason: StopReason,
+        refusal: Option<RefusalDetails>,
+        out: &mut Vec<ProviderEvent>,
+    ) {
+        if !self.stop_sent {
+            self.stop_sent = true;
+            out.push(ProviderEvent::Stop { reason, refusal });
+        }
+    }
+}
+
+/// 内容块事件的 `index`；缺失或不是整数时按 0 处理。
+fn block_index(payload: &Value) -> u32 {
+    payload.get("index").and_then(Value::as_u64).unwrap_or(0) as u32
+}
+
+/// `value[key]` 的字符串值。
+fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
+/// `value[key]` 的非空字符串值。
+fn non_empty<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    str_field(value, key).filter(|text| !text.is_empty())
 }
 
 impl super::StreamDecoder for StreamState {
@@ -657,6 +654,89 @@ mod tests {
         );
         // 重复 stop 不再发送。
         assert!(feed(&mut state, json!({"type": "message_stop"})).is_empty());
+    }
+
+    /// thinking 块（开始时自带的文字与签名、后续分段）、text 块自带的开头文字、`error`
+    /// 事件只发一次 `Stop`，以及非 JSON 数据与缺少 `event:` 行时按 `type` 字段分派。
+    #[test]
+    fn thinking_text_starts_and_error_events() {
+        let mut state = StreamState::default();
+        let events = feed(
+            &mut state,
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "hm", "signature": "s0"}
+            }),
+        );
+        assert_eq!(
+            events,
+            vec![
+                ProviderEvent::ThinkingDelta("hm".to_owned()),
+                ProviderEvent::ThinkingSignature("s0".to_owned()),
+            ]
+        );
+        let events = feed(
+            &mut state,
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "thinking_delta", "thinking": "more"}}),
+        );
+        assert_eq!(
+            events,
+            vec![ProviderEvent::ThinkingDelta("more".to_owned())]
+        );
+        let events = feed(
+            &mut state,
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "signature_delta", "signature": "s1"}}),
+        );
+        assert_eq!(
+            events,
+            vec![ProviderEvent::ThinkingSignature("s1".to_owned())]
+        );
+        // 空的开头文字不产生事件。
+        let events = feed(
+            &mut state,
+            json!({"type": "content_block_start", "index": 1,
+                   "content_block": {"type": "text", "text": ""}}),
+        );
+        assert!(events.is_empty());
+        let events = feed(
+            &mut state,
+            json!({"type": "content_block_start", "index": 2,
+                   "content_block": {"type": "text", "text": "hi"}}),
+        );
+        assert_eq!(events, vec![ProviderEvent::TextDelta("hi".to_owned())]);
+
+        // 非 JSON 的 data 忽略；没有 `event:` 行时用 payload 的 `type`。
+        assert!(
+            state
+                .handle(SseEvent {
+                    event: None,
+                    data: "[DONE]".to_owned()
+                })
+                .is_empty()
+        );
+        let events = state.handle(SseEvent {
+            event: None,
+            data: json!({"type": "error", "error": {"message": "overloaded"}}).to_string(),
+        });
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            matches!(&events[0], ProviderEvent::Error(error) if error.to_string().contains("overloaded")),
+            "{events:?}"
+        );
+        assert_eq!(
+            events[1],
+            ProviderEvent::Stop {
+                reason: StopReason::Error,
+                refusal: None
+            }
+        );
+        // `Stop` 已发出：之后的 `message_stop` 与第二个 `error` 都不再发 `Stop`。
+        assert!(feed(&mut state, json!({"type": "message_stop"})).is_empty());
+        let events = feed(&mut state, json!({"type": "error", "error": {}}));
+        assert_eq!(events.len(), 1, "{events:?}");
     }
 
     #[test]
