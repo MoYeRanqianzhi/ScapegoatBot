@@ -176,16 +176,21 @@ pub(super) fn open_message_file(
         .and_then(Value::as_str)
         .context("message file has no file_id")?
         .to_owned();
-    // 按文件头记录的算法解密：切换 `[storage].encryption` 后旧文件仍然可读。
-    let encryption = match header.get("encryption").and_then(Value::as_str) {
-        Some("none") => EncryptionMode::None,
-        Some("xchacha20poly1305") => EncryptionMode::XChaCha20Poly1305,
-        _ => fallback,
-    };
     Ok(Some(MessageFile {
         path: path.display().to_string(),
         file_id,
-        encryption,
+        encryption: header_encryption(&header, fallback),
         lines,
     }))
+}
+
+/// 文件头记录的加密方式；没有记录或不认识时用 `fallback`（当前配置）。
+///
+/// 按文件头而不是当前配置解密：切换 `[storage].encryption` 后旧文件仍然可读。
+pub(super) fn header_encryption(header: &Value, fallback: EncryptionMode) -> EncryptionMode {
+    match header.get("encryption").and_then(Value::as_str) {
+        Some("none") => EncryptionMode::None,
+        Some("xchacha20poly1305") => EncryptionMode::XChaCha20Poly1305,
+        _ => fallback,
+    }
 }

@@ -67,6 +67,9 @@
   定时源（`Monitor add` 不接受 `catch_up`：运行时 monitor 重启即消失）；长停机后的补投
   次数有上限。
 - `sbot doctor` 是只读的：它发现的问题需要你按提示手工修复。
+- 文件头损坏的消息文件（`message file has no usable header`）不会进索引，启动时的
+  文件数校验因此每次都不一致，每次启动都会重建一遍索引；把这个文件移出
+  `~/.sbot/data/messages/`（或从备份恢复）即可停止。
 
 ## 测试相关
 

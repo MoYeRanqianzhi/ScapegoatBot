@@ -747,6 +747,51 @@ mod tests {
         assert_eq!(store.recent(chat, 10).unwrap().len(), 2);
     }
 
+    /// 一行解不开（损坏 / 篡改 / 密钥不符）只跳过这一行：同一文件的其他行与其他文件
+    /// 照样补回，重建不失败（以前一个 `?` 让整个重建中止，启动时每次都重试、每次都失败）。
+    #[test]
+    fn rebuild_index_skips_undecodable_lines() {
+        let (store, dir) = store();
+        let first = ChatId::Group(1);
+        let second = ChatId::Group(2);
+        store.append(&message(first, 1, "a1")).unwrap();
+        store.append(&message(first, 2, "a2")).unwrap();
+        store.append(&message(second, 3, "b1")).unwrap();
+
+        // 找到第一个群的文件（文件头 peer_id = 1），把第一条消息的密文换成别的字节。
+        let file = walk(dir.path())
+            .into_iter()
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .find(|path| {
+                let text = std::fs::read_to_string(path).unwrap();
+                let header: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+                header["peer_id"] == 1
+            })
+            .unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        let mut line: Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(line["id"], 1);
+        line["ct"] = Value::String("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned());
+        lines[1] = line.to_string();
+        std::fs::write(&file, lines.join("\n") + "\n").unwrap();
+
+        {
+            let conn = store.db.lock();
+            conn.execute("DELETE FROM messages", []).unwrap();
+            conn.execute("DELETE FROM inbox_state", []).unwrap();
+        }
+        assert_eq!(store.rebuild_index().unwrap(), 2);
+        let texts: Vec<String> = store
+            .recent(first, 10)
+            .unwrap()
+            .iter()
+            .map(QqMessage::plain_text)
+            .collect();
+        assert_eq!(texts, vec!["a2"]);
+        assert_eq!(store.recent(second, 10).unwrap().len(), 1);
+    }
+
     /// 文件写成功、索引事务丢失一次（崩溃在两者之间）：之后的行号仍然等于物理位置，
     /// 新消息照常可读，重建能把丢失的那条补回来。
     #[test]
