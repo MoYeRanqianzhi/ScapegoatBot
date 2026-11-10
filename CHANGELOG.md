@@ -20,6 +20,8 @@
   （search / fetch 共用 `tool_backend`）、Anthropic 流解码的 `handle`（按事件类型拆成方法，
   `Stop` 只发一次的逻辑合一）、`MessageStore::rebuild_index`（文件头解析、逐行补索引、
   文件表同步分开；文件头的加密方式解析与读取路径共用 `header_encryption`）。
+- OpenAI Responses 流解码的 `handle` 拆出 `item_added` 与 `responses_usage`；两个协议的
+  解码器共用 `providers::str_field`。
 
 ## [0.2.0-alpha.43] - 2026-11-10
 
