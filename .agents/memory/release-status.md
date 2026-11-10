@@ -8,8 +8,8 @@ metadata:
   last_verified: 2026-11-10
 ---
 
-当前版本 `0.2.0-alpha.42`（本地 tag，未 push）；之后的修复记在 `CHANGELOG.md` 的 Unreleased 段，
-数据库迁移到 v12。`cargo test --locked --all-targets` = 498 lib + 16 integration passed，
+当前版本 `0.2.0-alpha.43`（本地 tag，未 push）；之后的修复记在 `CHANGELOG.md` 的 Unreleased 段，
+数据库迁移到 v12。`cargo test --locked --all-targets` = 499 lib（Linux 500）+ 15 integration passed，
 2 ignored；clippy/fmt 通过；WSL Debian `cargo test` 通过。最低 Rust 1.89。CI 已接入 GitHub Actions。
 
 发布状态：每批改动升版本并打本地 annotated tag（见 [[release-workflow]]）；尚未 push/release/deploy。

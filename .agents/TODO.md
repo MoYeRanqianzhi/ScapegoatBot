@@ -15,9 +15,9 @@
 
 ## 当前基线
 
-- `cargo test --locked --all-targets` = 498 lib + 16 集成测试通过，2 ignored；clippy / fmt 通过；
+- `cargo test --locked --all-targets` = 499 lib（Linux 500）+ 15 集成测试通过，2 ignored；clippy / fmt 通过；
   Linux（WSL Debian，`G:/sbot-wsl/check.sh check|test`）`cargo check` 与 `cargo test` 通过。
-  当前 `0.2.0-alpha.42`（本地 tag）；每批升版本、打 tag，未验证前不 push。
+  当前 `0.2.0-alpha.43`（本地 tag）；每批升版本、打 tag，未验证前不 push。
 - 服务器 `hw1` 的 `sbot.service` 仍停止；NapCat 未登录（2026-11-05 起 QR 登录失败）。
 
 ## 待用户确认

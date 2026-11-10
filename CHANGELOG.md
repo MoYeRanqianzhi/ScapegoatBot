@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.2.0-alpha.43] - 2026-11-10
+
 ### 修复
 
 - 开了 `allow_send` 的自定义子代理经 `API` 的 `local.media.image.*` 输出图片时，同样不能写
