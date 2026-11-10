@@ -50,8 +50,9 @@ sbot 不修改 NapCat 配置。
 - 写入 VFS 种子：`/AGENTS.md`、`/MEMORY.md`、`/USER.md`、`/memory/*`、
   `/agents`、`/skills`、`/trash`、`/tmp`。
 
-NapCat 没连上时守护进程照常启动，只是 QQ 动作会失败；日志会写
-`NapCat is not connected`。模型没配好同理：进程在，但不回复。
+NapCat 没连上（或 QQ 还没登录）时守护进程会一直等：控制通道可用，`sbot status` 的
+`agent.state` 是 `waiting_for_napcat`，日志每次重试写一条 `waiting for NapCat`；连上之后 agent
+才启动。模型没配好时进程在但不回复（`agent.state` 是 `no_provider`）。
 
 `Ctrl-C` 停止；也可以 `sbot stop`。
 

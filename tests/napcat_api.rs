@@ -146,7 +146,10 @@ async fn login_and_version_round_trip_over_onebot_ws() {
     assert_eq!(login.user_id, 10000);
     assert_eq!(login.nickname, "MockBot");
 
-    let version = client.version_info().await.unwrap();
+    let version = client
+        .call("get_version_info", serde_json::Value::Null)
+        .await
+        .unwrap();
     assert_eq!(version["app_name"], "NapCat");
 
     let actions: Vec<String> = records

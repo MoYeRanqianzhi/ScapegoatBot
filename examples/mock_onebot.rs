@@ -1,9 +1,10 @@
 //! 本地 OneBot 11 mock 服务端，用于实机验证 NapCat 客户端与 QQ 管线。
 //!
 //! 运行 `cargo run --example mock_onebot -- 39001`：
-//! - 接受一个 WebSocket 连接；
+//! - 一次服务一个 WebSocket 连接，断开后接着等下一个（守护进程重连时用得上）；
 //! - 回应 `get_login_info` / `get_version_info` / 发送类 action；
-//! - 连接建立后推送一条群消息事件；
+//! - 每个连接第一次 `get_login_info` 之后 3 秒推送一条群消息事件（守护进程登录后要先建好
+//!   agent 才订阅事件，推早了收不到）；
 //! - 每个收到的 action 打印为一行 JSON（stdout），便于测试脚本断言。
 
 use futures_util::{SinkExt, StreamExt};
@@ -21,10 +22,19 @@ async fn main() {
     let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     println!("READY {}", listener.local_addr().unwrap());
 
-    let (stream, _) = listener.accept().await.unwrap();
-    let mut socket = accept_async(stream).await.unwrap();
-    println!("CONNECTED");
+    loop {
+        let (stream, _) = listener.accept().await.unwrap();
+        let Ok(socket) = accept_async(stream).await else {
+            continue;
+        };
+        println!("CONNECTED");
+        serve(socket).await;
+        println!("DISCONNECTED");
+    }
+}
 
+/// 服务一个连接，直到对端断开。
+async fn serve(mut socket: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
     let mut sent_event = false;
 
     while let Some(Ok(message)) = socket.next().await {
@@ -52,8 +62,8 @@ async fn main() {
             .send(Message::Text(response.to_string().into()))
             .await;
 
-        // 在客户端完成登录/版本查询、订阅建立后推送一条群消息。
-        if action == "get_version_info" && !sent_event {
+        // 客户端登录之后、订阅建立之后推送一条群消息。
+        if action == "get_login_info" && !sent_event {
             sent_event = true;
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             let event = json!({

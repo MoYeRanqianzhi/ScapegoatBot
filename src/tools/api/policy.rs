@@ -394,6 +394,11 @@ impl ApiTool {
                 }
             }
             Err(error) => match (&ledger_id, &self.messages) {
+                // 没连上：请求没有离开本进程，肯定没发出去，不算“结果不明”。
+                (Some(id), Some(messages)) if crate::qq::client::is_not_connected(&error) => {
+                    let _ = messages.finish_send(id, "failed", None);
+                    ToolResult::error(error)
+                }
                 (Some(id), Some(messages)) => {
                     // 超时/断线可能发生在对方已收到之后；标 unknown，不能自动重试。
                     let _ = messages.finish_send(id, "unknown", None);

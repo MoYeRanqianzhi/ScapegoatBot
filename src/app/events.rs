@@ -135,8 +135,6 @@ pub(super) fn spawn_qq_pipeline(
     messages: Arc<MessageStore>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // 断线后一直重连：SDK 自己的重连有次数上限，之后由它接手（见 `QqClient::keep_connected`）。
-    client.keep_connected(shutdown.clone());
     tokio::spawn(async move {
         let mut subscription = client.subscribe();
         info!(qq = info.user_id, "listening for QQ events");

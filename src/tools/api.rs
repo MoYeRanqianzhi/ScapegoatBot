@@ -1833,6 +1833,49 @@ mod tests {
         assert!(text.contains("sbot gate approve"), "{text}");
     }
 
+    /// 每次调用都返回同一个错误的网关。
+    struct FailingGateway(String);
+
+    #[async_trait]
+    impl NapcatGateway for FailingGateway {
+        async fn call(&self, _action: &str, _params: Value) -> Result<Value, String> {
+            Err(self.0.clone())
+        }
+    }
+
+    /// 发送失败时账本怎么记：没连上（请求没离开本进程）是确定的失败，不留“未确认”，
+    /// agent 可以放心重试；其余错误（超时、NapCat 报错）可能发生在对方已经收到之后，
+    /// 记成未确认并提示先查聊天记录。
+    #[tokio::test]
+    async fn a_send_that_never_left_is_failed_not_unconfirmed() {
+        let send = json!({"action": "napcat.send_group_msg",
+                          "params": {"group_id": 1, "message": "hi"}});
+
+        let (messages, _dir) = message_store();
+        let offline = format!("{}: nothing was sent", crate::qq::client::NOT_CONNECTED);
+        let offline_tool = tool(Some(Arc::new(FailingGateway(offline))), None)
+            .with_messages(Arc::clone(&messages));
+        let result = offline_tool
+            .execute(&intent_ctx("group:1"), send.clone())
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.starts_with(crate::qq::client::NOT_CONNECTED),
+            "{}",
+            result.content
+        );
+        assert!(!result.content.contains("[ledger]"), "{}", result.content);
+        assert!(messages.unconfirmed_sends().unwrap().is_empty());
+
+        let (messages, _dir) = message_store();
+        let timeout_tool = tool(Some(Arc::new(FailingGateway("timed out".to_owned()))), None)
+            .with_messages(Arc::clone(&messages));
+        let result = timeout_tool.execute(&intent_ctx("group:1"), send).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("unconfirmed"), "{}", result.content);
+        assert_eq!(messages.unconfirmed_sends().unwrap().len(), 1);
+    }
+
     /// 只有带 `message` 的发送进归档，并使用 NapCat 返回的真实 message_id；
     /// 戳一戳不是消息，带 group_id 时作用于那个群。
     #[tokio::test]

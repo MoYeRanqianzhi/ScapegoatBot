@@ -231,3 +231,73 @@ async fn the_client_reconnects_after_the_server_closes_the_connection() {
     assert!(first.contains(&"get_login_info".to_owned()), "{first:?}");
     assert!(second.contains(&"get_login_info".to_owned()), "{second:?}");
 }
+
+/// NapCat 回了失败响应的 action 只发一次，错误立刻返回。SDK 默认会把超时与失败响应再重发
+/// 3 次（间隔 1、2、3 秒）；对发送来说那就是最多 4 条重复的 QQ 消息。
+#[tokio::test]
+async fn a_failed_action_is_sent_exactly_once() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorded = Arc::clone(&seen);
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        while let Some(Ok(Message::Text(text))) = socket.next().await {
+            let request: Value = serde_json::from_str(&text).unwrap();
+            let Some(action) = request.get("action").and_then(Value::as_str) else {
+                continue;
+            };
+            recorded.lock().await.push(action.to_owned());
+            let response = json!({
+                "status": "failed",
+                "retcode": 1200,
+                "data": null,
+                "message": "muted in this group",
+                "echo": request.get("echo").cloned().unwrap_or(Value::Null),
+            });
+            let _ = socket
+                .send(Message::Text(response.to_string().into()))
+                .await;
+        }
+    });
+
+    let client = QqClient::new(&url, None).unwrap();
+    client.connect().await.unwrap();
+    let started = std::time::Instant::now();
+    let error = client
+        .send_text(ChatId::Group(42), "hello", None)
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(900),
+        "the failure took {:?}: the SDK retried",
+        started.elapsed()
+    );
+    assert!(format!("{error:#}").contains("send_group_msg"), "{error:#}");
+    // 给可能存在的重发留出时间：第一次重发在 1 秒之后。
+    tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+    assert_eq!(*seen.lock().await, vec!["send_group_msg".to_owned()]);
+}
+
+/// 没连上时调用立即失败，错误可以被认出来是“没发出去”，而不是等满 30 秒超时。
+#[tokio::test]
+async fn calls_fail_fast_while_disconnected() {
+    // 一个没有任何服务在听的地址：从未连接过。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let client = QqClient::new(&url, None).unwrap();
+    assert!(!client.is_connected());
+
+    let started = std::time::Instant::now();
+    let error = client
+        .send_text(ChatId::Group(42), "hello", None)
+        .await
+        .unwrap_err();
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert!(
+        scapegoat_bot::qq::client::is_not_connected(&error.to_string()),
+        "{error:#}"
+    );
+}

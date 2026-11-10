@@ -23,11 +23,20 @@ use tracing::{info, warn};
 use super::event::ChatId;
 use super::ledger::{OutboundLedger, produces_message};
 
+/// 没连上 NapCat 时 [`QqClient::call`] 返回的错误以它开头。调用方据此区分“请求根本没有
+/// 发出去”（可以放心重试）与“发出去了但结果不明”（见 [`is_not_connected`]）。
+pub const NOT_CONNECTED: &str = "NapCat is not connected";
+
+/// 这条错误是否表示请求没有离开本进程（没连上 NapCat）。
+pub fn is_not_connected(error: &str) -> bool {
+    error.starts_with(NOT_CONNECTED)
+}
+
 /// [`QqClient::keep_connected`] 多久看一次连接状态。
 const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// 重连失败后的最短 / 最长等待；每次失败翻倍。
 const RETRY_MIN: Duration = Duration::from_secs(5);
-const RETRY_MAX: Duration = Duration::from_secs(300);
+const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// 登录信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +57,10 @@ impl QqClient {
     ///
     /// `token` 为空时不设置鉴权头（对应 NapCat 未配置 token 的情况）。
     pub fn new(url: &str, token: Option<&str>) -> Result<Self> {
-        let mut builder = NapLink::builder(url);
+        // 不让 SDK 自动重试 action。它默认对超时与失败响应各重发最多 3 次；发送类动作
+        // 超时并不代表没发出去，重发就是重复的 QQ 消息。结果不明时怎么办由上层决定
+        // （发送账本标成 `unknown`，由 agent 查过聊天记录再说）。
+        let mut builder = NapLink::builder(url).api_retries(0);
         if let Some(token) = token.filter(|token| !token.is_empty()) {
             builder = builder.token(token);
         }
@@ -59,12 +71,32 @@ impl QqClient {
         })
     }
 
-    /// 建立连接。
+    /// 建立连接。返回 `Ok` 时 [`Self::is_connected`] 已经为真。
     pub async fn connect(&self) -> Result<()> {
         self.link
             .connect()
             .await
-            .context("cannot connect to NapCat")
+            .context("cannot connect to NapCat")?;
+        // SDK 的连接状态由另一个任务更新，`connect()` 返回时通知可能还在路上；等它落地，
+        // 否则紧跟着的调用会被 `call` 的“未连接”检查误拒。上限 2 秒：连上后立刻又断开时
+        // 状态不会变成已连接，那时让后面的调用自己报“未连接”。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !self.is_connected() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
+    /// 没连上就连。已连接时直接返回；SDK 正在连接 / 重连时不插手，报“还在连”
+    /// （它的 actor 那时不处理新命令，排进去的 `connect()` 要等它忙完才有回音）。
+    pub async fn ensure_connected(&self) -> Result<()> {
+        match self.link.state() {
+            ConnectionState::Connected => Ok(()),
+            ConnectionState::Disconnected => self.connect().await,
+            ConnectionState::Connecting | ConnectionState::Reconnecting => {
+                bail!("the NapCat connection is still being established")
+            }
+        }
     }
 
     /// 连接是否处于“已连接”。
@@ -83,8 +115,8 @@ impl QqClient {
     /// 不处理新命令，排进去的 `connect()` 只会在它完成后收到一条“已连接”的拒绝）。
     /// 连不上时按 [`RETRY_MIN`]…[`RETRY_MAX`] 指数退避；连上后退避归零。
     ///
-    /// 只负责“恢复已经建立过的连接”：启动时就没连上的情况不走这里（那时账号还不知道，
-    /// 见 `app::assembly::connect_qq`）。
+    /// 只负责“恢复已经建立过的连接”：启动时等 NapCat 连上并登录是另一个循环
+    /// （`app::assembly::wait_for_login`），它结束之后才启动这里，两者不会同时去连。
     pub fn keep_connected(self: &Arc<Self>, shutdown: watch::Receiver<bool>) {
         self.keep_connected_every(CHECK_INTERVAL, RETRY_MIN, shutdown);
     }
@@ -170,7 +202,16 @@ impl QqClient {
     ///
     /// 会产生消息的 action 在调用前登记进账本、返回后补记 id：本进程的每一条
     /// 发送都经过这里，回声才能被认出来。
+    ///
+    /// 没连上时立即失败（错误以 [`NOT_CONNECTED`] 开头），什么都不发、不登记：SDK 在断线
+    /// 期间会把请求直接丢掉，然后让调用方等满 30 秒超时，得到一个分不清“发没发”的错误。
     pub async fn call(&self, action: &str, params: Value) -> Result<Value> {
+        if !self.is_connected() {
+            bail!(
+                "{NOT_CONNECTED}: {action} was not sent. The runtime keeps reconnecting; \
+                 try again later."
+            );
+        }
         // 守卫保证登记一定会结束：调用方的超时会直接丢弃这个 future，
         // 永远“在途”的登记会让该 chat 后续的手打消息都被当成 agent 的话。
         let mut guard = produces_message(action).then(|| SendGuard {
@@ -203,11 +244,6 @@ impl QqClient {
                 .unwrap_or_default()
                 .to_owned(),
         })
-    }
-
-    /// NapCat 版本信息（设计 §9.7：低于最低版本时告警但继续）。
-    pub async fn version_info(&self) -> Result<Value> {
-        self.call("get_version_info", Value::Null).await
     }
 
     /// 发送消息，返回 `message_id`。

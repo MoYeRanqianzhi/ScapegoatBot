@@ -43,7 +43,7 @@ mod stores;
 mod tools;
 
 pub(super) use providers::load_models;
-pub(super) use qq::{connect_qq, resolve_principals};
+pub(super) use qq::{napcat_client, resolve_principals, wait_for_login};
 pub(super) use stores::open_stores;
 
 use providers::{
@@ -79,8 +79,8 @@ pub(super) struct AgentInputs<'a> {
     pub turn_buffer: Arc<TurnBufferStore>,
     /// 安全闸。
     pub gate: Arc<Gate>,
-    /// NapCat 连接；未连接时为 `None`。
-    pub qq: Option<Arc<QqClient>>,
+    /// NapCat 连接（已登录）。
+    pub qq: Arc<QqClient>,
     /// 登录账号。
     pub self_id: u64,
     /// 主人 QQ。
@@ -100,8 +100,8 @@ type SharedHistory = Arc<Mutex<Vec<crate::agent::AgentMessage>>>;
 
 /// 按顺序装配 agent：provider → 视图 / monitor → 工具表 → runner → 队列与后台任务。
 ///
-/// 主模型不在模型清单里、或 provider 建不起来时返回 `Ok(None)`（已记日志），调用方
-/// 以“只连 QQ、不跑 agent”的方式继续；恢复 transcript 失败等真正的错误才返回 `Err`。
+/// 主模型不在模型清单里、或 provider 建不起来时返回 `Ok(None)`（已记日志），守护进程
+/// 留着控制通道但不跑 agent；恢复 transcript 失败等真正的错误才返回 `Err`。
 pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<AgentRuntime>>> {
     let config = &input.loaded.config;
     let Some(model_ref) = input.models.find(&config.agent.model) else {
@@ -140,7 +140,7 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
         views: Arc::clone(&views),
         monitors: Arc::clone(&monitors),
         ops: Arc::clone(&ops),
-        qq: input.qq.clone(),
+        qq: Some(Arc::clone(&input.qq)),
         account_qq: input.self_id,
         owner_qq: input.owner_qq,
         master_qq: input.master_qq,
@@ -249,10 +249,7 @@ fn build_views(input: &AgentInputs<'_>) -> Arc<Views> {
             Arc::clone(&input.vfs),
             Arc::clone(&input.messages),
             Arc::clone(&input.sessions),
-            input
-                .qq
-                .clone()
-                .map(|client| client as Arc<dyn crate::tools::api::NapcatGateway>),
+            Some(Arc::clone(&input.qq) as Arc<dyn crate::tools::api::NapcatGateway>),
         )
         .with_context(ViewContext {
             config: Some(Arc::clone(&input.config_handle)),
@@ -327,7 +324,7 @@ async fn build_runner(
         Arc::clone(&input.messages),
         Arc::clone(&input.sessions),
         Arc::clone(&input.turn_buffer),
-        input.qq.clone(),
+        Some(Arc::clone(&input.qq)),
         runner_config(
             config,
             model_ref,
