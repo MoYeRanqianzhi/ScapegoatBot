@@ -41,6 +41,15 @@ const TEXT_PURPOSE: &str = "vfs-text";
 /// 二进制加密的域标签。
 const BLOB_PURPOSE: &str = "vfs-blob";
 
+/// 谁在写文本：决定“先读后写”协议是否适用（见 [`VfsStore::write_text_system`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Writer {
+    /// agent 经工具写入：覆盖前必须完整读过当前版本，写完视为已读。
+    Agent,
+    /// 运行时自己写入（后台复盘）：不查也不记读取记录。
+    System,
+}
+
 /// VFS 存储。
 pub struct VfsStore {
     db: Arc<Database>,
@@ -310,9 +319,30 @@ impl VfsStore {
             current.replacen(old_text, new_text, 1)
         };
         let replaced = if replace_all { count } else { 1 };
-        let meta = self.write_text_tx(&tx, path, &updated, None)?;
+        let meta = self.write_text_tx(&tx, path, &updated, None, Writer::Agent)?;
         tx.commit()?;
         Ok((meta, replaced))
+    }
+
+    /// 系统（不是 agent）写一个文本文件：后台复盘写 `/STYLE.md` 与记忆候选时用。
+    ///
+    /// 与 [`Vfs::write_text`] 的区别只在“先读后写”协议——那条协议约束的是 agent：
+    /// - 覆盖已有文件不要求读过（系统不是在凭印象改一个它没看过的文件）；
+    /// - 写完不记“已读”。agent 之前读过这个文件的话，它的读取记录因版本不符而失效，
+    ///   下次 `Write` / `Edit` 会被要求重新读，不会在不知情的情况下覆盖系统刚写的内容。
+    ///
+    /// 配额、回收站与动态视图的限制照常生效。
+    pub fn write_text_system(&self, path: &VfsPath, content: &str) -> Result<NodeMeta, VfsError> {
+        if is_dynamic(path) {
+            return Err(VfsError::Storage(format!(
+                "{path} is a read-only dynamic view"
+            )));
+        }
+        let mut conn = self.db.lock();
+        let tx = conn.transaction()?;
+        let meta = self.write_text_tx(&tx, path, content, None, Writer::System)?;
+        tx.commit()?;
+        Ok(meta)
     }
 
     /// 解密文本但不记录“读过”。
@@ -445,6 +475,7 @@ impl VfsStore {
         path: &VfsPath,
         content: &str,
         origin_chat: Option<&str>,
+        writer: Writer,
     ) -> Result<NodeMeta, VfsError> {
         self.reject_trash_target(path)?;
         let len = content.len() as u64;
@@ -481,7 +512,9 @@ impl VfsStore {
                 if row.kind == NodeKind::Dir {
                     return Err(VfsError::IsADirectory(path.to_string()));
                 }
-                self.check_read_before_edit(conn, &row)?;
+                if writer == Writer::Agent {
+                    self.check_read_before_edit(conn, &row)?;
+                }
                 let version = row.version + 1;
                 let (bytes, nodes) = self.active_usage(conn)?;
                 let delta = len.saturating_sub(row.size);
@@ -498,8 +531,11 @@ impl VfsStore {
             }
         };
 
-        // 本次写入视为已读：后续编辑不必再读一遍。
-        self.record_read(conn, id, version, Some(&hash), false)?;
+        // agent 自己的写入视为已读：后续编辑不必再读一遍。系统写入不动读取记录——agent
+        // 没看过新内容，它的旧记录因版本不符而失效，下次改之前必须重新读。
+        if writer == Writer::Agent {
+            self.record_read(conn, id, version, Some(&hash), false)?;
+        }
 
         let row = self
             .lookup(conn, path)?
@@ -803,7 +839,7 @@ impl Vfs for VfsStore {
         }
         let mut conn = self.db.lock();
         let tx = conn.transaction()?;
-        let meta = self.write_text_tx(&tx, path, content, origin_chat)?;
+        let meta = self.write_text_tx(&tx, path, content, origin_chat, Writer::Agent)?;
         tx.commit()?;
         Ok(meta)
     }
@@ -1002,6 +1038,51 @@ mod tests {
         store.read(&path("/a.md"), None, None).unwrap();
         let meta = store.write_text(&path("/a.md"), "two", None).unwrap();
         assert_eq!(meta.version, 2);
+    }
+
+    /// 系统写入不经过“先读后写”：没读过也能覆盖；写完不替 agent 记“已读”，所以 agent
+    /// 之前的读取记录失效，必须重新读才能改——不会不知情地盖掉系统刚写的内容。
+    #[test]
+    fn system_writes_skip_the_read_protocol_and_invalidate_the_agents_read() {
+        let (store, _dir) = store();
+        store.write_text(&path("/STYLE.md"), "v1", None).unwrap();
+        {
+            let conn = store.db.lock();
+            conn.execute("DELETE FROM vfs_reads", []).unwrap();
+        }
+        // agent 没读过：agent 写入被拒绝，系统写入可以。
+        assert_eq!(
+            store.write_text(&path("/STYLE.md"), "agent", None),
+            Err(VfsError::NotReadYet)
+        );
+        let meta = store.write_text_system(&path("/STYLE.md"), "v2").unwrap();
+        assert_eq!(meta.version, 2);
+        assert_eq!(
+            store.write_text(&path("/STYLE.md"), "agent", None),
+            Err(VfsError::NotReadYet)
+        );
+
+        // agent 读过 v2 之后系统又写了 v3：agent 手里的是旧版本，必须重读。
+        store.read(&path("/STYLE.md"), None, None).unwrap();
+        store.write_text_system(&path("/STYLE.md"), "v3").unwrap();
+        assert_eq!(
+            store.write_text(&path("/STYLE.md"), "agent", None),
+            Err(VfsError::ModifiedSinceRead)
+        );
+        store.read(&path("/STYLE.md"), None, None).unwrap();
+        assert!(store.write_text(&path("/STYLE.md"), "agent", None).is_ok());
+
+        // 新建文件、回收站与动态视图的规则与普通写入一致。
+        assert!(store.write_text_system(&path("/new/file.md"), "x").is_ok());
+        assert!(matches!(
+            store.write_text_system(&path("/trash/x.md"), "x"),
+            Err(VfsError::InTrash(_))
+        ));
+        assert!(
+            store
+                .write_text_system(&path("/messages/x.md"), "x")
+                .is_err()
+        );
     }
 
     #[test]

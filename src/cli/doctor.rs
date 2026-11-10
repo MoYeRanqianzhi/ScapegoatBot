@@ -433,7 +433,12 @@ fn check_blobs(conn: &Connection, data_dir: &std::path::Path, report: &mut Repor
     }
 }
 
-/// `/MEMORY.md` 与 `/memory/*.md` 的对账（设计 §6.6）。
+/// `/MEMORY.md` 与 `/memory/*.md` 的对账：索引行指向的文件是否都在，`/memory` 下的文件是否
+/// 都进了索引。
+///
+/// 只看 `/memory` 这一层的 `<slug>.md`：索引约定的指针就是 `memory/<slug>.md`；子目录
+/// （`/memory/topics`、`/memory/notes`）是 agent 自由使用的，不参与对账。记忆由 agent 用
+/// 文件工具直接写，两边不一致是可能出现的正常漂移，所以都只是警告。
 fn check_memory(conn: &Connection, key: &MasterKey, report: &mut Report) {
     use rusqlite::OptionalExtension;
 
@@ -473,32 +478,17 @@ fn check_memory(conn: &Connection, key: &MasterKey, report: &mut Report) {
     };
     let indexed: std::collections::BTreeSet<String> = text
         .lines()
-        .filter_map(crate::tools::memory::index_slug)
+        .filter_map(crate::memory::files::index_slug)
         .collect();
 
-    let memory_dir: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM vfs_nodes
-             WHERE parent_id = 1 AND name = 'memory' AND kind = 'dir' AND trashed_at IS NULL",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .unwrap_or(None);
-    let mut files = std::collections::BTreeSet::new();
-    if let Some(memory_dir) = memory_dir
-        && let Ok(mut statement) = conn.prepare(
-            "SELECT name FROM vfs_nodes
-             WHERE parent_id = ?1 AND kind != 'dir' AND trashed_at IS NULL",
-        )
-        && let Ok(rows) = statement.query_map([memory_dir], |row| row.get::<_, String>(0))
-    {
-        for name in rows.flatten() {
-            if let Some(slug) = name.strip_suffix(".md") {
-                files.insert(slug.to_owned());
-            }
+    // 查询失败要说出来：当成“没有文件”会把每一条索引都报成指向缺失的文件。
+    let files = match memory_files(conn) {
+        Ok(files) => files,
+        Err(error) => {
+            report.warn(format!("memory: cannot list /memory: {error}"));
+            return;
         }
-    }
+    };
 
     let missing: Vec<&String> = indexed.difference(&files).collect();
     let orphans: Vec<&String> = files.difference(&indexed).collect();
@@ -521,20 +511,34 @@ fn check_memory(conn: &Connection, key: &MasterKey, report: &mut Report) {
             ));
         }
     }
+}
 
-    // 第三方对账：`memory_entries` 是 Memory 工具维护的可查询索引。
-    let recorded: u64 = conn
-        .query_row("SELECT COUNT(*) FROM memory_entries", [], |row| row.get(0))
-        .unwrap_or(0);
-    if recorded != files.len() as u64 {
-        report.warn(format!(
-            "memory: memory_entries has {recorded} row(s) but {} file(s) exist; \
-             the next Memory write rebuilds it",
-            files.len()
-        ));
-    } else {
-        report.ok(format!("memory: memory_entries matches {recorded} file(s)"));
+/// `/memory` 目录下（不含子目录）每个 `<slug>.md` 的 slug；目录不存在时为空集。
+fn memory_files(conn: &Connection) -> rusqlite::Result<std::collections::BTreeSet<String>> {
+    use rusqlite::OptionalExtension;
+
+    let memory_dir: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM vfs_nodes
+             WHERE parent_id = 1 AND name = 'memory' AND kind = 'dir' AND trashed_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut files = std::collections::BTreeSet::new();
+    let Some(memory_dir) = memory_dir else {
+        return Ok(files);
+    };
+    let mut statement = conn.prepare(
+        "SELECT name FROM vfs_nodes
+         WHERE parent_id = ?1 AND kind != 'dir' AND trashed_at IS NULL",
+    )?;
+    for name in statement.query_map([memory_dir], |row| row.get::<_, String>(0))? {
+        if let Some(slug) = name?.strip_suffix(".md") {
+            files.insert(slug.to_owned());
+        }
     }
+    Ok(files)
 }
 
 fn count_files(directory: &std::path::Path, extension: Option<&str>) -> u64 {

@@ -1,13 +1,17 @@
 //! 后台复盘：从 transcript 提取记忆候选与风格画像。
 //!
-//! 设计依据：设计 §8.5「记忆复盘」与 `[style]`。
+//! 记忆本身是 VFS 里的普通文件，agent 用文件工具读写（格式见 [`files`]）；这里是程序
+//! 自己替它做的那一部分——空闲时回看 transcript，把值得留下的事实追加进去。
 //!
 //! 约束：
 //! - 非交互：不发送 QQ 消息、不产生回合、不写 transcript；
 //! - 只在空闲时运行（队列没有活跃回合），避免与用户回复抢上下文；
-//! - 记忆来源固定为 `self`，永远不是 owner guidance；
-//! - 只追加记忆，已存在的 slug 跳过；风格写入 `/STYLE.md` 并受 `max_chars` 限制；
+//! - 记忆是 agent 的笔记，永远不是 owner guidance；
+//! - 只追加记忆（[`files::append_review`]），已存在的条目不动；风格写入 `/STYLE.md` 并受
+//!   `max_chars` 限制；
 //! - 模型面文本为英文，解析失败只记日志，不写半成品。
+
+pub(crate) mod files;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -21,10 +25,7 @@ use tracing::{debug, info, warn};
 use crate::config::{MemoryConfig, MemoryReviewMode, StyleConfig};
 use crate::providers::SharedProviderSlot;
 use crate::providers::{Provider, SystemBlock, complete_text};
-use crate::storage::Database;
-use crate::tools::memory::{MemoryLimits, ReviewEntry, apply_review};
 use crate::transcript::AgentMessage;
-use crate::vfs::Vfs;
 use crate::vfs::VfsPath;
 use crate::vfs::sqlite::VfsStore;
 
@@ -82,7 +83,6 @@ pub struct ReviewerConfig {
     pub review_model: Option<ReviewModel>,
     pub history: Arc<Mutex<Vec<AgentMessage>>>,
     pub vfs: Arc<VfsStore>,
-    pub db: Option<Arc<Database>>,
     pub queue: Arc<dyn QueueActivity>,
     pub memory: MemoryConfig,
     pub style: StyleConfig,
@@ -162,7 +162,6 @@ pub fn spawn(config: ReviewerConfig) {
 pub struct MemoryFlusher {
     review_model: Option<ReviewModel>,
     vfs: Arc<VfsStore>,
-    db: Option<Arc<Database>>,
     memory: MemoryConfig,
 }
 
@@ -170,13 +169,11 @@ impl MemoryFlusher {
     pub fn new(
         review_model: Option<ReviewModel>,
         vfs: Arc<VfsStore>,
-        db: Option<Arc<Database>>,
         memory: MemoryConfig,
     ) -> Self {
         Self {
             review_model,
             vfs,
-            db,
             memory,
         }
     }
@@ -188,16 +185,7 @@ impl MemoryFlusher {
         main: &SharedProviderSlot,
     ) -> Result<usize> {
         let (provider, model) = pick_model(self.review_model.as_ref(), main);
-        run_review(
-            &provider,
-            &model,
-            &self.vfs,
-            self.db.as_ref(),
-            &self.memory,
-            None,
-            history,
-        )
-        .await
+        run_review(&provider, &model, &self.vfs, &self.memory, None, history).await
     }
 }
 
@@ -208,7 +196,6 @@ async fn review_once(config: &ReviewerConfig, history: &[AgentMessage]) -> Resul
         &provider,
         &model,
         &config.vfs,
-        config.db.as_ref(),
         &config.memory,
         Some(&config.style),
         history,
@@ -217,12 +204,12 @@ async fn review_once(config: &ReviewerConfig, history: &[AgentMessage]) -> Resul
     .map(|_| ())
 }
 
-/// 复盘的核心：请求模型、解析 JSON、写记忆（可选写风格）。
+/// 复盘的核心：请求模型、解析 JSON、追加记忆（`[memory].enabled`）、可选写风格。
+/// 返回新增的记忆条数。
 async fn run_review(
     provider: &Arc<dyn Provider>,
     model: &str,
     vfs: &Arc<VfsStore>,
-    db: Option<&Arc<Database>>,
     memory: &MemoryConfig,
     style: Option<&StyleConfig>,
     history: &[AgentMessage],
@@ -245,46 +232,13 @@ async fn run_review(
     let json = crate::providers::extract_json_object(&text).context("review output is not JSON")?;
     let value: Value = serde_json::from_str(json).context("review output is not valid JSON")?;
 
-    let limits = MemoryLimits {
-        max_entry_chars: memory.max_entry_chars as usize,
-        max_index_lines: memory.max_index_lines as usize,
-        max_index_bytes: memory.max_index_bytes as usize,
+    let candidates = if memory.enabled {
+        candidates_from(&value)
+    } else {
+        Vec::new()
     };
-    let mut entries = Vec::new();
-    if memory.enabled
-        && let Some(memories) = value.get("memories").and_then(Value::as_array)
-    {
-        for memory in memories.iter().take(5) {
-            let Some(name) = memory.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            entries.push(ReviewEntry {
-                name: name.to_owned(),
-                kind: memory
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .unwrap_or("project")
-                    .to_owned(),
-                description: memory
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                content: memory
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                source: memory
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .unwrap_or("self")
-                    .to_owned(),
-            });
-        }
-    }
-    let added = apply_review(vfs, db.map(|db| db.as_ref()), &limits, &entries)
-        .context("cannot apply reviewed memories")?;
+    let added =
+        files::append_review(vfs, memory, &candidates).context("cannot apply reviewed memories")?;
     if added > 0 {
         info!(added, "background review added memories");
     }
@@ -301,15 +255,42 @@ async fn run_review(
             }
             let path = VfsPath::parse(&style.profile_path)
                 .unwrap_or_else(|_| VfsPath::parse("/STYLE.md").expect("valid"));
-            if vfs.stat(&path).is_ok() {
-                let _ = vfs.read_lines(&path, None, None);
-            }
-            vfs.write_text(&path, &text, None)
+            // 系统写入：不经过 agent 的“先读后写”，也不替 agent 记“已读”。
+            vfs.write_text_system(&path, &text)
                 .context("cannot write the style profile")?;
             debug!(chars = text.chars().count(), "style profile updated");
         }
     }
     Ok(added)
+}
+
+/// 复盘输出里的记忆候选：最多 5 条，没有 `name` 的跳过；其余字段缺失时留空或用默认值，
+/// 合不合格由 [`files::append_review`] 判断。
+fn candidates_from(value: &Value) -> Vec<files::Candidate> {
+    let Some(memories) = value.get("memories").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let field = |memory: &Value, key: &str, default: &str| {
+        memory
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or(default)
+            .to_owned()
+    };
+    memories
+        .iter()
+        .take(5)
+        .filter_map(|memory| {
+            let name = memory.get("name").and_then(Value::as_str)?;
+            Some(files::Candidate {
+                name: name.to_owned(),
+                kind: field(memory, "type", "project"),
+                description: field(memory, "description", ""),
+                content: field(memory, "content", ""),
+                source: field(memory, "source", "self"),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -343,6 +324,24 @@ mod tests {
             context_window: 0,
             supports_images: false,
         }))
+    }
+
+    /// 复盘输出 → 候选：最多 5 条、没有名字的跳过、缺失字段取默认值。
+    #[test]
+    fn candidates_are_read_from_the_review_output() {
+        let mut memories: Vec<Value> = (0..7)
+            .map(|index| serde_json::json!({"name": format!("m-{index}"), "content": "c"}))
+            .collect();
+        memories.insert(1, serde_json::json!({"content": "no name"}));
+        let candidates = candidates_from(&serde_json::json!({"memories": memories}));
+        // 取前 5 项，其中 1 项没有名字。
+        assert_eq!(candidates.len(), 4);
+        assert_eq!(candidates[0].name, "m-0");
+        assert_eq!(candidates[0].kind, "project");
+        assert_eq!(candidates[0].source, "self");
+        assert_eq!(candidates[0].description, "");
+        assert!(candidates_from(&serde_json::json!({"style": "x"})).is_empty());
+        assert!(candidates_from(&serde_json::json!({"memories": "nope"})).is_empty());
     }
 
     #[test]

@@ -37,7 +37,8 @@ const MAX_FILE_CHARS: u32 = 20_000;
 const MAX_SKILLS: usize = 64;
 const MAX_SKILL_DESCRIPTION_CHARS: usize = 200;
 
-/// 注入预算：来自配置，与写入端（Memory 工具、风格复盘）的上限一致。
+/// 注入预算：来自配置。记忆文件由 agent 用文件工具直接写，写的时候没有上限；这里的上限
+/// 决定每个会话实际放进上下文多少——超出的部分被截掉，所以它们就是这些文件的有效大小。
 #[derive(Debug, Clone)]
 pub struct ContextBudget {
     /// `/USER.md` 的字符上限（`[memory].user_max_chars`）。

@@ -12,8 +12,9 @@ QQ 消息，用可配置的 LLM 生成回复，并把所有状态集中在本机
 - **拟人回复**：静态提示词 + owner context + `/USER.md` + 记忆索引 + 风格画像 +
   技能索引；运行时上下文每回合单独注入。
 - **工具**：11 个文件工具（Read / Write / Edit / LS / Grep / Glob / RM / MV / CP /
-  Mkdir / Stat）、`API`（QQ 动作）、`Memory`、`Skill`、`Download`、`WebSearch` /
-  `WebFetch`、`Monitor`、`Agent`（子代理）、`MCP`（可选）。
+  Mkdir / Stat）、`API`（QQ 动作，以及下载、图片处理等本地动作）、`Skill`、
+  `WebSearch` / `WebFetch`、`Monitor`、`Agent`（子代理）、`MCP`（可选）。记忆是 VFS 里的
+  普通文件，agent 用文件工具读写。
 - **子代理**：`general` / `explore` / `plan` / `docs` 内置类型 + `/agents/*.md`
   自定义定义；独立上下文、工具集强制为父代理子集、支持嵌套与 monitor 绑定。
 - **动态视图**：`/messages`、`/inbox`、`/sessions`、`/friends`、`/groups`、

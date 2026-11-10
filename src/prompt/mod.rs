@@ -148,6 +148,10 @@ mod tests {
         // 没有独立的下载工具：下载是 `API` 的 `local.net.download`。
         assert!(!prompt.contains("`Download`"));
         assert!(prompt.contains("local.net.download"));
+        // 没有记忆工具：记忆是 agent 用文件工具维护的普通文件，提示词给出文件与索引行的格式。
+        assert!(!prompt.contains("`Memory`"));
+        assert!(prompt.contains("/memory/<slug>.md"));
+        assert!(prompt.contains("- [addressing](memory/addressing.md)"));
     }
 
     #[test]

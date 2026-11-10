@@ -22,7 +22,6 @@ pub use crate::actions;
 pub mod agent;
 pub mod api;
 pub mod fs;
-pub mod memory;
 pub mod monitor;
 pub mod net;
 pub mod skill;

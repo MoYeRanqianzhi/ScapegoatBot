@@ -17,7 +17,6 @@ use crate::storage::messages::MessageStore;
 use crate::tools::ToolRegistry;
 use crate::tools::agent::{AgentTool, HubHandle};
 use crate::tools::api::{AgentOps, ApiTool, Downloader, NapcatGateway};
-use crate::tools::memory::MemoryTool;
 use crate::tools::monitor::MonitorTool;
 use crate::tools::net::NetPolicy;
 use crate::tools::skill::SkillTool;
@@ -84,19 +83,6 @@ pub(super) async fn assemble_tools(assembly: ToolAssembly<'_>) -> ToolSet {
         register_mcp(&mut tools, &config.mcp).await;
     }
     tools.register(Arc::new(MonitorTool::new(Arc::clone(&assembly.monitors))));
-    if config.memory.enabled {
-        let memory = &config.memory;
-        tools.register(Arc::new(
-            MemoryTool::new(
-                Arc::clone(vfs),
-                memory.max_entry_chars,
-                memory.max_index_lines,
-                memory.max_index_bytes,
-                memory.user_max_chars,
-            )
-            .with_db(Arc::clone(db)),
-        ));
-    }
     // `local.net.download` 与 WebFetch 共用同一套域名 / 体积限制。
     let download_policy = NetPolicy {
         allowed_domains: config.tools.download.allowed_domains.clone(),

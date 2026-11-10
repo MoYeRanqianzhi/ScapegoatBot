@@ -4,7 +4,7 @@
 
 ```bash
 sbot status          # 进程在不在、模型、hold、ESTOP
-sbot doctor          # 只读检查配置、密钥、索引、记忆三方对账
+sbot doctor          # 只读检查配置、密钥、索引，以及记忆索引与文件的对账
 ```
 
 `doctor` 不修数据；它报错的地方按提示修。

@@ -230,8 +230,7 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     (
         6,
         "memory entries",
-        // 记忆的可查询索引：与 `/MEMORY.md` 和 `/memory/*.md` 三方对账。
-        // 文件仍是事实来源，本表损坏时可从文件重建。
+        // 已由迁移 13 删除：只有当时的 `Memory` 工具写它。已发布的迁移不改，保留原样。
         r#"
     CREATE TABLE memory_entries (
         slug        TEXT PRIMARY KEY,
@@ -317,6 +316,17 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         created_at  TEXT NOT NULL
     );
     CREATE INDEX event_audit_created ON event_audit(created_at);
+    "#,
+    ),
+    (
+        13,
+        "drop memory entries",
+        // `memory_entries` 是 `Memory` 工具维护的派生索引（slug、类型、来源）。工具删除后
+        // 记忆由文件工具直接写，这张表不再有写入者，留着只会是一份过期的副本。
+        // 它从来不是事实来源（`/MEMORY.md` 与 `/memory/*.md` 才是），删掉不丢数据。
+        r#"
+    DROP INDEX IF EXISTS memory_entries_kind;
+    DROP TABLE IF EXISTS memory_entries;
     "#,
     ),
 ];
@@ -655,6 +665,51 @@ mod tests {
         // 第二次打开不应重复执行迁移或报错。
         let db = Database::open(&path).unwrap();
         assert_eq!(db.schema_version().unwrap(), version);
+    }
+
+    /// 迁移 13 删除 `memory_entries`：从 v12（表里有数据）升级后表不存在，其他表不受影响。
+    #[test]
+    fn migration_13_drops_memory_entries_from_an_existing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sbot.db");
+        {
+            // 手工建一个停在 v12 的数据库：依次执行前 12 条迁移并登记版本。
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_migrations (
+                     version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+            )
+            .unwrap();
+            for (version, _, sql) in MIGRATIONS.iter().filter(|(version, _, _)| *version <= 12) {
+                conn.execute_batch(sql).unwrap();
+                conn.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, 'then')",
+                    params![version],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO memory_entries (slug, path, kind, source, observed_at, updated_at)
+                 VALUES ('a', '/memory/a.md', 'user', 'self', '', '')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.last().unwrap().0);
+        let conn = db.lock();
+        let tables = |name: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(tables("memory_entries"), 0);
+        assert_eq!(tables("memory_entries_kind"), 0);
+        assert_eq!(tables("event_audit"), 1);
     }
 
     #[test]

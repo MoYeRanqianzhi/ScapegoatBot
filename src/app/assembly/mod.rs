@@ -195,7 +195,6 @@ pub(super) async fn build_agent(input: AgentInputs<'_>) -> Result<Option<Arc<Age
         review_model: memory_model,
         history: Arc::clone(&history),
         vfs: Arc::clone(&input.vfs),
-        db: Some(Arc::clone(&input.db)),
         queue: Arc::clone(&queue) as Arc<dyn crate::memory::QueueActivity>,
         memory: config.memory.clone(),
         style: config.style.clone(),
@@ -315,7 +314,6 @@ async fn build_runner(
         Arc::new(crate::memory::MemoryFlusher::new(
             memory_model,
             Arc::clone(&input.vfs),
-            Some(Arc::clone(&input.db)),
             config.memory.clone(),
         ))
     });

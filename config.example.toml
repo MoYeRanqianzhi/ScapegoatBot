@@ -116,9 +116,13 @@ enabled = false
 # enabled = true
 
 [memory]
+# 记忆是 VFS 里的普通文件（/USER.md、/MEMORY.md、/memory/*.md），agent 用文件工具读写。
+# enabled：后台复盘是否把候选追加进记忆。
 enabled = true
+# 后台复盘追加时的上限：单条候选的字符数、索引的行数。
 max_entry_chars = 4000
 max_index_lines = 200
+# 注入上下文时的截断上限：/MEMORY.md 的字节数（也是复盘追加的上限）、/USER.md 的字符数。
 max_index_bytes = 25000
 user_max_chars = 4000
 # off / idle / every_turn

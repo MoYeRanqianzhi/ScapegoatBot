@@ -106,7 +106,6 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 | 工具 | 说明 |
 |------|------|
 | `API` | 唯一的 QQ 动作入口，也是下载、图片处理等本地动作的入口；`api.list` / `api.help` 查表 |
-| `Memory` | `/USER.md`、`/memory/*`、`/MEMORY.md` 的结构化写入（检查格式与预算、原子批量）；`Write` / `Edit` 也能直接改这些文件，但不做这些检查 |
 | `Skill` | 加载 `/skills/<name>/SKILL.md` 与资源清单 |
 | `WebSearch` / `WebFetch` | 搜索 / 抓取；由服务端工具或你配置的后端执行 |
 | `Monitor` | 增删查事件订阅，手动触发一次 |

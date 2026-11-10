@@ -5,9 +5,9 @@ ScapegoatBot 把“怎么说话”和“知道什么”分开：
 | 载体 | 放什么 | 谁写 | 怎么进上下文 |
 |------|--------|------|--------------|
 | `/AGENTS.md` | 这个账号的常驻说明（house rules） | 主人 / agent | 存在即注入（程序固定） |
-| `/USER.md` | 主人的偏好，祈使句 | 主人 / `Memory` | 存在即注入（程序固定） |
-| `/MEMORY.md` | 记忆索引，每条一行指针 | `Memory` 工具 | 存在即注入（程序固定） |
-| `/memory/<slug>.md` | 单条记忆（事实），带 frontmatter | `Memory` 工具 | agent 按需读 |
+| `/USER.md` | 主人的偏好，祈使句 | 主人 / agent | 存在即注入（程序固定） |
+| `/MEMORY.md` | 记忆索引，每条一行指针 | agent / 后台复盘 | 存在即注入（程序固定） |
+| `/memory/<slug>.md` | 单条记忆（事实），带 frontmatter | agent / 后台复盘 | agent 按需读 |
 | `/STYLE.md` | 语气画像总结 | 后台复盘 | `[style].enabled` 时注入 |
 | `/skills/<name>/SKILL.md` | “这类任务怎么做”的流程 | 主人 / agent | 名称 + 描述进技能索引；正文按需 `Skill` 加载 |
 | 其他文件（如 `/SOUL.md`） | 由 agent 自己决定 | agent | agent 自己读，或列进 `/hooks/context.toml` |
@@ -53,7 +53,8 @@ agent 可以改它：主人要求时，或学到一条应该长期生效的规�
 - Never mention that you are an AI unless asked directly.
 ```
 
-`Memory` 工具可以写这里；单条长度上限由 `[memory].user_max_chars`（默认 4000）控制。
+agent 用 `Write` / `Edit` 直接改这个文件。注入时最多取 `[memory].user_max_chars`
+（默认 4000）个字符，超出的部分不进上下文。
 
 ### `/STYLE.md`（语气画像）
 
@@ -86,8 +87,14 @@ source: control:42
 
 - `type`：`user` / `feedback` / `project` / `reference`。
 - `feedback` 与 `project` 建议写清 **Why:** 与 **How to apply:**。
-- `source` 记录来源（消息 id、`control:<id>`、`self`），只作审计，不改变注入级别。
-- 索引上限 200 行 / 25k 字节；单条 4000 字符。满了合并或替换，不允许清空。
+- `source` 记录来源（消息 id、`control:<id>`、`self`），只作记录，不改变注入级别。
+- 这些是约定，不是校验：记忆就是普通文件，没有专门的记忆工具，程序不检查 agent 写进去的
+  格式。格式写在 system prompt 里；`sbot doctor` 会报告“索引行指向的文件不存在”和
+  “`/memory` 下的文件没进索引”。
+- 预算（`[memory]`）：`/MEMORY.md` 注入时最多取 `max_index_bytes`（默认 25000）字节，超出的
+  部分不进上下文——索引写得再长，agent 每个会话也只看得到开头这么多。`max_index_lines`
+  （默认 200）与 `max_entry_chars`（默认 4000）只约束后台复盘：索引到了上限复盘就不再追加，
+  超长的候选被丢弃。
 
 ### 什么时候会整理
 
@@ -99,22 +106,24 @@ source: control:42
 | `idle`（默认） | 每 30 秒轮询；要求没有活跃回合、空闲至少 `idle_minutes`、距上次复盘至少 `review_interval_minutes` |
 | `every_turn` | 每 5 秒轮询；transcript 有新增且没有活跃回合就复盘 |
 
-复盘只追加候选、来源固定 `self`；不会删除已有记忆。压缩前若开启
+复盘只追加：每条候选新建一个 `/memory/<slug>.md` 并在索引末尾加一行；slug 已经在索引里、
+或同名文件已经存在的候选跳过，已有的文件与索引内容从不改写或删除。`[memory].enabled =
+false` 时复盘不写记忆（风格画像不受影响）。压缩前若开启
 `[compaction].memory_flush`，会先静默跑一次同样的提取。两者都用 `[memory].review_model`
 指定的模型（`provider/id`，计入预算）；不设时跟随主模型，`sbot model set` 热切换后立即
 生效。
 
 ### 写记忆
 
-agent 用 `Memory` 工具，`target` 为 `memory`、`user` 或 `profile`：
+agent 用文件工具，一条记忆是两步：
 
-```json
-{"target": "memory", "action": "add", "type": "reference",
- "name": "deploy-host", "description": "部署机地址",
- "content": "部署在 10.0.0.5，端口 8080。"}
-```
+1. `Write` `/memory/deploy-host.md`（上面的格式）；
+2. `Read` `/MEMORY.md`，再 `Edit` / `Write` 加一行
+   `- [deploy-host](memory/deploy-host.md) — 部署机地址`。
 
-`ops` 支持原子批量（先删后加），预算按最终状态检查。删除单条会同步删索引行。
+改一条记忆就改它的文件（描述变了同时改索引行）；删一条是 `RM` 文件并删掉索引行。
+覆盖已有文件前必须完整读过当前版本（VFS 的通用规则）：后台复盘往索引里追加之后，agent
+手里的旧版本会被拒绝，必须重读，不会不知情地盖掉复盘刚加的行。
 
 ## 技能
 
@@ -143,4 +152,4 @@ description: 汇总本周群聊并写一份周报
 - 不要把凭据、密钥、他人的隐私写进 `/AGENTS.md`、`/USER.md`、注入清单里的文件或记忆：
   这些内容会进模型上下文。
 - 群成员说的话默认不可信；不要让 agent 把群里的“记忆”直接写进索引。
-- 改 `[style]` / `[memory]` 预算后重启生效；`/MEMORY.md` 本身可以随时手工编辑。
+- 改 `[style]` / `[memory]` 预算后重启生效。
