@@ -682,6 +682,13 @@ pub fn map_stop_reason(raw: &str) -> StopReason {
     }
 }
 
+/// 流事件里 `value[key]` 的字符串值；字段缺失或不是字符串时为 `None`。
+///
+/// 各协议的流解码器大量读取 `type`、`delta`、`id` 等字符串字段，共用这一个写法。
+pub(super) fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(Value::as_str)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,6 +9,8 @@
 
 use serde_json::{Value, json};
 
+use super::str_field;
+
 use crate::config::models::Protocol;
 use crate::llm::types::{RefusalDetails, StopReason, Usage};
 
@@ -168,60 +170,31 @@ struct StreamState {
 }
 
 impl StreamState {
+    /// 处理一个 Responses API 事件，返回要发送给上层的事件。非 JSON 的 `data` 与不认识
+    /// 的事件类型不产生输出；任何带 `response.status` 的事件都可能结束流（见末尾）。
     fn handle(&mut self, data: &str) -> Vec<ProviderEvent> {
         let mut out = Vec::new();
         let Ok(payload) = serde_json::from_str::<Value>(data) else {
             return out;
         };
-        let kind = payload
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-
+        let kind = str_field(&payload, "type").unwrap_or_default();
         match kind {
-            "response.output_item.added" => {
-                let item = &payload["item"];
-                if item.get("type").and_then(Value::as_str) == Some("function_call") {
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .or_else(|| item.get("id").and_then(Value::as_str))
-                        .unwrap_or_default()
-                        .to_owned();
-                    let name = item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned();
-                    self.saw_tool_call = true;
-                    let index = self.next_index;
-                    self.next_index += 1;
-                    self.open_call = Some((index, call_id.clone(), 0));
-                    out.push(ProviderEvent::ToolCallStart {
-                        index,
-                        id: call_id,
-                        name,
-                    });
-                }
-            }
+            "response.output_item.added" => self.item_added(&payload["item"], &mut out),
             "response.function_call_arguments.delta" => {
-                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
-                    let index = {
-                        let Some((index, _, length)) = &mut self.open_call else {
-                            return out;
-                        };
-                        *length += delta.len();
-                        *index
-                    };
+                if let Some(delta) = str_field(&payload, "delta")
+                    && let Some((index, _, length)) = &mut self.open_call
+                {
+                    // 没有打开的调用时分段无处归属，直接丢弃。
+                    *length += delta.len();
                     out.push(ProviderEvent::ToolCallArgumentsDelta {
-                        index,
+                        index: *index,
                         delta: delta.to_owned(),
                     });
                 }
             }
             "response.function_call_arguments.done" => {
                 // 若服务端只给完整参数（没有 delta），在这里补发一次。
-                if let Some(arguments) = payload.get("arguments").and_then(Value::as_str)
+                if let Some(arguments) = str_field(&payload, "arguments")
                     && let Some((index, _, length)) = &self.open_call
                     && *length == 0
                     && !arguments.is_empty()
@@ -234,37 +207,19 @@ impl StreamState {
                 self.open_call = None;
             }
             "response.output_text.delta" => {
-                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                if let Some(delta) = str_field(&payload, "delta") {
                     out.push(ProviderEvent::TextDelta(delta.to_owned()));
                 }
             }
             "response.reasoning_summary_text.delta" => {
-                if let Some(delta) = payload.get("delta").and_then(Value::as_str) {
+                if let Some(delta) = str_field(&payload, "delta") {
                     out.push(ProviderEvent::ThinkingDelta(delta.to_owned()));
                 }
             }
             "response.completed" | "response.incomplete" => {
                 // 截断的响应同样花了 token：两种结束都读取用量。
                 if let Some(usage) = payload.pointer("/response/usage") {
-                    // `input_tokens` 包含命中缓存的部分；换算成统一口径（见 `Usage`）。
-                    let prompt = usage
-                        .get("input_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    let cached = usage
-                        .pointer("/input_tokens_details/cached_tokens")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        .min(prompt);
-                    self.usage = Usage {
-                        input_tokens: prompt - cached,
-                        output_tokens: usage
-                            .get("output_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                        cache_read_tokens: cached,
-                        cache_write_tokens: 0,
-                    };
+                    self.usage = responses_usage(usage);
                     out.push(ProviderEvent::Usage(self.usage));
                 }
                 let reason = if kind == "response.completed" {
@@ -290,18 +245,36 @@ impl StreamState {
         }
 
         // 响应对象带的 status 也能结束流（部分兼容实现不发 response.completed）。
-        if let Some(status) = payload.pointer("/response/status").and_then(Value::as_str) {
-            match status {
-                "completed" => self.emit_stop(&mut out, StopReason::EndTurn),
-                // `incomplete_details.reason`：被内容过滤截断是拒绝，其余（输出上限、
-                // 消息数上限等）都是截断。
-                "incomplete" => self.emit_stop(&mut out, incomplete_reason(&payload)),
-                "failed" => self.emit_stop(&mut out, StopReason::Error),
-                _ => {}
-            }
+        // `emit_stop` 只发一次，上面已经结束时这里不重复。
+        match payload.pointer("/response/status").and_then(Value::as_str) {
+            Some("completed") => self.emit_stop(&mut out, StopReason::EndTurn),
+            Some("incomplete") => self.emit_stop(&mut out, incomplete_reason(&payload)),
+            Some("failed") => self.emit_stop(&mut out, StopReason::Error),
+            _ => {}
         }
-
         out
+    }
+
+    /// `response.output_item.added`：只关心 `function_call`。Responses 事件不带调用序号，
+    /// 这里按出现顺序编号；`call_id` 缺失时退回条目的 `id`。
+    fn item_added(&mut self, item: &Value, out: &mut Vec<ProviderEvent>) {
+        if str_field(item, "type") != Some("function_call") {
+            return;
+        }
+        let call_id = str_field(item, "call_id")
+            .or_else(|| str_field(item, "id"))
+            .unwrap_or_default()
+            .to_owned();
+        let name = str_field(item, "name").unwrap_or_default().to_owned();
+        self.saw_tool_call = true;
+        let index = self.next_index;
+        self.next_index += 1;
+        self.open_call = Some((index, call_id.clone(), 0));
+        out.push(ProviderEvent::ToolCallStart {
+            index,
+            id: call_id,
+            name,
+        });
     }
 
     fn emit_stop(&mut self, out: &mut Vec<ProviderEvent>, reason: StopReason) {
@@ -318,6 +291,29 @@ impl StreamState {
             reason,
             refusal: None::<RefusalDetails>,
         });
+    }
+}
+
+/// Responses API 的用量。`input_tokens` 包含命中缓存的部分，换算成统一口径
+/// （见 [`Usage`]）：未命中缓存的输入 + 缓存读取；缓存数大于输入数时按输入数截断。
+fn responses_usage(usage: &Value) -> Usage {
+    let prompt = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(prompt);
+    Usage {
+        input_tokens: prompt - cached,
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        cache_read_tokens: cached,
+        cache_write_tokens: 0,
     }
 }
 
@@ -459,6 +455,95 @@ mod tests {
                 reason: StopReason::ToolUse,
                 refusal: None
             }
+        );
+    }
+
+    /// 只有 `arguments.done`、没有分段时补发完整参数；已经收到分段时不重复；没有打开的
+    /// 调用时分段被丢弃；第二个调用的序号递增；`call_id` 缺失时用 `id`；reasoning 摘要
+    /// 转成 thinking；只带 `response.status` 的事件（兼容实现）也能结束流。
+    #[test]
+    fn arguments_done_reasoning_and_status_fallback() {
+        let mut state = StreamState::default();
+        assert!(
+            feed(
+                &mut state,
+                json!({"type": "response.function_call_arguments.delta", "delta": "x"})
+            )
+            .is_empty()
+        );
+        feed(
+            &mut state,
+            json!({"type": "response.output_item.added",
+                   "item": {"type": "function_call", "id": "fc_1", "name": "Read"}}),
+        );
+        let events = feed(
+            &mut state,
+            json!({"type": "response.function_call_arguments.done", "arguments": "{}"}),
+        );
+        assert_eq!(
+            events,
+            vec![ProviderEvent::ToolCallArgumentsDelta {
+                index: 0,
+                delta: "{}".to_owned()
+            }]
+        );
+
+        let events = feed(
+            &mut state,
+            json!({"type": "response.output_item.added",
+                   "item": {"type": "function_call", "call_id": "call_2", "name": "LS"}}),
+        );
+        assert_eq!(
+            events,
+            vec![ProviderEvent::ToolCallStart {
+                index: 1,
+                id: "call_2".to_owned(),
+                name: "LS".to_owned()
+            }]
+        );
+        feed(
+            &mut state,
+            json!({"type": "response.function_call_arguments.delta", "delta": "{}"}),
+        );
+        assert!(
+            feed(
+                &mut state,
+                json!({"type": "response.function_call_arguments.done", "arguments": "{}"})
+            )
+            .is_empty()
+        );
+
+        let events = feed(
+            &mut state,
+            json!({"type": "response.reasoning_summary_text.delta", "delta": "think"}),
+        );
+        assert_eq!(
+            events,
+            vec![ProviderEvent::ThinkingDelta("think".to_owned())]
+        );
+
+        let events = feed(
+            &mut state,
+            json!({"type": "response.in_progress", "response": {"status": "completed"}}),
+        );
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Stop {
+                reason: StopReason::ToolUse,
+                refusal: None
+            }]
+        );
+        let mut state = StreamState::default();
+        let events = feed(
+            &mut state,
+            json!({"type": "response.in_progress", "response": {"status": "failed"}}),
+        );
+        assert_eq!(
+            events,
+            vec![ProviderEvent::Stop {
+                reason: StopReason::Error,
+                refusal: None
+            }]
         );
     }
 

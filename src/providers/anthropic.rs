@@ -6,6 +6,8 @@
 
 use serde_json::{Value, json};
 
+use super::str_field;
+
 use crate::config::models::Protocol;
 use crate::llm::types::{RefusalDetails, StopReason, Usage};
 
@@ -432,11 +434,6 @@ impl StreamState {
 /// 内容块事件的 `index`；缺失或不是整数时按 0 处理。
 fn block_index(payload: &Value) -> u32 {
     payload.get("index").and_then(Value::as_u64).unwrap_or(0) as u32
-}
-
-/// `value[key]` 的字符串值。
-fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    value.get(key).and_then(Value::as_str)
 }
 
 /// `value[key]` 的非空字符串值。
