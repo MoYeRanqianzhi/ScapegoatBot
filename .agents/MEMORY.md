@@ -7,6 +7,9 @@
 - [存储不变量](memory/storage-invariants.md) -- append 串行、(chat, message_id) 去重、索引校验、文件头加密、迁移 v12
 - [图片工具 local.media.image.*](memory/image-tools.md) -- 5 个 action、系统字体约束、依赖与模块命名坑
 - [功能范围纠正](memory/feature-scope-correction.md) -- 不要把代码限制升级成需求；禁止内置字体
+- [工具表](memory/tool-surface.md) -- 没有 Memory / Download 工具：记忆用文件工具写，下载在 API 里；新增顶层工具要用户同意
+- [文档归属](memory/docs-layout.md) -- 开发文档就是 .agents 记忆；使用文档是内嵌在二进制里的 skill
+- [提交说明](memory/commit-messages.md) -- 不带 Claude Code 共同作者行；2026-11-10 重写过历史，远端待强推
 - [发布状态](memory/release-status.md) -- 当前测试基线、tag/release 状态与未实测能力
 - [审查整改计划（2026-11-07）](plan/2026-11-07-review-remediation.md) -- 四份代码审查的已修/待修项与顺序
 - [重构总设计](plan/2026-10-28-rebuild-design.md) -- 0.2 设计依据与取舍理由；与代码冲突时以代码为准

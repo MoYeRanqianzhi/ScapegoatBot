@@ -104,7 +104,7 @@ RM / MV 进入；`Monitor add` 与配置同一套 schema；`wake-on-` 前缀改�
 - `已修 alpha.40`（部分按设计）模型写 `/config/filter` 可把 owner 加进 `ignore_users`；
   可删除 wake 预设；hold 期间也能写配置。hold 期间 `/config` 只读已修；排除主人、删除
   wake 预设按用户 alpha.38 的决定属于 agent 自己的选择，不加特权通道（曾误加主人免过滤，
-  已在 b52a58b 撤回）。
+  已在 f17a080 撤回）。
 - `已修 alpha.40` `/config/mcp` 与 `/config.toml` 暴露 `mcp.servers[].env` 里的 token；
   `persist()` 重建 `sbot.toml` 时用默认权限。
 - `已修 alpha.40` VFS 回收站不计配额、`purge_trash` 运行时从不调用；从回收站恢复不检查配额。

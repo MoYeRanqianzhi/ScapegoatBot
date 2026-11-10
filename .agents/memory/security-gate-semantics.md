@@ -31,7 +31,7 @@ metadata:
 `src/app/assembly.rs`（llm judge 装入）；测试 `security::gate::tests::{
 enforce_without_a_classifier_holds_instead_of_allowing, explicit_off_backend_stays_rules_only,
 rule_hits_are_not_suppressed_by_the_threshold, resume_review_uses_the_flagged_content,
-llm_backend_can_be_installed_after_construction}`；hold 范围提交 `d21eed4`。
+llm_backend_can_be_installed_after_construction}`；hold 范围提交 `b766619`。
 
 **Recheck when:** 修改 `GuardConfig` 默认值、hold 范围、resume 复核输入或周期检查时。
 

@@ -70,7 +70,7 @@ metadata:
 - `[gate].llm_review` 的默认值（当前 `false`）。
 
 **Evidence:** 设计文档 §1–§14；`src/config/sections/{agent,gate,memory,storage,compaction,swarm}.rs`
-的 `Default` 实现（2026-11-07 核对）；单会话化提交 `2f2948c`；hold 范围提交 `d21eed4`；
+的 `Default` 实现（2026-11-07 核对）；单会话化提交 `6768da8`；hold 范围提交 `b766619`；
 用户 2026-11-07 原话：“这是个自主运行的agent，理想情况下启动后就不会干预，主人只会通过qq进行交互，
 所以必须自主解除”“AGENTS.md可以写”“AGENTS.md是程序决定的是一定要注入的（如果存在），其他文件靠agent自己读或者自己设置hook注入”“这是本地工具类下属的媒体类的图片处理工具……不能直接image.开头”。
 
