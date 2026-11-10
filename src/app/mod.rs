@@ -695,11 +695,20 @@ impl Runtime {
                         }
                     },
                 };
-                // agent 没在跑就直接拒绝，什么都不存：存下来的输入不会在之后补跑。
+                // 跑不了就直接拒绝，什么都不存：存下来的输入不会在之后补跑，而“已接受”
+                // 应当意味着它会被执行。
                 let agent = match self.running_agent() {
                     Ok(agent) => agent,
                     Err(reason) => return Response::error(id, "not_ready", reason),
                 };
+                if !self.ai_enabled.load(Ordering::Relaxed) {
+                    return Response::error(
+                        id,
+                        "ai_stopped",
+                        "model calls are stopped, so this input would not run; \
+                         `sbot ai start` first",
+                    );
+                }
                 let sealed =
                     match self
                         .key
@@ -815,6 +824,35 @@ impl Runtime {
     }
 }
 
+/// 这条请求是不是发给本实例的。
+///
+/// 控制通道的端点名只由 `[ipc].name` 决定（Windows 的命名管道是全局命名空间；Unix 下设了
+/// `XDG_RUNTIME_DIR` 时套接字也不在实例目录里）。两个实例用了同一个名字时，只有一个起得来，
+/// 而发给没起来的那个的命令——`stop`、`chat`、`gate approve`——会被起来的这个执行。客户端
+/// 带上它的实例目录，对不上就拒绝并说明怎么改；不带的（旧客户端）照常处理。
+fn check_instance(
+    requested: Option<&str>,
+    own: &std::path::Path,
+    ipc_name: &str,
+) -> Result<(), String> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    // 两边都解析成真实路径再比：同一个目录可以有不同写法（相对路径、符号链接、大小写）。
+    // 解析不了（目录不存在）时按原文比较，那样它不可能等于本实例正在用的目录。
+    let resolve =
+        |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or(path.to_path_buf());
+    if resolve(std::path::Path::new(requested)) == resolve(own) {
+        return Ok(());
+    }
+    Err(format!(
+        "this daemon serves {}, but the command was issued for {requested}. Both use the \
+         control channel name {ipc_name:?}; instances that run side by side each need their \
+         own [ipc].name in sbot.toml.",
+        own.display()
+    ))
+}
+
 impl AgentRuntime {
     /// 准入过滤（消息、notice、request）；拒收的事件计入 `filtered`。
     fn admit(&self, event: &crate::qq::event::QqEvent) -> bool {
@@ -838,6 +876,13 @@ impl AgentRuntime {
 #[async_trait::async_trait]
 impl Handler for Runtime {
     async fn handle(&self, request: Request) -> Response {
+        if let Err(reason) = check_instance(
+            request.home.as_deref(),
+            self.paths.home(),
+            &self.config().config.ipc.name,
+        ) {
+            return Response::error(request.id, "wrong_instance", reason);
+        }
         let idempotency_key = if request.wants_idempotency() {
             request.idempotency_key.clone()
         } else {
@@ -867,5 +912,36 @@ impl Handler for Runtime {
             warn!(%error, "cannot store idempotent response");
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 发给别的实例的命令被拒绝，并说明两边各是哪个目录、该改什么；同一个目录的不同写法
+    /// 与不带目录的旧客户端照常放行。
+    #[test]
+    fn commands_for_another_instance_are_refused() {
+        let own = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let own_text = own.path().display().to_string();
+
+        assert!(check_instance(None, own.path(), "scapegoat-bot").is_ok());
+        assert!(check_instance(Some(&own_text), own.path(), "scapegoat-bot").is_ok());
+        // 同一个目录，写法不同。
+        let dotted = own.path().join(".").display().to_string();
+        assert!(check_instance(Some(&dotted), own.path(), "scapegoat-bot").is_ok());
+
+        let other_text = other.path().display().to_string();
+        let reason = check_instance(Some(&other_text), own.path(), "scapegoat-bot").unwrap_err();
+        assert!(reason.contains(&own_text), "{reason}");
+        assert!(reason.contains(&other_text), "{reason}");
+        assert!(reason.contains("[ipc].name"), "{reason}");
+        assert!(reason.contains("\"scapegoat-bot\""), "{reason}");
+
+        // 不存在的目录不可能是本实例。
+        let missing = own.path().join("missing").display().to_string();
+        assert!(check_instance(Some(&missing), own.path(), "scapegoat-bot").is_err());
     }
 }

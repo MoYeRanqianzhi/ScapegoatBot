@@ -43,6 +43,10 @@ pub struct Request {
     /// 幂等键；仅对有副作用的请求有意义。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+    /// 客户端以为自己在操作的实例目录（它的 `SBOT_HOME`）。端点名只由 `[ipc].name` 决定，
+    /// 两个实例用了同一个名字时，发给甲的命令会到乙手里；服务端据此拒绝。旧客户端不带它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
     #[serde(flatten)]
     pub body: RequestBody,
 }
@@ -158,8 +162,15 @@ impl Request {
             v: PROTOCOL_VERSION,
             id: new_request_id(),
             idempotency_key: None,
+            home: None,
             body,
         }
+    }
+
+    /// 标明这条请求是发给哪个实例目录的（见 [`Request::home`]）。
+    pub fn for_home(mut self, home: &std::path::Path) -> Self {
+        self.home = Some(home.display().to_string());
+        self
     }
 
     /// 附加幂等键。

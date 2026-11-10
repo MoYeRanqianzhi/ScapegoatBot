@@ -5,7 +5,7 @@
 //! CLI 是独立进程：`start` 变成守护进程本身，其余子命令通过 IPC 与控制通道交互。
 //! 人类面输出可以本地化；这里用中文，便于主人直接阅读。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -163,91 +163,102 @@ pub async fn run() -> Result<()> {
 
 /// 通过 IPC 与控制通道执行的子命令。
 async fn run_remote(command: Command, paths: &SbotPaths, config: Option<PathBuf>) -> Result<()> {
-    let loaded = load_config_lenient(paths, config);
-    let endpoint = ipc::Endpoint::resolve(paths, &loaded.name);
+    let daemon = Daemon {
+        endpoint: ipc::Endpoint::resolve(paths, &client_ipc_config(paths, config.as_deref())),
+        home: paths.home().to_path_buf(),
+    };
 
     match command {
         Command::Start | Command::Backup { .. } | Command::Doctor => {
             unreachable!("local commands are handled before the daemon connection")
         }
-        Command::Status => request(&endpoint, Request::new(RequestBody::Status)).await,
-        Command::Stop => request(&endpoint, Request::new(RequestBody::Shutdown)).await,
-        Command::Restart => restart(&endpoint).await,
+        Command::Status => daemon.run(RequestBody::Status).await,
+        Command::Stop => daemon.run(RequestBody::Shutdown).await,
+        Command::Restart => restart(&daemon, config.as_deref()).await,
 
         Command::Ai { action } => {
             let action = match action {
                 AiCommand::Start => AiAction::Start,
                 AiCommand::Stop => AiAction::Stop,
             };
-            request(&endpoint, Request::new(RequestBody::Ai { action })).await
+            daemon.run(RequestBody::Ai { action }).await
         }
 
         Command::Chat { message, scope } => {
-            let request = Request::new(RequestBody::Chat { message, scope });
-            // 同一次调用内重试时复用同一个幂等键，避免重复入队。
-            let key = request.id.clone();
-            request_with_retry(&endpoint, request.with_idempotency(key)).await
+            daemon.run_once(RequestBody::Chat { message, scope }).await
         }
 
-        Command::Pause => request(&endpoint, Request::new(RequestBody::Pause)).await,
-        Command::Resume => request(&endpoint, Request::new(RequestBody::Resume)).await,
+        Command::Pause => daemon.run(RequestBody::Pause).await,
+        Command::Resume => daemon.run(RequestBody::Resume).await,
 
         Command::Security { action } => match action {
-            SecurityCommand::Status => {
-                request(&endpoint, Request::new(RequestBody::SecurityStatus)).await
-            }
-            SecurityCommand::Resume => {
-                request(&endpoint, Request::new(RequestBody::SecurityResume)).await
-            }
+            SecurityCommand::Status => daemon.run(RequestBody::SecurityStatus).await,
+            SecurityCommand::Resume => daemon.run(RequestBody::SecurityResume).await,
         },
 
         Command::Gate { action } => match action {
-            GateCommand::Pending => {
-                request(&endpoint, Request::new(RequestBody::GatePending)).await
-            }
+            GateCommand::Pending => daemon.run(RequestBody::GatePending).await,
             GateCommand::Approve { id: approval } => {
-                request(
-                    &endpoint,
-                    Request::new(RequestBody::GateApprove { approval }),
-                )
-                .await
+                daemon.run(RequestBody::GateApprove { approval }).await
             }
             GateCommand::Reject { id: approval } => {
-                request(
-                    &endpoint,
-                    Request::new(RequestBody::GateReject { approval }),
-                )
-                .await
+                daemon.run(RequestBody::GateReject { approval }).await
             }
         },
 
         Command::Model { action } => match action {
-            ModelAction::Set { model } => {
-                let request = Request::new(RequestBody::SetModel { model });
-                let key = request.id.clone();
-                request_with_retry(&endpoint, request.with_idempotency(key)).await
-            }
-            ModelAction::List => {
-                // 经守护进程查询：它持有合并后的模型清单与热切换后的当前模型。
-                let list = request_payload(&endpoint, Request::new(RequestBody::ModelList)).await?;
-                print_value(&list)?;
-                Ok(())
-            }
+            ModelAction::Set { model } => daemon.run_once(RequestBody::SetModel { model }).await,
+            // 经守护进程查询：它持有合并后的模型清单与热切换后的当前模型。
+            ModelAction::List => daemon.run(RequestBody::ModelList).await,
         },
 
         Command::Effort { action } => match action {
-            EffortAction::Set { level } => {
-                let request = Request::new(RequestBody::SetEffort { level });
-                let key = request.id.clone();
-                request_with_retry(&endpoint, request.with_idempotency(key)).await
-            }
-            EffortAction::List => {
-                let list =
-                    request_payload(&endpoint, Request::new(RequestBody::EffortList)).await?;
-                print_value(&list)?;
-                Ok(())
-            }
+            EffortAction::Set { level } => daemon.run_once(RequestBody::SetEffort { level }).await,
+            EffortAction::List => daemon.run(RequestBody::EffortList).await,
         },
+    }
+}
+
+/// 控制通道的另一端：端点，以及这次调用所属的实例目录。
+///
+/// 请求都经这里构造，实例目录不会漏带：端点名只由 `[ipc].name` 决定，两个实例用了同一个
+/// 名字时，守护进程靠请求里的目录认出“这条命令不是给我的”。
+struct Daemon {
+    endpoint: ipc::Endpoint,
+    home: PathBuf,
+}
+
+impl Daemon {
+    /// 发一条请求；成功返回 payload，失败把错误码与说明一起抛出。
+    async fn send(&self, request: Request) -> Result<serde_json::Value> {
+        let mut client = ipc::Client::connect(&self.endpoint).await?;
+        let response = client.request(&request).await?;
+        into_payload(response)
+    }
+
+    /// 发一条请求并打印结果。
+    async fn run(&self, body: RequestBody) -> Result<()> {
+        let payload = self.send(Request::new(body).for_home(&self.home)).await?;
+        print_value(&payload)
+    }
+
+    /// 发一条有副作用的请求并打印结果。传输层失败时重试一次，两次用同一个幂等键：
+    /// 第一次其实已经送达时，守护进程回放原结果，不会执行两遍。
+    async fn run_once(&self, body: RequestBody) -> Result<()> {
+        let request = Request::new(body).for_home(&self.home);
+        let key = request.id.clone();
+        let request = request.with_idempotency(key);
+        let payload = match self.send(request.clone()).await {
+            Ok(payload) => payload,
+            Err(first) => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                match self.send(request).await {
+                    Ok(payload) => payload,
+                    Err(_) => return Err(first),
+                }
+            }
+        };
+        print_value(&payload)
     }
 }
 
@@ -255,46 +266,12 @@ async fn run_remote(command: Command, paths: &SbotPaths, config: Option<PathBuf>
 ///
 /// 配置损坏的完整校验由守护进程在启动时完成；CLI 只需一个名字，
 /// 强行在这里报错会让 `sbot status` 在配置出错时也无法使用——那恰恰是最需要它的时候。
-fn load_config_lenient(paths: &SbotPaths, explicit: Option<PathBuf>) -> ClientConfig {
-    let path = explicit.unwrap_or_else(|| paths.config_file());
+fn client_ipc_config(paths: &SbotPaths, explicit: Option<&Path>) -> IpcConfig {
+    let path = explicit.map_or_else(|| paths.config_file(), Path::to_path_buf);
     match SbotConfig::load(&path) {
-        Ok(LoadedConfig { config, .. }) => ClientConfig { name: config.ipc },
-        Err(_) => ClientConfig {
-            name: IpcConfig::default(),
-        },
+        Ok(LoadedConfig { config, .. }) => config.ipc,
+        Err(_) => IpcConfig::default(),
     }
-}
-
-struct ClientConfig {
-    name: IpcConfig,
-}
-
-/// 发送一次请求并打印结果。
-async fn request(endpoint: &ipc::Endpoint, request: Request) -> Result<()> {
-    let payload = request_payload(endpoint, request).await?;
-    print_value(&payload)
-}
-
-/// 发送请求，成功时返回 payload；失败时把错误码与说明一起抛出。
-async fn request_payload(endpoint: &ipc::Endpoint, request: Request) -> Result<serde_json::Value> {
-    let mut client = ipc::Client::connect(endpoint).await?;
-    let response = client.request(&request).await?;
-    into_payload(response)
-}
-
-/// 带一次重试的请求：只在传输层失败时重试，且复用同一个幂等键。
-async fn request_with_retry(endpoint: &ipc::Endpoint, request: Request) -> Result<()> {
-    let payload = match request_payload(endpoint, request.clone()).await {
-        Ok(payload) => payload,
-        Err(first) => {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            match request_payload(endpoint, request).await {
-                Ok(payload) => payload,
-                Err(_) => return Err(first),
-            }
-        }
-    };
-    print_value(&payload)
 }
 
 fn into_payload(response: Response) -> Result<serde_json::Value> {
@@ -316,25 +293,29 @@ fn print_value(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// 重启：先停，等端口关闭，再以分离进程拉起 `sbot start`。
-async fn restart(endpoint: &ipc::Endpoint) -> Result<()> {
+/// 重启：先停，等旧进程放开控制通道，再以分离进程拉起 `sbot start`。
+///
+/// 新进程不受任何服务管理器管理，输出也不留（stdout / stderr 接到空设备）。守护进程由
+/// systemd 之类托管时应该用它的重启命令。
+async fn restart(daemon: &Daemon, config: Option<&Path>) -> Result<()> {
     // 停止失败（例如本来就没在运行）不阻止继续拉起。
-    let stop = request_payload(endpoint, Request::new(RequestBody::Shutdown)).await;
+    let stop = daemon
+        .send(Request::new(RequestBody::Shutdown).for_home(&daemon.home))
+        .await;
     if stop.is_err() {
         eprintln!("提示：没有找到正在运行的实例，直接启动新进程。");
     }
 
     // 等待旧进程释放 IPC 与单实例锁，最多 15 秒。
     for _ in 0..150 {
-        if ipc::Client::connect(endpoint).await.is_err() {
+        if ipc::Client::connect(&daemon.endpoint).await.is_err() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     let exe = std::env::current_exe().context("cannot locate the sbot executable")?;
-    let mut command = std::process::Command::new(exe);
-    command.arg("start");
+    let mut command = start_command(&exe, config);
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::null());
     command.stderr(std::process::Stdio::null());
@@ -363,6 +344,19 @@ async fn restart(endpoint: &ipc::Endpoint) -> Result<()> {
     Ok(())
 }
 
+/// 拉起守护进程的命令行：`sbot [--config <path>] start`。
+///
+/// `--config` 必须原样带上：漏了它，新进程会去读默认位置的配置（没有就新建一份默认的），
+/// 重启就悄悄变成了“换一份配置启动”。`SBOT_HOME` 等环境变量由子进程继承。
+fn start_command(exe: &Path, config: Option<&Path>) -> std::process::Command {
+    let mut command = std::process::Command::new(exe);
+    if let Some(config) = config {
+        command.arg("--config").arg(config);
+    }
+    command.arg("start");
+    command
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,6 +377,24 @@ mod tests {
             },
             _ => panic!("expected model command"),
         }
+    }
+
+    #[test]
+    fn restart_starts_the_daemon_with_the_same_config() {
+        let args = |command: std::process::Command| -> Vec<String> {
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(args(start_command(Path::new("sbot"), None)), ["start"]);
+        assert_eq!(
+            args(start_command(
+                Path::new("sbot"),
+                Some(Path::new("/etc/sbot/b.toml"))
+            )),
+            ["--config", "/etc/sbot/b.toml", "start"]
+        );
     }
 
     #[test]
