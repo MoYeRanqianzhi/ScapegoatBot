@@ -13,7 +13,7 @@ metadata:
 2 ignored；clippy/fmt 通过；WSL Debian `cargo test` 通过。最低 Rust 1.89。CI 已接入 GitHub Actions。
 
 发布状态：每批改动升版本并打本地 annotated tag（见 [[release-workflow]]）；尚未 push/release/deploy。
-当前 HEAD 未跑过 `cargo build --release`（上次早于图片依赖）。服务器 `hw1` 的
+`cargo build --release` 在 alpha.43 上通过（Windows，2026-11-10，`sbot --version` = 0.2.0-alpha.43）。服务器 `hw1` 的
 `sbot.service` 已停止。
 
 已经由代码与测试保证、但**未在真实 NapCat 上实测**的行为：
