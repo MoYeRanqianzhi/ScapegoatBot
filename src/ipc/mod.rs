@@ -269,23 +269,36 @@ pub enum Endpoint {
 }
 
 impl Endpoint {
-    /// 由配置与路径布局解析端点。
+    /// 守护进程监听的端点。
     pub fn resolve(paths: &crate::paths::SbotPaths, config: &crate::config::IpcConfig) -> Self {
+        // 第一个候选就是监听位置。
+        Self::candidates(paths, config).swap_remove(0)
+    }
+
+    /// 客户端依次尝试的端点；第一个是 [`Endpoint::resolve`] 给出的监听位置，至少有一个。
+    ///
+    /// Unix 下监听位置取决于环境变量 `XDG_RUNTIME_DIR`，而守护进程（systemd 服务里通常没有
+    /// 这个变量）与登录 shell 里的 CLI（有）看到的往往不一样。CLI 因此在自己算出的位置连
+    /// 不上时再试实例目录下的 `run/`，不必让使用者去对齐两边的环境。Windows 的管道名与
+    /// 环境无关，只有一个候选。
+    pub fn candidates(
+        paths: &crate::paths::SbotPaths,
+        config: &crate::config::IpcConfig,
+    ) -> Vec<Self> {
         #[cfg(windows)]
         {
             let _ = paths;
-            Self::Pipe(format!(r"\\.\pipe\{}", config.name))
+            vec![Self::Pipe(format!(r"\\.\pipe\{}", config.name))]
         }
         #[cfg(unix)]
         {
-            // 优先 XDG_RUNTIME_DIR（用户私有、重启清空），回退 `~/.sbot/run`。
-            // 不回退共享的临时目录：其他用户可以在那里抢先放一个同名套接字，
-            // 守护进程起不来，`sbot` 客户端还会把控制命令与审批码发给对方。
-            let dir = std::env::var_os("XDG_RUNTIME_DIR")
+            let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
                 .filter(|dir| !dir.is_empty())
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| paths.run_dir());
-            Self::Socket(dir.join(format!("{}.sock", config.name)))
+                .map(std::path::PathBuf::from);
+            socket_candidates(runtime_dir, paths.run_dir(), &config.name)
+                .into_iter()
+                .map(Self::Socket)
+                .collect()
         }
     }
 
@@ -298,6 +311,25 @@ impl Endpoint {
             Self::Socket(path) => path.display().to_string(),
         }
     }
+}
+
+/// 套接字可能在的位置，按优先级：`$XDG_RUNTIME_DIR`（用户私有、重启清空），然后是实例目录
+/// 下的 `run/`。
+///
+/// 不包括共享的临时目录：其他用户可以在那里抢先放一个同名套接字，守护进程起不来，`sbot`
+/// 客户端还会把控制命令与审批码发给对方。
+#[cfg(unix)]
+fn socket_candidates(
+    runtime_dir: Option<std::path::PathBuf>,
+    run_dir: std::path::PathBuf,
+    name: &str,
+) -> Vec<std::path::PathBuf> {
+    let file = format!("{name}.sock");
+    runtime_dir
+        .into_iter()
+        .chain([run_dir])
+        .map(|dir| dir.join(&file))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -496,6 +528,35 @@ mod tests {
         let a = Request::new(RequestBody::Status);
         let b = Request::new(RequestBody::Status);
         assert_ne!(a.id, b.id);
+    }
+}
+
+/// Unix 下端点候选的顺序。
+#[cfg(all(test, unix))]
+mod endpoint_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// 设了 `XDG_RUNTIME_DIR` 时监听在那里，实例目录下的 `run/` 是 CLI 的第二个尝试；
+    /// 没设时只有 `run/`。
+    #[test]
+    fn socket_candidates_prefer_the_runtime_dir() {
+        let run_dir = PathBuf::from("/home/sbot/.sbot/run");
+        assert_eq!(
+            socket_candidates(
+                Some(PathBuf::from("/run/user/1000")),
+                run_dir.clone(),
+                "bot"
+            ),
+            [
+                PathBuf::from("/run/user/1000/bot.sock"),
+                PathBuf::from("/home/sbot/.sbot/run/bot.sock"),
+            ]
+        );
+        assert_eq!(
+            socket_candidates(None, run_dir, "bot"),
+            [PathBuf::from("/home/sbot/.sbot/run/bot.sock")]
+        );
     }
 }
 

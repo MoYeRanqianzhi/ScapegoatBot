@@ -164,7 +164,7 @@ pub async fn run() -> Result<()> {
 /// 通过 IPC 与控制通道执行的子命令。
 async fn run_remote(command: Command, paths: &SbotPaths, config: Option<PathBuf>) -> Result<()> {
     let daemon = Daemon {
-        endpoint: ipc::Endpoint::resolve(paths, &client_ipc_config(paths, config.as_deref())),
+        endpoints: ipc::Endpoint::candidates(paths, &client_ipc_config(paths, config.as_deref())),
         home: paths.home().to_path_buf(),
     };
 
@@ -219,21 +219,47 @@ async fn run_remote(command: Command, paths: &SbotPaths, config: Option<PathBuf>
     }
 }
 
-/// 控制通道的另一端：端点，以及这次调用所属的实例目录。
+/// 控制通道的另一端：可能的端点，以及这次调用所属的实例目录。
 ///
 /// 请求都经这里构造，实例目录不会漏带：端点名只由 `[ipc].name` 决定，两个实例用了同一个
 /// 名字时，守护进程靠请求里的目录认出“这条命令不是给我的”。
 struct Daemon {
-    endpoint: ipc::Endpoint,
+    /// 依次尝试的端点（见 [`ipc::Endpoint::candidates`]）。
+    endpoints: Vec<ipc::Endpoint>,
     home: PathBuf,
 }
 
 impl Daemon {
     /// 发一条请求；成功返回 payload，失败把错误码与说明一起抛出。
+    ///
+    /// 逐个端点试：连不上的跳过；连上了但对面是另一个实例（`wrong_instance`）的也跳过——
+    /// 那不是要找的守护进程，它可能正好在下一个位置。全都不行时报第一个失败，并附上其余的。
     async fn send(&self, request: Request) -> Result<serde_json::Value> {
-        let mut client = ipc::Client::connect(&self.endpoint).await?;
-        let response = client.request(&request).await?;
-        into_payload(response)
+        let mut failures: Vec<anyhow::Error> = Vec::new();
+        for endpoint in &self.endpoints {
+            let response = match exchange(endpoint, &request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    failures.push(error);
+                    continue;
+                }
+            };
+            let other_instance = response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == "wrong_instance");
+            match into_payload(response) {
+                Err(error) if other_instance => failures.push(error),
+                result => return result,
+            }
+        }
+        let mut failures = failures.into_iter();
+        let first = failures
+            .next()
+            .unwrap_or_else(|| anyhow::anyhow!("no control endpoint to try"));
+        Err(failures.fold(first, |error, next| {
+            error.context(format!("also tried: {next:#}"))
+        }))
     }
 
     /// 发一条请求并打印结果。
@@ -274,6 +300,12 @@ fn client_ipc_config(paths: &SbotPaths, explicit: Option<&Path>) -> IpcConfig {
     }
 }
 
+/// 连上一个端点，发一条请求，取回响应。
+async fn exchange(endpoint: &ipc::Endpoint, request: &Request) -> Result<Response> {
+    let mut client = ipc::Client::connect(endpoint).await?;
+    client.request(request).await
+}
+
 fn into_payload(response: Response) -> Result<serde_json::Value> {
     if response.ok {
         Ok(response.payload.unwrap_or(serde_json::Value::Null))
@@ -306,9 +338,10 @@ async fn restart(daemon: &Daemon, config: Option<&Path>) -> Result<()> {
         eprintln!("提示：没有找到正在运行的实例，直接启动新进程。");
     }
 
-    // 等待旧进程释放 IPC 与单实例锁，最多 15 秒。
+    // 等待旧进程释放 IPC 与单实例锁，最多 15 秒：问到它不再应答为止。
     for _ in 0..150 {
-        if ipc::Client::connect(&daemon.endpoint).await.is_err() {
+        let probe = Request::new(RequestBody::Status).for_home(&daemon.home);
+        if daemon.send(probe).await.is_err() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -395,6 +428,90 @@ mod tests {
             )),
             ["--config", "/etc/sbot/b.toml", "start"]
         );
+    }
+
+    /// 只回一种结果的处理器。
+    struct Fixed(fn(String) -> Response);
+
+    #[async_trait::async_trait]
+    impl ipc::Handler for Fixed {
+        async fn handle(&self, request: Request) -> Response {
+            (self.0)(request.id)
+        }
+    }
+
+    /// 一个本测试独占的端点；Unix 下套接字放在 `dir` 里。
+    fn test_endpoint(dir: &Path, tag: &str) -> ipc::Endpoint {
+        #[cfg(windows)]
+        {
+            let _ = dir;
+            ipc::Endpoint::Pipe(format!(
+                r"\\.\pipe\sbot-cli-test-{}-{tag}",
+                std::process::id()
+            ))
+        }
+        #[cfg(unix)]
+        {
+            ipc::Endpoint::Socket(dir.join(format!("{tag}.sock")))
+        }
+    }
+
+    /// 在端点上起一个服务端，等到它能连上。
+    async fn serve_fixed(
+        endpoint: &ipc::Endpoint,
+        reply: fn(String) -> Response,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move { ipc::serve(&endpoint, std::sync::Arc::new(Fixed(reply)), shutdown).await }
+        });
+        for _ in 0..200 {
+            if ipc::Client::connect(endpoint).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the test server at {} never came up", endpoint.display());
+    }
+
+    /// 没有服务的端点、后面是别的实例的端点都跳过，直到找到要找的守护进程；都不是时，
+    /// 错误里既有第一个失败，也有后面试过的。
+    #[tokio::test]
+    async fn the_client_skips_endpoints_that_are_down_or_belong_to_another_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let nobody = test_endpoint(dir.path(), "nobody");
+        let stranger = test_endpoint(dir.path(), "stranger");
+        let ours = test_endpoint(dir.path(), "ours");
+        serve_fixed(
+            &stranger,
+            |id| Response::error(id, "wrong_instance", "this daemon serves /elsewhere"),
+            shutdown.clone(),
+        )
+        .await;
+        serve_fixed(
+            &ours,
+            |id| Response::ok(id, json!({"here": true})),
+            shutdown,
+        )
+        .await;
+        let request = || Request::new(RequestBody::Status).for_home(dir.path());
+
+        let daemon = Daemon {
+            endpoints: vec![nobody.clone(), stranger.clone(), ours],
+            home: dir.path().to_path_buf(),
+        };
+        assert_eq!(daemon.send(request()).await.unwrap(), json!({"here": true}));
+
+        let daemon = Daemon {
+            endpoints: vec![nobody, stranger],
+            home: dir.path().to_path_buf(),
+        };
+        let error = format!("{:#}", daemon.send(request()).await.unwrap_err());
+        assert!(error.contains("Is the daemon running?"), "{error}");
+        assert!(error.contains("wrong_instance"), "{error}");
+        let _ = stop.send(true);
     }
 
     #[test]

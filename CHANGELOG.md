@@ -49,6 +49,10 @@
   并提示给每个实例单独的 `[ipc].name`。
 - `sbot --config <路径> restart` 拉起的新进程带上同一个 `--config`。以前新进程读的是默认位置的
   配置（没有就新建一份默认的），重启悄悄变成了换配置启动。
+- Unix 下 `sbot` 在 `$XDG_RUNTIME_DIR` 里连不上守护进程时，再试实例目录下的 `run/<name>.sock`。
+  守护进程由服务管理器拉起时环境里常常没有 `XDG_RUNTIME_DIR`，套接字就在 `~/.sbot/run/`；登录
+  shell 里有这个变量，CLI 以前只去那里找，`sbot status` 便一直报守护进程没在运行。路过的
+  端点如果属于另一个实例（`wrong_instance`），同样跳过、接着找。
 - 模型调用被 `sbot ai stop` 停掉时，`sbot chat` 返回 `ai_stopped`，不再回答“已接受”然后在后台
   失败。
 - 后台复盘写记忆时的三个问题：`/MEMORY.md` 读不出来时被当成空索引，随后被新条目整体替换；
