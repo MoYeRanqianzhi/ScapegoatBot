@@ -57,7 +57,7 @@ pub enum ViewRead {
 /// 配置写入后的热更新回调。
 pub type HotReload = Arc<dyn Fn(&SbotConfig) + Send + Sync>;
 
-/// 动态视图服务。
+// 各视图的读写实现，由下面 `Views` 的 `list` / `read` / `write` 路由调用。
 mod config;
 mod contacts;
 mod filter;
@@ -66,6 +66,7 @@ mod messages;
 mod sessions;
 mod system;
 
+/// 动态视图服务。
 pub struct Views {
     vfs: Arc<VfsStore>,
     messages: Arc<MessageStore>,

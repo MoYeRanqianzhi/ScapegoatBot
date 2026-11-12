@@ -2,7 +2,7 @@
 //!
 //! 以前块只在回合结束、提交之前才一次性写入 buffer，进程在回合中途退出（崩溃、
 //! 关机超时）就丢掉整个回合——包括已经执行过、对外产生过效果的工具调用。
-//! 现在模型循环每并入一块就发一个 [`AgentEvent::Appended`]，日志在事件任务里
+//! 现在模型循环每并入一块就发一个 [`AgentEvent::Appended`](crate::agent::AgentEvent::Appended)，日志在事件任务里
 //! 立刻写入；提交时只补写循环之后才加入的块（Stop hook 等），再整体提交。
 //! 崩溃恢复（`TurnBufferStore::recover_open`）会补齐未配对的工具结果。
 

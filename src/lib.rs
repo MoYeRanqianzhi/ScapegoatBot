@@ -2,10 +2,25 @@
 //!
 //! 二进制 `sbot` 只是薄壳（见 `main.rs`）；把模块放进库是为了：
 //! - 集成测试可以直接调用 provider / agent / VFS；
-//! - 未来 `sbot doctor` 等工具能复用同一套实现。
+//! - 守护进程与 `sbot doctor` / `sbot backup` 等本地命令复用同一套实现。
+//!
+//! 这个库只给 `sbot` 自己与测试用，文档按维护者的需要用 `--document-private-items` 构建
+//! （CI 加 `-D warnings`），所以公开项的文档可以链到私有项。
 
-// Agent 循环：内/外循环、事件流、steering 与工具执行。
+#![allow(rustdoc::private_intra_doc_links)]
+
+/// 全局内存分配器：mimalloc。
+///
+/// 放在库里而不是 `main.rs`：单元测试、集成测试与 `sbot` 用的是同一个分配器，CI 在各平台
+/// 跑测试时也就验证了它。选它是为了性能：musl 自带的 malloc 在多线程下慢得多（发布的
+/// Linux 全静态版本用 musl），glibc 的 malloc 在长时间运行的多线程进程里容易碎片化；各平台
+/// 统一用一个分配器，性能与内存行为也一致。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// `API` 工具的 action 注册表：名字、参数 schema、分级与作用域（执行在 `tools/api.rs`）。
 pub mod actions;
+// Agent 循环：内/外循环、事件流、steering 与工具执行。
 pub mod agent;
 pub mod app;
 // 运行预算：每日 token/USD、回合上限与 guard 花费。
@@ -34,7 +49,7 @@ pub mod providers;
 pub mod security;
 pub mod storage;
 pub(crate) mod transcript;
-// 工具层：注册表、文件/API/记忆/技能/网络/监视器与动态视图。
+// 工具层：注册表、文件/API/子代理/技能/网络/监视器与动态视图。
 pub mod tools;
 // QQ 接入：事件归一化、消息格式与准入过滤。
 pub mod qq;

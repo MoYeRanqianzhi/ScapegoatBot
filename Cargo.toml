@@ -19,15 +19,18 @@ clap = { version = "4", features = ["derive"] }
 # 异步运行时：守护进程、IPC、WebSocket、数据库都跑在 tokio 上。
 tokio = { version = "1", features = ["full"] }
 # NapCatLink SDK：QQ 机器人 WebSocket 客户端（项目自有代码，固定 alpha.2）。
-# 上游运行时日志是中文，vendored 到 ./vendor/napcat-link 以翻译成英文；
-# 版本 pin 不变，[patch.crates-io] 让本地副本参与构建。
+# vendored 到 ./vendor/napcat-link：上游运行时日志是中文，翻译成英文；TLS 后端从
+# native-tls 换成 rustls（见下面 tokio-tungstenite 的说明）。版本 pin 不变，
+# [patch.crates-io] 让本地副本参与构建。
 napcat-link = "=0.1.0-alpha.2"
 # HTTP 客户端：provider 与 Jev 判定器。
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 # 流式读取 SSE 与并行工具执行。
 futures-util = "0.3"
 # monitor 的 stream 源（外部 WebSocket）；与 napcat-link 用同一版本与 TLS 后端。
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+# TLS 用 rustls + 内置的 Mozilla 根证书（webpki-roots），与 reqwest 一致：二进制不依赖系统的
+# OpenSSL（native-tls 在 Linux 上动态链接 libssl.so.3，发行版之间不通用），也不读系统证书库。
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 # 异步 trait：IPC Handler 需要 `Arc<dyn Handler>`。
 async-trait = "0.1"
 # 序列化 / 反序列化：IPC 帧、auth.json、models.json、审计记录。
@@ -59,17 +62,23 @@ fs2 = "0.4"
 dirs = "6"
 # 过滤器正则（sbot.toml 的 [filter].ignore_patterns）。
 regex = "1"
-# Base64：加密后的 JSONL 行。
-font8x8 = "0.3"
+# 图片：解码 / 缩放 / 重新编码（入站图片、local.media.image.*）。
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
+# 在图片上画形状与文字（local.media.image.*）。
+imageproc = "0.27.0"
+# 系统字体枚举与字形渲染（local.media.image.text / .fonts）。不内置字体：没有系统字体时
+# `.fonts` 为空、`.text` 报错。
+fontdb = "0.24.0"
+ab_glyph = "0.2.32"
+# Base64：加密后的 JSONL 行、发给 NapCat 的 base64:// 文件。
 base64 = "0.22"
 # 十六进制编码：主密钥文件与哈希摘要。
 hex = "0.4"
 # VFS 路径的 Unicode NFC 规范化（设计 §6.3）。
 unicode-normalization = "0.1"
-imageproc = "0.27.0"
-fontdb = "0.24.0"
-ab_glyph = "0.2.32"
+# 全局内存分配器（见 src/main.rs）。musl 自带的 malloc 在多线程下很慢；各平台统一用它，
+# 性能与内存行为一致。
+mimalloc = "0.1.52"
 # Unix 域套接字权限、Windows 管道 DACL 需要平台 API。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -78,7 +87,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Authorization",
 ] }
 
-# 用本地 vendored 副本替换 registry 里的 napcat-link（只翻译了日志文本）。
+# 用本地 vendored 副本替换 registry 里的 napcat-link（日志文本翻译、TLS 换 rustls）。
 [patch.crates-io]
 napcat-link = { path = "vendor/napcat-link" }
 

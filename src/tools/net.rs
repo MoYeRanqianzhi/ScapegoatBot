@@ -255,7 +255,7 @@ fn is_link_local_v6(ip: std::net::Ipv6Addr) -> bool {
 
 /// 读取响应体到内存，超过 `max_bytes` 立即中止。返回内容与 `Content-Type`。
 ///
-/// 只适合小响应；可能很大的下载用 [`stream_limited`] 边收边写。
+/// 只适合小响应；可能很大的下载用 [`LimitedBody`] 边收边写（`API local.net.download`）。
 pub async fn read_limited(
     response: reqwest::Response,
     max_bytes: u64,

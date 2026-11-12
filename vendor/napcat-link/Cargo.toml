@@ -117,7 +117,9 @@ version = "0.1"
 
 [dependencies.tokio-tungstenite]
 version = "0.26"
-features = ["native-tls"]
+# ScapegoatBot 的改动：上游是 native-tls（Linux 上动态链接 libssl.so.3）；换成 rustls，
+# 与 ScapegoatBot 其余的 TLS 一致，二进制不依赖系统 OpenSSL。
+features = ["rustls-tls-webpki-roots"]
 
 [dependencies.tracing]
 version = "0.1"

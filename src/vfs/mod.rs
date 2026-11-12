@@ -7,7 +7,7 @@
 //! - [`filter`]：查询参数 `filter` 的条件语法；
 //! - [`sqlite`]：SQLite 后端（文本加密、二进制分块、回收站、Read-before-Edit）；
 //! - [`quota`]：配额与磁盘水位；
-//! - [`dynamic`]：动态视图（`/friends`、`/messages` 等，数据源由运行时提供）。
+//! - 动态视图（`/friends`、`/messages` 等）不在这里，在 [`crate::tools::views`]，数据源由运行时提供。
 //!
 //! 本文件只定义公共类型与 trait，不包含存储细节。
 

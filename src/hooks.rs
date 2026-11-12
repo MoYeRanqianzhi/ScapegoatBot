@@ -6,7 +6,7 @@
 //! - [`fire`]：其余事件的 `log` / `block` / `notify`（`notify` 由调用方发出）；
 //! - [`injected`]：`inject_context` 的文本，`text` 原样、`path` 从 VFS 读取。
 //!
-//! 三个入口用同一套 `match` 规则（[`matches`]）：要求 `group_id` / `user_id` 的 hook
+//! 三个入口用同一套 `match` 规则（[`matches()`]）：要求 `group_id` / `user_id` 的 hook
 //! 只在有对应 chat 的事件上命中。
 
 use regex::Regex;

@@ -365,10 +365,11 @@ impl AgentLoop {
             .await
     }
 
-    /// 与 [`AgentLoop::run`] 相同，但额外接受一个实时 steering 通道。
+    /// 运行一次 agent，并接受一个实时 steering 通道（测试用的 `run` 是不带通道的简写）。
     ///
-    /// 队列在回合运行期间把同 chat 的新消息送进来；每个请求边界都会被排空，
-    /// 对应设计 §3.4 的 `steer` 语义。
+    /// `history` 是可变的全量历史；`prompts` 是本次触发追加的消息；`steering` 在循环中被
+    /// 消费，剩余消息作为 follow-up 开新轮。`incoming` 由队列在回合运行期间送进同 chat 的
+    /// 新消息；每个请求边界都会被排空，对应设计 §3.4 的 `steer` 语义。
     pub(crate) async fn run_with_steering(
         &self,
         history: &mut Vec<AgentMessage>,

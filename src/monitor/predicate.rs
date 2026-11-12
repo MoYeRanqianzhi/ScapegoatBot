@@ -2,7 +2,7 @@
 //!
 //! 支持的项：`event.mentions_self`、`event.type == '…'`、`event.chat == '…'`、
 //! `event.sender == '…'` / `!=`、`event.text contains '…'`。创建 monitor 时用
-//! [`validate_when`] 逐项校验；运行时用 [`matches`] 求值。
+//! [`validate_when`] 逐项校验；运行时用 [`matches()`] 求值。
 
 use super::MonitorEvent;
 

@@ -369,4 +369,33 @@ mod tests {
         );
         assert_eq!(truncate("short".to_owned()), "short");
     }
+
+    /// `wss://` 走 rustls，握手失败是一个错误，不是 panic。
+    ///
+    /// 两件事一起锁住：
+    /// - TLS 后端是 rustls（握手失败报 `Io`；native-tls 报 `Tls`，没编译 TLS 支持报 `Url`）。
+    ///   换回 native-tls 会让 Linux 版重新动态依赖 `libssl.so.3`。
+    /// - rustls 的 crypto provider 能唯一确定。rustls 0.23 在没有显式安装 provider 时按编译
+    ///   进来的特性挑一个；依赖图里 `ring` 与 `aws-lc-rs` 都被启用时挑不出来，第一次 `wss://`
+    ///   连接就 panic（NapCat 与 monitor 的 stream 源走的是同一段代码）。
+    ///
+    /// 本地服务只接 TCP、回一行明文就关闭：客户端得先建好 TLS 配置、发出 ClientHello，才会
+    /// 发现对面不是 TLS。
+    #[tokio::test]
+    async fn wss_handshake_failures_are_errors_not_panics() {
+        use tokio::io::AsyncWriteExt;
+        use tokio_tungstenite::tungstenite::Error;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+        });
+
+        let error = tokio_tungstenite::connect_async(format!("wss://{addr}/"))
+            .await
+            .expect_err("the peer does not speak TLS");
+        assert!(matches!(error, Error::Io(_)), "{error:?}");
+    }
 }

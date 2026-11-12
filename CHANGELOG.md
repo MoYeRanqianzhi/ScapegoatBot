@@ -22,11 +22,18 @@
   的话，守护进程以“账号未知”的状态跑下去，之后再也不会去连，要有人重启才恢复。等待期间控制
   通道可用（`sbot status` / `stop` / `model set` 等）；`sbot chat` 这类需要 agent 的命令返回
   `not_ready` 并说明原因，输入不落库（以前会存下一条不会被执行的输入）。
+- `wss://` 连接（NapCat、monitor 的 stream 源）改用 rustls 与内置的 Mozilla 根证书（与 HTTPS
+  请求一致），不再读系统证书库：只有装进系统证书库的私有 CA 签的 `wss://` 服务不再被信任。
+  换来的是二进制不再依赖系统 OpenSSL——以前 Linux 版动态链接 `libssl.so.3`，没有 OpenSSL 3
+  的发行版上启动不了。
 
 ### 新增
 
 - `sbot status` 多了 `napcat.connected`（WebSocket 此刻是否连着）与 `agent.state`
   （`waiting_for_napcat` / `starting` / `running` / `no_provider`）。
+- `sbot --version` 多报三行：`target:`（这个二进制对应的发布文件名平台段，例如
+  `x86_64_v3-unknown-linux-musl`）、`commit:`（发布构建才有）、`cpu:`（x86_64 上本机 CPU 最高
+  能跑的等级），用来挑选发布页上对应的文件。`sbot -V` 仍只打印版本号。
 
 ### 修复
 
@@ -73,6 +80,11 @@
   文件表同步分开；文件头的加密方式解析与读取路径共用 `header_encryption`）。
 - OpenAI Responses 流解码的 `handle` 拆出 `item_added` 与 `responses_usage`；两个协议的
   解码器共用 `providers::str_field`。
+- 全局内存分配器换成 mimalloc（v3）：发布的 Linux 全静态版用 musl，musl 自带的 malloc 在
+  多线程下慢得多；各平台统一一个分配器，性能与内存行为一致。测试也跑在它上面。
+- 删除没有任何代码使用的依赖 `font8x8`（旧水印实现的遗留）。
+- rustdoc 的断链修正（改名或删掉的目标、`matches` 函数与宏同名的歧义、一处挂错位置的文档
+  注释把 `Views` 的说明挂到了 `mod config` 上）。
 
 ## [0.2.0-alpha.43] - 2026-11-10
 

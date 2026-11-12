@@ -18,12 +18,15 @@ use crate::paths::SbotPaths;
 /// 本地子命令模块：备份与诊断。
 pub mod backup;
 pub mod doctor;
+// `sbot --version` 的构建信息（目标平台、CPU 等级）。
+mod version;
 
 /// `sbot` 命令行。
 #[derive(Debug, Parser)]
 #[command(
     name = "sbot",
     version,
+    long_version = version::long_version(),
     about = "ScapegoatBot — 一个 QQ Agent，代替用户像真人一样回复消息",
     disable_help_subcommand = true
 )]
