@@ -64,8 +64,10 @@ dirs = "6"
 regex = "1"
 # 图片：解码 / 缩放 / 重新编码（入站图片、local.media.image.*）。
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
-# 在图片上画形状与文字（local.media.image.*）。
-imageproc = "0.27.0"
+# 在图片上画文字与旋转（local.media.image.*）。只开 `text`：默认特性会打开 image 的全部默认
+# 格式（AVIF 编码器 rav1e、EXR、TIFF、DDS……，体积大，也多了一批解析不可信输入的解码器）、
+# rayon 线程池与 FFT，这里都用不上；解码格式只有上面 image 列出的那几种。
+imageproc = { version = "0.27.0", default-features = false, features = ["text"] }
 # 系统字体枚举与字形渲染（local.media.image.text / .fonts）。不内置字体：没有系统字体时
 # `.fonts` 为空、`.text` 报错。
 fontdb = "0.24.0"

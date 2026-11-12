@@ -83,6 +83,10 @@
 - 全局内存分配器换成 mimalloc（v3）：发布的 Linux 全静态版用 musl，musl 自带的 malloc 在
   多线程下慢得多；各平台统一一个分配器，性能与内存行为一致。测试也跑在它上面。
 - 删除没有任何代码使用的依赖 `font8x8`（旧水印实现的遗留）。
+- `imageproc` 只开 `text` 特性。它的默认特性会打开 `image` 的全部默认格式，二进制里因此
+  多了一个 AV1 编码器（rav1e）与 EXR、TIFF、DDS、QOI 等解码器，还有 rayon 线程池与 FFT——
+  都用不上，依赖少了 55 个。可解码的图片格式回到 `Cargo.toml` 里写明的 JPEG / PNG / WebP /
+  GIF / BMP（以前实际还能解 TIFF、ICO 等），少一批解析不可信输入的代码。
 - rustdoc 的断链修正（改名或删掉的目标、`matches` 函数与宏同名的歧义、一处挂错位置的文档
   注释把 `Views` 的说明挂到了 `mod config` 上）。
 
