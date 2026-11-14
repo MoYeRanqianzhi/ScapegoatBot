@@ -118,8 +118,10 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 - `local.*`：只读写 VFS 的本地工具，hold 期间照常可用。
   - `local.media.image.*`（本地工具 → 媒体 → 图片）：`info`、`transform`（裁剪/任意角度
     旋转/缩放/缩略）、`convert`（PNG/JPEG/WebP，quality 只作用于 JPEG）、`text`（字体、
-    位置、颜色、透明度）、`fonts`（列出系统字体）。不内置字体，`text` 使用系统安装的字体；
-    没有字体时 `fonts` 返回空列表，`text` 返回明确错误。
+    位置、颜色、透明度）、`fonts`（列出系统字体）。不内置字体，`text` 使用系统安装的字体，
+    一次画一行（不排版，带换行的文字被拒绝）。不指定 `font` 时自动挑一个画得出整段文字的
+    已安装字体；指定的字体缺字时报错并列出画不出的字符，不会画成方块。没有字体时 `fonts`
+    返回空列表，`text` 返回明确错误。
   - `local.net.download`：`{url, path, max_bytes?}`，把 HTTP(S) 内容下载到 VFS。只连公网
     地址（SSRF 防护、域名允许/阻止、重定向逐跳校验），大小受 `[tools.download].max_bytes`
     限制；边收边加密暂存，不把整个文件留在内存里。文本类型（`text/*`、JSON、XML、JS）且

@@ -631,7 +631,7 @@ fn specs_local_media_image(list: &mut Vec<ActionSpec>) {
         ),
         (
             "local.media.image.text",
-            "Draw text on an image at any position with font, size, color and opacity.",
+            "Draw one line of text on an image at any position with font, size, color and opacity. Without font, an installed font that can draw the whole text is picked; a font that lacks some of the characters is an error naming them.",
             json!({
                 "path": {"type": "string"},
                 "out": {"type": "string"},

@@ -1561,37 +1561,66 @@ mod tests {
         let value: Value = serde_json::from_str(&fonts.content).unwrap();
         let count = value["count"].as_u64().unwrap_or(0);
 
-        if count > 0 {
-            let family = value["fonts"][0]["family"].as_str().unwrap().to_owned();
-            let result = run_image(
-                &tool,
-                &ctx,
-                "local.media.image.text",
-                json!({
-                    "path": "/tmp/src.png", "out": "/tmp/text.png", "text": "Hi 42",
-                    "font": family, "x": 2, "y": 2, "size": 14,
-                    "color": "#ff0000", "opacity": 0.8
-                }),
-            )
-            .await;
-            assert!(!result.is_error, "{}", result.content);
+        // 不指定字体：自动选一个画得出这段文字的。机器上没有任何字体、或者装的字体都没有
+        // 拉丁字形时（只装了符号 / 表情字体的最小系统）必须报错，不能交出一张没字的图。
+        let result = run_image(
+            &tool,
+            &ctx,
+            "local.media.image.text",
+            json!({
+                "path": "/tmp/src.png", "out": "/tmp/text.png", "text": "Hi 42",
+                "x": 2, "y": 2, "size": 14, "color": "#ff0000", "opacity": 0.8
+            }),
+        )
+        .await;
+        if result.is_error {
+            assert!(result.content.contains("font"), "{}", result.content);
+            let path = crate::vfs::path::VfsPath::parse("/tmp/text.png").unwrap();
+            assert!(vfs.read_bytes(&path).is_err(), "a failed draw wrote a file");
+        } else {
             let source = load_output(&vfs, "/tmp/src.png").to_rgba8();
             let marked = load_output(&vfs, "/tmp/text.png").to_rgba8();
             assert!(
                 source.pixels().zip(marked.pixels()).any(|(a, b)| a != b),
                 "text did not change any pixel"
             );
-        } else {
-            let result = run_image(
-                &tool,
-                &ctx,
-                "local.media.image.text",
-                json!({"path": "/tmp/src.png", "out": "/tmp/text.png", "text": "Hi"}),
-            )
-            .await;
-            assert!(result.is_error);
-            assert!(result.content.contains("font"), "{}", result.content);
         }
+        if count == 0 {
+            assert!(result.is_error, "drew text without any font installed");
+        }
+
+        // 指定的字体没安装：报错并指向 fonts。
+        let missing = run_image(
+            &tool,
+            &ctx,
+            "local.media.image.text",
+            json!({
+                "path": "/tmp/src.png", "out": "/tmp/none.png", "text": "Hi",
+                "font": "No Such Family 0xDEADBEEF"
+            }),
+        )
+        .await;
+        assert!(missing.is_error);
+        assert!(
+            missing.content.contains("is not installed"),
+            "{}",
+            missing.content
+        );
+
+        // 换行不排版，拒绝而不是画成方块。
+        let multiline = run_image(
+            &tool,
+            &ctx,
+            "local.media.image.text",
+            json!({"path": "/tmp/src.png", "out": "/tmp/lines.png", "text": "a\nb"}),
+        )
+        .await;
+        assert!(multiline.is_error);
+        assert!(
+            multiline.content.contains("single line"),
+            "{}",
+            multiline.content
+        );
 
         let bad = run_image(
             &tool,

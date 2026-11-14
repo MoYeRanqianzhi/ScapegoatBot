@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use ab_glyph::{FontVec, PxScale};
+use ab_glyph::{Font, FontRef, PxScale};
 use image::{DynamicImage, Rgba, RgbaImage};
 use imageproc::drawing::draw_text_mut;
 use imageproc::geometric_transformations::{Border, Interpolation, rotate_about_center_no_crop};
@@ -207,6 +207,13 @@ fn image_text(params: &Value, ctx: &ToolContext) -> ToolResult {
     if text.chars().count() > MAX_TEXT_CHARS {
         return ToolResult::error(format!("text must be at most {MAX_TEXT_CHARS} characters"));
     }
+    // 渲染器一个字符画一个字形、不排版：换行符和制表符不会换行或对齐，只会被画成缺字形的
+    // 方块。直接拒绝，让调用方一行一次地画。
+    if text.chars().any(char::is_control) {
+        return ToolResult::error(
+            "text must be a single line without control characters; draw each line with its own call",
+        );
+    }
     let size = params.get("size").and_then(Value::as_f64).unwrap_or(32.0);
     if !(1.0..=512.0).contains(&size) {
         return ToolResult::error("size must be between 1 and 512");
@@ -236,7 +243,9 @@ fn image_text(params: &Value, ctx: &ToolContext) -> ToolResult {
         .unwrap_or(1.0)
         .clamp(0.0, 1.0);
     let family = params.get("font").and_then(Value::as_str);
-    let font = match load_font(family) {
+    let mut database = fontdb::Database::new();
+    database.load_system_fonts();
+    let font = match pick_font(&database, family, text) {
         Ok(font) => font,
         Err(error) => return ToolResult::error(error),
     };
@@ -247,15 +256,13 @@ fn image_text(params: &Value, ctx: &ToolContext) -> ToolResult {
         color[2],
         (opacity * 255.0).round() as u8,
     ]);
-    draw_text_mut(
-        &mut rgba,
-        color,
-        x,
-        y,
-        PxScale::from(size as f32),
-        &font,
-        text,
-    );
+    let scale = PxScale::from(size as f32);
+    let drawn = with_font(&database, font, |font| {
+        draw_text_mut(&mut rgba, color, x, y, scale, font, text);
+    });
+    if drawn.is_none() {
+        return ToolResult::error("cannot read the selected font");
+    }
     finish(
         input,
         out,
@@ -496,28 +503,128 @@ fn parse_color(raw: &str) -> Result<Rgba<u8>, String> {
     ]))
 }
 
-fn load_font(family: Option<&str>) -> Result<FontVec, String> {
-    let mut database = fontdb::Database::new();
-    database.load_system_fonts();
-    let family = family
-        .map(fontdb::Family::Name)
-        .unwrap_or(fontdb::Family::SansSerif);
-    let query = fontdb::Query {
-        families: &[family],
-        ..Default::default()
-    };
-    let id = database.query(&query).ok_or_else(|| match family {
-        fontdb::Family::Name(name) => {
-            format!("font {name:?} is not installed; call local.media.image.fonts to list families")
+/// 选出画 `text` 用的字体。
+///
+/// 渲染没有字体回退：整段文字只用一个字体画，字体里没有的字符会被画成“豆腐块”
+/// （`.notdef`）或者什么都不画，动作却照样成功。所以先核对字形，画不全就报错：
+///
+/// - 指定了 `family`：只用它。没安装、或有字符画不出都报错，错误里列出画不出的字符；
+/// - 没指定：先试系统默认的无衬线字体；它没安装（Linux 上 fontconfig 配的首选字体经常没装）
+///   或画不全（拉丁字体画不了中文）时，换成第一个画得全的已安装字体，正体、常规字重优先。
+fn pick_font(
+    database: &fontdb::Database,
+    family: Option<&str>,
+    text: &str,
+) -> Result<fontdb::ID, String> {
+    // 每个字符只核对一次；保持出现顺序，报错时按原文的先后列出。
+    let mut chars: Vec<char> = Vec::new();
+    for ch in text.chars() {
+        if !chars.contains(&ch) {
+            chars.push(ch);
         }
-        _ => "no sans-serif font is installed; call local.media.image.fonts to list families"
-            .to_owned(),
-    })?;
-    let (data, index) = database
-        .with_face_data(id, |data, index| (data.to_vec(), index))
-        .ok_or_else(|| "cannot read the selected font data".to_owned())?;
-    FontVec::try_from_vec_and_index(data, index)
-        .map_err(|error| format!("cannot parse the selected font: {error}"))
+    }
+    let wanted = [family.map_or(fontdb::Family::SansSerif, fontdb::Family::Name)];
+    let preferred = database.query(&fontdb::Query {
+        families: &wanted,
+        ..Default::default()
+    });
+
+    if let Some(name) = family {
+        let id = preferred.ok_or_else(|| {
+            format!("font {name:?} is not installed; call local.media.image.fonts to list families")
+        })?;
+        let missing: Vec<char> = with_font(database, id, |font| {
+            chars
+                .iter()
+                .copied()
+                .filter(|&ch| !can_draw(font, ch))
+                .collect()
+        })
+        .ok_or_else(|| format!("cannot read font {name:?}"))?;
+        if !missing.is_empty() {
+            return Err(format!(
+                "font {name:?} cannot draw {}; choose another family \
+                 (local.media.image.fonts) or omit font to pick one automatically",
+                list_chars(&missing)
+            ));
+        }
+        return Ok(id);
+    }
+
+    // 默认字体排最前；其余按“正体、字重接近 400”排，同分保持系统字体库里的顺序（稳定排序）。
+    let mut rest: Vec<&fontdb::FaceInfo> = database.faces().collect();
+    rest.sort_by_key(|face| {
+        (
+            face.style != fontdb::Style::Normal,
+            face.weight.0.abs_diff(fontdb::Weight::NORMAL.0),
+        )
+    });
+    for id in preferred.into_iter().chain(rest.iter().map(|face| face.id)) {
+        // 读不出、解析不了的字体文件当作画不了，跳过：一个坏文件不该挡住其余字体。
+        let covers = with_font(database, id, |font| {
+            !is_placeholder(font) && chars.iter().all(|&ch| can_draw(font, ch))
+        });
+        if covers == Some(true) {
+            return Ok(id);
+        }
+    }
+    Err(if database.is_empty() {
+        "no fonts are installed on this system, so text cannot be drawn".to_owned()
+    } else {
+        "no installed font can draw every character of this text; split it and draw each part \
+         with a font that covers it (local.media.image.fonts lists families)"
+            .to_owned()
+    })
+}
+
+/// 用一个已安装的字体执行 `work`；字体文件读不出或解析不了时为 `None`。
+///
+/// 字体数据只借用（文件由 `fontdb` 内存映射），不复制：中文字体一个就有几十 MB，没指定字体
+/// 时还要挨个核对系统里的字体。
+fn with_font<T>(
+    database: &fontdb::Database,
+    id: fontdb::ID,
+    work: impl FnOnce(&FontRef<'_>) -> T,
+) -> Option<T> {
+    database
+        .with_face_data(id, |data, index| {
+            FontRef::try_from_slice_and_index(data, index)
+                .ok()
+                .map(|font| work(&font))
+        })
+        .flatten()
+}
+
+/// 这个字体能不能画出 `ch`。
+///
+/// 要有这个字符的字形（没有时渲染器画 0 号字形 `.notdef`），并且字形有轮廓：有字形却没有
+/// 轮廓的是位图 / 彩色字体（例如 Noto Color Emoji），渲染器只会画轮廓。空白字符只要求有
+/// 字形，它本来就不画，只占宽度。
+fn can_draw(font: &FontRef<'_>, ch: char) -> bool {
+    let glyph = font.glyph_id(ch);
+    glyph.0 != 0 && (ch.is_whitespace() || font.outline(glyph).is_some())
+}
+
+/// 占位字体（Unicode Last Resort 一类，macOS 自带 `LastResort.otf`）：给每个码位都配一个
+/// “这是哪个区段的字符”的示意字形，连永远不会分配字符的 U+10FFFF 都有。用它画出来的不是
+/// 文字，自动选字体时跳过；点名要用它的照常给。
+fn is_placeholder(font: &FontRef<'_>) -> bool {
+    font.glyph_id('\u{10FFFF}').0 != 0
+}
+
+/// 报错时列出画不出的字符，例如 `'你', '\u{fe0f}'`（看不见的字符按转义写）；太多时只列前几个。
+fn list_chars(chars: &[char]) -> String {
+    const SHOWN: usize = 12;
+    let mut listed = chars
+        .iter()
+        .take(SHOWN)
+        .map(|ch| format!("{ch:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if chars.len() > SHOWN {
+        listed.push_str(&format!(" and {} more", chars.len() - SHOWN));
+    }
+    listed
 }
 
 #[cfg(test)]
@@ -540,5 +647,65 @@ mod tests {
         let small = RgbaImage::new(100, 50);
         let rotated = rotate_rgba(small, 30.0).unwrap();
         assert_eq!(rotated.dimensions(), (112, 94));
+    }
+
+    fn system_fonts() -> fontdb::Database {
+        let mut database = fontdb::Database::new();
+        database.load_system_fonts();
+        database
+    }
+
+    /// 没有任何字体（最小化安装的服务器）：两种选法都报错，并且说得出原因。
+    #[test]
+    fn without_fonts_text_is_an_error() {
+        let empty = fontdb::Database::new();
+        let error = pick_font(&empty, None, "Hi").unwrap_err();
+        assert!(error.contains("no fonts are installed"), "{error}");
+        let error = pick_font(&empty, Some("Arial"), "Hi").unwrap_err();
+        assert!(error.contains("is not installed"), "{error}");
+    }
+
+    /// 自动选出的字体一定画得出整段文字。装了哪些字体因机器而异，所以只断言这条不变量：
+    /// 要么报错，要么选中的字体每个字符都有可画的字形（CI 的 Linux 机器上排在最前的字体
+    /// 没有拉丁字形，以前照样被选中，画出来一个像素都没变）。
+    #[test]
+    fn an_automatically_picked_font_covers_the_whole_text() {
+        let database = system_fonts();
+        for text in ["Hi 42", "你好，世界", "mixed 中文 text"] {
+            let Ok(id) = pick_font(&database, None, text) else {
+                continue;
+            };
+            let covered = with_font(&database, id, |font| {
+                text.chars().all(|ch| can_draw(font, ch))
+            });
+            assert_eq!(covered, Some(true), "{text:?}");
+        }
+    }
+
+    /// U+10FFFF 是非字符，正常字体都没有它的字形（有的是占位字体，自动选择时跳过）：自动
+    /// 选不出字体；指定字体时报错并点出这个字符，而不是画一个豆腐块了事。
+    #[test]
+    fn a_character_no_font_has_is_refused() {
+        let database = system_fonts();
+        let text = "a\u{10FFFF}";
+        assert!(pick_font(&database, None, text).is_err());
+
+        // 取一个确实装着、画得出拉丁字母的字体来指定；机器上没有这样的字体时没有可测的。
+        let Ok(id) = pick_font(&database, None, "a") else {
+            return;
+        };
+        let family = database.face(id).unwrap().families[0].0.clone();
+        let error = pick_font(&database, Some(&family), text).unwrap_err();
+        assert!(error.contains("cannot draw '\\u{10ffff}'"), "{error}");
+        assert!(pick_font(&database, Some(&family), "a").is_ok());
+    }
+
+    #[test]
+    fn long_lists_of_missing_characters_are_cut_short() {
+        assert_eq!(list_chars(&['你', '\u{fe0f}']), "'你', '\\u{fe0f}'");
+        let many: Vec<char> = ('a'..='z').collect();
+        let listed = list_chars(&many);
+        assert!(listed.starts_with("'a', 'b', "), "{listed}");
+        assert!(listed.ends_with("'l' and 14 more"), "{listed}");
     }
 }
