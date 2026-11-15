@@ -86,7 +86,9 @@ fn encode_within(image: &DynamicImage, max_side: u32) -> Result<Vec<u8>, String>
 
 /// 在阻塞线程池里运行 `work`，等它结束。
 ///
-/// 任务 panic 或运行时关闭时返回错误文本，而不是把 panic 传到调用方的异步任务里。
+/// 任务没能跑完时返回错误文本。发布构建里这只会是运行时正在关闭：那里是 `panic = "abort"`，
+/// `work` 里的 panic 直接结束整个进程，到不了这里。测试与调试构建会展开栈，panic 在这里变成
+/// 错误。所以这不是隔离 panic 的手段，`work` 自己不能 panic。
 pub async fn blocking<T, F>(work: F) -> Result<T, String>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -154,8 +156,10 @@ mod tests {
         assert!(shrink_to_fit(&noisy, 1200, 1_000).is_err());
     }
 
+    /// 任务没跑完时得到的是错误文本。这里用 panic 造出“没跑完”：测试构建会展开栈；发布构建
+    /// 是 `panic = "abort"`，同样的 panic 会结束进程（见 [`blocking`] 的说明）。
     #[tokio::test]
-    async fn blocking_work_reports_panics_as_errors() {
+    async fn blocking_work_that_does_not_finish_is_an_error() {
         assert_eq!(blocking(|| 2 + 2).await, Ok(4));
         let failed: Result<(), String> = blocking(|| panic!("boom")).await;
         assert!(failed.unwrap_err().contains("image task failed"));

@@ -33,7 +33,10 @@
 
 - 只支持 OneBot 11（通过 NapCat WebSocket）；没有官方 QQ 协议实现。
 - 单实例：同一 `SBOT_HOME` 同时只能跑一个进程。
-- `start` 是前台进程；systemd / Windows 服务需要你自己包一层。
+- `start` 是前台进程；systemd / Windows 服务需要你自己包一层，并且要配自动重启：程序内部
+  出错（panic）时进程直接退出而不是带着坏掉的后台任务继续跑，靠服务管理器把它拉起来，中断的
+  回合在启动时恢复。systemd 用 `Restart=on-failure`（`sbot stop` 的退出码是 0，不会被重新
+  拉起）。
 - MCP 只有 stdio 传输、一个聚合 `MCP` 工具；不支持 HTTP/SSE 传输；
   `tools/list` 分页最多取 10 页，超过会告警并停止发现剩余工具。
 - 不迁移 0.1 数据；0.2 从空存储开始。

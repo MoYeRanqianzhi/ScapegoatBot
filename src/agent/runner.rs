@@ -803,7 +803,8 @@ impl Runner {
         drop(events_tx);
         let journal = match logger.await {
             Ok(journal) => journal,
-            // 事件任务 panic：用同一个 turn id 重建日志，提交时按 seq 覆盖重写，不会重复。
+            // 事件任务没把日志交回来（调试构建里它 panic 了；发布构建的 panic 直接结束进程，
+            // 到不了这里）：用同一个 turn id 重建日志，提交时按 seq 覆盖重写，不会重复。
             Err(error) => {
                 warn!(%error, "the turn event task failed");
                 journal::TurnJournal::new(Arc::clone(&self.deps.turn_buffer), turn_id, 0)
