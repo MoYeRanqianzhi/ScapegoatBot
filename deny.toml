@@ -26,7 +26,13 @@ feature-depth = 1
 [advisories]
 # RustSec 公告库里命中的漏洞、不再维护、已撤回（yanked）的版本都报错。要忽略某一条，
 # 写清楚原因：{ id = "RUSTSEC-xxxx-xxxx", reason = "..." }。
-ignore = []
+ignore = [
+    # ttf-parser 不再维护（不是漏洞公告）。它经 ab_glyph（owned_ttf_parser）进来，ab_glyph 与
+    # imageproc 的文字渲染目前只有这一个字体解析后端，没有可升级的版本。它解析的是本机安装
+    # 的系统字体（`local.media.image.text` / `.fonts`），不是聊天里来的数据。ab_glyph 换了
+    # 解析后端，或者 ttf-parser 出了真正的漏洞公告（那是另一个 ID，仍然会报错）时删掉这一条。
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained, no replacement in ab_glyph yet; it only parses fonts installed on the host" },
+]
 
 [licenses]
 # 允许的许可证：都是宽松许可证。MPL-2.0 是文件级的弱 copyleft，只要求修改过的那个文件

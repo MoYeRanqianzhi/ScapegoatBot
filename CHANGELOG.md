@@ -112,6 +112,16 @@
   musl，并且实际把守护进程跑起来再停下；新增最低 Rust 版本、rustdoc、依赖审计（cargo-deny：
   安全公告、许可证、禁用 OpenSSL、来源）、未使用的依赖、workflow 与脚本检查（actionlint、
   zizmor、shellcheck）、CodeQL；Dependabot 每周检查 cargo 与 GitHub Actions 的更新。
+- 依赖审计第一次运行查出的三条安全公告，升级解决：
+  - `rusqlite` 0.32 → 0.43：随包的 SQLite 从 3.46.0 升到 3.54.1（CVE-2026-119375 /
+    RUSTSEC-2026-0459：打开别人能写的数据库文件及其 `-wal` 时可能读到未初始化的内存。sbot
+    只打开自己数据目录里的库，要先能写这个目录才谈得上利用）。数据库文件格式不变，新旧版本
+    互相能读（实测）；
+  - `tokio` 1.50 → 1.54（RUSTSEC-2026-0386）、`anyhow` 1.0.102 → 1.0.104
+    （RUSTSEC-2026-0190）：两条都是“安全代码可以触发未定义行为”的接口缺陷，sbot 没有用到
+    涉及的接口。
+  `ttf-parser` 被标为不再维护（RUSTSEC-2026-0192），没有可升级的版本：它经 `ab_glyph` 进来，
+  只解析本机安装的字体；在 `deny.toml` 里写明原因后忽略。
 
 ## [0.2.0-alpha.43] - 2026-11-10
 
