@@ -97,6 +97,21 @@
   GIF / BMP（以前实际还能解 TIFF、ICO 等），少一批解析不可信输入的代码。
 - rustdoc 的断链修正（改名或删掉的目标、`matches` 函数与宏同名的歧义、一处挂错位置的文档
   注释把 `Views` 的说明挂到了 `mod config` 上）。
+- 发布页的文件从 2 个变成 20 个，名字是 `sbot-<版本>-<平台>.tar.gz`（Windows 是 `.zip`），另有
+  `SHA256SUMS` 与构建来源证明（`gh attestation verify`）。以前只有 Linux 与 Windows 的 x86_64
+  两个裸文件，而且 Linux 版要 glibc 2.39（Debian 12、Ubuntu 22.04 上启动不了）、Windows 版要
+  另装 VC++ 运行库。现在：
+  - Linux glibc 版在 glibc 2.28 的环境里编译（Debian 10+、Ubuntu 20.04+、RHEL 8+ 可用），另有
+    全静态的 musl 版（任何 Linux）；Windows 版静态链接 C 运行时；macOS 版最低 11；
+  - 以上四种平台都有 x86_64 与 aarch64；x86_64 按 CPU 等级（x86-64 v1–v4）各出一份，Rust 代码
+    与 C 依赖（SQLite、mimalloc、ring）都按那一级的指令集编译；
+  - 每个文件发布前都核对过动态依赖，并且实际运行过（在空数据目录上 start → status →
+    doctor → stop）、用同样的编译参数跑过全部单元测试；构建机器的 CPU 跑不动的等级（v4 需要
+    AVX-512）只做链接检查，发布说明里会列出来。
+- CI：所有 cargo 命令带 `--locked`；测试覆盖 Linux / Windows / macOS 的 x86_64 与 aarch64，以及
+  musl，并且实际把守护进程跑起来再停下；新增最低 Rust 版本、rustdoc、依赖审计（cargo-deny：
+  安全公告、许可证、禁用 OpenSSL、来源）、未使用的依赖、workflow 与脚本检查（actionlint、
+  zizmor、shellcheck）、CodeQL；Dependabot 每周检查 cargo 与 GitHub Actions 的更新。
 
 ## [0.2.0-alpha.43] - 2026-11-10
 

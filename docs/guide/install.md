@@ -4,13 +4,44 @@
 
 | 依赖 | 要求 | 说明 |
 |------|------|------|
-| Rust | 1.89+（edition 2024） | 用 `rustup` 安装 stable 即可；最低版本见 `Cargo.toml` 的 `rust-version` |
+| Rust | 1.89+（edition 2024） | 只在从源码构建时需要：用 `rustup` 安装 stable 即可；最低版本见 `Cargo.toml` 的 `rust-version` |
 | NapCatQQ | 支持 OneBot 11 的版本 | 提供 WebSocket 接口 |
 | LLM API | Anthropic Messages / OpenAI Chat Completions / OpenAI Responses 兼容 | 见 `models.json` |
 
 不需要 Node、Python 或数据库服务：状态全部在 `~/.sbot`，SQLite 由程序内置。
 
-## 构建
+## 下载预编译版本
+
+[Releases](https://github.com/MoYeRanqianzhi/ScapegoatBot/releases) 里每个版本有 20 个文件，名字是
+`sbot-<版本>-<平台>.tar.gz`（Windows 是 `.zip`），解开后是一个同名目录，里面是 `sbot` 本体、
+LICENSE 与 README。
+
+| 系统 | 平台 | 说明 |
+|------|------|------|
+| Linux，glibc ≥ 2.28（Debian 10+、Ubuntu 20.04+、RHEL / Rocky / Alma 8+、Amazon Linux 2023、Fedora、Arch、openSUSE 等） | `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu` | 首选 |
+| 任何 Linux（包括 Alpine、glibc 更旧的系统） | `x86_64-unknown-linux-musl`、`aarch64-unknown-linux-musl` | 全静态，不依赖任何系统库 |
+| Windows 10 / 11 | `x86_64-pc-windows-msvc`、`aarch64-pc-windows-msvc` | 不需要安装 VC++ 运行库 |
+| macOS 11+ | `aarch64-apple-darwin`（Apple 芯片）、`x86_64-apple-darwin`（Intel） | |
+
+x86_64 的每种平台按 CPU 等级各出一份，等级写在架构后面（`x86_64_v3-unknown-linux-gnu`）；等级
+越高，编译器能用的指令越新、越快：
+
+- 不带后缀（v1）：任何 x86-64 CPU；
+- `_v2`：2009 年以后的 CPU（SSE4.2、POPCNT）；
+- `_v3`：Intel Haswell（2013）及以后、AMD Zen 及以后（AVX2、BMI2、FMA）；
+- `_v4`：支持 AVX-512 的 CPU。
+
+不确定就先下不带后缀的版本，运行 `sbot --version`：`cpu:` 一行是这台机器能用的最高等级，再换成
+对应的文件。选高了，程序一启动就以“非法指令”（Illegal instruction）退出，不会有别的影响。
+
+校验下载的文件（第二条核对它确实由本仓库的 release workflow 从 tag 对应的提交构建）：
+
+```bash
+sha256sum -c SHA256SUMS --ignore-missing
+gh attestation verify sbot-<版本>-<平台>.tar.gz --repo MoYeRanqianzhi/ScapegoatBot
+```
+
+## 从源码构建
 
 ```bash
 git clone https://github.com/MoYeRanqianzhi/ScapegoatBot
@@ -18,7 +49,7 @@ cd ScapegoatBot
 cargo build --release
 ```
 
-产物是 `target/release/sbot`。下面用 `sbot` 代指它。
+产物是 `target/release/sbot`。下面用 `sbot` 代指它（预编译版本就是解出来的那个文件）。
 
 ## NapCat
 

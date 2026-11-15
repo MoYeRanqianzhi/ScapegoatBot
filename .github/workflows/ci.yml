@@ -1,54 +1,225 @@
+# CI：每次推送到 main、每个 PR 都跑；每周一再跑一次，捕捉新的安全公告与新版工具链带来的问题。
+#
+# 约定（release.yml、codeql.yml 同样遵守）：
+# - 第三方 action 按 commit SHA 固定，注释写版本号；Dependabot 负责升级（.github/dependabot.yml）。
+# - 默认只读权限；需要写的任务单独声明。
+# - checkout 不保留凭据（persist-credentials: false），后续步骤拿不到 token。
+# - cargo 一律 `--locked`：Cargo.lock 没跟上 Cargo.toml 时直接失败（alpha.30 的发布就是这样
+#   坏掉的）。
+# - `run:` 里不直接展开 `${{ }}`，要用的值经 `env:` 传入，避免注入。
 name: ci
 
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # 每周一 03:17 UTC。
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # 同一分支 / PR 的新推送取消还在跑的旧任务。
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # 增量编译只对反复本地构建有用，CI 上只增加缓存体积。
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
 
 jobs:
-  test:
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: clippy, rustfmt
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all --check
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Format
-        run: cargo fmt --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --all-targets
-
-      - name: Example config
-        run: cargo test --test config_example
-
-  windows:
-    runs-on: windows-latest
+  clippy:
+    name: clippy (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux, os: ubuntu-latest }
+          - { name: windows, os: windows-latest }
+          - { name: macos, os: macos-latest }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
           components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+  test:
+    # 发布的每种操作系统 × 架构都在原生机器上跑一遍测试。
+    name: test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-latest }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm }
+          - { name: windows-x86_64, os: windows-latest }
+          - { name: windows-aarch64, os: windows-11-arm }
+          - { name: macos-aarch64, os: macos-latest }
+          - { name: macos-x86_64, os: macos-15-intel }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test --locked --all-targets
+      - name: Run the daemon (start, status, doctor, stop)
+        # 测试覆盖不到的那一段：真的把程序跑起来，在空数据目录上建配置、密钥与数据库，经 IPC
+        # 查询状态，再正常停下（退出码必须是 0）。发布时每个产物都跑同一个脚本。
+        shell: bash
+        run: |
+          cargo build --locked
+          bin=target/debug/sbot
+          if [ -f "$bin.exe" ]; then bin=$bin.exe; fi
+          # 默认参数的构建：`sbot --version` 的 target 就是本机的三元组。
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          .github/scripts/smoke-test.sh "$bin" "$host" "$version"
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+  musl:
+    # 发布的 Linux 全静态版本用 musl：libc 不同（DNS 解析、内存分配器所在的 C 运行时），
+    # 测试单独在 musl 上跑一遍。
+    name: test (linux-x86_64-musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      # musl-gcc：编译 C 依赖（SQLite、mimalloc、ring）。
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo test --locked --all-targets --target x86_64-unknown-linux-musl
 
-      - name: Test
-        run: cargo test --all-targets
+  msrv:
+    # Cargo.toml 的 `rust-version` 是对使用者的承诺：用这个版本确实编得过。
+    name: msrv
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          test -n "$version" || { echo "rust-version not found in Cargo.toml" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo check --locked --all-targets
+
+  docs:
+    # 文档按维护者的用法构建（包括私有项），断链与歧义链接都算错误。
+    name: docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo doc --locked --no-deps --document-private-items
+
+  deny:
+    # 依赖的安全公告、许可证、禁用包（OpenSSL）与来源，规则见 deny.toml。
+    name: deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+
+  unused-deps:
+    # Cargo.toml 里声明了、代码却没用的依赖（font8x8 就这样留了很久）。
+    name: unused dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-shear
+      - run: cargo shear
+
+  workflows:
+    # workflow 本身：语法与表达式（actionlint，含 shellcheck），安全问题（zizmor）；
+    # workflow 调用的脚本（.github/scripts）：shellcheck。
+    name: workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: zizmor
+      - name: actionlint
+        env:
+          # 升级时两项一起改；校验和取自该版本发布页的 checksums.txt。Dependabot 不管这里。
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          archive=actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v$ACTIONLINT_VERSION/$archive"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+      - name: shellcheck
+        # runner 镜像自带 shellcheck。
+        run: shellcheck .github/scripts/*.sh
+      - name: zizmor
+        # token 只有本 workflow 的只读权限；zizmor 用它做在线审计（固定的 SHA 是否真是
+        # 上游仓库的提交、action 是否有已知漏洞）。Dependabot 的配置也一起看。
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor --format plain .github/workflows .github/dependabot.yml

@@ -1,0 +1,46 @@
+# Dependabot：每周检查依赖的新版本并开 PR；有安全公告的依赖随时开（仓库设置里的
+# “Dependabot security updates”）。PR 要过 ci.yml 的全部检查才能合并。
+#
+# 管不到的地方（要手动升级）：release.yml 里 manylinux 容器镜像的 tag 与摘要；ci.yml 里
+# actionlint 的版本号。
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Asia/Shanghai
+    # 刚发布的版本先等一周：出问题的版本通常几天内就被撤回（yank）。安全更新不受这个限制。
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      # 兼容更新（补丁与次版本）合成一个 PR；主版本更新可能要改代码，各开各的。
+      compatible:
+        update-types: [minor, patch]
+    ignore:
+      # 版本固定为 `=0.1.0-alpha.2`，并且实际用的是 vendor/napcat-link 里的本地副本
+      # （见 Cargo.toml 的 [patch.crates-io]）；升级要连同副本一起手动做。
+      - dependency-name: napcat-link
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:00"
+      timezone: Asia/Shanghai
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: ci
+    groups:
+      # action 的更新不分大小，一周一个 PR。
+      actions:
+        patterns: ["*"]

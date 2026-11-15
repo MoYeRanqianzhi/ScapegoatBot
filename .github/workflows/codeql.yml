@@ -1,0 +1,44 @@
+# CodeQL：静态分析 Rust 代码与 workflow 本身，结果在仓库的 Security → Code scanning。
+#
+# 与 ci.yml 相同的约定：action 按 commit SHA 固定、最小权限、checkout 不保留凭据。
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 每周二 05:43 UTC：没有新提交时也用更新过的查询规则再扫一遍。
+    - cron: "43 5 * * 2"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read # 读源码
+      security-events: write # 上传分析结果
+    strategy:
+      fail-fast: false
+      matrix:
+        # `actions` 分析 .github/workflows；两种语言都不需要构建（build-mode: none）。
+        language: [actions, rust]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:${{ matrix.language }}

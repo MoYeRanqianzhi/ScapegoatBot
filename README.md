@@ -38,7 +38,12 @@ QQ 消息，用可配置的 LLM 生成回复，并把所有状态集中在本机
 
 ## 快速开始
 
-前置：Rust 1.89+（edition 2024；`Cargo.toml` 的 `rust-version`）、NapCatQQ（OneBot 11 WebSocket）、一个兼容的 LLM API。
+前置：NapCatQQ（OneBot 11 WebSocket）、一个兼容的 LLM API。
+
+预编译版本在 [Releases](https://github.com/MoYeRanqianzhi/ScapegoatBot/releases)：Linux（glibc 与
+全静态的 musl）、Windows、macOS，x86_64 与 aarch64 都有，解开就能用；该下哪个文件见
+[docs/guide/install.md](docs/guide/install.md)。从源码构建需要 Rust 1.89+（edition 2024；
+`Cargo.toml` 的 `rust-version`）：
 
 ```bash
 cargo build --release
@@ -165,7 +170,9 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
-CI（GitHub Actions）运行同样的三项检查。
+CI（GitHub Actions，`.github/workflows/ci.yml`）在 Linux / Windows / macOS 的 x86_64 与 aarch64 上
+跑这三项，另外还有 musl 上的测试、最低 Rust 版本、rustdoc、依赖审计（`deny.toml`）、未使用的
+依赖与 workflow 自身的检查。
 
 真实 API 测试默认忽略，需要显式环境变量：
 
