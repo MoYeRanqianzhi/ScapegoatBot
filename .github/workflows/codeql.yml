@@ -39,6 +39,11 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: none
+          # vendor/napcat-link/examples 是上游 SDK 的示例程序：不进 sbot 的二进制，本来就是把
+          # 登录信息、好友列表打印出来给人看的（会被报成“明文日志”）。
+          config: |
+            paths-ignore:
+              - vendor/napcat-link/examples
       - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: /language:${{ matrix.language }}

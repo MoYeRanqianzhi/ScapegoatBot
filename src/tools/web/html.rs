@@ -173,8 +173,12 @@ mod tests {
         let html = "<script>".repeat(200_000) + &"x".repeat(1_000_000);
         let started = std::time::Instant::now();
         assert_eq!(html_to_text(&html), "");
-        let entities = "&".repeat(1_000_000);
-        assert_eq!(html_to_text(&entities).len(), 1_000_000);
+        // 每个 `&` 最多向后看 `MAX_ENTITY_CHARS` 个字符；不设这个上限的话每个都要扫到文末。
+        // 规模的取法：线性实现在最慢的 CI 机器（未优化的测试构建）上也远不到 1 秒，二次方的
+        // 实现要几分钟，5 秒的界线离两边都很远。曾经用 100 万个 `&`，线性实现在慢机器上
+        // 自己就要 7 秒。
+        let entities = "&".repeat(100_000);
+        assert_eq!(html_to_text(&entities).len(), 100_000);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "took {:?}",
