@@ -533,6 +533,20 @@ mod tests {
         }
     }
 
+    /// 等到收到 `count` 条投递（最多 5 秒），返回当时的全部投递。
+    ///
+    /// 投递发生在后台任务里，什么时候轮到它跑取决于机器；固定睡一段时间再断言的写法在慢的
+    /// CI 机器上会偶发失败。
+    async fn wait_for_deliveries(sink: &RecordingSink, count: usize) -> Vec<MonitorDelivery> {
+        for _ in 0..500 {
+            if sink.deliveries.lock().unwrap().len() >= count {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        sink.deliveries.lock().unwrap().clone()
+    }
+
     /// 一个默认的运行时 monitor：逐个投递、10 次上限、不过期。
     fn spec(name: &str, source: &str) -> MonitorSpec {
         MonitorSpec {
@@ -604,13 +618,7 @@ mod tests {
             "daily token budget exhausted",
         );
         // 监听任务异步投递；等到两条都到达。
-        for _ in 0..100 {
-            if sink.deliveries.lock().unwrap().len() >= 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let deliveries = sink.deliveries.lock().unwrap().clone();
+        let deliveries = wait_for_deliveries(&sink, 2).await;
         let names: Vec<&str> = deliveries
             .iter()
             .map(|delivery| delivery.name.as_str())
@@ -752,8 +760,7 @@ mod tests {
         // 窗口未到时不应投递。
         assert!(sink.deliveries.lock().unwrap().is_empty());
 
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        let deliveries = sink.deliveries.lock().unwrap();
+        let deliveries = wait_for_deliveries(&sink, 1).await;
         assert_eq!(deliveries.len(), 1);
         assert!(deliveries[0].text.contains("first"));
         assert!(deliveries[0].text.contains("second"));
@@ -779,8 +786,7 @@ mod tests {
         assert!(sink.deliveries.lock().unwrap().is_empty());
 
         sink.idle.store(true, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        assert_eq!(sink.deliveries.lock().unwrap().len(), 1);
+        assert_eq!(wait_for_deliveries(&sink, 1).await.len(), 1);
     }
 
     #[tokio::test]
