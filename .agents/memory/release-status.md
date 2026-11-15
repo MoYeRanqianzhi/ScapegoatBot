@@ -5,45 +5,51 @@ metadata:
   type: project
   scope: 整个 0.2 分支，随版本更新
   status: active
-  last_verified: 2026-11-10
+  last_verified: 2026-11-16
 ---
 
-当前版本 `0.2.0-alpha.43`（本地 tag，未 push）；之后的修复记在 `CHANGELOG.md` 的 Unreleased 段，
-数据库迁移到 v12。`cargo test --locked --all-targets` = 499 lib（Linux 500）+ 15 integration passed，
-2 ignored；clippy/fmt 通过；WSL Debian `cargo test` 通过。最低 Rust 1.89。CI 已接入 GitHub Actions。
+当前版本 `0.2.0-alpha.44`，已发布（2026-11-15 UTC，tag `v0.2.0-alpha.44` = 提交 `95830ea`，
+GitHub release 标为 Latest）。数据库 schema v13。最低 Rust 1.89。
 
-发布状态：每批改动升版本并打本地 annotated tag（见 [[release-workflow]]）；尚未 push/release/deploy。
-`cargo build --release` 在 alpha.43 上通过（Windows，2026-11-10，`sbot --version` = 0.2.0-alpha.43）。服务器 `hw1` 的
-`sbot.service` 已停止。
+发布了什么、怎么验证的：
+
+- 20 个压缩包 + `SHA256SUMS` + 构建来源证明。x86_64 的 v1–v4 × {linux-gnu（glibc 2.28）、
+  linux-musl（全静态）、windows-msvc（静态 CRT）、macOS 11+}，aarch64 × 同四种。流程与每一步
+  的理由写在 `.github/workflows/release.yml` 与 `.github/scripts/*.sh` 的注释里。
+- CI 上每个产物：链接检查、实际运行（空数据目录上 start → status → doctor → stop）、同参数
+  编译的库单元测试（Linux / macOS 529 个，Windows 527 个）。**v4 是否在 CI 上跑过取决于当次
+  分到的 runner 有没有 AVX-512**：alpha.44 里 `x86_64_v4` 的 macOS、Windows、linux-musl 三个
+  只做了链接检查（发布说明里列出），linux-gnu 的 v4 跑过。
+- 发布后本地实测：Debian 12（WSL，glibc 2.36，CPU 是 v3）上 gnu 与 musl 的 v1–v3 六个包都跑
+  通同一套冒烟脚本，v4 两个按预期以非法指令退出（退出码 132）；Windows 11 上 x86_64 的 v1–v3
+  同样跑通。`sha256sum -c` 与 `gh attestation verify` 通过，证明指向 release.yml 与 tag 的提交。
+- **没有实测过**：任何 aarch64 产物与 macOS 产物在 CI 之外的机器上；glibc 正好 2.28 的发行版
+  （靠 manylinux_2_28 容器与符号版本检查保证）；v4 产物在真正支持 AVX-512 的非 CI 机器上。
+
+测试基线（alpha.44）：`cargo test --locked --all-targets` = 527 lib（Linux 529）+ 18 集成测试
+通过，2 ignored；clippy / fmt / rustdoc `-D warnings` / cargo-deny / zizmor / actionlint /
+shellcheck / CodeQL 在 CI 上全过。
+
+服务器 `hw1` 的 `sbot.service` 仍停止，部署未授权；NapCat 未登录（2026-11-05 起 QR 失败）。
 
 已经由代码与测试保证、但**未在真实 NapCat 上实测**的行为：
 
 - 发给 NapCat 的文件引用一律是 `base64://`（VFS 路径本进程读出，URL 本进程下载）。
 - 私聊 `message_sent` 回声按 `target_id` 归到对方会话（依据 NapCatQQ 源码）。
-- 发送账本认领 `message_sent` 回声，stand_in 下主人手打的消息进 inbox 并由 `wake-on-owner` 唤醒（`src/qq/ledger.rs` 单测覆盖；需要 `reportSelfMessage`，未在真实 NapCat 上测）。
+- 发送账本认领 `message_sent` 回声，stand_in 下主人手打的消息进 inbox 并由 `wake-on-owner`
+  唤醒（`src/qq/ledger.rs` 单测覆盖；需要 `reportSelfMessage`）。
 - `approve` 的私聊确认码只接受 owner/master 从另一个账号的回复；队列持久化在
   `gate_approvals`，重启后未过期的请求与批准仍有效。
+- `get_image`、QQ CDN 下载、`get_msg` / `get_forward_msg`、发出媒体。
 
-仍存在的边界（细节见 `docs/guide/limits.md` 与
-`.agents/plan/2026-11-07-review-remediation.md`）：
+其他边界见 `docs/guide/limits.md`（该目录计划并入 skill，见 [[docs-layout]]）。
 
-- NapCat 未登录（2026-11-05 05:22 起 QR 失败）；`get_image`、QQ CDN 下载、
-  `get_msg`/`get_forward_msg`、发出媒体都未实测。
-- 服务器无系统字体：`local.media.image.fonts` 为空、`.text` 明确报错；不内置字体。
-- 审查发现的 P0（子代理权限、非法 monitor 谓词、turn buffer、
-  消息索引错位、联系人视图）尚未核实与修复。
-- WebFetch 默认后端模式下内容在 final_url 复核前已被取走；`local = true` 才逐跳抓取。
-- hooks 的 rewrite 只在 BeforeSend；SessionEnd/Stop/ConfigChange 的 inject 无去处。
-- README 写 MSRV 1.85，但代码用 let-chains，实际需要 Rust 1.88+（edition 2024；待修文档）。
-  `napcat-link` 固定 0.1.0-alpha.2。
+**Evidence:** release 运行 43747825572 与试跑 43742813837（全部任务 success）；
+`gh release view v0.2.0-alpha.44`（21 个资产）；2026-11-16 在 WSL Debian 12 与本机 Windows 上
+用 `.github/scripts/smoke-test.sh` / `check-binary.sh` 对下载的包实跑的输出。
 
-**Evidence:** 2026-11-07 全量测试输出与 `git describe`；`CHANGELOG.md` Unreleased 段；
-`src/security/action_gate.rs` 的 `ApprovalQueue`（数据库加载）与测试
-`approvals_persist_and_match_by_nonce`。
+**Recheck when:** 打新 tag、部署、NapCat 登录后实测，或改发布矩阵。
 
-**Recheck when:** 打新 tag、push/deploy、安装字体、NapCat 登录后实测，或改变安全默认值。
+**Why:** 新会话需要知道哪些能力真的可用、哪些只有代码或 CI 保证。
 
-**Why:** 新会话需要知道哪些能力真的可用、哪些只有代码保证，以及 tag/构建是否可发布。
-
-**How to apply:** 先跑测试三项与 `git describe` 确认基线；发布前重指 tag 并重跑 release；
-不要把未实测的 NapCat 行为描述成已验证。
+**How to apply:** 说某个平台“可用”之前看上面它属于哪一类；发新版按 [[release-workflow]]。

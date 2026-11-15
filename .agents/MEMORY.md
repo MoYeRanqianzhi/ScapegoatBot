@@ -2,15 +2,15 @@
 
 - [设计决定](memory/design-decisions.md) -- 无人值守（hold 必须自主解除）、AGENTS.md 可写、单会话、命名分层等用户拍板的取舍，改架构前先读
 - [提示词风格](memory/prompt-style.md) -- 参考 Claude Code 的哲学感写法与比喻；常用 API 写进 system prompt；声明必须与代码一致
-- [版本与发布](memory/release-workflow.md) -- 每批升版本号并自动打 tag；未验证前不 push
+- [版本与发布](memory/release-workflow.md) -- 每批升版本号打 tag；push 与 GitHub release 已授权，部署 hw1 没有；发版步骤
 - [安全闸语义](memory/security-gate-semantics.md) -- shadow/enforce、fail-closed、llm 后端装入、hold 只拦 napcat.*、resume 复核
-- [存储不变量](memory/storage-invariants.md) -- append 串行、(chat, message_id) 去重、索引校验、文件头加密、迁移 v12
+- [存储不变量](memory/storage-invariants.md) -- append 串行、(chat, message_id) 去重、索引校验、文件头加密、迁移 v13
 - [图片工具 local.media.image.*](memory/image-tools.md) -- 5 个 action、系统字体约束、依赖与模块命名坑
 - [功能范围纠正](memory/feature-scope-correction.md) -- 不要把代码限制升级成需求；禁止内置字体
-- [工具表](memory/tool-surface.md) -- 没有 Memory / Download 工具：记忆用文件工具写，下载在 API 里；新增顶层工具要用户同意
+- [工具表](memory/tool-surface.md) -- 没有 Memory / Download 工具；API 前缀只是命名空间，`local` 待改名 `native`，要能接任意渠道与自定义 action；新增顶层工具要用户同意
 - [文档归属](memory/docs-layout.md) -- 开发文档就是 .agents 记忆；使用文档是内嵌在二进制里的 skill
-- [提交说明](memory/commit-messages.md) -- 不带 Claude Code 共同作者行；2026-11-10 重写过历史，远端待强推
-- [发布状态](memory/release-status.md) -- 当前测试基线、tag/release 状态与未实测能力
+- [提交说明](memory/commit-messages.md) -- 不带 Claude Code 共同作者行；2026-11-10 重写过历史，远端已强推
+- [发布状态](memory/release-status.md) -- alpha.44 已发布：20 个产物怎么验证的、哪些平台没实测、测试基线
 - [审查整改计划（2026-11-07）](plan/2026-11-07-review-remediation.md) -- 四份代码审查的已修/待修项与顺序
 - [重构总设计](plan/2026-10-28-rebuild-design.md) -- 0.2 设计依据与取舍理由；与代码冲突时以代码为准
 - [Prompt Catalog](plan/2026-10-29-prompt-catalog.md) -- 模型面文本（工具描述、压缩、子代理、门禁提示）的英文稿

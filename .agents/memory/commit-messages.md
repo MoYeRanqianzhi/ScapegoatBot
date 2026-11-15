@@ -5,7 +5,7 @@ metadata:
   type: feedback
   scope: 本仓库所有分支与 tag 的提交说明
   status: active
-  last_verified: 2026-11-10
+  last_verified: 2026-11-16
 ---
 
 提交说明不带 `Co-Authored-By: Claude Code <noreply@anthropic.com>` 这一行（任何 agent 的
@@ -20,11 +20,12 @@ metadata:
 `git log --branches --tags --format=%B | grep -c Co-Authored-By` = 0；旧历史的完整备份是
 `G:\sbot-pre-coauthor-rewrite-2026-11-10.bundle`。
 
-**Recheck when:** 远端被强推成新历史之后（那时备份可以删，`.agents/TODO.md` 的对应项关闭）；
-或用户改变署名规则。
+**Recheck when:** 用户改变署名规则。备份 bundle 在远端强推后已无用，删不删由用户决定
+（`.agents/TODO.md` 的“待用户确认”）。
 
 **Why:** 用户不要这类署名出现在项目历史里。
 
-**How to apply:** 提交时不要加共同作者行，即使客户端默认会加。远端 `origin/main` 与
-alpha.33 及之前的 tag 仍是旧历史，强推需要用户授权（见 `.agents/TODO.md`）。重写历史后，
+**How to apply:** 提交时不要加共同作者行，即使客户端默认会加。远端已于 2026-11-13 强推成
+新历史（用户授权）；其他 clone 要重新 clone，或
+`git fetch --all --prune --tags --force && git reset --hard origin/main`。再次重写历史时，
 记录里引用的提交哈希要一起换（2026-11-10 换过 4 处）。

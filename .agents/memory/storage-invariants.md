@@ -5,7 +5,7 @@ metadata:
   type: project
   scope: src/storage、src/session、vfs blob 与迁移
   status: active
-  last_verified: 2026-11-07
+  last_verified: 2026-11-16
 ---
 
 存储层的硬不变量：
@@ -23,7 +23,8 @@ metadata:
 - 崩溃恢复：`turn_buffer` 中 open/committing 的回合在启动时补齐缺失的 tool_result，
   按“已写入 transcript 的后缀”去重后追加，避免 committing 中断导致整段重复。
   单会话化后 `turn_buffer.scope` / `transcript_files.scope` 列只为旧数据保留，新写入恒为 `shared`。
-- 迁移只追加、不修改已发布条目；当前最新是 v12（`event audit`）。
+- 迁移只追加、不修改已发布条目；当前最新是 v13（删除 `memory_entries` 表：只有已删除的
+  `Memory` 工具写过它）。
 
 **Evidence:** `src/storage/messages.rs`（`append` / `read_line` / `rebuild_index`）、
 `src/storage/mod.rs`（`MIGRATIONS`）、`src/session/{mod,turn_buffer}.rs`；
