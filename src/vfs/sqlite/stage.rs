@@ -8,7 +8,8 @@
 //! 3. [`VfsStore::commit_stage`] 在一个事务里逐块解密、按节点 id 重新加密写入正式位置。
 //!
 //! 暂存分块同样是密文，磁盘上任何时候都没有明文。`BlobStage` 被丢弃（下载失败、超限）
-//! 时删除暂存目录；进程崩溃留下的暂存目录在下次 [`VfsStore::open`] 时清理。
+//! 时删除暂存目录；进程崩溃留下的暂存目录在下次 [`VfsStore::open`] 时清理。提交时怎样替换
+//! 节点已有的分块、失败了怎样恢复，见 `swap.rs`。
 
 use super::*;
 
@@ -212,7 +213,8 @@ impl VfsStore {
         self.write_binary_chunks(path, kind, stage.len, &hash, &mut chunks)
     }
 
-    /// 删除崩溃遗留的暂存目录：分段写入的 `stage-*` 与整块写入的 `<id>.tmp-*`。
+    /// 删除崩溃遗留的分段写入暂存目录 `stage-*`（分块目录替换到一半留下的东西由
+    /// [`VfsStore::recover_blob_swaps`] 处理）。
     ///
     /// 只在打开时调用：生产环境唯一的打开点 `app::assembly::open_stores` 在拿到实例锁
     /// （`InstanceLock`）之后，不会有另一个进程正在往这些目录里写。
@@ -223,7 +225,7 @@ impl VfsStore {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if (name.starts_with(STAGE_PREFIX) || name.contains(".tmp-"))
+            if name.starts_with(STAGE_PREFIX)
                 && let Err(error) = std::fs::remove_dir_all(entry.path())
             {
                 tracing::warn!(%error, dir = %name, "cannot remove a stale blob stage");
@@ -359,6 +361,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("blobs").join("7.tmp-123")).unwrap();
         std::fs::create_dir_all(dir.path().join("blobs").join("8")).unwrap();
         store.remove_stale_stages();
+        store.recover_blob_swaps();
         let left: Vec<String> = std::fs::read_dir(dir.path().join("blobs"))
             .unwrap()
             .flatten()

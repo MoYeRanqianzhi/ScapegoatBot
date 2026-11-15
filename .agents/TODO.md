@@ -74,11 +74,12 @@ Dependabot 开了 4 个 PR（#1 兼容更新合集；#2 getrandom 0.4、#3 chach
 
 ## 待核实的正确性风险（2026-11-10 子代理通读长函数所得，逐条未核实）
 
+已核实并修掉的不留在这里（`write_binary_chunks` 的提交顺序：2026-11-16，见 `src/vfs/sqlite/swap.rs`）。
+顺带看到、还没处理的：文本节点被二进制覆盖后 `content_enc` 里留着旧密文；二进制节点被文本
+覆盖后 `vfs_chunks` 行与 `blobs/<id>/` 留着——都只是占空间，读取不受影响，删节点时一并清掉。
+
 核实后：是 bug 就修并补测试，不是就从这里删掉。行号是当时的，会漂移。
 
-- [ ] `vfs/sqlite.rs::write_binary_chunks`：旧 blob 目录的删除与暂存目录改名发生在
-      `tx.commit()` 之前；提交失败时数据库回滚到旧分块行，磁盘上却已是新 blob。中途出错时
-      暂存目录是否清理也要看。
 - [ ] `agent/runner/compaction.rs`：压缩先快照 history、放锁、长时间摘要、再整体替换；
       `compact_now` 不拿 `turn_lock`，期间追加的内容可能丢失。`record_checkpoint` /
       `sessions.append` 失败时分段已经轮转而 history 没变。

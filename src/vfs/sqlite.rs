@@ -13,7 +13,7 @@
 //! 也满足“同一节点串行、不同节点不冲突”的要求（串行是更强的不冲突）。
 
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -30,9 +30,11 @@ use super::{FileContent, NodeKind, NodeMeta, RemoveOutcome, Usage, Vfs, VfsError
 
 mod codec;
 mod stage;
+mod swap;
 mod tree;
 
 pub use stage::{BlobStage, StoragePressure};
+use swap::BlobSwap;
 
 /// 二进制分块大小：1 MiB。
 const BLOB_CHUNK_BYTES: usize = 1024 * 1024;
@@ -74,8 +76,9 @@ impl VfsStore {
             storage,
             quota: Quota::new(limits),
         };
-        // 上次运行崩溃时可能留下没提交的暂存目录。
+        // 上次运行崩溃时可能留下没提交的暂存目录，或换到一半的分块目录。
         store.remove_stale_stages();
+        store.recover_blob_swaps();
         store.ensure_seeds()?;
         Ok(store)
     }
@@ -606,8 +609,8 @@ impl VfsStore {
     /// 写入二进制节点的公共实现：整块写入与分段提交共用。
     ///
     /// `chunks` 依次给出 1 MiB 的明文分块（最后一块可以更短），总长必须是 `len`、
-    /// 整体 SHA-256 必须是 `hash`。新分块先写进临时目录、事务提交前整体替换旧目录，
-    /// 中途失败不留半份数据。
+    /// 整体 SHA-256 必须是 `hash`。失败时节点保持写之前的样子：数据库的改动随事务回滚，
+    /// 磁盘上的旧分块原样留着（见 `swap.rs`）。
     fn write_binary_chunks(
         &self,
         path: &VfsPath,
@@ -667,48 +670,47 @@ impl VfsStore {
             Some(row) => (row.id, row.version + 1),
         };
 
-        // 先把新分块写进临时目录，再整体替换旧目录，避免中途失败留下半份数据。
-        let blobs = self.storage.join("blobs");
-        let target = blobs.join(id.to_string());
-        let staging = blobs.join(format!("{id}.tmp-{}", std::process::id()));
-        if staging.exists() {
-            std::fs::remove_dir_all(&staging)?;
-        }
-        std::fs::create_dir_all(&staging)?;
-
-        tx.execute("DELETE FROM vfs_chunks WHERE node_id = ?1", params![id])?;
-        let mut offset = 0u64;
-        for (index, chunk) in chunks.enumerate() {
-            let chunk = chunk?;
-            let sealed = self.seal_blob(id, index, &chunk)?;
-            std::fs::write(staging.join(index.to_string()), sealed)?;
+        // 磁盘上的分块目录与数据库事务同进退（见 `swap.rs`）：新分块先写进暂存目录，换到
+        // 正式位置时旧目录留作备份，事务提交之后才删；提交之前任何一步失败都恢复原状。
+        let old_version = existing.as_ref().map(|row| row.version);
+        let mut swap = BlobSwap::begin(&self.storage.join("blobs"), id, old_version)?;
+        let written = (|| -> Result<(), VfsError> {
+            tx.execute("DELETE FROM vfs_chunks WHERE node_id = ?1", params![id])?;
+            let mut offset = 0u64;
+            for (index, chunk) in chunks.enumerate() {
+                let chunk = chunk?;
+                let sealed = self.seal_blob(id, index, &chunk)?;
+                std::fs::write(swap.staging().join(index.to_string()), sealed)?;
+                tx.execute(
+                    "INSERT INTO vfs_chunks (node_id, idx, offset, length, hash)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        id,
+                        index as i64,
+                        offset as i64,
+                        chunk.len() as i64,
+                        hash_bytes(&chunk)
+                    ],
+                )?;
+                offset += chunk.len() as u64;
+            }
+            swap.install()?;
             tx.execute(
-                "INSERT INTO vfs_chunks (node_id, idx, offset, length, hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    id,
-                    index as i64,
-                    offset as i64,
-                    chunk.len() as i64,
-                    hash_bytes(&chunk)
-                ],
+                "UPDATE vfs_nodes
+                 SET size = ?1, mime = ?2, version = ?3, updated_at = ?4, hash = ?5, kind = ?6
+                 WHERE id = ?7",
+                params![len, mime, version, now_value, hash, kind.as_str(), id],
             )?;
-            offset += chunk.len() as u64;
+            self.record_read(&tx, id, version, Some(hash), false)
+        })();
+        match written.and_then(|()| tx.commit().map_err(VfsError::from)) {
+            Ok(()) => swap.finish(),
+            // 没提交的事务在返回时回滚，数据库回到旧的分块行；磁盘跟着恢复。
+            Err(error) => {
+                swap.rollback();
+                return Err(error);
+            }
         }
-
-        if target.exists() {
-            std::fs::remove_dir_all(&target)?;
-        }
-        std::fs::rename(&staging, &target)?;
-
-        tx.execute(
-            "UPDATE vfs_nodes
-             SET size = ?1, mime = ?2, version = ?3, updated_at = ?4, hash = ?5, kind = ?6
-             WHERE id = ?7",
-            params![len, mime, version, now_value, hash, kind.as_str(), id],
-        )?;
-        self.record_read(&tx, id, version, Some(hash), false)?;
-        tx.commit()?;
         // 先释放连接锁再重新读取，否则会自锁。
         drop(conn);
 
