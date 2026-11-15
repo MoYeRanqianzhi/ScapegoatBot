@@ -164,6 +164,43 @@ enum Stop {
     StartFailed(anyhow::Error),
 }
 
+/// 等到守护进程该停下的那一刻，返回原因：有人要求（关闭信号、Ctrl-C、终止信号），或控制
+/// 通道自己垮了。
+///
+/// `server` 是跑 [`ipc::serve`] 的任务。它只在收到关闭信号时正常返回；在那之前返回说明控制
+/// 通道建不起来（套接字目录不安全、绑定失败、管道被占用）。没有控制通道的守护进程既查不了
+/// 状态也停不下来，所以算致命错误，而不是悄悄继续跑。返回 [`Stop::IpcFailed`] 时 `server`
+/// 的结果已经被取走，调用方不能再等它。
+async fn wait_for_stop(
+    mut shutdown: watch::Receiver<bool>,
+    server: &mut tokio::task::JoinHandle<Result<()>>,
+) -> Stop {
+    tokio::select! {
+        // 按书写顺序检查，不随机挑。`sbot stop` 发出关闭信号后，`ipc::serve` 跟着正常返回：
+        // 两个分支在同一次轮询里都可能就绪。随机挑的话，一部分正常的停止会落到最后那个分支，
+        // 被当成“控制通道垮了”，进程以错误码退出（服务管理器会把它当成崩溃再拉起来）。
+        // 关闭信号排在前面，最后一个分支就只剩“没人要求停、IPC 却结束了”这一种情况。
+        biased;
+        _ = shutdown.changed() => Stop::Requested,
+        _ = tokio::signal::ctrl_c() => {
+            info!("received Ctrl-C, shutting down");
+            Stop::Requested
+        }
+        _ = terminate_signal() => {
+            info!("received termination signal, shutting down");
+            Stop::Requested
+        }
+        result = server => {
+            let error = match result {
+                Ok(Ok(())) => anyhow::anyhow!("the IPC server stopped unexpectedly"),
+                Ok(Err(error)) => error.context("the IPC server failed"),
+                Err(error) => anyhow::anyhow!("the IPC server task failed: {error}"),
+            };
+            Stop::IpcFailed(error)
+        }
+    }
+}
+
 /// 启动时要打开的全部存储句柄。
 struct Stores {
     db: Arc<Database>,
@@ -261,32 +298,8 @@ impl Runtime {
         });
 
         let stop = {
-            let mut wait_shutdown = runtime.shutdown.subscribe();
-            // 停下来的原因：有人要求（IPC、Ctrl-C、终止信号），或控制通道自己垮了。
-            // `ipc::serve` 只在收到关闭信号时正常返回；在那之前返回说明控制通道建不起来
-            // （套接字目录不安全、绑定失败、管道被占用）。没有控制通道的守护进程既查不了
-            // 状态也停不下来，所以报错退出，而不是悄悄继续跑。
-            let stop = async {
-                tokio::select! {
-                    _ = wait_shutdown.changed() => Stop::Requested,
-                    _ = tokio::signal::ctrl_c() => {
-                        info!("received Ctrl-C, shutting down");
-                        Stop::Requested
-                    }
-                    _ = terminate_signal() => {
-                        info!("received termination signal, shutting down");
-                        Stop::Requested
-                    }
-                    result = &mut server => {
-                        let error = match result {
-                            Ok(Ok(())) => anyhow::anyhow!("the IPC server stopped unexpectedly"),
-                            Ok(Err(error)) => error.context("the IPC server failed"),
-                            Err(error) => anyhow::anyhow!("the IPC server task failed: {error}"),
-                        };
-                        Stop::IpcFailed(error)
-                    }
-                }
-            };
+            // 用最初那个接收端的副本：从建通道起的任何一次关闭信号它都看得到。
+            let stop = wait_for_stop(shutdown_rx.clone(), &mut server);
             tokio::pin!(stop);
             // 第一段：等 NapCat、建 agent，随时可以被停下。第二段：一直跑到被停下。
             let attached = tokio::select! {
@@ -918,6 +931,57 @@ impl Handler for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sbot stop` 之后关闭信号与“IPC 任务正常结束”同时就绪：必须算作有人要求停下，守护
+    /// 进程以 0 退出。曾经随机挑分支，约四分之一的正常停止被报成“IPC 意外停止”并以 1 退出。
+    #[tokio::test]
+    async fn a_requested_stop_is_not_reported_as_an_ipc_failure() {
+        // 随机挑分支时每一轮有一半以上的概率挑错，64 轮足以稳定地暴露它。
+        for _ in 0..64 {
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            // 与真实流程一样：IPC 任务看到关闭信号后正常返回。
+            let mut server = tokio::spawn({
+                let mut shutdown_rx = shutdown_rx.clone();
+                async move {
+                    let _ = shutdown_rx.changed().await;
+                    Ok(())
+                }
+            });
+            shutdown.send(true).unwrap();
+            // 等 IPC 任务真的结束，两个分支才同时就绪。
+            while !server.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let stop = wait_for_stop(shutdown_rx, &mut server).await;
+            assert!(matches!(stop, Stop::Requested));
+            // 结果没有被取走：之后还能等这个任务一次（`start` 在关闭时就这么做）。
+            assert!(server.await.unwrap().is_ok());
+        }
+    }
+
+    /// 没人要求停、IPC 任务却结束了：不管它返回的是 `Ok` 还是错误，都是致命错误。
+    #[tokio::test]
+    async fn an_ipc_server_that_ends_on_its_own_is_fatal() {
+        for result in [Ok(()), Err(anyhow::anyhow!("cannot bind"))] {
+            let failed = result.is_err();
+            // 发送端留着：通道关闭也会让 `changed()` 返回，那是另一回事。
+            let (_shutdown, shutdown_rx) = watch::channel(false);
+            let mut server = tokio::spawn(async move { result });
+            let stop = wait_for_stop(shutdown_rx, &mut server).await;
+            let Stop::IpcFailed(error) = stop else {
+                panic!("expected an IPC failure");
+            };
+            let text = format!("{error:#}");
+            if failed {
+                assert!(
+                    text.contains("the IPC server failed: cannot bind"),
+                    "{text}"
+                );
+            } else {
+                assert!(text.contains("stopped unexpectedly"), "{text}");
+            }
+        }
+    }
 
     /// 发给别的实例的命令被拒绝，并说明两边各是哪个目录、该改什么；同一个目录的不同写法
     /// 与不带目录的旧客户端照常放行。

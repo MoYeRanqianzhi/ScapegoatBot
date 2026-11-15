@@ -48,6 +48,9 @@
 - 控制通道建不起来（套接字目录不安全、绑定失败、管道被占用）时守护进程报错退出。以前要到
   退出时才发现，期间进程照常运行，但既查不了状态也停不下来。一次 accept / connect 失败不再
   让控制通道的接受循环结束。
+- `sbot stop` 之后守护进程以 0 退出。以前有时（本机实测 20 次里 5 次）把这次正常的停止报成
+  “the IPC server stopped unexpectedly”并以 1 退出：关闭信号与“控制通道任务结束”同时就绪时
+  挑错了原因。`Restart=on-failure` 的 systemd 服务会把它当成崩溃再拉起来。
 - `sbot model set` / `sbot effort set` 在 agent 启动的那一小段时间里执行时不再丢：agent 就位后
   按最新的配置再切一遍。
 - 发给另一个实例的控制命令被拒绝（`wrong_instance`）。控制通道的端点名只由 `[ipc].name`
