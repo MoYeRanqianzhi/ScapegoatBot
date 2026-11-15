@@ -84,7 +84,7 @@ unicode-normalization = "0.1"
 mimalloc = "0.1.52"
 # Unix 域套接字权限、Windows 管道 DACL 需要平台 API。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
