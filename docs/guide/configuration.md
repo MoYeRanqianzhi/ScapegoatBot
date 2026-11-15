@@ -161,7 +161,7 @@ token 放在 `env` 里：agent 读到的 `/config/mcp` 与 `/config.toml` 把 `e
 |----|------|------|
 | `enabled` | true | 子代理总开关 |
 | `max_depth` | 8 | 嵌套深度 |
-| `max_concurrency` | 16 | 并发子代理 |
+| `max_concurrency` | 16 | 同时运行的子代理数上限；给已结束的子代理发消息会重新启动它，同样占一个名额 |
 | `agents_dir` | `~/.sbot/agents` | 自定义定义目录 |
 | `default_max_steps` | 32 | 子代理步数 |
 

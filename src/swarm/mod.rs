@@ -299,8 +299,23 @@ pub struct AgentHub {
     host_dir: PathBuf,
     instances: RwLock<HashMap<String, Arc<AgentInstance>>>,
     counter: AtomicU64,
+    /// 串行化“数一遍正在运行的实例、再把一个实例标成运行中”（见 [`AgentHub::admit`]）。
+    admission: Mutex<()>,
     /// 子代理运行结束时通知 `internal:agent` monitor；运行时装配后接入。
     events: std::sync::OnceLock<crate::monitor::InternalBus>,
+}
+
+/// 一次 spawn 用的配方：内置类型或自定义定义解析出来的结果。
+struct Blueprint {
+    /// `check` 里的 `agent`：内置类型名，或自定义定义的名字。
+    label: String,
+    /// `check` 里的 `kind`：内置类型名；自定义定义一律是 `custom`。
+    kind: &'static str,
+    system: String,
+    tools: Vec<&'static str>,
+    max_steps: u32,
+    /// `API` 是否换成不能做 QQ 操作的副本。
+    local_only: bool,
 }
 
 impl AgentHub {
@@ -322,6 +337,7 @@ impl AgentHub {
             host_dir,
             instances: RwLock::new(HashMap::new()),
             counter: AtomicU64::new(1),
+            admission: Mutex::new(()),
             events: std::sync::OnceLock::new(),
         })
     }
@@ -336,6 +352,23 @@ impl AgentHub {
             }
         }
         count
+    }
+
+    /// 申请一个运行名额：还有名额就返回一把锁，调用方在放掉它之前把实例标成运行中
+    /// （新实例插进 `instances`，或把已结束实例的状态改回 `Running`）。
+    ///
+    /// 检查与占位必须是一步：`Agent` 工具可以在同一步里并行调用，monitor 的投递也在各自的
+    /// 任务里；分开做的话，几个调用会同时看到“还有名额”然后各占一个，超过上限。实例结束
+    /// （`Running` → `Done` / `Failed`）不经过这把锁，那只会让数出来的数偏大，不会超限。
+    async fn admit(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        let guard = self.admission.lock().await;
+        if self.running().await >= self.config.max_concurrency as usize {
+            anyhow::bail!(
+                "swarm concurrency limit reached ({} running)",
+                self.config.max_concurrency
+            );
+        }
+        Ok(guard)
     }
 
     /// 读取自定义定义：宿主层只读，VFS 本地层覆盖同名项。
@@ -382,6 +415,61 @@ impl AgentHub {
         out
     }
 
+    /// 把 spawn 的参数解析成配方。给了 `agent` 就用那个自定义定义；否则用内置类型，没写
+    /// `kind` 时是 `general`。`kind` 写了就必须是认识的类型名，即使同时给了 `agent`、用不上它：
+    /// 写错的参数应该报出来，而不是悄悄换成别的。
+    async fn blueprint(&self, kind: Option<&str>, agent: Option<&str>) -> Result<Blueprint> {
+        let kind = match kind {
+            Some(raw) => AgentType::parse(raw).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown agent type {raw:?}; expected general, explore, plan or docs"
+                )
+            })?,
+            None => AgentType::General,
+        };
+        let Some(agent_name) = agent else {
+            return Ok(Blueprint {
+                label: kind.as_str().to_owned(),
+                kind: kind.as_str(),
+                system: format!("{SUBAGENT_COMMON}\n\n# Your role\n{}", kind.instructions()),
+                tools: kind.tools(),
+                max_steps: self.config.default_max_steps,
+                // 内置类型没有发送权限。
+                local_only: true,
+            });
+        };
+        let definitions = self.definitions().await;
+        let definition = definitions
+            .iter()
+            .find(|definition| definition.name == agent_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown agent {agent_name:?}; available: {:?}",
+                    definitions.iter().map(|d| &d.name).collect::<Vec<_>>()
+                )
+            })?;
+        // 只接受已知的内置工具名；未知项跳过。
+        let mut tools: Vec<&'static str> = definition
+            .tools
+            .iter()
+            .filter_map(|name| known_tool(name))
+            .collect();
+        if definition.allow_send && !tools.contains(&"API") {
+            tools.push("API");
+        }
+        Ok(Blueprint {
+            label: agent_name.to_owned(),
+            kind: "custom",
+            system: definition.system_prompt(),
+            tools,
+            max_steps: definition
+                .max_steps
+                .unwrap_or(self.config.default_max_steps),
+            // 自定义定义没开 allow_send 时，`tools = [API]` 也不能做 QQ 操作。
+            local_only: !definition.allow_send,
+        })
+    }
+
     /// 生成并启动一个子代理。
     pub async fn spawn(
         &self,
@@ -403,67 +491,20 @@ impl AgentHub {
         if task.trim().is_empty() {
             anyhow::bail!("task must not be empty");
         }
-        if self.running().await >= self.config.max_concurrency as usize {
-            anyhow::bail!(
-                "swarm concurrency limit reached ({} running)",
-                self.config.max_concurrency
-            );
-        }
-
-        let (label, system, tools, max_steps, local_only) = if let Some(agent_name) = agent {
-            let definitions = self.definitions().await;
-            let definition = definitions
-                .iter()
-                .find(|definition| definition.name == agent_name)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "unknown agent {agent_name:?}; available: {:?}",
-                        definitions.iter().map(|d| &d.name).collect::<Vec<_>>()
-                    )
-                })?;
-            let mut tools: Vec<&'static str> = Vec::new();
-            for name in &definition.tools {
-                // 只接受已知的内置工具名；未知项跳过。
-                if let Some(known) = known_tool(name) {
-                    tools.push(known);
-                }
-            }
-            if definition.allow_send && !tools.contains(&"API") {
-                tools.push("API");
-            }
-            (
-                agent_name.to_owned(),
-                definition.system_prompt(),
-                tools,
-                definition
-                    .max_steps
-                    .unwrap_or(self.config.default_max_steps),
-                // 自定义定义没开 allow_send 时，`tools = [API]` 也不能做 QQ 操作。
-                !definition.allow_send,
-            )
-        } else {
-            let kind = kind
-                .and_then(AgentType::parse)
-                .unwrap_or(AgentType::General);
-            let system = format!("{SUBAGENT_COMMON}\n\n# Your role\n{}", kind.instructions());
-            (
-                kind.as_str().to_owned(),
-                system,
-                kind.tools(),
-                self.config.default_max_steps,
-                // 内置类型没有发送权限。
-                true,
-            )
-        };
+        let Blueprint {
+            label,
+            kind,
+            system,
+            tools,
+            max_steps,
+            local_only,
+        } = self.blueprint(kind, agent).await?;
 
         let id = format!("sa-{}", self.counter.fetch_add(1, Ordering::Relaxed));
         let instance = Arc::new(AgentInstance {
             id: id.clone(),
             label: label.clone(),
-            kind: kind
-                .and_then(AgentType::parse)
-                .map(|kind| kind.as_str().to_owned())
-                .unwrap_or_else(|| "custom".to_owned()),
+            kind: kind.to_owned(),
             created_at: Utc::now(),
             system: system.clone(),
             tools: tools.clone(),
@@ -479,10 +520,14 @@ impl AgentHub {
             dispatch_lock: tokio::sync::Mutex::new(()),
             finished: tokio::sync::Notify::new(),
         });
-        self.instances
-            .write()
-            .await
-            .insert(id.clone(), Arc::clone(&instance));
+        {
+            // 配方已经解析完（那一步要读盘）：名额的检查与占位之间不再有别的事。
+            let _admission = self.admit().await?;
+            self.instances
+                .write()
+                .await
+                .insert(id.clone(), Arc::clone(&instance));
+        }
 
         let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
         *instance.incoming.lock().await = Some(incoming_tx);
@@ -516,7 +561,7 @@ impl AgentHub {
         }))
     }
 
-    /// 给子代理追加消息；已完成/失败的实例会带历史重新启动。
+    /// 给子代理追加消息；已完成/失败的实例会带历史重新启动（占一个运行名额，名额满了报错）。
     ///
     /// `evidence` 是调用方这一回合的证据：
     /// - 送进正在运行的实例时，实例仍按 spawn 时的证据执行；所以 spawn 带着 owner intent、
@@ -564,6 +609,9 @@ impl AgentHub {
             finished.await;
         };
         let _dispatch = dispatch;
+        // 重新启动一个已结束的实例同样占一个运行名额；没有名额时什么都不改（代数、历史、
+        // 上一轮的结果都留着），调用方稍后再发。
+        let admission = self.admit().await?;
         instance
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -573,6 +621,7 @@ impl AgentHub {
             history.clone()
         };
         *instance.status.lock().await = InstanceStatus::Running;
+        drop(admission);
         *instance.result.lock().await = None;
         let system = format!(
             "{}\n\n# Your role\nContinue the previous task. Keep the same boundaries.",
@@ -1042,6 +1091,186 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("concurrency"));
+    }
+
+    /// 等到被放行才结束的 runner，用来把实例停在“运行中”。
+    struct GatedRunner {
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl SubagentRunner for GatedRunner {
+        async fn run_subagent(&self, request: SubagentRequest) -> Result<String> {
+            self.release.notified().await;
+            Ok(format!("done: {}", request.task))
+        }
+    }
+
+    /// 一个并发上限为 `max_concurrency` 的 hub，runner 要等放行。
+    fn gated_hub(max_concurrency: u32) -> (Arc<AgentHub>, Arc<GatedRunner>) {
+        let runner = Arc::new(GatedRunner {
+            release: tokio::sync::Notify::new(),
+        });
+        let base = hub(Arc::clone(&runner) as Arc<dyn SubagentRunner>);
+        let hub = AgentHub::new(
+            Arc::clone(&runner) as Arc<dyn SubagentRunner>,
+            SwarmConfig {
+                max_concurrency,
+                ..SwarmConfig::default()
+            },
+            Arc::clone(&base.vfs),
+            base.host_dir.clone(),
+        );
+        (hub, runner)
+    }
+
+    /// 同时发起的 spawn 不会一起挤过上限：名额的检查与占位是一步。分开做的时候，这些调用
+    /// 都先看到“还有名额”，然后各占一个。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn simultaneous_spawns_stay_within_the_limit() {
+        let (hub, _runner) = gated_hub(3);
+        let attempts = (0..24).map(|index| {
+            let hub = Arc::clone(&hub);
+            tokio::spawn(async move {
+                hub.spawn(None, None, format!("task {index}"), 0, Default::default())
+                    .await
+            })
+        });
+        let mut admitted = 0;
+        for attempt in attempts.collect::<Vec<_>>() {
+            match attempt.await.unwrap() {
+                Ok(_) => admitted += 1,
+                Err(error) => assert!(error.to_string().contains("concurrency"), "{error}"),
+            }
+        }
+        assert_eq!(admitted, 3);
+        assert_eq!(hub.running().await, 3);
+        // 被拒绝的调用不留下实例。
+        assert_eq!(hub.check(None).await.unwrap().as_array().unwrap().len(), 3);
+    }
+
+    /// 给已结束的实例发消息会把它重新启动，这同样占一个运行名额；名额满时拒绝，而且不动
+    /// 那个实例（上一轮的结果还在，之后有名额了照常续聊）。
+    #[tokio::test]
+    async fn restarting_a_finished_subagent_needs_a_free_slot() {
+        let (hub, runner) = gated_hub(1);
+        let first = hub
+            .spawn(None, None, "first".to_owned(), 0, Default::default())
+            .await
+            .unwrap();
+        let first = first["id"].as_str().unwrap().to_owned();
+        // `notify_one` 会存下一个许可，runner 还没开始等也不会漏。
+        runner.release.notify_one();
+        let done = hub
+            .wait(&first, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(done["status"], "done");
+
+        let second = hub
+            .spawn(None, None, "second".to_owned(), 0, Default::default())
+            .await
+            .unwrap();
+        let second = second["id"].as_str().unwrap().to_owned();
+
+        let error = hub
+            .message(&first, "again".to_owned(), Default::default())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("concurrency"), "{error}");
+        let untouched = hub.check(Some(&first)).await.unwrap();
+        assert_eq!(untouched[0]["status"], "done");
+        assert_eq!(untouched[0]["result"], "done: first");
+
+        runner.release.notify_one();
+        hub.wait(&second, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let restarted = hub
+            .message(&first, "again".to_owned(), Default::default())
+            .await
+            .unwrap();
+        assert_eq!(restarted["restarted"], true);
+        runner.release.notify_one();
+        let done = hub
+            .wait(&first, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(done["result"], "done: again");
+    }
+
+    /// `check` 里的 `kind` 说的是实际用了哪种配方：没写类型是 `general`，自定义定义是
+    /// `custom`（即使调用时顺手带了一个内置类型名）；不认识的类型名是错误，不悄悄当成
+    /// `general`。
+    #[tokio::test]
+    async fn the_recorded_kind_matches_what_ran() {
+        let hub = hub(Arc::new(FakeRunner::default()) as Arc<dyn SubagentRunner>);
+        hub.vfs
+            .write_text(
+                &VfsPath::parse("/agents/reviewer.md").unwrap(),
+                "---\nname: reviewer\ndescription: test\ntools: Read\n---\nReview it.",
+                None,
+            )
+            .unwrap();
+
+        let error = hub
+            .spawn(
+                Some("explorer"),
+                None,
+                "task".to_owned(),
+                0,
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown agent type"), "{error}");
+        // 同时给了自定义定义也一样：写错的类型名不会被忽略。
+        let error = hub
+            .spawn(
+                Some("explorer"),
+                Some("reviewer"),
+                "task".to_owned(),
+                0,
+                Default::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown agent type"), "{error}");
+        assert!(
+            hub.check(None)
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let mut seen = Vec::new();
+        for (kind, agent) in [
+            (None, None),
+            (Some("plan"), None),
+            (None, Some("reviewer")),
+            (Some("explore"), Some("reviewer")),
+        ] {
+            let spawned = hub
+                .spawn(kind, agent, "task".to_owned(), 0, Default::default())
+                .await
+                .unwrap();
+            let id = spawned["id"].as_str().unwrap().to_owned();
+            let checked = hub.check(Some(&id)).await.unwrap();
+            seen.push((
+                checked[0]["agent"].as_str().unwrap().to_owned(),
+                checked[0]["kind"].as_str().unwrap().to_owned(),
+            ));
+        }
+        let expected = [
+            ("general", "general"),
+            ("plan", "plan"),
+            ("reviewer", "custom"),
+            ("reviewer", "custom"),
+        ]
+        .map(|(agent, kind)| (agent.to_owned(), kind.to_owned()));
+        assert_eq!(seen, expected);
     }
 
     struct InterruptRunner {

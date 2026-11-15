@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::{Tool, ToolContext, arg_opt_str, arg_str, object_schema};
-use crate::swarm::{AgentHub, AgentType};
+use crate::swarm::AgentHub;
 use crate::transcript::ToolResult;
 
 /// 子代理管理器句柄；runner 构造完成后注入。
@@ -88,15 +88,9 @@ impl Tool for AgentTool {
                     Ok(task) => task.to_owned(),
                     Err(error) => return error,
                 };
-                let kind = arg_opt_str(&args, "type");
-                if let Some(kind) = kind
-                    && AgentType::parse(kind).is_none()
-                {
-                    return ToolResult::error("type must be general, explore, plan or docs.");
-                }
                 match hub
                     .spawn(
-                        kind,
+                        arg_opt_str(&args, "type"),
                         arg_opt_str(&args, "agent"),
                         task,
                         self.depth,

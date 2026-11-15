@@ -78,14 +78,13 @@ Dependabot 开了 4 个 PR（#1 兼容更新合集；#2 getrandom 0.4、#3 chach
 已核实并修掉的不留在这里（2026-11-16：`write_binary_chunks` 的提交顺序，见
 `src/vfs/sqlite/swap.rs`；压缩的轮转与写入不是一步，见 `SessionStore::rotate_with`。同一条里
 “`compact_now` 不拿回合锁、期间追加的内容会丢”核实后不成立：它的两个调用方都在回合锁之内，
-所有写共享历史的地方也都在回合锁之内）。
+所有写共享历史的地方也都在回合锁之内；`swarm::spawn` 的并发上限与类型记法，见
+`AgentHub::admit` / `AgentHub::blueprint`）。
 顺带看到、还没处理的：文本节点被二进制覆盖后 `content_enc` 里留着旧密文；二进制节点被文本
 覆盖后 `vfs_chunks` 行与 `blobs/<id>/` 留着——都只是占空间，读取不受影响，删节点时一并清掉。
 
 核实后：是 bug 就修并补测试，不是就从这里删掉。行号是当时的，会漂移。
 
-- [ ] `swarm/mod.rs::spawn`：`max_concurrency` 的检查与插入之间有 await（TOCTOU）；未知的
-      `type` 字符串静默退回 `general`，而 `instance.kind` 记成 `custom`。
 - [ ] `storage/messages.rs::append`：JSONL 行写完后索引事务失败会返回错误但不留索引行；
       同一条消息重投能通过去重检查，再写一行重复的 JSONL。
 - [ ] `tools/views/config.rs::write_config`：`sbot.toml` 的读-改-写没有串行化，并发写会丢
