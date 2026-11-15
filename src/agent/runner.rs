@@ -1636,17 +1636,18 @@ mod tests {
             crate::security::gate::hold_path(dir.path()),
         ));
         let tools = Arc::new(crate::tools::ToolRegistry::new(Arc::clone(&vfs), None));
+        // 两次摘要请求：第一次压缩在落盘时失败，第二次成功。
+        let summary_reply = || {
+            vec![
+                ProviderEvent::TextDelta("## Facts\ncompacted".to_owned()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    refusal: None,
+                },
+            ]
+        };
         let provider = Arc::new(FakeProvider {
-            script: StdMutex::new(
-                vec![vec![
-                    ProviderEvent::TextDelta("## Facts\ncompacted".to_owned()),
-                    ProviderEvent::Stop {
-                        reason: StopReason::EndTurn,
-                        refusal: None,
-                    },
-                ]]
-                .into(),
-            ),
+            script: StdMutex::new(vec![summary_reply(), summary_reply()].into()),
         });
         let history = Arc::new(Mutex::new(Vec::new()));
         let runner = Runner::new(
@@ -1723,6 +1724,27 @@ mod tests {
             }));
         }
         let previous = sessions.current().unwrap();
+
+        // 摘要做完了、新分段登记不上：这次压缩失败，当前分段与内存里的历史都必须原样不动
+        // （否则旧分段已经关闭、当前分段是空的，进程重启后上下文从空分段恢复）。
+        let before = history.lock().await.clone();
+        db.lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_insert BEFORE INSERT ON transcript_files
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+        let error = runner.compact_now("test").await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected failure"),
+            "{error:#}"
+        );
+        db.lock().execute_batch("DROP TRIGGER fail_insert").unwrap();
+        let unchanged = sessions.current().unwrap();
+        assert_eq!(unchanged.file, previous.file);
+        assert!(unchanged.ended_at.is_none());
+        assert_eq!(*history.lock().await, before);
+
         let value = runner.compact_now("test").await.unwrap();
         assert_eq!(value["compacted"], true);
         assert_eq!(value["previous_session"], previous.file);
@@ -1747,6 +1769,9 @@ mod tests {
             _ => true,
         }));
         assert!(crate::session::compaction::estimate_messages(&new_history) < 10_000);
+        // 新分段里落盘的就是内存里的新历史：进程重启后恢复出的上下文与现在相同。
+        assert_eq!(sessions.read_segment(&current.file).unwrap(), *new_history);
+        assert_eq!(current.message_count, new_history.len() as u64);
     }
 
     #[tokio::test]

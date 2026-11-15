@@ -126,7 +126,7 @@ impl SessionStore {
             }),
             None => {
                 let prev = self.latest_closed()?;
-                self.create(prev.as_deref())
+                self.create(prev.as_deref(), &[], None)
             }
         }
     }
@@ -237,8 +237,18 @@ impl SessionStore {
         Ok(rows)
     }
 
-    /// 轮转：关闭当前分段并创建新分段（压缩成功后调用）。
+    /// 轮转：关闭当前分段并创建一个空的新分段（清空上下文时调用）。
     pub(crate) fn rotate(&self) -> Result<SessionFile> {
+        self.rotate_with(&[])
+    }
+
+    /// 轮转，并把 `first` 作为新分段的开头（压缩时是摘要与保留的消息）。
+    ///
+    /// 要么全部发生，要么什么都没变：新分段的文件连同 `first` 先写好，然后在一个数据库事务
+    /// 里关闭旧分段、登记新分段；任何一步失败都删掉新文件，当前分段还是原来那个。分两步做
+    /// （先轮转、再追加）的话，第二步失败会留下一个空的当前分段：进程重启时上下文从它恢复，
+    /// 之前的对话连同摘要一起没了。
+    pub(crate) fn rotate_with(&self, first: &[AgentMessage]) -> Result<SessionFile> {
         let _guard = self
             .append_lock
             .lock()
@@ -248,14 +258,7 @@ impl SessionStore {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.current_unlocked()?;
-        {
-            let conn = self.db.lock();
-            conn.execute(
-                "UPDATE transcript_files SET ended_at = ?1 WHERE file = ?2",
-                params![Utc::now().to_rfc3339(), current.file],
-            )?;
-        }
-        let next = self.create(Some(&current.file))?;
+        let next = self.create(Some(&current.file), first, Some(&current.file))?;
         // 轮转后顺手清理：超过保留期或总大小超过 `max_session_bytes` 的已关闭分段。
         // 两个条件独立——只设了大小上限（默认 2 GiB、保留期 0）时同样要清理。
         if self.limits_retention()
@@ -421,8 +424,13 @@ impl SessionStore {
             .optional()?)
     }
 
-    /// 创建新分段。
-    fn create(&self, prev_file: Option<&str>) -> Result<SessionFile> {
+    /// 创建新分段，内容是 `first`；`close` 是要在同一个事务里关闭的分段（轮转时的旧分段）。
+    fn create(
+        &self,
+        prev_file: Option<&str>,
+        first: &[AgentMessage],
+        close: Option<&str>,
+    ) -> Result<SessionFile> {
         let started_at = Utc::now();
         let prefix = "";
         // `create_new` 是原子占位；冲突时换随机后缀重试，避免 exists()+create 的 TOCTOU。
@@ -437,7 +445,7 @@ impl SessionStore {
                 "{prefix}{}-{suffix}.jsonl",
                 started_at.format("%Y%m%dT%H%M%SZ")
             );
-            match self.create_named(file, file_id, prev_file, started_at) {
+            match self.create_named(file, file_id, prev_file, started_at, first, close) {
                 Ok(info) => return Ok(info),
                 Err(error)
                     if error
@@ -452,12 +460,16 @@ impl SessionStore {
         anyhow::bail!("cannot allocate a unique transcript file")
     }
 
+    /// [`create`](Self::create) 的一次尝试：用给定的文件名。文件已存在时返回
+    /// `AlreadyExists`（调用方换名字重试），不碰那个文件。
     fn create_named(
         &self,
         file: String,
         file_id: String,
         prev_file: Option<&str>,
         started_at: DateTime<Utc>,
+        first: &[AgentMessage],
+        close: Option<&str>,
     ) -> Result<SessionFile> {
         let path = self.root.join("sessions").join(&file);
         let header = json!({
@@ -471,36 +483,66 @@ impl SessionStore {
                 EncryptionMode::None => "none",
             },
         });
+        // `create_new` 失败（文件已存在）时直接返回：那不是这次调用建的文件，不能删。
         let mut handle = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .with_context(|| format!("cannot create {}", path.display()))?;
-        handle.write_all(format!("{header}\n").as_bytes())?;
-        handle.flush()?;
 
-        let info = SessionFile {
-            file,
-            file_id,
-            prev_file: prev_file.map(str::to_owned),
-            started_at: started_at.to_rfc3339(),
-            ended_at: None,
-            message_count: 0,
-            bytes: 0,
-        };
-        let conn = self.db.lock();
-        conn.execute(
-            "INSERT INTO transcript_files (file, file_id, prev_file, started_at, scope)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                info.file,
-                info.file_id,
-                info.prev_file,
-                info.started_at,
-                "shared"
-            ],
-        )?;
-        Ok(info)
+        // 从这里起文件是这次调用建的：后面任何一步失败都删掉它，不留下没登记的分段。
+        let registered = (|| -> Result<SessionFile> {
+            handle.write_all(format!("{header}\n").as_bytes())?;
+            // 与 `append` 相同的记法：行号从 1 起（第 0 行是文件头），`bytes` 不含文件头。
+            let mut bytes = 0u64;
+            for (index, message) in first.iter().enumerate() {
+                let line = self.encode_line(message, &file_id, index + 1)?;
+                handle.write_all(line.as_bytes())?;
+                bytes += line.len() as u64;
+            }
+            handle.flush()?;
+
+            let info = SessionFile {
+                file: file.clone(),
+                file_id: file_id.clone(),
+                prev_file: prev_file.map(str::to_owned),
+                started_at: started_at.to_rfc3339(),
+                ended_at: None,
+                message_count: first.len() as u64,
+                bytes,
+            };
+            let mut conn = self.db.lock();
+            let tx = conn.transaction()?;
+            if let Some(close) = close {
+                tx.execute(
+                    "UPDATE transcript_files SET ended_at = ?1 WHERE file = ?2",
+                    params![Utc::now().to_rfc3339(), close],
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO transcript_files
+                    (file, file_id, prev_file, started_at, scope, message_count, bytes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    info.file,
+                    info.file_id,
+                    info.prev_file,
+                    info.started_at,
+                    "shared",
+                    info.message_count,
+                    info.bytes
+                ],
+            )?;
+            tx.commit()?;
+            Ok(info)
+        })();
+        if registered.is_err() {
+            drop(handle);
+            if let Err(error) = std::fs::remove_file(&path) {
+                warn!(%error, file = %path.display(), "cannot remove an unregistered transcript segment");
+            }
+        }
+        registered
     }
 
     fn encode_line(&self, message: &AgentMessage, file_id: &str, line_no: usize) -> Result<String> {
@@ -715,6 +757,95 @@ mod tests {
         assert_eq!(store.current().unwrap().file, second.file);
 
         store.append(&[AgentMessage::user("two")]).unwrap();
+        assert_eq!(store.read_segment(&second.file).unwrap().len(), 1);
+    }
+
+    /// `sessions/` 下的文件名，排好序。
+    fn segment_files(dir: &tempfile::TempDir) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("sessions"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// 带着开头消息轮转：新分段一建好就有这些消息，索引里的条数与字节数和 `append` 写进去
+    /// 的记法一致（之后再追加，行号接着往下排，整段都读得出来）。
+    #[test]
+    fn rotate_with_starts_the_new_segment_with_its_first_messages() {
+        let (store, dir) = store();
+        store.append(&[AgentMessage::user("one")]).unwrap();
+        let first = store.current().unwrap();
+
+        let opening = [AgentMessage::user("summary"), assistant("kept")];
+        let second = store.rotate_with(&opening).unwrap();
+        assert_eq!(second.prev_file.as_deref(), Some(first.file.as_str()));
+        assert_eq!(second.message_count, 2);
+        assert!(store.info(&first.file).unwrap().unwrap().ended_at.is_some());
+
+        // 返回值与索引里的行一致；`bytes` 是文件头之后的全部字节。
+        let indexed = store.current().unwrap();
+        assert_eq!(indexed.file, second.file);
+        assert_eq!(indexed.message_count, 2);
+        assert_eq!(indexed.bytes, second.bytes);
+        let raw = std::fs::read(dir.path().join("sessions").join(&second.file)).unwrap();
+        let header_len = raw.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        assert_eq!(second.bytes, (raw.len() - header_len) as u64);
+
+        let messages = store.read_segment(&second.file).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], AgentMessage::user("summary"));
+
+        store.append(&[AgentMessage::user("next")]).unwrap();
+        let messages = store.read_segment(&second.file).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2], AgentMessage::user("next"));
+        assert_eq!(store.current().unwrap().message_count, 3);
+    }
+
+    /// 轮转在登记新分段时失败：旧分段没有被关闭、仍是当前分段，磁盘上不留下没登记的文件，
+    /// 之后的追加照常落在旧分段里。以前关闭旧分段与登记新分段是两条独立的语句。
+    #[test]
+    fn a_failed_rotation_changes_nothing() {
+        let (store, dir) = store();
+        store.append(&[AgentMessage::user("one")]).unwrap();
+        let first = store.current().unwrap();
+        let files_before = segment_files(&dir);
+
+        // 让登记新分段的 INSERT 失败：它在关闭旧分段的 UPDATE 之后。
+        store
+            .db
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_insert BEFORE INSERT ON transcript_files
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+        let error = store
+            .rotate_with(&[AgentMessage::user("summary")])
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected failure"),
+            "{error:#}"
+        );
+
+        let current = store.current().unwrap();
+        assert_eq!(current.file, first.file);
+        assert!(current.ended_at.is_none());
+        assert_eq!(segment_files(&dir), files_before);
+        store.append(&[AgentMessage::user("two")]).unwrap();
+        assert_eq!(store.read_segment(&first.file).unwrap().len(), 2);
+
+        // 故障排除后同一次轮转成功。
+        store
+            .db
+            .lock()
+            .execute_batch("DROP TRIGGER fail_insert")
+            .unwrap();
+        let second = store.rotate_with(&[AgentMessage::user("summary")]).unwrap();
+        assert_eq!(store.current().unwrap().file, second.file);
         assert_eq!(store.read_segment(&second.file).unwrap().len(), 1);
     }
 

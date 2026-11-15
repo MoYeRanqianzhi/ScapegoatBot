@@ -33,9 +33,10 @@ Dependabot 开了 4 个 PR（#1 兼容更新合集；#2 getrandom 0.4、#3 chach
       `.ref/` 下的 grok-build、codex、hermes）：现在的实现已经保留最近约 2 万 token 的原文
       （pi / openclaw 同款）；“无感”的三家（grok-build 默认开、codex 与 hermes 默认关）都不是
       后台算完直接换，而是提前算好一部分、到阈值时仍有一步同步操作；codex 的做法（快照时记
-      长度，采用时把之后追加的消息原样接回去）最适合这里，顺带能修掉下面“正确性风险”里压缩
-      丢消息的那一条。建议：保留尾巴不变；空闲时在软阈值提前压缩，回合边界采用；硬阈值保留
-      同步压缩兜底。
+      长度，采用时把之后追加的消息原样接回去）最适合这里。建议：保留尾巴不变；空闲时在
+      软阈值提前压缩，回合边界采用；硬阈值保留同步压缩兜底。实现时注意：现在的
+      `compact_scope` 靠回合锁保证“快照到替换之间没人追加”（见它的文档注释），提前压缩
+      在回合之外做摘要，这条前提就不成立了，必须改成“记长度、接回后缀”。
 - [ ] **命名与可扩展性**（`local.*` → `native.*`、自定义 action、任意渠道、可禁用 NapCat）：
       方向记在 [`memory/tool-surface.md`](memory/tool-surface.md)。下一步是写设计稿
       （`plan/`）给用户确认，确认前不动代码。
@@ -74,15 +75,15 @@ Dependabot 开了 4 个 PR（#1 兼容更新合集；#2 getrandom 0.4、#3 chach
 
 ## 待核实的正确性风险（2026-11-10 子代理通读长函数所得，逐条未核实）
 
-已核实并修掉的不留在这里（`write_binary_chunks` 的提交顺序：2026-11-16，见 `src/vfs/sqlite/swap.rs`）。
+已核实并修掉的不留在这里（2026-11-16：`write_binary_chunks` 的提交顺序，见
+`src/vfs/sqlite/swap.rs`；压缩的轮转与写入不是一步，见 `SessionStore::rotate_with`。同一条里
+“`compact_now` 不拿回合锁、期间追加的内容会丢”核实后不成立：它的两个调用方都在回合锁之内，
+所有写共享历史的地方也都在回合锁之内）。
 顺带看到、还没处理的：文本节点被二进制覆盖后 `content_enc` 里留着旧密文；二进制节点被文本
 覆盖后 `vfs_chunks` 行与 `blobs/<id>/` 留着——都只是占空间，读取不受影响，删节点时一并清掉。
 
 核实后：是 bug 就修并补测试，不是就从这里删掉。行号是当时的，会漂移。
 
-- [ ] `agent/runner/compaction.rs`：压缩先快照 history、放锁、长时间摘要、再整体替换；
-      `compact_now` 不拿 `turn_lock`，期间追加的内容可能丢失。`record_checkpoint` /
-      `sessions.append` 失败时分段已经轮转而 history 没变。
 - [ ] `swarm/mod.rs::spawn`：`max_concurrency` 的检查与插入之间有 await（TOCTOU）；未知的
       `type` 字符串静默退回 `general`，而 `instance.kind` 记成 `custom`。
 - [ ] `storage/messages.rs::append`：JSONL 行写完后索引事务失败会返回错误但不留索引行；

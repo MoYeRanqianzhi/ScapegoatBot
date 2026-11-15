@@ -76,6 +76,10 @@ impl Runner {
     }
 
     /// 在指定链上压缩。
+    ///
+    /// 调用方必须在回合锁之内（自动压缩在回合开头，`agent.compact` 是回合里的一次工具调用）：
+    /// 这里先取历史的快照、做完摘要再整体替换，中间不持有历史的锁。回合锁保证这段时间没有
+    /// 别的回合往共享历史与 transcript 里追加；没有它，追加的内容会被替换掉。
     async fn compact_scope(
         &self,
         reason: &str,
@@ -132,11 +136,6 @@ impl Runner {
                 previous.file
             ),
         };
-        let next = sessions.rotate()?;
-        // 检查点与分段首行摘要同时落库；分段首行仍是权威。
-        sessions
-            .record_checkpoint(&previous.file, &summary)
-            .map_err(|error| anyhow::anyhow!("cannot record the compaction checkpoint: {error}"))?;
         let mut new_history = vec![summary_message];
         // 保留消息上的 `usage` 描述的是压缩前那段（已经不存在的）提示：留着它，
         // `estimate_messages` 会拿它当基准，判定仍然超限，下次唤醒又压缩一次。
@@ -170,7 +169,13 @@ impl Runner {
                 ),
             });
         }
-        sessions.append(&new_history)?;
+        // 关闭旧分段、建新分段、写入新历史是一步（`rotate_with`）：失败时当前分段还是旧的那个，
+        // 内存里的历史也没动，下次照常重试。
+        let next = sessions.rotate_with(&new_history)?;
+        // 检查点只是可查询的副本（新分段的首行才是权威），记不上不影响这次压缩。
+        if let Err(error) = sessions.record_checkpoint(&previous.file, &summary) {
+            warn!(%error, "cannot record the compaction checkpoint");
+        }
         let kept_messages = new_history.len() - 1;
         *history.lock().await = new_history;
         // PostCompact：hooks 可能依赖刚写入的记忆/技能，重新读盘并重建。
