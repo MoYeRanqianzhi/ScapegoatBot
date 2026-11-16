@@ -110,19 +110,39 @@ impl Runner {
     }
 }
 
-/// 渲染周期检查窗口：从最新消息向前，直到字符预算。
+/// 周期检查窗口的基本长度（字符）；再加上 `check_overlap_tokens` 折算的重叠部分。
+const REVIEW_WINDOW_CHARS: usize = 48_000;
+/// 窗口长度的上限（字符）：`check_overlap_tokens` 没有上限，窗口不能跟着它无限变长——
+/// 超出审查模型的上下文窗口时请求失败，而审查失败是按放行处理的。
+const REVIEW_WINDOW_MAX_CHARS: usize = 200_000;
+
+/// 渲染周期检查窗口：最近的消息按时间顺序排列，总长不超过字符预算。
+///
+/// 永远保留最新的内容：从最新一条往回取，放不下的那一条只留它的结尾。最新一条本身就
+/// 超过预算时（一个很长的工具结果）窗口里是它的结尾，而不是空的——空窗口等于没有审查。
 fn render_review_window(history: &[AgentMessage], overlap_tokens: u64) -> String {
-    let budget = 48_000usize.saturating_add((overlap_tokens as usize).saturating_mul(4));
-    let mut out = String::new();
+    let budget = REVIEW_WINDOW_CHARS
+        .saturating_add((overlap_tokens as usize).saturating_mul(4))
+        .min(REVIEW_WINDOW_MAX_CHARS);
+    let mut left = budget;
+    // 先按“最新在前”收集，最后倒过来。
+    let mut parts: Vec<String> = Vec::new();
     for message in history.iter().rev() {
         let rendered = crate::agent::agent_loop::render_message(message);
-        if out.len() + rendered.len() + 1 > budget {
-            break;
+        let length = rendered.chars().count();
+        if length <= left {
+            left -= length;
+            parts.push(rendered);
+            continue;
         }
-        out.insert_str(0, &rendered);
-        out.insert(0, '\n');
+        if left > 0 {
+            let tail: String = rendered.chars().skip(length - left).collect();
+            parts.push(format!("…{tail}"));
+        }
+        break;
     }
-    out
+    parts.reverse();
+    parts.concat()
 }
 
 impl Runner {
@@ -148,5 +168,66 @@ impl Runner {
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 历史比预算长时，窗口里是最新的那一段，按时间顺序；最旧的被丢掉。
+    #[test]
+    fn the_review_window_keeps_the_newest_messages() {
+        // 每条约 1000 个字符，共 100 条：远超默认预算。
+        let history: Vec<AgentMessage> = (0..100)
+            .map(|index| AgentMessage::user(format!("message-{index:03} {}", "x".repeat(985))))
+            .collect();
+        let window = render_review_window(&history, 4_096);
+        let length = window.chars().count();
+        // 被截断的那一条前面多一个省略号，不计入预算。
+        assert!(
+            length <= REVIEW_WINDOW_CHARS + 4_096 * 4 + 1,
+            "window is {length} characters"
+        );
+        // 预算基本用满，没有因为一条放不下就提前停住。
+        assert!(
+            length > REVIEW_WINDOW_CHARS,
+            "window is {length} characters"
+        );
+        assert!(window.contains("message-099"), "the newest message is kept");
+        assert!(!window.contains("message-000"), "the oldest is dropped");
+        let newest = window.find("message-099").unwrap();
+        let older = window.find("message-090").unwrap();
+        assert!(older < newest, "messages stay in chronological order");
+    }
+
+    /// 最新一条自己就超过预算：窗口里是它的结尾，而不是空的。
+    #[test]
+    fn an_oversized_newest_message_is_reviewed_by_its_tail() {
+        let history = [
+            AgentMessage::user("earlier"),
+            AgentMessage::user(format!("{}THE-END", "y".repeat(300_000))),
+        ];
+        let window = render_review_window(&history, 0);
+        assert_eq!(window.chars().count(), REVIEW_WINDOW_CHARS + 1);
+        assert!(window.starts_with('…'));
+        assert!(window.trim_end().ends_with("THE-END"));
+        assert!(!window.contains("earlier"));
+    }
+
+    /// 重叠再大，窗口也不超过上限。
+    #[test]
+    fn the_review_window_is_capped() {
+        let history = [AgentMessage::user("z".repeat(1_000_000))];
+        let window = render_review_window(&history, u64::MAX);
+        assert_eq!(window.chars().count(), REVIEW_WINDOW_MAX_CHARS + 1);
+    }
+
+    /// 多字节字符按字符计数：中文内容不会被按字节多算而少看一大半。
+    #[test]
+    fn the_review_window_counts_characters() {
+        let history = [AgentMessage::user("好".repeat(40_000))];
+        let window = render_review_window(&history, 0);
+        assert_eq!(window.matches('好').count(), 40_000);
     }
 }

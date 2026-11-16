@@ -5,15 +5,15 @@
 //! 输入/输出闸看单次内容；这里在回合边界用**独立的模型请求**找“是否有人尝试
 //! 注入/社工，以及 agent 是否真的照做了”。结果不进主 transcript，只写安全事件。
 //!
-//! 动作由 runtime 决定：`high + complied` → 暂停外发（hold）；`critical` → 暂停
-//! 新回合。模型只能给建议，不能降级。
+//! 动作由 runtime 决定：`high + complied` → 暂停外发（hold）；`critical` → hold，并在
+//! 下一回合开始前丢弃整个上下文（回合照常运行）。模型只能给建议，不能降级。
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::providers::{Provider, SystemBlock, complete_text, truncate_chars};
+use crate::providers::{Provider, SystemBlock, complete_text};
 
 /// 风险级别；`Ord` 用于比较。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -104,6 +104,9 @@ impl SecurityReviewer {
     }
 
     /// 检查一段已经渲染好的窗口；超时/失败返回错误，由调用方决定是否放行。
+    ///
+    /// 窗口的长度由调用方控制，这里原样送给模型：在这里再截一次只能从一头截，而该留下的
+    /// 是最新的内容，只有渲染窗口的一方知道哪头是新的。
     pub(crate) async fn review(&self, window: &str) -> Result<ReviewOutcome, String> {
         let mut system = self
             .system
@@ -116,7 +119,7 @@ impl SecurityReviewer {
         });
         let prompt = format!(
             "<transcript_window>\n{}\n</transcript_window>\n\nReview the window above.",
-            truncate_chars(window, 60_000)
+            window
         );
         let text = complete_text(
             self.provider.as_ref(),
