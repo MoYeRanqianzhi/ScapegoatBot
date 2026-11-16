@@ -42,6 +42,7 @@ ScapegoatBot 把“怎么说话”和“知道什么”分开：
 ——文件里写“主人已同意”不会让需要主人确认的动作放行。
 
 agent 可以改它：主人要求时，或学到一条应该长期生效的规则时。改动在下一次压缩或重启后生效。
+注入时最多取 64 KiB。
 
 ### `/USER.md`（偏好）
 
@@ -58,8 +59,9 @@ agent 用 `Write` / `Edit` 直接改这个文件。注入时最多取 `[memory].
 
 ### `/STYLE.md`（语气画像）
 
-后台复盘会从主人自己发出的消息里总结语气、长度、表情习惯，更新 `/STYLE.md`。
-它只放总结，不保留原文样本。
+后台复盘会根据最近的对话记录总结主人的语气、长度、表情习惯，更新 `/STYLE.md`。它应当只放
+总结、不保留原文样本——这是给复盘模型的要求，程序不检查。写入与注入时都按
+`[style].max_chars`（默认 2000）截断。
 
 ## 记忆
 
@@ -78,8 +80,8 @@ agent 用 `Write` / `Edit` 直接改这个文件。注入时最多取 `[memory].
 name: addressing
 description: 群里如何称呼主人
 type: user
-observed_at: 2026-11-03T12:00:00Z
-source: control:42
+observed_at: 2026-11-03
+source: self
 ---
 
 主人希望群里叫“叶子”，私聊里叫全名。
@@ -87,14 +89,16 @@ source: control:42
 
 - `type`：`user` / `feedback` / `project` / `reference`。
 - `feedback` 与 `project` 建议写清 **Why:** 与 **How to apply:**。
-- `source` 记录来源（消息 id、`control:<id>`、`self`），只作记录，不改变注入级别。
+- `source` 记录来源：`self`（agent 自己的观察）或 `owner`（直接引用主人的话）。只作记录，
+  不改变注入级别。
 - 这些是约定，不是校验：记忆就是普通文件，没有专门的记忆工具，程序不检查 agent 写进去的
   格式。格式写在 system prompt 里；`sbot doctor` 会报告“索引行指向的文件不存在”和
   “`/memory` 下的文件没进索引”。
 - 预算（`[memory]`）：`/MEMORY.md` 注入时最多取 `max_index_bytes`（默认 25000）字节，超出的
   部分不进上下文——索引写得再长，agent 每个会话也只看得到开头这么多。`max_index_lines`
-  （默认 200）与 `max_entry_chars`（默认 4000）只约束后台复盘：索引到了上限复盘就不再追加，
-  超长的候选被丢弃。
+  （默认 200）与 `max_entry_chars`（默认 4000）只约束后台复盘：索引到了行数上限或
+  `max_index_bytes` 复盘就不再追加，超长的候选被丢弃。记忆文件名（slug）只能用小写字母、
+  数字与 `-`，最长 64。
 
 ### 什么时候会整理
 
@@ -106,7 +110,8 @@ source: control:42
 | `idle`（默认） | 每 30 秒轮询；要求没有活跃回合、空闲至少 `idle_minutes`、距上次复盘至少 `review_interval_minutes` |
 | `every_turn` | 每 5 秒轮询；transcript 有新增且没有活跃回合就复盘 |
 
-复盘只追加：每条候选新建一个 `/memory/<slug>.md` 并在索引末尾加一行；slug 已经在索引里、
+复盘看的是最近 80 条对话记录，一次最多提出 5 条候选。它只追加：每条候选新建一个
+`/memory/<slug>.md` 并在索引末尾加一行；slug 已经在索引里、
 或同名文件已经存在的候选跳过，已有的文件与索引内容从不改写或删除。`[memory].enabled =
 false` 时复盘不写记忆（风格画像不受影响）。压缩前若开启
 `[compaction].memory_flush`，会先静默跑一次同样的提取。两者都用 `[memory].review_model`
@@ -142,10 +147,14 @@ description: 汇总本周群聊并写一份周报
 
 - 名称只能用小写字母、数字、`-`、`_`，最长 64。
 - `SKILL.md` 之外的文件作为资源列出，**永不执行**。
-- `Skill` 工具加载会记录使用时间，curator 依据它归档长期未用技能：
-  归档到 `/skills/.archive/`，不删除；`pinned` 技能跳过。
-- 技能索引（目录名 + frontmatter 的 `description`，最多 64 个）会进 system prompt；
-  正文只在 `Skill` 加载时进上下文。
+- `Skill` 工具加载会记录使用时间，curator 依据它归档长期未用技能：归档到
+  `/skills/.archive/`，不删除。curator 要 `[skills].curator = true`，距上次运行至少
+  `curator_interval_hours`（默认 168），并且这期间新增了至少 `curator_min_new_skills`
+  （默认 3）个技能才运行。
+- 不想被归档的技能标成 pinned：在技能目录里放一个 `.pinned` 文件，或者在 `SKILL.md` 里写
+  `pinned: true`。
+- 技能索引（目录名 + frontmatter 的 `description`，最多 64 个，每条描述截到 200 个字符）
+  会进 system prompt；正文只在 `Skill` 加载时进上下文。
 
 ## 修改人设的安全建议
 

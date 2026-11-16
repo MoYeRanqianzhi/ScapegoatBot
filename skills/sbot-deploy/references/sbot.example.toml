@@ -1,9 +1,9 @@
 # ScapegoatBot 0.2 配置示例
 #
 # 严格 schema：未知字段会让启动失败；`version` 必须为 1。
-# 完整说明见 docs/guide/configuration.md。
-# 本文件由 tests/config_example.rs 校验：改坏了会让测试失败；写出的值必须等于代码默认值
-# （示例 monitor 除外），想改就在自己的配置里改。
+# 完整说明见 `sbot docs sbot-deploy configuration`。
+# 这里写出的每个值都等于程序的默认值（末尾的示例 monitor 除外）：整份照抄不会改变任何
+# 行为。要改哪一项，就在自己的 sbot.toml 里只写那一项。
 
 version = 1
 
@@ -56,7 +56,7 @@ url = "ws://127.0.0.1:3001"
 ignore_groups = []
 ignore_users = []
 ignore_patterns = []
-# 群里只有 @ 自己或回复自己时才接收。
+# 群里只接收 @ 了本账号（或 @全体成员）的消息；只回复本账号、没有 @ 的不算。
 require_mention = false
 
 [queue]
@@ -175,7 +175,7 @@ mode = "shadow"
 # jev / llm / off；llm 复用主 provider。
 backend = "jev"
 model = ""
-# Jev 端点；enforce 下必须非空，否则每个回合都会被 hold。
+# Jev 端点；backend = "jev" 且 enforce 时必须非空（auth.json 里还要有 key），否则每个回合都会被 hold。
 base_url = ""
 threshold = 0.9
 timeout_ms = 800
@@ -211,7 +211,7 @@ prune_keep_turns = 3
 # 上下文注入不在配置里：/AGENTS.md、/USER.md、/MEMORY.md、风格档案与技能索引
 # 存在即注入；其余文件（例如人设 /SOUL.md）由 agent 自己列在 VFS 的 /hooks/context.toml。
 
-# 事件 hook：事件与动作的可用组合见 docs/guide/configuration.md。
+# 事件 hook：事件与动作的可用组合见 `sbot docs sbot-deploy configuration`。
 # [[hooks.events]]
 # event = "before_send"
 # action = "rewrite"

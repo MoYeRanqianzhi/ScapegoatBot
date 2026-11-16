@@ -18,7 +18,7 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 ```
 
 `/hooks/context.toml` 不是种子文件：agent 想让别的文件（例如 `/SOUL.md`）每个会话自动注入时
-自己创建，格式见 [人设、记忆与技能](persona-memory.md)。
+自己创建，格式见 `sbot docs sbot-use persona-memory`。
 
 `/quarantine/` 由 agent 在可疑内容上创建。
 
@@ -28,10 +28,10 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 
 | 路径 | 内容 |
 |------|------|
-| `/messages` | 未读摘要 |
+| `/messages` | 未读摘要（每个 chat 有多少未读） |
 | `/messages/groups/<gid>/<YYYY-MM>/<DD>.md` | 某天群消息 |
 | `/messages/private/<qq>/<YYYY-MM>/<DD>.md` | 某天私聊消息 |
-| `/inbox` | 未读来源列表 |
+| `/inbox` | `LS` 列出有未读的 chat；`Read` 返回跨全部 chat 的一页未读消息**正文**，并把这一页标为已读 |
 | `/inbox/<chat>` | 某 chat 的未读 |
 | `/inbox/<chat>/<message_id>.md` | 单条消息 |
 | `/sessions` | transcript 分段列表 |
@@ -40,8 +40,16 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 | `/friends/<qq>.md` | 好友资料（NapCat 实时） |
 | `/groups/<gid>.md` | 群资料 |
 | `/groups/<gid>/<qq>.md` | 群成员资料 |
-| `/config` / `/config.toml` | 配置视图 |
-| `/system` / `/system/<section>` | 运行状态、hold、用量 |
+| `/config`、`/config/<节>`、`/config/<节>/<键>`、`/config.toml` | 配置视图；部分可写，见下 |
+| `/system`、`/system/<section>` | 运行状态。`/system` 等于 `/system/status`；section 有 `status`、`storage`（用量）、`security`、`gate`、`hooks`、`context`、`events` |
+
+`<chat>` 写作 `group:<群号>` 或 `private:<QQ 号>`。
+
+`/config` 是 agent 改自己配置的地方：`Write` 到 `/config/<节>/<键>`（一个 TOML 字面量）、
+`/config/<节>`（整节）或 `/config.toml`（整份）。它能改的只有 `[filter]`、`[queue]`、
+`[compaction]`、`[skills]`、`[style]`，以及 `[agent]` 的 `available_models` 与
+`thinking_level`；其余只读，hold 期间全部只读，`/config/models.json` 只读。哪些改了立即生效见
+`sbot docs sbot-deploy configuration` 的“什么时候生效”。
 
 查询参数只允许出现在这些路径上，静态文件带查询直接报错：
 
@@ -51,7 +59,8 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 ```
 
 视图先按 `filter` 筛选，再按 `order` 排序（`asc` 旧的在前，默认；`desc` 新的在前），
-然后跳过 `offset` 条、最多取 `limit` 条（默认 50、上限 500）。结果没给全时末尾附一行
+然后跳过 `offset` 条、最多取 `limit` 条（默认 50、上限 500，`limit=0` 报错）。`filter` 最长
+1024 个字符、最多 16 个条件。结果没给全时末尾附一行
 说明：可翻页的视图写明下一页的 `offset`，`/inbox` 写明还剩多少未读。
 
 - `Read` 只在消息集合上接受查询串：`/inbox`、`/inbox/<chat>`（及其 `index.md`）、
@@ -59,15 +68,18 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
   其余单文档视图（`/config.toml`、`/system/*`、单条消息等）带查询串报错。
   `Read` 的按行 `offset` / `limit` 参数不用于动态视图，传了会报错，翻页写在查询串里。
 - `LS` 在任何动态目录上接受查询串，`filter` 只认 `contains:`（比较条目路径），
-  其他条件报错。
-- `RM` 带查询串时与 `Read` 同样筛选、分页，只忽略这一页，并报告还剩多少满足条件。
+  其他条件报错。不带查询串的 `LS` 返回全部条目，不分页。
+- `RM` 在 `/inbox` 下的意思是**忽略**：把消息从收件箱里拿掉（状态变成 `dismissed`），不算
+  读过，消息本身仍在 `/messages` 里。可以忽略单条、整个 chat，或者带查询串
+  （`RM /inbox?filter=…`，不带 `filter` 的整箱忽略会被拒绝）。带查询串时与 `Read` 同样筛选、
+  分页，只忽略这一页，并报告还剩多少满足条件。
 
-`filter` 是空白分隔的若干条件，全部满足才算匹配（实现：`src/vfs/filter.rs`）：
+`filter` 是空白分隔的若干条件，全部满足才算匹配：
 
 | 条件 | 含义 |
 |------|------|
 | `unread` | 等同 `state:unread` |
-| `state:<unread\|read\|dismissed>` | 收件箱状态；不在收件箱里的消息（本账号发出的）不满足任何 `state:` |
+| `state:<unread\|read\|dismissed>` | 收件箱状态。本账号发出的消息一入库就是 `read` |
 | `from:<qq>` | 发送者 QQ 号 |
 | `mentions_self` | @ 了本账号或 @全体成员 |
 | `contains:<text>` | 正文包含子串，不区分大小写；含空白时加双引号 `contains:"a b"`，引号内 `\"`、`\\` 转义 |
@@ -79,10 +91,13 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 ### 读状态语义
 
 - `Read` 进来的内容算“读过”，按条标记已读。
-- `Grep` **不**标记：只扫描、不读入上下文。
+- `Grep` **不**改变收件箱状态：只扫描、不读入上下文。（普通文件被 `Grep` 命中后算“读过”，
+  可以直接 `Edit`，这与收件箱无关。）
 - `LS` / `Stat` 只给元信息，不标记。`Stat` 对动态文件给出类型与大小，对 `/inbox/<chat>`
   这类目录给出未读数。
-- monitor 投递同样算读入。
+- monitor 把消息投递给 agent **不**标记已读：被唤醒之后，那条消息在 `/inbox` 里仍是未读，
+  agent `Read` 了才算。唯一的例外是配置里 `qq.backlog = "inbox"` 的启动补投，补投过的标为
+  已读。
 
 ## 内置工具
 
@@ -93,11 +108,11 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 | `Read` | 读文本（`offset` 从 0 开始的行号） | `path`、`offset`、`limit` |
 | `Write` | 写文本（覆盖需先完整读过） | `path`、`content` |
 | `Edit` | 精确替换（需先读过且版本未变） | `path`、`old_text`、`new_text`、`replace_all` |
-| `LS` | 列目录 | `path` |
-| `Grep` | 正则搜索内容，大目录按子节点计量预算 | `pattern`、`path`、`file_ext`、`case_insensitive` |
+| `LS` | 列目录 | `path`、`recursive` |
+| `Grep` | 正则搜索内容。有预算：`path` 的每个直接子节点下最多扫 200 个文件（`/messages`、`/sessions` 下从最新的扫起），总共最多返回 200 行，到了预算的子节点在结果末尾注明 | `pattern`、`path`、`file_ext`、`case_insensitive` |
 | `Glob` | 按 glob 找文件 | `pattern`、`path` |
-| `RM` | 移入 `/trash`（或 `permanent: true` 彻底删；目录需 `recursive`） | `path`、`recursive`、`permanent` |
-| `MV` / `CP` | 移动 / 复制（复制受配额约束） | `from`、`to` |
+| `RM` | 移入 `/trash`（或 `permanent: true` 彻底删；目录需 `recursive`）。`/trash` 里的东西再 `RM` 就是彻底删；在 `/inbox` 下是“忽略”，见上 | `path`、`recursive`、`permanent` |
+| `MV` / `CP` | 移动 / 复制（复制受配额约束；复制目录要 `recursive: true`）。`Write`、`CP`、`Mkdir` 不能以 `/trash` 为目标 | `from`、`to`、`recursive` |
 | `Mkdir` | 建目录；父目录不存在时需要 `parents: true` | `path`、`parents` |
 | `Stat` | 类型、大小、版本、hash、子节点数 | `path` |
 
@@ -109,8 +124,8 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 | `Skill` | 加载 `/skills/<name>/SKILL.md` 与资源清单 |
 | `WebSearch` / `WebFetch` | 搜索 / 抓取；由服务端工具或你配置的后端执行 |
 | `Monitor` | 增删查事件订阅，手动触发一次 |
-| `Agent` | 生成/续聊/查询/等待子代理 |
-| `MCP` | 调用已连接的 MCP 服务器工具（可选） |
+| `Agent` | 生成/续聊/查询/等待子代理（`[swarm].enabled = false` 时没有这个工具） |
+| `MCP` | 调用已连接的 MCP 服务器工具（`[mcp].enabled = true` 时才有） |
 
 `API` 的 action 名是分层的，第一段说明效果落在哪里：
 
@@ -125,21 +140,23 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
   - `local.net.download`：`{url, path, max_bytes?}`，把 HTTP(S) 内容下载到 VFS。只连公网
     地址（SSRF 防护、域名允许/阻止、重定向逐跳校验），大小受 `[tools.download].max_bytes`
     限制；边收边加密暂存，不把整个文件留在内存里。文本类型（`text/*`、JSON、XML、JS）且
-    不超过文本上限、是合法 UTF-8 时存成文本节点，否则存成二进制。
+    不超过文本上限、是合法 UTF-8 时存成文本节点；`image/*`、`audio/*`、`video/*` 分别存成
+    图片、音频、视频节点；其余存成二进制。
 - `agent.*`：`status`、`resume`、`quarantine`、`compact`、`clear_context`。只有主代理能用
   （上下文与 hold 属于主代理，子代理调用会被拒绝）。
 - `api.*`：`list`（`namespace` 按层级前缀过滤，如 `local.media`；另有分类/关键词/分页）、
   `help`（单个 action 的 schema）。
 
-`Read` 读取 VFS 图片时会把图片作为 tool result 的 image attachment 交给 provider；
-图片处理工具的输出同样适用；图片附件会随 transcript 持久化，重启后仍可恢复
-（受 3.5 MB / MIME 限制）。超过 3.5 MB 的图片先缩成 JPEG（最长边从 2000px 起逐级
-缩小，直到放得下）；超过 64 MB 或单边超过 8192px 的图片不解码。解码与编码在阻塞
-线程池里进行，`Read`、`local.media.image.*` 与 MCP 截图共用 `src/media.rs` 的上限。`API` 的响应若包含 `base64` / `image` 字段，也会自动
+`Read` 读取 VFS 图片时会把图片作为 tool result 的 image attachment 交给 provider。
+`local.media.image.*` 的结果只是一段 JSON（输出文件的路径与尺寸），要看处理后的图片再
+`Read` 输出文件。图片附件会随 transcript 持久化，重启后仍可恢复（受 3.5 MB / MIME 限制）。
+超过 3.5 MB 的图片先缩成 JPEG（最长边从 2000px 起逐级缩小到 512px，还放不下就只返回一段
+文字说明）；超过 64 MB 或单边超过 8192px 的图片不解码。解码与编码在阻塞
+线程池里进行，`Read`、`local.media.image.*` 与 MCP 截图共用这一组上限。`API` 的响应若包含 `base64` / `image` 字段，也会自动
 转成图片附件，而不是只把 JSON 塞进文本。
 
-发送、请求处理、管理动作都在表里标注了作用域与是否 destructive；目标为 owner/master
-的踢人/禁言等动作无条件拒绝。
+目标为 owner/master 的踢人/禁言等动作无条件拒绝。图片动作的限制：`text` 最多 1000 个字符、
+字号 1–512、颜色只认 `#RRGGBB`、输出文件的扩展名只能是 `png` / `jpg` / `jpeg` / `webp`。
 
 ## 配额与清理
 
@@ -150,38 +167,45 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 | 单文本 | 1 MiB | 超限拒绝 |
 | 单二进制 | 512 MiB | 超限拒绝，blob 按 1 MiB 分块加密 |
 | 消息归档 | 10 GiB | 超限删最旧完整月份，绝不删当前月 |
-| transcript | 2 GiB | 超限关闭最旧分段 |
+| transcript | 2 GiB | 超限删除最旧的已关闭分段，绝不动当前分段 |
 | 磁盘余量 | ≥1 GiB | 低于阈值拒绝写入 |
 
 回收站不计入上表的 VFS 总量，但有自己的上限：字节不超过总量的 10%、节点不超过节点上限的
 10%，条目保留 30 天。移入时就在同一事务里执行上限（超出时先清最早移入的；单个条目自己就超限
 时直接永久删除，`RM` 会如实报告），过期条目由每天一次的后台清理移除。从回收站恢复（`MV` 出
-`/trash`）按活跃配额检查，放不下就拒绝。墓碑与用量可在 `/system` 查看；`/system/events` 列出最近 100 条 notice/request/meta/unknown
-原始事件（正文已解密）。
+`/trash`）按活跃配额检查，放不下就拒绝。用量在 `/system/storage`；被清理掉的 transcript 分段
+在 `/sessions/index.jsonl` 里标着 `pruned`。`/system/events` 列出最近 100 条
+notice/request/meta/unknown 原始事件（正文已解密）。
 
 ## 子代理
 
 `Agent` 工具的动作：
 
 ```json
-{"action": "spawn", "task": "...", "agent": "explore"}
+{"action": "spawn", "task": "...", "type": "explore"}
+{"action": "spawn", "task": "...", "agent": "reviewer"}
 {"action": "message", "id": "sa-1", "text": "..."}
 {"action": "check", "id": "sa-1"}
 {"action": "wait", "id": "sa-1", "timeout_secs": 60}
 {"action": "list"}
 ```
 
-- 内置类型：`general`、`explore`、`plan`、`docs`。
-- 自定义：`/agents/<name>.md`，frontmatter 支持 `tools`、`model`、`thinking_level`、
-  `max_steps`、`allow_send`。
+- 内置类型用 `type`：`general`、`explore`、`plan`、`docs`。
+- 自定义定义用 `agent`（定义的名字）：VFS 的 `/agents/<name>.md`，或宿主机上
+  `[swarm].agents_dir`（默认 `~/.sbot/agents`，只读）里的同名文件，两边都有时 VFS 的优先。
+  frontmatter 支持 `name`、`description`、`tools`、`max_steps`、`allow_send`。`tools` 只认
+  内置工具的名字（没有 `MCP`），写了不认识的名字会被悄悄跳过。子代理用的模型始终是主 agent
+  当前的模型，不能单独指定。
 - 工具集强制是父代理的子集。子代理的 `API` 默认只有 `local.*` 与 `api.*`，不能做任何 QQ
   操作（`napcat.*` 的查询也不行）；只有自定义定义写了 `allow_send: true` 才拿到完整的
   `API`。`agent.*` 对任何子代理都拒绝。`general` 的工具：`Read`/`LS`/`Stat`/`Glob`/`Grep`、
   `Write`/`Edit`/`MV`/`CP`/`Mkdir`、`API`、`WebSearch`/`WebFetch`、`Monitor`（没有 `RM`）；
-  `docs` 是只读文件工具加 `API`；`explore` / `plan` 只有只读文件工具。
+  `docs` 是只读文件工具加 `API`；`explore` / `plan` 只有只读文件工具。子代理拿不到由
+  provider 执行的服务端工具：`WebSearch` / `WebFetch` 走服务端时，子代理没有这两个工具。
 - 子代理（包括自定义定义）**不能**：写 `/config`、`/config.toml`、`/MEMORY.md`、`/memory`、
   `/USER.md`、`/AGENTS.md`、`/agents`、`/hooks`（`Write`/`Edit`/`MV`/`CP`/`Mkdir` 与 `API`
-  的 `local.*` 输出都拒绝），删除任何东西（`RM`、`MV` 进 `/trash`）。要改这些就写进结果，
+  的 `local.*` 输出都拒绝），删除任何东西（`RM`、`MV` 进 `/trash`，也包括忽略收件箱里的
+  消息）。要改这些就写进结果，
   由主代理决定。
 - 子代理用 `Monitor add` 建的 monitor 只投给它自己（`deliver.to` 省略或写自己的 id）。
 - 子代理有独立上下文，结果回给父代理；`max_depth` 限制嵌套。
@@ -190,5 +214,6 @@ agent 不直接接触宿主文件系统。它看到一个 POSIX 风格的虚拟�
 ## MCP
 
 `[mcp].enabled = true` 后，启动时连接配置的 stdio 服务器并发现工具。模型只看到
-一个 `MCP` 工具，参数为 `{server, tool, args}`。服务器失败只告警；stdio 单行与
-单次结果都有上限（8 MiB / 256 KiB），超出报错或截断。
+一个 `MCP` 工具，参数为 `{server, tool, args}`；不写 `server` / `tool` 时返回已连接的服务器、
+它们的工具与启动失败的服务器。服务器失败只告警；stdio 单行与单次结果都有上限
+（8 MiB / 256 KiB），超出报错或截断；单次请求 30 秒超时。

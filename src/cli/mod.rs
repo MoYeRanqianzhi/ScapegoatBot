@@ -2,7 +2,8 @@
 //!
 //! 设计依据：设计 §2.1 / §2.3 / §9.5。
 //!
-//! CLI 是独立进程：`start` 变成守护进程本身，其余子命令通过 IPC 与控制通道交互。
+//! CLI 是独立进程：`start` 变成守护进程本身，`backup` / `doctor` / `docs` 在本地完成，
+//! 其余子命令通过 IPC 与控制通道交互。
 //! 人类面输出可以本地化；这里用中文，便于主人直接阅读。
 
 use std::path::{Path, PathBuf};
@@ -15,8 +16,9 @@ use crate::config::{IpcConfig, LoadedConfig, SbotConfig};
 use crate::ipc::{self, AiAction, Request, RequestBody, Response};
 use crate::paths::SbotPaths;
 
-/// 本地子命令模块：备份与诊断。
+/// 本地子命令模块：备份、诊断与内嵌文档。
 pub mod backup;
+pub mod docs;
 pub mod doctor;
 // `sbot --version` 的构建信息（目标平台、CPU 等级）。
 mod version;
@@ -95,6 +97,16 @@ pub enum Command {
     },
     /// 只读一致性自检：配置、密钥、索引、记忆对账。
     Doctor,
+    /// 打印编在二进制里的使用文档（部署、使用、运维）；不带参数列出全部。
+    Docs {
+        /// skill 名，例如 `sbot-deploy`。
+        skill: Option<String>,
+        /// 该 skill 的参考文件名，例如 `configuration`。
+        reference: Option<String>,
+        /// 不打印，把整套文件写进这个目录（每个 skill 一个子目录）。
+        #[arg(long, value_name = "DIR", conflicts_with_all = ["skill", "reference"])]
+        export: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -119,12 +131,12 @@ pub enum GateCommand {
     Pending,
     /// 批准一个请求；批准后 120 秒内可重试一次。
     Approve {
-        /// 请求 id，例如 `g1`。
+        /// 请求 id：`sbot gate pending` 列出的 `id`。
         id: String,
     },
     /// 拒绝一个请求。
     Reject {
-        /// 请求 id，例如 `g1`。
+        /// 请求 id：`sbot gate pending` 列出的 `id`。
         id: String,
     },
 }
@@ -148,6 +160,15 @@ pub enum EffortAction {
 /// 入口：解析参数并分派。
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
+    // 文档在定位实例目录之前处理：它不需要 `~/.sbot`，连主目录都找不到的环境里也要能用。
+    if let Command::Docs {
+        skill,
+        reference,
+        export,
+    } = &cli.command
+    {
+        return docs::run(skill.as_deref(), reference.as_deref(), export.as_deref());
+    }
     let paths = SbotPaths::discover()?;
 
     match cli.command {
@@ -172,7 +193,7 @@ async fn run_remote(command: Command, paths: &SbotPaths, config: Option<PathBuf>
     };
 
     match command {
-        Command::Start | Command::Backup { .. } | Command::Doctor => {
+        Command::Start | Command::Backup { .. } | Command::Doctor | Command::Docs { .. } => {
             unreachable!("local commands are handled before the daemon connection")
         }
         Command::Status => daemon.run(RequestBody::Status).await,

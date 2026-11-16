@@ -4,7 +4,7 @@
 //!
 //! - 用 SQLite backup API 生成一致性快照，运行中也可以执行；
 //! - 连同 `key`、`sbot.toml`、`models.json`、`auth.json`、`messages/`、
-//!   `sessions/`、`blobs/`、`skills/`、`agents/` 一起复制；
+//!   `sessions/`、`blobs/`、`agents/` 一起复制（技能在 VFS 里，已随数据库快照）；
 //! - 归档包含主密钥：泄露归档等于泄露全部内容，输出里必须明确警告；
 //! - 默认写入 `~/.sbot/backups/<timestamp>/`，自定义路径时同样警告。
 

@@ -1,6 +1,6 @@
 //! `Views` 的联系人部分：`/friends` 与 `/groups`，实时查询 NapCat。
 //!
-//! 路由（与 `docs/guide/tools-and-vfs.md` 一致）：
+//! 路由（与 `skills/sbot-use/references/tools-and-vfs.md` 一致）：
 //!
 //! | 路径 | 列目录 | 读文件 |
 //! |------|--------|--------|

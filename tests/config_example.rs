@@ -5,19 +5,22 @@
 use scapegoat_bot::config::SbotConfig;
 use scapegoat_bot::config::models::ModelsFile;
 
+/// 带注释的完整样例；随部署 skill 一起编进二进制（`sbot docs sbot-deploy sbot.example.toml`）。
+const EXAMPLE: &str = "skills/sbot-deploy/references/sbot.example.toml";
+
 #[test]
 fn config_example_is_valid() {
-    let loaded = SbotConfig::load("config.example.toml").expect("config.example.toml must parse");
+    let loaded = SbotConfig::load(EXAMPLE).expect("the example config must parse");
     loaded
         .config
         .validate_shape()
-        .unwrap_or_else(|errors| panic!("config.example.toml failed validation:\n{errors}"));
+        .unwrap_or_else(|errors| panic!("{EXAMPLE} failed validation:\n{errors}"));
 
     let models = ModelsFile::embedded().expect("default models");
     loaded
         .config
         .validate_with_models(&models)
-        .unwrap_or_else(|errors| panic!("config.example.toml vs models:\n{errors}"));
+        .unwrap_or_else(|errors| panic!("{EXAMPLE} vs models:\n{errors}"));
 }
 
 #[test]
@@ -30,23 +33,38 @@ fn default_config_passes_shape_validation() {
 }
 
 #[test]
-fn readme_minimal_configs_are_valid() {
-    // README 与入门指南里“最小配置”的 toml 代码块必须真的能启动：直接从文档里抽出来测，
-    // 不再维护一份内联副本（副本会和文档各自漂移）。
+fn documented_configs_are_valid() {
+    // README 与部署 skill 里的 toml 代码块必须真的能用：直接从文档里抽出来测，不再维护一份
+    // 内联副本（副本会和文档各自漂移）。每份文档的第一个代码块是“最小配置”，必须独立通过
+    // 校验；后面的代码块是往配置里加的片段，接在最小配置后面也必须通过——配置是严格
+    // schema，文档里写错一个键名，照着做的人就启动不了。
     let models = ModelsFile::embedded().expect("default models");
-    for doc in ["README.md", "docs/guide/README.md"] {
+    // 代码块的数量写死：数量变了说明文档结构变了，上面的假设要跟着核对。
+    for (doc, expected) in [("README.md", 1), ("skills/sbot-deploy/SKILL.md", 2)] {
         let text = std::fs::read_to_string(doc).unwrap();
         let blocks = toml_blocks(&text);
-        // 两份文档都只有一个 toml 代码块，就是最小配置；数量变了说明文档结构变了，要跟着改。
-        assert_eq!(blocks.len(), 1, "{doc}: expected exactly one toml block");
-        let config: SbotConfig = toml::from_str(&blocks[0])
-            .unwrap_or_else(|error| panic!("{doc}: minimal config does not parse: {error}"));
-        config
-            .validate_shape()
-            .unwrap_or_else(|errors| panic!("{doc}: minimal config invalid:\n{errors}"));
-        config
-            .validate_with_models(&models)
-            .unwrap_or_else(|errors| panic!("{doc}: minimal config vs models:\n{errors}"));
+        assert_eq!(
+            blocks.len(),
+            expected,
+            "{doc}: unexpected number of toml blocks"
+        );
+        let minimal = &blocks[0];
+        for (index, block) in blocks.iter().enumerate() {
+            let source = if index == 0 {
+                minimal.clone()
+            } else {
+                format!("{minimal}\n{block}")
+            };
+            let config: SbotConfig = toml::from_str(&source).unwrap_or_else(|error| {
+                panic!("{doc}: toml block {index} does not parse: {error}")
+            });
+            config
+                .validate_shape()
+                .unwrap_or_else(|errors| panic!("{doc}: toml block {index} invalid:\n{errors}"));
+            config
+                .validate_with_models(&models)
+                .unwrap_or_else(|errors| panic!("{doc}: toml block {index} vs models:\n{errors}"));
+        }
     }
 }
 
@@ -72,7 +90,7 @@ fn toml_blocks(markdown: &str) -> Vec<String> {
 
 #[test]
 fn config_example_has_no_credentials() {
-    let text = std::fs::read_to_string("config.example.toml").unwrap();
+    let text = std::fs::read_to_string(EXAMPLE).unwrap();
     assert!(!text.contains("sk-"), "no literal key may appear");
     for line in text.lines() {
         let line = line.trim();
@@ -89,8 +107,8 @@ fn config_example_has_no_credentials() {
 #[test]
 fn config_example_values_match_code_defaults() {
     // 示例写出的每个值都必须等于代码默认值：以前示例与代码各说各的（max_steps 48 / 64 等）。
-    let text = std::fs::read_to_string("config.example.toml").unwrap();
-    let example: toml::Value = toml::from_str(&text).expect("config.example.toml must parse");
+    let text = std::fs::read_to_string(EXAMPLE).unwrap();
+    let example: toml::Value = toml::from_str(&text).expect("the example config must parse");
     let defaults = toml::Value::try_from(SbotConfig::default()).expect("defaults serialize");
     let mut diffs = Vec::new();
     collect_differences("", &example, &defaults, &mut diffs);
@@ -98,7 +116,7 @@ fn config_example_values_match_code_defaults() {
     diffs.retain(|diff| !diff.starts_with("monitor:"));
     assert!(
         diffs.is_empty(),
-        "config.example.toml differs from the code defaults:\n{}",
+        "{EXAMPLE} differs from the code defaults:\n{}",
         diffs.join("\n")
     );
 }

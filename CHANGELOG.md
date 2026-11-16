@@ -14,6 +14,18 @@
 - `sbot backup --output` 只接受空目录或还不存在的目录；已有内容的目录现在报错，什么都不写。
   往上一次的备份里再写一遍得到的不是一致的快照（已经删掉的消息文件还留在里面）。
 
+### 新增
+
+- `sbot docs`：说明书内嵌在二进制里，与它同一个版本。`sbot docs` 列出全部，
+  `sbot docs <skill>` 打印一个 skill，`sbot docs <skill> <reference>` 打印它的一份参考文件，
+  `sbot docs --export <DIR>` 把整套文件写进一个目录。它不需要 `~/.sbot`、不需要守护进程，
+  在一台什么都还没配的机器上就能用。
+- 四个 agent skill，在仓库的 `skills/` 下，也就是 `sbot docs` 内嵌的那一份：`sbot`（从哪里
+  开始）、`sbot-deploy`（安装、NapCat、配置、服务管理器、升级与换机器）、`sbot-use`（命令、
+  审批、三个开关、人设与记忆、工具与 VFS）、`sbot-operate`（读状态、排障、hold、备份与恢复、
+  安全模型、已知限制）。内容按当前代码逐条核对过：引用的日志与报错是原文，配置样例由测试
+  校验。
+
 ### 修复
 
 - `sbot backup --output` 指向实例目录本身（例如 `~/.sbot`）时不再毁掉主密钥。那时密钥、
@@ -103,6 +115,9 @@
 
 ### 变更
 
+- `docs/guide/` 并入上面的 skill，目录删除；`config.example.toml` 移到
+  `skills/sbot-deploy/references/sbot.example.toml`（`sbot docs sbot-deploy sbot.example.toml`）。
+  `docs/development/` 删除：开发侧的约定在 `.agents/memory/`。
 - 依赖升级：`chacha20poly1305` 0.10 → 0.11、`getrandom` 0.3 → 0.4、`windows-sys` 0.59 → 0.61，
   以及 `clap`、`serde`、`serde_json`、`chrono`、`regex`、`tempfile`、`tracing-subscriber` 的
   补丁 / 次版本更新。加密算法、密钥派生与密文格式不变：新增的测试用 0.10 加密出来的一段

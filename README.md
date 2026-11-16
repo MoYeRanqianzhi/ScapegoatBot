@@ -3,9 +3,9 @@
 一个 QQ Agent：代替主人、像真人一样回复消息。守护进程通过 NapCat（OneBot 11）收发
 QQ 消息，用可配置的 LLM 生成回复，并把所有状态集中在本机 `~/.sbot`。
 
-> 0.2 是完全重写的版本，旧的 0.1 代码没有迁移；重构量化见
-> [docs/development/refactor-report.md](docs/development/refactor-report.md)。
-> 使用说明见 [docs/guide/](docs/guide/README.md)。
+> 0.2 是完全重写的版本，旧的 0.1 代码与数据都没有迁移。
+> 说明书在二进制里，与它同一个版本：`sbot docs` 列出全部，`sbot docs sbot` 从头讲起。同一份内容在
+> 仓库的 [skills/](skills/) 下，也可以用 `sbot docs --export <目录>` 导出，直接装成 agent skill。
 
 ## 能力
 
@@ -42,7 +42,7 @@ QQ 消息，用可配置的 LLM 生成回复，并把所有状态集中在本机
 
 预编译版本在 [Releases](https://github.com/MoYeRanqianzhi/ScapegoatBot/releases)：Linux（glibc 与
 全静态的 musl）、Windows、macOS，x86_64 与 aarch64 都有，解开就能用；该下哪个文件见
-[docs/guide/install.md](docs/guide/install.md)。从源码构建需要 Rust 1.89+（edition 2024；
+[skills/sbot-deploy/SKILL.md](skills/sbot-deploy/SKILL.md)。从源码构建需要 Rust 1.89+（edition 2024；
 `Cargo.toml` 的 `rust-version`）：
 
 ```bash
@@ -60,7 +60,8 @@ VFS 种子（`/AGENTS.md`、`/MEMORY.md`、`/USER.md`、`/memory/*`、`/agents`�
 SBOT_HOME=/tmp/sbot ./target/release/sbot start
 ```
 
-完整安装步骤见 [docs/guide/install.md](docs/guide/install.md)。
+完整的部署步骤（NapCat、凭据、服务管理器、升级与换机器）：`sbot docs sbot-deploy`，即
+[skills/sbot-deploy/SKILL.md](skills/sbot-deploy/SKILL.md)。
 
 ### 最小配置
 
@@ -80,9 +81,11 @@ url = "ws://127.0.0.1:3001"
 # 留空表示接收全部；规则语义是“拒收”，不是静默。
 ```
 
-所有可用键、默认值与 `models.json` / `auth.json` 格式见
-[docs/guide/configuration.md](docs/guide/configuration.md)，可运行样例是仓库根目录的
-[config.example.toml](config.example.toml)（由 `tests/config_example.rs` 校验）。
+所有可用键、默认值与 `models.json` / `auth.json` 格式：`sbot docs sbot-deploy configuration`
+（[configuration.md](skills/sbot-deploy/references/configuration.md)）。写全了每个默认值的样例：
+`sbot docs sbot-deploy sbot.example.toml`
+（[sbot.example.toml](skills/sbot-deploy/references/sbot.example.toml)，由
+`tests/config_example.rs` 校验）。
 
 ### 凭据
 
@@ -123,9 +126,10 @@ url = "ws://127.0.0.1:3001"
 | `sbot effort set <level>` / `list` | 热切换 effort / 列出当前模型支持的级别 |
 | `sbot backup [--output DIR]` | SQLite 快照 + 文件归档；**包含主密钥与 `auth.json`（明文 API key）** |
 | `sbot doctor` | 只读诊断，不修复数据 |
+| `sbot docs [<skill> [<reference>]]` / `--export <DIR>` | 列出、打印或导出内嵌的说明书 |
 
 `--config <PATH>` 可指定另一份 `sbot.toml`；`backup` / `doctor` / `start` 直接读本地
-文件，不需要守护进程在跑。
+文件，不需要守护进程在跑；`docs` 连 `~/.sbot` 都不需要。
 
 ## 安全模型
 
@@ -144,8 +148,9 @@ url = "ws://127.0.0.1:3001"
   `sessions/` 无法解密。
 - **威胁边界**：不防同机管理员、不防进程内存读取。
 
-细节与未实现项见 [docs/guide/security.md](docs/guide/security.md) 与
-[docs/guide/limits.md](docs/guide/limits.md)。
+细节与未实现项：`sbot docs sbot-operate security`
+（[security.md](skills/sbot-operate/references/security.md)）与 `sbot docs sbot-operate limits`
+（[limits.md](skills/sbot-operate/references/limits.md)）。
 
 ## 隐私与已知限制
 
@@ -160,7 +165,7 @@ url = "ws://127.0.0.1:3001"
   （`max_concurrent` 的信号量上限需重启）。
 - 尚未提供旧 0.1 数据迁移；0.2 从空存储开始。
 - 已知边界（审批通道、启发式规则、WebFetch 后端抓取、群级动作保护等）见
-  [docs/guide/limits.md](docs/guide/limits.md)。
+  [limits.md](skills/sbot-operate/references/limits.md)。
 
 ## 测试
 
@@ -184,7 +189,7 @@ SBOT_LIVE_BASE_URL=... SBOT_LIVE_API_KEY=... SBOT_LIVE_MODEL=... \
 `SBOT_LIVE_JEV_BASE_URL` / `SBOT_LIVE_JEV_API_KEY` 用于真实 Jev 分类器测试。
 `tests/onebot_mock_client.rs` 与 `tests/napcat_api.rs` 对本地模拟的 OneBot 服务端运行，
 不需要 NapCat，随 `cargo test` 一起跑；真实 NapCat 的验证步骤见
-[docs/development/live-testing.md](docs/development/live-testing.md)。
+[.agents/memory/live-testing.md](.agents/memory/live-testing.md)。
 
 ## 目录
 
@@ -214,9 +219,8 @@ src/
   ipc/             命名管道 / UDS
   cli/             命令、备份、诊断
   config/          根结构 + sections/ 分节 schema
-docs/
-  guide/           用户指南
-  development/     开发文档（架构入口、实机测试、提示词维护）
+skills/            说明书：sbot、sbot-deploy、sbot-use、sbot-operate；编译时内嵌进二进制（`sbot docs`）
+.agents/           给开发者（人与 agent）的记忆、计划与 TODO；本项目没有另外的开发文档
 ```
 
 ## License

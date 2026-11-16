@@ -50,6 +50,11 @@ x86_64 还按 CPU 等级各出一份，等级写在架构后面（\`x86_64_v3-un
 不确定就先下不带后缀的版本，运行 \`sbot --version\`：\`cpu:\` 一行是这台机器能用的最高等级，再换成对应的
 文件。选高了，程序一启动就以“非法指令”（Illegal instruction）退出，不会有别的影响。
 
+## 文档
+
+说明书在二进制里，与它同一个版本：\`sbot docs\` 列出全部，\`sbot docs sbot-deploy\` 从安装讲起，
+\`sbot docs --export <目录>\` 把整套文件导出成 agent skill。
+
 ## 校验
 
 \`\`\`bash
