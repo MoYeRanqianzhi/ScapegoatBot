@@ -79,14 +79,13 @@ Dependabot 开了 4 个 PR（#1 兼容更新合集；#2 getrandom 0.4、#3 chach
 `src/vfs/sqlite/swap.rs`；压缩的轮转与写入不是一步，见 `SessionStore::rotate_with`。同一条里
 “`compact_now` 不拿回合锁、期间追加的内容会丢”核实后不成立：它的两个调用方都在回合锁之内，
 所有写共享历史的地方也都在回合锁之内；`swarm::spawn` 的并发上限与类型记法，见
-`AgentHub::admit` / `AgentHub::blueprint`）。
+`AgentHub::admit` / `AgentHub::blueprint`；`messages::append` 索引写失败后留下的行，见
+`MessageStore::index_appended` 的调用处）。
 顺带看到、还没处理的：文本节点被二进制覆盖后 `content_enc` 里留着旧密文；二进制节点被文本
 覆盖后 `vfs_chunks` 行与 `blobs/<id>/` 留着——都只是占空间，读取不受影响，删节点时一并清掉。
 
 核实后：是 bug 就修并补测试，不是就从这里删掉。行号是当时的，会漂移。
 
-- [ ] `storage/messages.rs::append`：JSONL 行写完后索引事务失败会返回错误但不留索引行；
-      同一条消息重投能通过去重检查，再写一行重复的 JSONL。
 - [ ] `tools/views/config.rs::write_config`：`sbot.toml` 的读-改-写没有串行化，并发写会丢
       更新；`notify` 在句柄替换之前调用。
 - [ ] `cli/backup.rs`：`output.starts_with(source)` 比较的是没有规范化的路径（相对路径、
@@ -105,13 +104,13 @@ Dependabot 开了 4 个 PR（#1 兼容更新合集；#2 getrandom 0.4、#3 chach
 ## 仍然超过 100 行的函数（不阻塞）
 
 `app::dispatch` 176、`runner::run_turn` 166、`views::system::read_system` 156、
-`loop::run_with_steering` 155、`app::start` 154、`loop::request_once` 141、`swarm::spawn` 131、
+`loop::run_with_steering` 155、`app::start` 154、`loop::request_once` 141、
 `backup::run_with_paths` 127、`runner::run_subagent` 124、`views::config::write_config` 122
 （“校验 → 落盘 → 通知 → 换句柄”的收尾重复了 3 次）、`monitor::validate_monitor` 122、
-`assembly::build_agent` 120、`messages::append` 118、`events::handle_qq_event` 118、
+`assembly::build_agent` 120、`events::handle_qq_event` 118、
 `delivery::deliver_once` 117、`compaction::compact_scope` 115。其中是“一个 match 平铺 /
-同一层的线性步骤”的不必拆；有重复块或混了几件事的（`write_config`、`run_turn`、
-`spawn`、`append`）值得拆。
+同一层的线性步骤”的不必拆；有重复块或混了几件事的（`write_config`、`run_turn`）值得拆。
+`swarm::spawn`（89）与 `messages::append`（86）在 2026-11-16 修 bug 时拆过了。
 
 ## 外部验证（需 NapCat 登录）
 

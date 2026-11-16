@@ -133,6 +133,24 @@ fn next_line(cache: &mut HashMap<PathBuf, (u64, usize)>, path: &Path) -> Result<
     Ok((length, count))
 }
 
+/// 一行消息落在了哪里：登记索引时用。
+struct Placement<'a> {
+    /// 日文件相对数据根目录的路径（`messages/<scope>/<peer>/<月>/<日>.jsonl`）。
+    relative: &'a str,
+    /// 会话类型目录：`groups` / `private`。
+    scope: &'a str,
+    /// 群号或对端 QQ。
+    peer: u64,
+    /// `YYYY-MM`。
+    month: &'a str,
+    /// `YYYY-MM-DD`。
+    date: &'a str,
+    /// 这一行在文件里的物理行号（文件头是第 0 行）。
+    line_no: usize,
+    /// 这一行的字节数（含换行），计入配额。
+    bytes: usize,
+}
+
 impl MessageStore {
     /// 打开存储并确保目录存在。
     pub(crate) fn open(
@@ -219,9 +237,41 @@ impl MessageStore {
                 return Err(error.into());
             }
         }
-        let line_no = line_no as i64;
+        // 索引写在文件之后。索引写不进去时把刚写的那一行截掉：留着它，这条消息再投递一次
+        // 会通过上面的去重检查（索引里没有它），在文件里再写一行。进程恰好死在两步之间时
+        // 那一行会留下来，由 `rebuild_index` 补进索引。
+        let placement = Placement {
+            relative: &relative,
+            scope,
+            peer,
+            month: &month,
+            date: &date,
+            line_no,
+            bytes: line.len(),
+        };
+        if let Err(error) = self.index_appended(message, &placement) {
+            let truncated = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_len(length));
+            match truncated {
+                Ok(()) => {
+                    lines.insert(path, (length, line_no));
+                }
+                Err(truncate_error) => {
+                    // 截不掉就按磁盘重新数行号；那一行等 `rebuild_index` 收进索引。
+                    lines.remove(&path);
+                    warn!(%truncate_error, file = %relative, "cannot remove a message line whose index entry failed");
+                }
+            }
+            return Err(error);
+        }
+        Ok(true)
+    }
 
-        // 索引写入放在文件之后：即使进程在两者之间崩溃，`rebuild_index` 能补回来。
+    /// 把刚写进文件的一行登记进索引：`messages`、收件箱状态、文件的条数与字节数、媒体来源，
+    /// 在一个事务里。
+    fn index_appended(&self, message: &QqMessage, placement: &Placement<'_>) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let mut conn = self.db.lock();
         let tx = conn.transaction()?;
@@ -235,9 +285,9 @@ impl MessageStore {
                 message.message_id,
                 message.sender.label(),
                 message.time.to_rfc3339(),
-                date,
-                relative,
-                line_no,
+                placement.date,
+                placement.relative,
+                placement.line_no as i64,
                 message.reply_to,
                 message.is_self as i32
             ],
@@ -262,12 +312,12 @@ impl MessageStore {
                 bytes = message_files.bytes + ?6,
                 updated_at = excluded.updated_at",
             params![
-                relative,
-                scope,
-                peer as i64,
-                month,
-                date,
-                line.len() as i64,
+                placement.relative,
+                placement.scope,
+                placement.peer as i64,
+                placement.month,
+                placement.date,
+                placement.bytes as i64,
                 now
             ],
         )?;
@@ -280,7 +330,7 @@ impl MessageStore {
             )?;
         }
         tx.commit()?;
-        Ok(true)
+        Ok(())
     }
 
     /// 按 message_id 找它所属的 chat；`get_msg` 没有 chat 参数时用它做范围校验。
@@ -817,6 +867,63 @@ mod tests {
         assert_eq!(texts, vec!["a", "c"]);
         assert_eq!(store.rebuild_index().unwrap(), 1);
         assert_eq!(store.recent(chat, 10).unwrap().len(), 3);
+    }
+
+    /// 文件写成功、索引写失败：这次追加报错，文件里不留下那一行；同一条消息再投递一次只
+    /// 写一份。留着那一行的话，重投能通过去重检查（索引里没有它），文件里就有两行同一条消息。
+    #[test]
+    fn a_failed_index_write_leaves_no_line_behind() {
+        let (store, dir) = store();
+        let chat = ChatId::Group(123);
+        store.append(&message(chat, 1, "a")).unwrap();
+        let file = walk(dir.path())
+            .into_iter()
+            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .unwrap();
+        let before = std::fs::read(&file).unwrap();
+
+        // 让事务里靠后的一条语句失败：前面的 `messages` / `inbox_state` 两条要一起回滚。
+        store
+            .db
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_update BEFORE UPDATE ON message_files
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+        let error = store.append(&message(chat, 2, "b")).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected failure"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        assert_eq!(store.recent(chat, 10).unwrap().len(), 1);
+        assert!(store.unread(Some(chat)).unwrap().len() == 1);
+
+        store
+            .db
+            .lock()
+            .execute_batch("DROP TRIGGER fail_update")
+            .unwrap();
+        assert!(store.append(&message(chat, 2, "b")).unwrap());
+        store.append(&message(chat, 3, "c")).unwrap();
+        // 文件头 + 三条消息，各一行；行号与物理位置一致，三条都读得出来。
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(text.lines().count(), 4);
+        let texts: Vec<String> = store
+            .recent(chat, 10)
+            .unwrap()
+            .iter()
+            .map(QqMessage::plain_text)
+            .collect();
+        assert_eq!(texts, vec!["a", "b", "c"]);
+        // 索引与文件一致：没有可补的行，条数与字节数等于文件里的消息行。
+        assert_eq!(store.rebuild_index().unwrap(), 0);
+        let header_len = text.find('\n').unwrap() + 1;
+        assert_eq!(
+            store.usage().unwrap(),
+            ((text.len() - header_len) as u64, 3)
+        );
     }
 
     /// 上次写到一半的残行不会和下一条消息粘在一起。
