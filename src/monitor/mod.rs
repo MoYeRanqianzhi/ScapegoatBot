@@ -766,6 +766,96 @@ mod tests {
         assert!(deliveries[0].text.contains("second"));
     }
 
+    /// 事件文本里碰巧（或有人故意）写了占位符：原样投递，不被模板的替换再改一遍。模板里
+    /// 重复出现的占位符每一处都替换，不认识的 `{{…}}` 原样留着。
+    #[tokio::test]
+    async fn placeholders_inside_the_event_text_are_not_expanded() {
+        let sink = Arc::new(RecordingSink::default());
+        let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+        manager
+            .add(MonitorSpec {
+                prompt: Some(
+                    "{{count}} from {{event.chat}}: {{event.text}} | {{event.chat}} {{other}} \
+                     {{{count}}"
+                        .to_owned(),
+                ),
+                deliver_as: DeliverAs::Prompt,
+                ..spec("templated", "qq")
+            })
+            .await
+            .unwrap();
+        let monitor = manager
+            .monitors
+            .read()
+            .await
+            .get("templated")
+            .cloned()
+            .unwrap();
+        let event = event(
+            "group:1001",
+            "say {{count}} in {{event.chat}} {{event.text}}",
+            false,
+        );
+        enqueue(&monitor, &manager.sink, &event).await;
+        let deliveries = wait_for_deliveries(&sink, 1).await;
+        assert_eq!(
+            deliveries[0].text,
+            "1 from group:1001: say {{count}} in {{event.chat}} {{event.text}} | group:1001 \
+             {{other}} {1"
+        );
+    }
+
+    /// 等 agent 空闲的时候 monitor 到期了：停用它并发到期通知，和一开始就到期一样；那次
+    /// 事件不投递。
+    #[tokio::test]
+    async fn a_monitor_that_expires_while_waiting_for_idle_is_disabled() {
+        let sink = Arc::new(RecordingSink::default());
+        sink.idle.store(false, Ordering::SeqCst);
+        let manager = MonitorManager::new(Arc::clone(&sink) as Arc<dyn MonitorSink>);
+        manager
+            .add(MonitorSpec {
+                idle_only: true,
+                expires: Some(Duration::from_millis(100)),
+                ..spec("short-lived", "qq")
+            })
+            .await
+            .unwrap();
+        let monitor = manager
+            .monitors
+            .read()
+            .await
+            .get("short-lived")
+            .cloned()
+            .unwrap();
+        enqueue(
+            &monitor,
+            &manager.sink,
+            &event("private:10001", "hello", false),
+        )
+        .await;
+
+        let deliveries = wait_for_deliveries(&sink, 1).await;
+        assert_eq!(deliveries.len(), 1, "{deliveries:?}");
+        assert!(deliveries[0].system);
+        assert!(
+            deliveries[0].text.contains("expired and was disabled"),
+            "{}",
+            deliveries[0].text
+        );
+        assert!(monitor.cancelled.load(Ordering::SeqCst));
+
+        // 之后 agent 空闲了、又来了事件：已经停用，不再投递，也不重复通知。
+        sink.idle.store(true, Ordering::SeqCst);
+        enqueue(
+            &monitor,
+            &manager.sink,
+            &event("private:10001", "again", false),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(sink.deliveries.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn idle_only_waits_for_the_agent() {
         let sink = Arc::new(RecordingSink::default());
