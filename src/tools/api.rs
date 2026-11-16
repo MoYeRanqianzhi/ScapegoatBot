@@ -337,7 +337,7 @@ impl Tool for ApiTool {
                  Report what you found in your result instead.",
             ),
             "agent" => self.run_agent(spec, &params).await,
-            // 本地工具只读写 VFS；按第二段再分。
+            // 由本进程自己执行的动作（图片处理、下载）；按第二段再分。
             "local" => self.run_local(spec, &params, ctx).await,
             "napcat" if self.local_only => ToolResult::error(
                 "This subagent cannot perform QQ operations: only local.* and api.* are \
