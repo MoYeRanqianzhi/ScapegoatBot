@@ -47,17 +47,31 @@ fn run_with_paths(
             .backups_dir()
             .join(chrono::Local::now().format("%Y%m%dT%H%M%S").to_string())
     });
-    // 归档目录不能落在被复制的目录里，否则复制会递归包含正在写入的归档。
+    // 写到词法规范化后的绝对路径：下面按它判断真实位置，两者必须是同一个地方（`a/../b`
+    // 交给操作系统的话，Unix 上还会顺手把 `a` 建出来）。
+    let output = crate::paths::normalize(&std::path::absolute(&output).unwrap_or(output));
+    // 归档目录不能落在被复制的目录里，否则复制会递归包含正在写入的归档。比的是真实位置：
+    // 同一个目录可以有别的写法（相对路径、符号链接、Windows 上的大小写）。
+    let real_output = real_location(&output);
     for (name, source) in [
         ("storage.path", &data_dir),
         ("swarm.agents_dir", &agents_dir),
     ] {
-        if output.starts_with(source) {
+        if real_output.starts_with(real_location(source)) {
             bail!(
                 "refusing to write the backup inside {name} ({}); choose another --output",
                 source.display()
             );
         }
+    }
+    // 只写进空目录。已有内容的目录要么是上一次的备份（混在一起就不是一致的快照），要么是
+    // 实例目录本身——那时密钥、配置的“备份位置”就是它们自己，而把文件复制到自身会把它清空。
+    if std::fs::read_dir(&output).is_ok_and(|mut entries| entries.next().is_some()) {
+        bail!(
+            "refusing to write the backup into {}: the directory is not empty; choose an empty \
+             or new --output",
+            output.display()
+        );
     }
     std::fs::create_dir_all(&output)
         .with_context(|| format!("cannot create {}", output.display()))?;
@@ -152,6 +166,29 @@ fn run_with_paths(
     Ok(output)
 }
 
+/// 一个（可能还不存在的）路径在磁盘上的真实位置：最近的已存在祖先解析掉符号链接，后面
+/// 还不存在的部分原样接上。`path` 必须是词法规范化过的绝对路径（没有 `.` 与 `..`），这样
+/// 接上去的都是普通名字，结果就是之后在 `path` 上创建目录时实际落到的地方。
+///
+/// 一级祖先都解析不了时返回 `path` 本身。
+fn real_location(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(mut real) = std::fs::canonicalize(existing) {
+            real.extend(missing.iter().rev());
+            return real;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 fn copy_dir(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {
@@ -234,5 +271,78 @@ mod tests {
             error.to_string().contains("refusing"),
             "unexpected error: {error}"
         );
+    }
+
+    /// 同一个位置的另一种写法也拒绝：判断的是真实位置，不是字符串前缀。
+    #[test]
+    fn refuses_output_inside_the_storage_directory_under_another_spelling() {
+        let (_dir, paths) = setup();
+        let data_name = paths.data_dir().file_name().unwrap().to_owned();
+        // `<home>/missing/../<data>/backup`：按路径分量看不以数据目录开头。
+        let output = paths
+            .home()
+            .join("missing")
+            .join("..")
+            .join(&data_name)
+            .join("backup");
+        let error = run_with_paths(paths.clone(), None, Some(output)).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing"),
+            "unexpected error: {error}"
+        );
+        assert!(!paths.data_dir().join("backup").exists());
+        assert!(!paths.home().join("missing").exists());
+    }
+
+    /// 经由符号链接指进数据目录的输出路径同样拒绝。
+    #[cfg(unix)]
+    #[test]
+    fn refuses_output_that_reaches_the_storage_directory_through_a_symlink() {
+        let (dir, paths) = setup();
+        let link = dir.path().join("elsewhere");
+        std::os::unix::fs::symlink(paths.data_dir(), &link).unwrap();
+        let error = run_with_paths(paths.clone(), None, Some(link.join("backup"))).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing"),
+            "unexpected error: {error}"
+        );
+        assert!(!paths.data_dir().join("backup").exists());
+    }
+
+    /// 输出目录里已经有东西就拒绝，而且什么都不碰。把实例目录本身当输出目录时，密钥、配置
+    /// 与子代理定义的“备份位置”就是它们自己：复制到自身会把源文件清空。
+    #[test]
+    fn refuses_a_non_empty_output_and_touches_nothing() {
+        let (_dir, paths) = setup();
+        let agents = paths.home().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("reviewer.md"), "---\nname: reviewer\n---\nbody").unwrap();
+        let key_before = std::fs::read(paths.key_file()).unwrap();
+        let config_before = std::fs::read(paths.config_file()).unwrap();
+        assert!(!key_before.is_empty());
+
+        let error =
+            run_with_paths(paths.clone(), None, Some(paths.home().to_path_buf())).unwrap_err();
+        assert!(
+            error.to_string().contains("not empty"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(std::fs::read(paths.key_file()).unwrap(), key_before);
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), config_before);
+        assert_eq!(
+            std::fs::read_to_string(agents.join("reviewer.md")).unwrap(),
+            "---\nname: reviewer\n---\nbody"
+        );
+        assert!(!paths.home().join("data.db").exists());
+    }
+
+    /// 已经存在的空目录可以用作输出目录。
+    #[test]
+    fn an_existing_empty_output_directory_is_accepted() {
+        let (dir, paths) = setup();
+        let output = dir.path().join("empty");
+        std::fs::create_dir(&output).unwrap();
+        run_with_paths(paths, None, Some(output.clone())).unwrap();
+        assert!(output.join("key").is_file());
     }
 }

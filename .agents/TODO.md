@@ -81,14 +81,13 @@ Dependabot 开了 4 个 PR（#1 兼容更新合集；#2 getrandom 0.4、#3 chach
 所有写共享历史的地方也都在回合锁之内；`swarm::spawn` 的并发上限与类型记法，见
 `AgentHub::admit` / `AgentHub::blueprint`；`messages::append` 索引写失败后留下的行，见
 `MessageStore::index_appended` 的调用处；`sbot.toml` 的读改写没有串行化、先通知后换句柄，
-见 `Views::write_config` 与 `config::replace_file`）。
+见 `Views::write_config` 与 `config::replace_file`；`sbot backup` 的输出目录检查，见
+`cli::backup::real_location` 与它旁边的“只写进空目录”）。
 顺带看到、还没处理的：文本节点被二进制覆盖后 `content_enc` 里留着旧密文；二进制节点被文本
 覆盖后 `vfs_chunks` 行与 `blobs/<id>/` 留着——都只是占空间，读取不受影响，删节点时一并清掉。
 
 核实后：是 bug 就修并补测试，不是就从这里删掉。行号是当时的，会漂移。
 
-- [ ] `cli/backup.rs`：`output.starts_with(source)` 比较的是没有规范化的路径（相对路径、
-      符号链接、Windows 大小写都能绕过“备份放进数据目录”的检查）。
 - [ ] `monitor/delivery.rs::deliver_once`：先代入事件文本再代入其他占位符，事件文本里的
       `{{event.chat}}` / `{{count}}` 会被二次展开；等空闲期间 monitor 过期时直接返回，
       没有标记取消，也没有“过期”通知。
