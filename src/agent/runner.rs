@@ -593,7 +593,7 @@ impl Runner {
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        // 1) 入站消息立即进入 transcript 与共享历史。
+        // 1) 入站消息进入 transcript 与共享历史（在请求模型之前）。
         let mut inbound = Vec::with_capacity(input.messages.len());
         let mut accepted_messages = Vec::new();
         for message in &input.messages {
@@ -610,9 +610,13 @@ impl Runner {
                 continue;
             }
             accepted_messages.push(message.clone());
-            let agent_message = AgentMessage::user(text);
-            inbound.push(agent_message.clone());
-            sessions.append(&[agent_message])?;
+            inbound.push(AgentMessage::user(text));
+        }
+        // 整批一次追加（要么全部写进分段，要么分段不变），成功之后才进共享历史：这批消息
+        // 要么两边都有，要么两边都没有。逐条追加的话，中途失败时前几条只在 transcript 里，
+        // 运行中的上下文与重启后恢复出来的上下文就不一样了。
+        sessions.append(&inbound)?;
+        for message in &accepted_messages {
             if let Err(error) =
                 self.deps
                     .messages
@@ -625,9 +629,7 @@ impl Runner {
         // 2) 取历史副本；后续新块只写本地副本。
         let mut working = {
             let mut history = history.lock().await;
-            for message in &inbound {
-                history.push(message.clone());
-            }
+            history.extend(inbound);
             history.clone()
         };
 
@@ -2161,6 +2163,128 @@ mod tests {
         );
         // hold 仍在：解除是 agent 自己的事（`agent.resume`）。
         assert!(gate.hold_active());
+    }
+
+    /// 一个只回 `ok` 的 runner，不带周期审查。
+    async fn plain_runner() -> (Arc<Runner>, tempfile::TempDir) {
+        let reply = || {
+            vec![
+                ProviderEvent::TextDelta("ok".to_owned()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                    refusal: None,
+                },
+            ]
+        };
+        let (runner, _gate, dir) = runner_with(None, vec![reply(), reply()], 120_000, 20_000).await;
+        (runner, dir)
+    }
+
+    /// 让 transcript 的索引更新在消息数到达 `count` 时失败。
+    fn fail_transcript_at(runner: &Runner, count: u32) {
+        runner
+            .deps
+            .sessions
+            .database()
+            .lock()
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_update BEFORE UPDATE ON transcript_files
+                 WHEN NEW.message_count >= {count}
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;"
+            ))
+            .unwrap();
+    }
+
+    /// 当前分段里落盘的消息。
+    fn transcript(runner: &Runner) -> Vec<AgentMessage> {
+        let sessions = &runner.deps.sessions;
+        sessions
+            .read_segment(&sessions.current().unwrap().file)
+            .unwrap()
+    }
+
+    /// 一批入站消息写 transcript 写到一半失败：回合报错，transcript 与共享历史里都没有这批
+    /// 消息的任何一条。只进了其中一边的话，运行中的上下文与重启后恢复出来的上下文就不一样。
+    #[tokio::test]
+    async fn an_inbound_batch_enters_the_transcript_and_the_history_together() {
+        let (runner, _dir) = plain_runner().await;
+        let chat = ChatId::Group(1);
+        // 第一条消息能写进去，第二条写不进去。
+        fail_transcript_at(&runner, 2);
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let report = runner
+            .handle(
+                TurnInput {
+                    chat,
+                    messages: vec![inbound(chat, 1, "first"), inbound(chat, 2, "second")],
+                    dropped: 0,
+                },
+                rx,
+            )
+            .await;
+        let error = report.error.expect("the turn fails");
+        assert!(
+            format!("{error:#}").contains("injected failure"),
+            "{error:#}"
+        );
+        assert!(transcript(&runner).is_empty(), "{:?}", transcript(&runner));
+        assert!(runner.history.lock().await.is_empty());
+
+        // 故障排除后同一批消息照常处理，两边一致。
+        runner
+            .deps
+            .sessions
+            .database()
+            .lock()
+            .execute_batch("DROP TRIGGER fail_update")
+            .unwrap();
+        let (_tx, rx) = mpsc::unbounded_channel();
+        runner
+            .handle(
+                TurnInput {
+                    chat,
+                    messages: vec![inbound(chat, 1, "first"), inbound(chat, 2, "second")],
+                    dropped: 0,
+                },
+                rx,
+            )
+            .await
+            .expect_ok();
+        let history = runner.history.lock().await.clone();
+        assert_eq!(history.len(), 3, "{history:?}");
+        assert_eq!(transcript(&runner), history);
+    }
+
+    /// monitor 投递（控制通道同理）的消息写不进 transcript：回合报错，共享历史里也没有它。
+    #[tokio::test]
+    async fn an_injected_message_enters_the_transcript_and_the_history_together() {
+        let (runner, _dir) = plain_runner().await;
+        fail_transcript_at(&runner, 1);
+        let error = runner
+            .run_event("probe", "timer", "tick", false)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected failure"),
+            "{error:#}"
+        );
+        assert!(transcript(&runner).is_empty(), "{:?}", transcript(&runner));
+        assert!(runner.history.lock().await.is_empty());
+
+        runner
+            .deps
+            .sessions
+            .database()
+            .lock()
+            .execute_batch("DROP TRIGGER fail_update")
+            .unwrap();
+        runner
+            .run_event("probe", "timer", "tick", false)
+            .await
+            .unwrap();
+        let history = runner.history.lock().await.clone();
+        assert_eq!(history.len(), 2, "{history:?}");
+        assert_eq!(transcript(&runner), history);
     }
 
     #[tokio::test]

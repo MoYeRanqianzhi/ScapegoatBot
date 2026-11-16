@@ -137,6 +137,10 @@ impl SessionStore {
     }
 
     /// 追加消息到当前分段。
+    ///
+    /// 要么全部追加上，要么分段不变：写文件或更新索引失败时，把文件截回追加之前的长度。
+    /// 留着写进去的行的话，调用方以为没追加上（内存里的上下文没有这些消息），进程重启从
+    /// 分段恢复上下文时它们却在。
     pub(crate) fn append(&self, messages: &[AgentMessage]) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -147,31 +151,49 @@ impl SessionStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.current_unlocked()?;
         let path = self.root.join("sessions").join(&current.file);
-        let mut count = current.message_count;
-        let mut added_bytes = 0u64;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("cannot open {}", path.display()))?;
+        let length_before = file
+            .metadata()
+            .with_context(|| format!("cannot stat {}", path.display()))?
+            .len();
 
-        for message in messages {
-            let line_no = count as usize + 1; // 第 0 行是文件头
-            let line = self.encode_line(message, &current.file_id, line_no)?;
-            file.write_all(line.as_bytes())?;
-            added_bytes += line.len() as u64;
-            count += 1;
+        let appended = (|| -> Result<()> {
+            let mut count = current.message_count;
+            let mut added_bytes = 0u64;
+            for message in messages {
+                let line_no = count as usize + 1; // 第 0 行是文件头
+                let line = self.encode_line(message, &current.file_id, line_no)?;
+                file.write_all(line.as_bytes())?;
+                added_bytes += line.len() as u64;
+                count += 1;
+            }
+            file.flush()?;
+
+            let conn = self.db.lock();
+            conn.execute(
+                "UPDATE transcript_files
+                 SET message_count = ?1, bytes = bytes + ?2
+                 WHERE file = ?3",
+                params![count as i64, added_bytes as i64, current.file],
+            )?;
+            Ok(())
+        })();
+        drop(file);
+        if appended.is_err() {
+            // 另开一个句柄来截：只能追加的句柄在 Windows 上没有改文件长度的权限。
+            let truncated = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_len(length_before));
+            if let Err(error) = truncated {
+                warn!(%error, file = %current.file, "cannot remove transcript lines whose index update failed");
+            }
         }
-        file.flush()?;
-
-        let conn = self.db.lock();
-        conn.execute(
-            "UPDATE transcript_files
-             SET message_count = ?1, bytes = bytes + ?2
-             WHERE file = ?3",
-            params![count as i64, added_bytes as i64, current.file],
-        )?;
-        Ok(())
+        appended
     }
 
     /// 读取整个分段。
@@ -267,6 +289,12 @@ impl SessionStore {
             warn!(%error, "cannot enforce transcript retention");
         }
         Ok(next)
+    }
+
+    /// 测试用：直接在数据库上做手脚（例如装一个让索引更新失败的触发器）。
+    #[cfg(test)]
+    pub(crate) fn database(&self) -> &Arc<Database> {
+        &self.db
     }
 
     /// 是否设了保留期或总大小上限（任一非零就需要清理）。
@@ -758,6 +786,54 @@ mod tests {
 
         store.append(&[AgentMessage::user("two")]).unwrap();
         assert_eq!(store.read_segment(&second.file).unwrap().len(), 1);
+    }
+
+    /// 追加在更新索引时失败：分段文件回到追加之前的样子，这批消息一条都不留。留着的话，
+    /// 调用方以为没追加上（内存里的上下文没有它们），进程重启从分段恢复时它们却在。
+    #[test]
+    fn a_failed_append_leaves_the_segment_unchanged() {
+        let (store, dir) = store();
+        store.append(&[AgentMessage::user("one")]).unwrap();
+        let current = store.current().unwrap();
+        let path = dir.path().join("sessions").join(&current.file);
+        let before = std::fs::read(&path).unwrap();
+
+        store
+            .db
+            .lock()
+            .execute_batch(
+                "CREATE TRIGGER fail_update BEFORE UPDATE ON transcript_files
+                 BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+            )
+            .unwrap();
+        let error = store
+            .append(&[AgentMessage::user("two"), AgentMessage::user("three")])
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("injected failure"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(store.current().unwrap().message_count, 1);
+
+        store
+            .db
+            .lock()
+            .execute_batch("DROP TRIGGER fail_update")
+            .unwrap();
+        store
+            .append(&[AgentMessage::user("two"), AgentMessage::user("three")])
+            .unwrap();
+        let messages = store.read_segment(&current.file).unwrap();
+        assert_eq!(
+            messages,
+            vec![
+                AgentMessage::user("one"),
+                AgentMessage::user("two"),
+                AgentMessage::user("three")
+            ]
+        );
+        assert_eq!(store.current().unwrap().message_count, 3);
     }
 
     /// `sessions/` 下的文件名，排好序。

@@ -73,33 +73,22 @@ Dependabot 开了 4 个 PR（#1 兼容更新合集；#2 getrandom 0.4、#3 chach
       #6 `fetch_image` 的 http→https 升级）；`vendor/napcat-link/examples` 的 4 条在
       `codeql.yml` 里排除了路径，下次扫描后应自动关闭——没关的话去 Security 页看。
 
-## 待核实的正确性风险（2026-11-10 子代理通读长函数所得，逐条未核实）
+## 正确性风险
 
-已核实并修掉的不留在这里（2026-11-16：`write_binary_chunks` 的提交顺序，见
-`src/vfs/sqlite/swap.rs`；压缩的轮转与写入不是一步，见 `SessionStore::rotate_with`。同一条里
-“`compact_now` 不拿回合锁、期间追加的内容会丢”核实后不成立：它的两个调用方都在回合锁之内，
-所有写共享历史的地方也都在回合锁之内；`swarm::spawn` 的并发上限与类型记法，见
-`AgentHub::admit` / `AgentHub::blueprint`；`messages::append` 索引写失败后留下的行，见
-`MessageStore::index_appended` 的调用处；`sbot.toml` 的读改写没有串行化、先通知后换句柄，
-见 `Views::write_config` 与 `config::replace_file`；`sbot backup` 的输出目录检查，见
-`cli::backup::real_location` 与它旁边的“只写进空目录”；monitor 模板的二次展开与等空闲时
-到期，见 `monitor::delivery` 的 `render_prompt` / `expire`；重试时的事件，见
-`AgentEvent::MessageStart` 的文档注释——`MessageUpdate` 现在没有任何消费者，重复片段在生产里
-观察不到，实际的毛病是一次失败的请求会发 3 条 `Error`、重试成功的也发）。
-顺带看到、还没处理的：文本节点被二进制覆盖后 `content_enc` 里留着旧密文；二进制节点被文本
-覆盖后 `vfs_chunks` 行与 `blobs/<id>/` 留着——都只是占空间，读取不受影响，删节点时一并清掉。
+2026-11-10 通读长函数列出的十条已在 2026-11-16 逐条核实：九条是 bug，修了并各补了能在旧代码
+上失败的测试（见 CHANGELOG 当时的 Unreleased 段与那天的 `fix(...)` 提交）；“`run_control`
+不检查 ESTOP”不是 bug，是文档写明的设计。判断依据都写在对应代码的注释里，这里不重复。
 
-核实后：是 bug 就修并补测试，不是就从这里删掉。行号是当时的，会漂移。
+核实时顺带看到、还没处理的：
 
-- [ ] `agent/runner/injected.rs`：`run_control` 检查 `ai_enabled` 但不检查 ESTOP（`run_event`
-      与 `run_turn` 都检查）；`run_injected` 先 push history 再 `sessions.append`，与
-      `run_turn` 的顺序相反。
-- [ ] `agent/runner.rs::run_turn`：入站循环里的 `sessions.append(...)?` 中途失败时，前面的
-      消息已进 transcript 却没进共享 history。
+- [ ] VFS：文本节点被二进制覆盖后 `content_enc` 里留着旧密文；二进制节点被文本覆盖后
+      `vfs_chunks` 行与 `blobs/<id>/` 留着。只是占空间，读取不受影响，删节点时会一并清掉。
+- [ ] `SessionStore::append` 用 `create(true)` 打开分段文件：文件被外部删掉时会建出一个没有
+      文件头的分段。应当报错而不是悄悄建一个读不回来的文件；没核实过有没有别的路径依赖它。
 
 ## 仍然超过 100 行的函数（不阻塞）
 
-`app::dispatch` 176、`runner::run_turn` 166、`views::system::read_system` 156、
+`app::dispatch` 176、`runner::run_turn` 168、`views::system::read_system` 156、
 `loop::run_with_steering` 155、`app::start` 154、`loop::request_once` 133、
 `backup::run_with_paths` 127、`runner::run_subagent` 124、`monitor::validate_monitor` 122、
 `assembly::build_agent` 120、`events::handle_qq_event` 118、

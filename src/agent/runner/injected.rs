@@ -3,6 +3,9 @@ use super::*;
 impl Runner {
     /// 控制通道回合；主代理不受并发配额限制，串行化由 turn_lock 负责。
     ///
+    /// 只看 `sbot ai stop`，不看 ESTOP：`sbot pause` 停的是 QQ / monitor 回合与子代理，宿主机
+    /// 上的 `sbot chat` 在暂停期间照常可用（主人要靠它问清楚状况再决定是否恢复）。
+    ///
     /// `scope` 是 `sbot chat --scope` 指定的目标会话：写进 `owner_context` 的 `scope`
     /// 属性，告诉模型这句话针对哪个群 / 私聊；省略时由模型自己判断。
     pub(crate) async fn run_control(
@@ -76,11 +79,10 @@ impl Runner {
         }
         let sessions = Arc::clone(&self.deps.sessions);
         let history = Arc::clone(&self.history);
-        {
-            let mut history = history.lock().await;
-            history.push(message.clone());
-        }
-        sessions.append(&[message])?;
+        // 先落盘，成功之后才进共享历史：写不进 transcript 的消息也不留在内存里，运行中的
+        // 上下文与重启后从分段恢复出来的上下文始终一致。
+        sessions.append(std::slice::from_ref(&message))?;
+        history.lock().await.push(message);
 
         let mut working = { history.lock().await.clone() };
         // 控制/monitor 回合同样可能很长：以前没有压缩，长会话会一直涨到超窗。
