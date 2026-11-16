@@ -5,7 +5,7 @@ metadata:
   type: feedback
   scope: src/tools 的工具表、子代理工具表、system prompt 里的工具说明
   status: active
-  last_verified: 2026-11-16
+  last_verified: 2026-11-17
 ---
 
 用户 2026-11-10 明确：**从未同意过 `Memory` 与 `Download` 这两个工具**，它们是 agent 私自
@@ -29,9 +29,9 @@ metadata:
 - `API` 要**可扩展**：用户能自己增加工具（action）；能接**任意即时通讯渠道**并映射成 `API`
   的 action；**NapCat 可以禁用**。目标是更高的自由度，而不是写死 QQ。
 
-顺序（agent 的计划，用户没有逐条确认）：先把策略从前缀挪到属性上 → 写渠道与自定义 action 的
-设计稿给用户确认 → 最后统一改名（代码、提示词、测试、文档、CHANGELOG 的破坏性变更）。改名
-本身是破坏性变更，不要在设计确认之前零散地改。
+设计稿在 `.agents/plan/2026-11-17-channels-and-custom-actions.md`（2026-11-17 写成，**用户还没
+确认**）：分五步——属性代替前缀 → 改名 → 适配器进程提供自定义动作 → NapCat 可禁用 → 渠道
+抽象；文末列了要用户定的事。改名本身是破坏性变更，不要在设计确认之前零散地改。
 
 **Evidence:** 用户 2026-11-10 原话：“我从来没有同意有工具Memory和Download，这都是私自
 加入的，记忆文件直接文件工具读写，下载这种非必要功能明显要放在API工具中”。用户 2026-11-13：

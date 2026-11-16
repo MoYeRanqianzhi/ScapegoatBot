@@ -39,8 +39,10 @@ PR 本身没有动，Dependabot 下次运行时会自己关掉；没关的话可
       `compact_scope` 靠回合锁保证“快照到替换之间没人追加”（见它的文档注释），提前压缩
       在回合之外做摘要，这条前提就不成立了，必须改成“记长度、接回后缀”。
 - [ ] **命名与可扩展性**（`local.*` → `native.*`、自定义 action、任意渠道、可禁用 NapCat）：
-      方向记在 [`memory/tool-surface.md`](memory/tool-surface.md)。下一步是写设计稿
-      （`plan/`）给用户确认，确认前不动代码。
+      设计稿写好了，在
+      [`plan/2026-11-17-channels-and-custom-actions.md`](plan/2026-11-17-channels-and-custom-actions.md)，
+      文末列了六件要用户定的事并各给了建议。**等用户确认，确认前不动代码。** 用户同意后从
+      步骤 A（属性代替前缀，纯重构）做起。
 - [ ] 是否授权部署 hw1。
 - [ ] 临时目录要用户手动删（安全检查拦下了 `rm -rf`）：`G:\sbot-e2e-{lists,startwait,startwait-other,fresh,tmp}`
       是 11 月几轮实机验证建的；`G:\sbot-e2e-{live,perchat,phase7,qq}` 更早，用途未核实。旧历史
