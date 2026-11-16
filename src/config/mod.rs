@@ -168,6 +168,41 @@ impl Default for SbotConfig {
     }
 }
 
+/// 原子地替换配置文件的内容：临时文件 + fsync + rename，并沿用原文件的权限。
+///
+/// `sbot.toml` 可能被收紧到 `0600`（MCP 服务器的 `env` 里有 token）；临时文件按默认权限创建
+/// 再 rename，会悄悄放宽它。Unix 上临时文件一开始就只给属主读写，写完再复制原文件的权限。
+///
+/// 调用方负责串行化（运行中的进程里是配置句柄的写锁）：临时文件名只按进程区分，而且
+/// “读出来、改、写回去”必须是一步，否则后写的会盖掉先写的改动。
+pub(crate) fn replace_file(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let written = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        if let Ok(metadata) = std::fs::metadata(path) {
+            std::fs::set_permissions(&tmp, metadata.permissions())?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        // 没换成：不留下临时文件（里面是完整的配置）。
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
 /// 加载后的配置：保留路径信息，供相对路径解析与写回使用。
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
@@ -365,6 +400,54 @@ pub use sections::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 目录里的文件名，排好序。
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// 替换内容后目录里只有配置文件本身；换不成（目标是个目录）时报错，也不留下临时文件。
+    #[test]
+    fn replace_file_swaps_the_content_and_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sbot.toml");
+        std::fs::write(&path, "version = 1\n").unwrap();
+        replace_file(&path, "version = 1\n[agent]\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "version = 1\n[agent]\n"
+        );
+        assert_eq!(file_names(dir.path()), vec!["sbot.toml"]);
+
+        let blocked = dir.path().join("blocked.toml");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("keep"), "x").unwrap();
+        assert!(replace_file(&blocked, "version = 1\n").is_err());
+        assert_eq!(file_names(dir.path()), vec!["blocked.toml", "sbot.toml"]);
+    }
+
+    /// 收紧过权限的配置文件（MCP 的 `env` 里有 token）写回后权限不变。
+    #[cfg(unix)]
+    #[test]
+    fn replace_file_keeps_the_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sbot.toml");
+        std::fs::write(&path, "version = 1\n").unwrap();
+        for mode in [0o600, 0o640] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            replace_file(&path, "version = 1\n").unwrap();
+            let actual = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(actual, mode);
+        }
+    }
 
     /// 最小可用配置：默认值即可通过形状校验。
     #[test]

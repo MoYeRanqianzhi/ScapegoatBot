@@ -116,7 +116,8 @@ impl Views {
         ))
     }
 
-    /// 写配置：只允许 `model_writable` 白名单；校验通过后原子写回。
+    /// 写配置：只允许 `model_writable` 白名单；校验通过后原子写回，再换掉内存里的配置并
+    /// 通知热更新。
     ///
     /// 支持三种形式：
     /// - `/config/<section>/<key>`：叶子值（TOML 字面量）；
@@ -144,132 +145,42 @@ impl Views {
                 crate::tools::CONFIG_HOLD_DISABLED.to_owned(),
             ));
         }
-        let path = {
-            let guard = handle.read().expect("config lock poisoned");
-            guard.path.clone()
-        };
+        // 从读文件到换句柄全程持有配置句柄的写锁。控制通道改模型 / 思考强度也是在这把锁里
+        // 读改写同一个文件；两边各读一份旧文件、各自写回去的话，后写的会把先写的改动盖掉，
+        // 文件与内存里的配置还会和正在用的 provider 对不上。
+        let mut loaded = handle.write().expect("config lock poisoned");
+        let path = loaded.path.clone();
         let current_text =
             std::fs::read_to_string(&path).map_err(|error| VfsError::Storage(error.to_string()))?;
-        let mut document: toml_edit::DocumentMut = current_text
+        let document: toml_edit::DocumentMut = current_text
             .parse()
             .map_err(|error| VfsError::Storage(format!("cannot parse sbot.toml: {error}")))?;
 
-        let segments = target.path.segments();
-        match segments {
-            [root] if *root == "config.toml" => {
-                let mut new_document: toml_edit::DocumentMut =
-                    content.parse().map_err(|error| {
-                        VfsError::Storage(format!("the new sbot.toml is not valid TOML: {error}"))
-                    })?;
-                // 视图里读到的是遮蔽后的原文：原样带回的占位符换回原值。
-                redact::restore_redacted(&mut new_document, &document);
-                // 逐键对比，只读键发生变化则整体拒绝。
-                let old_value: toml::Value = toml::from_str(&current_text)
-                    .map_err(|error| VfsError::Storage(error.to_string()))?;
-                let new_value: toml::Value = toml::from_str(&new_document.to_string())
-                    .map_err(|error| VfsError::Storage(error.to_string()))?;
-                check_protected_keys(&old_value, &new_value)?;
-                let config =
-                    validate_config_text(&new_document.to_string(), self.context.models.as_ref())?;
-                self.persist(&path, new_document.to_string())?;
-                self.notify(&config);
-                *handle.write().expect("config lock poisoned") = LoadedConfig {
-                    config,
-                    path: path.clone(),
-                    dir: path
-                        .parent()
-                        .map(std::path::Path::to_path_buf)
-                        .unwrap_or_else(|| PathBuf::from(".")),
-                };
-                Ok(format!("wrote {} bytes to /config.toml", content.len()))
-            }
-            [root, section] if *root == "config" => {
-                if !section_writable(section) {
-                    return Err(VfsError::Storage(format!(
-                        "config section {section:?} is read-only for the agent"
-                    )));
-                }
-                let snippet: toml_edit::DocumentMut = content.parse().map_err(|error| {
-                    VfsError::Storage(format!("cannot parse the section body: {error}"))
-                })?;
-                let table = snippet.as_table().clone();
-                document[section.as_str()] = toml_edit::Item::Table(table);
-                let config =
-                    validate_config_text(&document.to_string(), self.context.models.as_ref())?;
-                self.persist(&path, document.to_string())?;
-                self.notify(&config);
-                *handle.write().expect("config lock poisoned") = LoadedConfig {
-                    config,
-                    path: path.clone(),
-                    dir: path
-                        .parent()
-                        .map(std::path::Path::to_path_buf)
-                        .unwrap_or_else(|| PathBuf::from(".")),
-                };
-                Ok(format!("wrote /config/{section}"))
-            }
-            [root, section, key] if *root == "config" => {
-                if !key_writable(section, key) {
-                    return Err(VfsError::Storage(format!(
-                        "config key {section}.{key} is read-only for the agent"
-                    )));
-                }
-                let snippet: toml_edit::DocumentMut =
-                    format!("{key} = {content}").parse().map_err(|error| {
-                        VfsError::Storage(format!(
-                            "value for {section}.{key} is not a TOML literal: {error}"
-                        ))
-                    })?;
-                let Some(item) = snippet.as_table().get(key).cloned() else {
-                    return Err(VfsError::Storage("empty config value".to_owned()));
-                };
-                if !document.contains_key(section) {
-                    document[section.as_str()] = toml_edit::Item::Table(toml_edit::Table::new());
-                }
-                document[section.as_str()][key.as_str()] = item;
-                let config =
-                    validate_config_text(&document.to_string(), self.context.models.as_ref())?;
-                self.persist(&path, document.to_string())?;
-                self.notify(&config);
-                *handle.write().expect("config lock poisoned") = LoadedConfig {
-                    config,
-                    path: path.clone(),
-                    dir: path
-                        .parent()
-                        .map(std::path::Path::to_path_buf)
-                        .unwrap_or_else(|| PathBuf::from(".")),
-                };
-                Ok(format!("wrote /config/{section}/{key}"))
-            }
-            _ => Err(VfsError::NotFound(target.path.to_string())),
-        }
-    }
-
-    /// 原子写回：临时文件 + fsync + rename，并沿用原文件的权限。
-    ///
-    /// `sbot.toml` 可能被收紧到 `0600`（MCP env 里有 token）；临时文件按默认权限
-    /// 创建再 rename，会悄悄放宽它。Unix 上临时文件一开始就只给属主读写，写完再
-    /// 复制原文件的权限。
-    pub(super) fn persist(&self, path: &std::path::Path, text: String) -> Result<(), VfsError> {
-        let storage = |error: std::io::Error| VfsError::Storage(error.to_string());
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-        {
-            use std::io::Write;
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&tmp).map_err(storage)?;
-            file.write_all(text.as_bytes()).map_err(storage)?;
-            file.sync_all().map_err(storage)?;
-        }
-        if let Ok(metadata) = std::fs::metadata(path) {
-            std::fs::set_permissions(&tmp, metadata.permissions()).map_err(storage)?;
-        }
-        std::fs::rename(&tmp, path).map_err(storage)
+        let (new_text, written) = match target.path.segments() {
+            [root] if *root == "config.toml" => (
+                whole_file(content, &current_text, &document)?,
+                format!("wrote {} bytes to /config.toml", content.len()),
+            ),
+            [root, section] if *root == "config" => (
+                replace_section(document, section, content)?,
+                format!("wrote /config/{section}"),
+            ),
+            [root, section, key] if *root == "config" => (
+                replace_value(document, section, key, content)?,
+                format!("wrote /config/{section}/{key}"),
+            ),
+            _ => return Err(VfsError::NotFound(target.path.to_string())),
+        };
+        // 校验不过就不落盘；落盘不成就不换内存里的配置。
+        let config = validate_config_text(&new_text, self.context.models.as_ref())?;
+        crate::config::replace_file(&path, &new_text)
+            .map_err(|error| VfsError::Storage(error.to_string()))?;
+        loaded.config = config.clone();
+        drop(loaded);
+        // 通知在换好句柄、放掉锁之后：回调读配置句柄时看到的已经是新配置，也不会在持锁时
+        // 重入这把锁。
+        self.notify(&config);
+        Ok(written)
     }
 
     /// 是否属于可写的配置视图（`/config/**` 或 `/config.toml`）。
@@ -278,6 +189,74 @@ impl Views {
             .first()
             .is_some_and(|first| *first == "config" || *first == "config.toml")
     }
+}
+
+/// `/config.toml`：整文件替换。返回要写回的文本。
+///
+/// 视图里读到的是遮蔽后的原文，原样带回的占位符换回原值；只读键与现在的文件逐键对比，
+/// 有变化就整体拒绝。
+fn whole_file(
+    content: &str,
+    current_text: &str,
+    current: &toml_edit::DocumentMut,
+) -> Result<String, VfsError> {
+    let mut document: toml_edit::DocumentMut = content.parse().map_err(|error| {
+        VfsError::Storage(format!("the new sbot.toml is not valid TOML: {error}"))
+    })?;
+    redact::restore_redacted(&mut document, current);
+    let new_text = document.to_string();
+    let old_value: toml::Value =
+        toml::from_str(current_text).map_err(|error| VfsError::Storage(error.to_string()))?;
+    let new_value: toml::Value =
+        toml::from_str(&new_text).map_err(|error| VfsError::Storage(error.to_string()))?;
+    check_protected_keys(&old_value, &new_value)?;
+    Ok(new_text)
+}
+
+/// `/config/<section>`：整段覆盖，`content` 是这一段的正文。返回要写回的文本。
+fn replace_section(
+    mut document: toml_edit::DocumentMut,
+    section: &str,
+    content: &str,
+) -> Result<String, VfsError> {
+    if !section_writable(section) {
+        return Err(VfsError::Storage(format!(
+            "config section {section:?} is read-only for the agent"
+        )));
+    }
+    let snippet: toml_edit::DocumentMut = content
+        .parse()
+        .map_err(|error| VfsError::Storage(format!("cannot parse the section body: {error}")))?;
+    document[section] = toml_edit::Item::Table(snippet.as_table().clone());
+    Ok(document.to_string())
+}
+
+/// `/config/<section>/<key>`：改一个叶子值，`content` 是 TOML 字面量。返回要写回的文本。
+fn replace_value(
+    mut document: toml_edit::DocumentMut,
+    section: &str,
+    key: &str,
+    content: &str,
+) -> Result<String, VfsError> {
+    if !key_writable(section, key) {
+        return Err(VfsError::Storage(format!(
+            "config key {section}.{key} is read-only for the agent"
+        )));
+    }
+    let snippet: toml_edit::DocumentMut =
+        format!("{key} = {content}").parse().map_err(|error| {
+            VfsError::Storage(format!(
+                "value for {section}.{key} is not a TOML literal: {error}"
+            ))
+        })?;
+    let Some(item) = snippet.as_table().get(key).cloned() else {
+        return Err(VfsError::Storage("empty config value".to_owned()));
+    };
+    if !document.contains_key(section) {
+        document[section] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    document[section][key] = item;
+    Ok(document.to_string())
 }
 
 /// 整段可写的配置节。

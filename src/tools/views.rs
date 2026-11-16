@@ -1152,6 +1152,97 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
+    /// 热更新回调被调用时，配置句柄里已经是新配置，而且回调可以去读它（写锁已经放掉）。
+    /// 以前先通知、后换句柄：回调读句柄看到的是旧配置。
+    #[tokio::test]
+    async fn hot_reload_runs_after_the_handle_holds_the_new_config() {
+        let (views, _dir) = views();
+        let handle = Arc::clone(views.context.config.as_ref().unwrap());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        views.set_hot_reload(Arc::new(move |config| {
+            let in_handle = handle
+                .try_read()
+                .expect("the config lock is free during the callback")
+                .config
+                .agent
+                .thinking_level
+                .clone();
+            record
+                .lock()
+                .unwrap()
+                .push((config.agent.thinking_level.clone(), in_handle));
+        }));
+        views
+            .write_config(&target("/config/agent/thinking_level"), "\"low\"")
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("low".to_owned(), "low".to_owned())]
+        );
+    }
+
+    /// 同时写不同的键：每一次写都读到上一次写完的文件，最后文件、内存里的配置与每一次
+    /// 写入一致。读改写没有串行化时，两个写入各读一份旧文件、各自写回，后写的盖掉先写的。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_config_writes_do_not_lose_updates() {
+        let (views, dir) = views();
+        let views = Arc::new(views);
+        let writes: Vec<(&str, String)> = vec![
+            ("/config/filter/ignore_users", "[11, 12]".to_owned()),
+            ("/config/filter/ignore_groups", "[21]".to_owned()),
+            ("/config/filter/require_mention", "true".to_owned()),
+            ("/config/queue/debounce_ms", "1234".to_owned()),
+            ("/config/queue/cap_messages", "77".to_owned()),
+            ("/config/agent/thinking_level", "\"low\"".to_owned()),
+        ];
+        // 多轮：每轮所有键一起写，轮与轮之间值不同，增加交错的机会。
+        for round in 0..20u64 {
+            let tasks: Vec<_> = writes
+                .iter()
+                .map(|(path, value)| {
+                    let views = Arc::clone(&views);
+                    let path = (*path).to_owned();
+                    let value = if path.ends_with("debounce_ms") {
+                        (1000 + round).to_string()
+                    } else {
+                        value.clone()
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        views.write_config(&target(&path), &value).unwrap();
+                    })
+                })
+                .collect();
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let on_disk: SbotConfig =
+                toml::from_str(&std::fs::read_to_string(dir.path().join("sbot.toml")).unwrap())
+                    .unwrap();
+            assert_eq!(on_disk.filter.ignore_users, vec![11, 12], "round {round}");
+            assert_eq!(on_disk.filter.ignore_groups, vec![21], "round {round}");
+            assert!(on_disk.filter.require_mention, "round {round}");
+            assert_eq!(on_disk.queue.debounce_ms, 1000 + round, "round {round}");
+            assert_eq!(on_disk.queue.cap_messages, 77, "round {round}");
+            assert_eq!(on_disk.agent.thinking_level, "low", "round {round}");
+            // 内存里的配置与文件一致。
+            let in_memory = views.config_snapshot().unwrap();
+            assert_eq!(
+                toml::to_string(&in_memory).unwrap(),
+                toml::to_string(&on_disk).unwrap(),
+                "round {round}"
+            );
+        }
+        // 不留下临时文件。
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
     #[tokio::test]
     async fn receive_scopes_filter_views() {
         let (views, _dir) = views();

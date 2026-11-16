@@ -80,14 +80,13 @@ Dependabot 开了 4 个 PR（#1 兼容更新合集；#2 getrandom 0.4、#3 chach
 “`compact_now` 不拿回合锁、期间追加的内容会丢”核实后不成立：它的两个调用方都在回合锁之内，
 所有写共享历史的地方也都在回合锁之内；`swarm::spawn` 的并发上限与类型记法，见
 `AgentHub::admit` / `AgentHub::blueprint`；`messages::append` 索引写失败后留下的行，见
-`MessageStore::index_appended` 的调用处）。
+`MessageStore::index_appended` 的调用处；`sbot.toml` 的读改写没有串行化、先通知后换句柄，
+见 `Views::write_config` 与 `config::replace_file`）。
 顺带看到、还没处理的：文本节点被二进制覆盖后 `content_enc` 里留着旧密文；二进制节点被文本
 覆盖后 `vfs_chunks` 行与 `blobs/<id>/` 留着——都只是占空间，读取不受影响，删节点时一并清掉。
 
 核实后：是 bug 就修并补测试，不是就从这里删掉。行号是当时的，会漂移。
 
-- [ ] `tools/views/config.rs::write_config`：`sbot.toml` 的读-改-写没有串行化，并发写会丢
-      更新；`notify` 在句柄替换之前调用。
 - [ ] `cli/backup.rs`：`output.starts_with(source)` 比较的是没有规范化的路径（相对路径、
       符号链接、Windows 大小写都能绕过“备份放进数据目录”的检查）。
 - [ ] `monitor/delivery.rs::deliver_once`：先代入事件文本再代入其他占位符，事件文本里的
@@ -105,12 +104,11 @@ Dependabot 开了 4 个 PR（#1 兼容更新合集；#2 getrandom 0.4、#3 chach
 
 `app::dispatch` 176、`runner::run_turn` 166、`views::system::read_system` 156、
 `loop::run_with_steering` 155、`app::start` 154、`loop::request_once` 141、
-`backup::run_with_paths` 127、`runner::run_subagent` 124、`views::config::write_config` 122
-（“校验 → 落盘 → 通知 → 换句柄”的收尾重复了 3 次）、`monitor::validate_monitor` 122、
+`backup::run_with_paths` 127、`runner::run_subagent` 124、`monitor::validate_monitor` 122、
 `assembly::build_agent` 120、`events::handle_qq_event` 118、
 `delivery::deliver_once` 117、`compaction::compact_scope` 115。其中是“一个 match 平铺 /
-同一层的线性步骤”的不必拆；有重复块或混了几件事的（`write_config`、`run_turn`）值得拆。
-`swarm::spawn`（89）与 `messages::append`（86）在 2026-11-16 修 bug 时拆过了。
+同一层的线性步骤”的不必拆；混了几件事的（`run_turn`）值得拆。`swarm::spawn`（89）、
+`messages::append`（86）与 `write_config`（59）在 2026-11-16 修 bug 时拆过了。
 
 ## 外部验证（需 NapCat 登录）
 

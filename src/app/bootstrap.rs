@@ -121,6 +121,9 @@ pub(super) fn remove_sentinel(path: &Path) -> Result<()> {
     }
 }
 
+/// 把 `[agent]` 里的一个字符串键写回 `sbot.toml`，其余内容（包括注释与排版）不动。
+///
+/// 调用方持有配置句柄的写锁：agent 写 `/config` 也在同一把锁里读改写这个文件。
 pub(super) fn persist_agent_setting(path: &Path, key: &str, value: &str) -> Result<()> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
@@ -133,10 +136,8 @@ pub(super) fn persist_agent_setting(path: &Path, key: &str, value: &str) -> Resu
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("[agent] in {} is not a table", path.display()))?;
     agent[key] = toml_edit::value(value);
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, document.to_string())
-        .with_context(|| format!("cannot write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))?;
+    crate::config::replace_file(path, &document.to_string())
+        .with_context(|| format!("cannot replace {}", path.display()))?;
     Ok(())
 }
 
