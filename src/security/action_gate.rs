@@ -714,6 +714,9 @@ impl ActionGate {
     ///
     /// 没有文本的发送（纯图片、文件）也记一条：它们计入每小时上限；重复与跨群规则只比较
     /// 非空、足够长的文本，空内容不会误伤。
+    ///
+    /// `params` 必须是 [`Self::check`] 看过的那一份（模型给的原样），不是发送前改写之后的：
+    /// 下一次检查拿来比的也是模型给的原样，记下改写后的样子，同样的内容再发一次就对不上。
     pub(crate) fn note_send(&self, params: &Value, chat: &str) {
         let content = message_content(params);
         let mut sends = self.sends.lock().unwrap_or_else(|e| e.into_inner());
@@ -825,9 +828,28 @@ fn contains_at_all(params: &Value) -> bool {
         })
 }
 
+/// 发送规则比较用的内容。
+///
+/// 同一段文字可以写成字符串，也可以写成一个或几个 `text` 段；两种写法得到同一个结果，
+/// 换一种写法重发不算“不同的内容”。带别的段（图片、@、文件……）的消息用整个段数组的
+/// JSON：段的种类与顺序都算内容的一部分。
 fn message_content(params: &Value) -> String {
     match params.get("message") {
         Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(segments)) => {
+            let texts: Option<Vec<&str>> = segments
+                .iter()
+                .map(|segment| {
+                    (segment.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| segment.pointer("/data/text").and_then(Value::as_str))
+                        .flatten()
+                })
+                .collect();
+            match texts {
+                Some(texts) => texts.concat(),
+                None => Value::Array(segments.clone()).to_string(),
+            }
+        }
         Some(value) => value.to_string(),
         None => String::new(),
     }
@@ -843,6 +865,32 @@ mod tests {
             .iter()
             .find(|spec| spec.action == action)
             .expect("action exists")
+    }
+
+    /// 同一段文字写成字符串、一个 `text` 段或拆成几个 `text` 段，比较用的内容相同；带别的
+    /// 段的消息则连同段的种类一起比较。
+    #[test]
+    fn message_content_is_the_same_for_every_way_of_writing_text() {
+        let text = |value: Value| message_content(&json!({ "message": value }));
+        assert_eq!(text(json!("hello there")), "hello there");
+        assert_eq!(
+            text(json!([{"type": "text", "data": {"text": "hello there"}}])),
+            "hello there"
+        );
+        assert_eq!(
+            text(json!([
+                {"type": "text", "data": {"text": "hello "}},
+                {"type": "text", "data": {"text": "there"}}
+            ])),
+            "hello there"
+        );
+        let with_image = text(json!([
+            {"type": "text", "data": {"text": "hello there"}},
+            {"type": "image", "data": {"file": "a.png"}}
+        ]));
+        assert_ne!(with_image, "hello there");
+        assert!(with_image.contains("a.png"));
+        assert_eq!(message_content(&json!({})), "");
     }
 
     fn auto_gate() -> ActionGate {

@@ -62,13 +62,15 @@ impl ApiTool {
         if let Err(result) = self.check_action_gate(spec, &params, ctx).await {
             return result;
         }
+        // 门禁看过的内容留一份：发送成功后记进发送记录的是它，而不是下面改写之后的参数。
+        let checked = crate::actions::published_view(spec, &params).map(|view| view.into_owned());
         // 8. 发送前改写：`params` 留给账本与归档，`wire` 才交给 NapCat。
         let (params, wire) = match self.prepare_outbound(spec, params, ctx).await {
             Ok(prepared) => prepared,
             Err(error) => return ToolResult::error(error),
         };
         // 9. 调用与记录。
-        self.call_and_record(spec, napcat_action, gateway.as_ref(), params, wire)
+        self.call_and_record(spec, napcat_action, gateway.as_ref(), params, wire, checked)
             .await
     }
 
@@ -336,6 +338,8 @@ impl ApiTool {
     ///
     /// 带 `message` 的发送成功后，把这条消息以 `self` 写入归档；有真实
     /// message_id 时用它，NapCat 的 `message_sent` 回声会按 `(chat, message_id)` 去重。
+    ///
+    /// `checked` 是门禁检查时看到的发布内容（改写之前），成功后记进门禁的发送记录。
     async fn call_and_record(
         &self,
         spec: &ActionSpec,
@@ -343,6 +347,7 @@ impl ApiTool {
         gateway: &dyn NapcatGateway,
         params: Value,
         wire: Value,
+        checked: Option<Value>,
     ) -> ToolResult {
         let chat = crate::actions::chat_of(spec, &params);
         // 发送前登记意图；失败或超时都不能当成“肯定没发出去”。
@@ -360,12 +365,10 @@ impl ApiTool {
         match gateway.call(napcat_action, wire).await {
             Ok(response) => {
                 // 只有成功才计入重复/跨群规则；失败重试不被自己的记录挡住。
-                if let (Some(action_gate), Some(chat), Some(view)) = (
-                    &self.action_gate,
-                    chat,
-                    crate::actions::published_view(spec, &params),
-                ) {
-                    action_gate.note_send(&view, &chat.to_string());
+                if let (Some(action_gate), Some(chat), Some(view)) =
+                    (&self.action_gate, chat, &checked)
+                {
+                    action_gate.note_send(view, &chat.to_string());
                 }
                 let message_id = response
                     .get("message_id")

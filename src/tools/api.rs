@@ -912,6 +912,68 @@ mod tests {
         assert!(notice.1["message"].as_str().unwrap().contains(&nonce));
     }
 
+    /// 同一段话 30 秒内往同一个会话再发一次会被拦下，不管消息写成字符串还是段数组、
+    /// 发送前有没有被 hook 改写过。以前门禁检查的是模型给的原样，记下的却是改写之后的
+    /// 参数（字符串已经变成段数组），两边永远对不上：字符串形式的消息可以无限重复，
+    /// 也不受“同文群发”规则约束。
+    #[tokio::test]
+    async fn a_repeated_message_is_blocked_in_every_form() {
+        let gateway = Arc::new(FakeGateway::default());
+        let gate = Arc::new(crate::security::action_gate::ActionGate::new(
+            &crate::config::GateConfig {
+                mode: crate::config::GateMode::Auto,
+                max_per_minute: 60,
+                llm_review: false,
+            },
+            crate::security::action_gate::ApprovalQueue::new(),
+        ));
+        // 发送前把一个词换掉：实际发出去的文本与模型给的不一样。
+        let rewrite = crate::config::EventHookConfig {
+            event: crate::config::HookEvent::BeforeSend,
+            action: crate::config::HookAction::Rewrite,
+            pattern: "secret".to_owned(),
+            replacement: "[redacted]".to_owned(),
+            ..crate::config::EventHookConfig::default()
+        };
+        let tool = tool(Some(gateway.clone()), None)
+            .with_action_gate(gate)
+            .with_event_hooks(vec![rewrite]);
+        let send = |group: u64, message: Value| {
+            let tool = &tool;
+            async move {
+                tool.execute(
+                    &intent_ctx(&format!("group:{group}")),
+                    json!({"action": "napcat.send_group_msg",
+                           "params": {"group_id": group, "message": message}}),
+                )
+                .await
+            }
+        };
+        let text = "the secret meeting is at noon";
+        let as_segments = json!([{"type": "text", "data": {"text": text}}]);
+
+        let first = send(1, json!(text)).await;
+        assert!(!first.is_error, "{}", first.content);
+        for repeat in [json!(text), as_segments] {
+            let result = send(1, repeat).await;
+            assert!(result.is_error, "{}", result.content);
+            assert!(
+                result.content.contains("do not repeat"),
+                "{}",
+                result.content
+            );
+        }
+        // 只有第一条真的发了出去，而且是改写之后的文本。
+        {
+            let calls = gateway.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].1.to_string().contains("[redacted] meeting"));
+        }
+        // 别的会话不受“重复”规则影响。
+        let elsewhere = send(2, json!(text)).await;
+        assert!(!elsewhere.is_error, "{}", elsewhere.content);
+    }
+
     #[tokio::test]
     async fn before_send_hooks_can_block() {
         let gateway = Arc::new(FakeGateway::default());
