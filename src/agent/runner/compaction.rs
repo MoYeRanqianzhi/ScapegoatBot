@@ -31,8 +31,6 @@ impl Runner {
             .await
         {
             Ok(_) => {
-                self.compaction_failures
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
                 *working = history.lock().await.clone();
             }
             Err(error) => {
@@ -56,6 +54,9 @@ impl Runner {
         let current = self.deps.sessions.current()?;
         let next = self.deps.sessions.rotate()?;
         self.history.lock().await.clear();
+        // 上下文空了，之前压缩失败的原因不再成立：自动压缩重新开始尝试。
+        self.compaction_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         Ok(serde_json::json!({
             "cleared": true,
             "previous_session": current.file,
@@ -178,6 +179,10 @@ impl Runner {
         }
         let kept_messages = new_history.len() - 1;
         *history.lock().await = new_history;
+        // 任何一次成功的压缩都把连续失败数清零，包括 agent 自己调用的 `agent.compact`：
+        // 自动压缩停掉之后，agent 手动压缩成功一次就恢复，不必等人来重启进程。
+        self.compaction_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         // PostCompact：hooks 可能依赖刚写入的记忆/技能，重新读盘并重建。
         self.rebuild_system();
         let _ = self

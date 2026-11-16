@@ -6,7 +6,7 @@
 //! - 内置 `general` / `explore` / `plan` / `docs` 四种类型，工具集由类型强制；
 //! - 自定义定义来自宿主 `[swarm].agents_dir`（只读）与 VFS `/agents`（可写，同名本地优先）；
 //! - `spawn` / `message` / `check` / `wait` / `list`；
-//! - 并发上限与 `max_depth`（当前实现为单层，嵌套 spawn 暂不支持）；
+//! - 并发上限与嵌套深度上限 `max_depth`（子代理可以再派子代理，到这个深度为止）；
 //! - 子代理有独立历史，不写 transcript、不产生持久记忆。
 //!
 //! 子代理的执行由 [`SubagentRunner`] 提供；runtime 用同一个 provider 槽位与安全闸。
@@ -157,7 +157,6 @@ pub struct AgentDefinition {
     pub description: String,
     pub body: String,
     pub tools: Vec<String>,
-    pub model: Option<String>,
     pub allow_send: bool,
     pub max_steps: Option<u32>,
     /// `host` 或 `vfs`，用于冲突提示。
@@ -174,7 +173,6 @@ impl AgentDefinition {
         let mut name = name_hint.to_owned();
         let mut description = String::new();
         let mut tools = Vec::new();
-        let mut model = None;
         let mut allow_send = false;
         let mut max_steps = None;
         let mut body = String::new();
@@ -197,11 +195,6 @@ impl AgentDefinition {
                         .map(|item| item.trim().trim_matches('"').to_owned())
                         .filter(|item| !item.is_empty())
                         .collect();
-                } else if let Some(value) = line.strip_prefix("model:") {
-                    let value = value.trim().trim_matches('"');
-                    if !value.is_empty() {
-                        model = Some(value.to_owned());
-                    }
                 } else if let Some(value) = line.strip_prefix("allow_send:") {
                     allow_send = value.trim() == "true";
                 } else if let Some(value) = line.strip_prefix("max_steps:") {
@@ -220,7 +213,6 @@ impl AgentDefinition {
             description,
             body: body.trim().to_owned(),
             tools,
-            model,
             allow_send,
             max_steps,
             origin,

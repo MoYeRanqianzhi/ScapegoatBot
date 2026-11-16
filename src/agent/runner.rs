@@ -287,19 +287,6 @@ impl Runner {
             }
         }
 
-        let dynamic = prompt::context::load(&vfs, &config.context_budget);
-
-        let mut system = vec![SystemBlock {
-            text: prompt::render_static(config.mode),
-            cache: true,
-        }];
-        for block in dynamic.render() {
-            system.push(SystemBlock {
-                text: block,
-                cache: false,
-            });
-        }
-
         let slot = Arc::new(std::sync::RwLock::new(ProviderSlot {
             reference: config.model.clone(),
             api_model: provider.model_id().to_owned(),
@@ -329,7 +316,8 @@ impl Runner {
             config,
             history,
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
-            system: std::sync::RwLock::new(system),
+            // 下面由 `rebuild_system` 填上：启动与压缩之后是同一套组装。
+            system: std::sync::RwLock::new(Vec::new()),
             compaction_lock: Mutex::new(()),
             compaction_failures: std::sync::atomic::AtomicU32::new(0),
             turn_times: Mutex::new(HashMap::new()),
@@ -339,6 +327,7 @@ impl Runner {
             review_lock: Mutex::new(()),
             active_turns: std::sync::atomic::AtomicUsize::new(0),
         });
+        runner.rebuild_system();
         let _ = runner
             .fire_hooks(crate::config::HookEvent::SessionStart, None, None)
             .await;
@@ -406,6 +395,9 @@ impl Runner {
             .await;
     }
 
+    /// 组装 system：静态提示词、VFS 里常驻注入的文件、`session_start` hook 注入的上下文。
+    ///
+    /// 启动时与每次压缩之后都走这里，两处得到的是同一种 system。
     fn rebuild_system(&self) {
         let mut system = vec![SystemBlock {
             text: prompt::render_static(self.config.mode),
@@ -746,6 +738,7 @@ impl Runner {
         let mut inbound = evidence::SteeredInbound::new(
             chat,
             self.config.owner_qq,
+            &self.config.event_hooks,
             evidence.clone(),
             &mut *steering_rx,
         );
@@ -1747,9 +1740,13 @@ mod tests {
         assert!(unchanged.ended_at.is_none());
         assert_eq!(*history.lock().await, before);
 
+        // 自动压缩已经因为连续失败停掉时，一次成功的手动压缩让它恢复。
+        let failures = &runner.compaction_failures;
+        failures.store(3, std::sync::atomic::Ordering::Relaxed);
         let value = runner.compact_now("test").await.unwrap();
         assert_eq!(value["compacted"], true);
         assert_eq!(value["previous_session"], previous.file);
+        assert_eq!(failures.load(std::sync::atomic::Ordering::Relaxed), 0);
         let current = sessions.current().unwrap();
         assert_ne!(current.file, previous.file);
         let new_history = history.lock().await;
@@ -1982,6 +1979,24 @@ mod tests {
         turn_context_budget: u32,
         keep_recent_tokens: u32,
     ) -> (Arc<Runner>, Arc<Gate>, tempfile::TempDir) {
+        runner_with_hooks(
+            outcome,
+            script,
+            turn_context_budget,
+            keep_recent_tokens,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// [`runner_with`] 加上事件 hook。
+    async fn runner_with_hooks(
+        outcome: Option<crate::security::review::ReviewOutcome>,
+        script: Vec<Vec<ProviderEvent>>,
+        turn_context_budget: u32,
+        keep_recent_tokens: u32,
+        event_hooks: Vec<crate::config::EventHookConfig>,
+    ) -> (Arc<Runner>, Arc<Gate>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_in_memory().unwrap());
         let key = Arc::new(MasterKey::from_bytes([11u8; 32]));
@@ -2085,7 +2100,7 @@ mod tests {
                 last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
                 budget: None,
                 max_state_chars: 32_000,
-                event_hooks: Vec::new(),
+                event_hooks,
             },
             Arc::clone(&history),
             Arc::new(AtomicBool::new(true)),
@@ -2163,6 +2178,39 @@ mod tests {
         );
         // hold 仍在：解除是 agent 自己的事（`agent.resume`）。
         assert!(gate.hold_active());
+    }
+
+    /// `session_start` 的 `inject_context` 从启动起就在 system 里，压缩之后也还在。以前启动时
+    /// 的 system 不含它，要等到第一次压缩才出现：配置写了、日志也记了，模型却看不到。
+    #[tokio::test]
+    async fn session_start_context_is_in_the_system_from_startup() {
+        let hook = crate::config::EventHookConfig {
+            event: crate::config::HookEvent::SessionStart,
+            action: crate::config::HookAction::InjectContext,
+            text: "house rule: marker-7461".to_owned(),
+            ..Default::default()
+        };
+        let (runner, _gate, _dir) =
+            runner_with_hooks(None, Vec::new(), 120_000, 20_000, vec![hook]).await;
+        let injected = |runner: &Runner| {
+            runner
+                .system
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|block| block.text.contains("marker-7461"))
+                .count()
+        };
+        assert_eq!(injected(&runner), 1);
+        // 静态提示词仍是第一块，而且是唯一带缓存断点的。
+        {
+            let system = runner.system.read().unwrap();
+            assert!(system[0].cache);
+            assert!(system[1..].iter().all(|block| !block.cache));
+        }
+        // 重建不会把它加第二遍。
+        runner.rebuild_system();
+        assert_eq!(injected(&runner), 1);
     }
 
     /// 一个只回 `ok` 的 runner，不带周期审查。

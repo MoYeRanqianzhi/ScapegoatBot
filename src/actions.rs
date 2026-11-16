@@ -417,7 +417,7 @@ fn specs_napcat_admin_destructive(list: &mut Vec<ActionSpec>) {
                 | "napcat.set_group_card"
                 | "napcat.set_group_admin"
         );
-        // 收缩暴露面（踢/禁言/退群/解散）agent 可自主执行；
+        // 收缩暴露面的踢人、禁言 agent 可自主执行；
         // 改名片、改群名、发公告、授予权限属于扩张，需要 owner intent。
         let expands = matches!(
             action,

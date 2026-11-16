@@ -59,8 +59,9 @@ impl MessageFilter {
     ///
     /// 被忽略的群里的进群、撤回、戳一戳等通知，以及被忽略的人发来的好友/加群请求，
     /// 与消息一样不入库、不进 inbox、不进 monitor。正则与 `require_mention` 只对
-    /// 有正文的消息有意义。其余事件（meta、连接状态、无法归类的事件）不属于任何
-    /// chat，放行。
+    /// 有正文的消息有意义。无法归类的事件按它带的 `group_id` / `user_id` 同样过滤：带了这些
+    /// 字段的会以 `[unknown]` 写进 inbox，被忽略的群不能靠一种认不出的事件类型绕进来。
+    /// meta 与连接状态不属于任何 chat，放行。
     pub fn check_event(&self, event: &QqEvent, self_id: u64) -> FilterVerdict {
         let (group, actor) = match event {
             QqEvent::Message(message) => return self.check(message, self_id),
@@ -72,7 +73,11 @@ impl MessageFilter {
                 notice.actor,
             ),
             QqEvent::Request(request) => (request.group, request.actor),
-            _ => return FilterVerdict::Accept,
+            QqEvent::Unknown { data, .. } => (
+                data.get("group_id").and_then(serde_json::Value::as_u64),
+                data.get("user_id").and_then(serde_json::Value::as_u64),
+            ),
+            QqEvent::Meta { .. } | QqEvent::Connection { .. } => return FilterVerdict::Accept,
         };
         if group.is_some_and(|group| self.ignore_groups.contains(&group)) {
             return FilterVerdict::Reject {
@@ -159,6 +164,39 @@ mod tests {
 
     fn filter(config: FilterConfig) -> MessageFilter {
         MessageFilter::from_config(&config)
+    }
+
+    /// 认不出类型的事件带着 `group_id` / `user_id` 时会写进 inbox，所以和通知一样按群与
+    /// 发起人过滤；不带这些字段的不属于任何 chat，放行（它们不入库）。
+    #[test]
+    fn unknown_events_are_filtered_by_their_group_and_user() {
+        let filter = filter(FilterConfig {
+            ignore_groups: vec![42],
+            ignore_users: vec![7],
+            ..FilterConfig::default()
+        });
+        let unknown = |data: Value| QqEvent::Unknown {
+            name: "notice.something_new".to_owned(),
+            data,
+        };
+        let verdict = |data: Value| filter.check_event(&unknown(data), 10000);
+        assert_eq!(
+            verdict(serde_json::json!({"group_id": 42, "user_id": 1})),
+            FilterVerdict::Reject {
+                rule: "ignore_groups"
+            }
+        );
+        assert_eq!(
+            verdict(serde_json::json!({"group_id": 1, "user_id": 7})),
+            FilterVerdict::Reject {
+                rule: "ignore_users"
+            }
+        );
+        assert_eq!(
+            verdict(serde_json::json!({"group_id": 1, "user_id": 1})),
+            FilterVerdict::Accept
+        );
+        assert_eq!(verdict(serde_json::json!({})), FilterVerdict::Accept);
     }
 
     #[test]

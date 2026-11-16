@@ -24,9 +24,13 @@ pub(super) fn batch_owner_intent(owner_qq: u64, messages: &[QqMessage]) -> bool 
 ///
 /// 回合开始时的 owner intent 只覆盖开始时的批次；之后进入的非 self 消息只要有一条
 /// 不是主人的，就撤销 intent——模型接下来照着谁的话行动无法区分。
+///
+/// 这里与回合开始时的触发批次过同一个 `message_received` hook：被 `block` 的消息从哪条路
+/// 进来都不进上下文。（`inject_context` 只按 chat 匹配，回合开始时已经注入过了。）
 pub(super) struct SteeredInbound<'a> {
     chat: ChatId,
     owner_qq: u64,
+    hooks: &'a [crate::config::EventHookConfig],
     evidence: TurnEvidence,
     receiver: &'a mut mpsc::UnboundedReceiver<QqMessage>,
 }
@@ -35,12 +39,14 @@ impl<'a> SteeredInbound<'a> {
     pub(super) fn new(
         chat: ChatId,
         owner_qq: u64,
+        hooks: &'a [crate::config::EventHookConfig],
         evidence: TurnEvidence,
         receiver: &'a mut mpsc::UnboundedReceiver<QqMessage>,
     ) -> Self {
         Self {
             chat,
             owner_qq,
+            hooks,
             evidence,
             receiver,
         }
@@ -49,13 +55,25 @@ impl<'a> SteeredInbound<'a> {
 
 impl crate::agent::agent_loop::SteeringSource for SteeredInbound<'_> {
     fn try_next(&mut self) -> Option<AgentMessage> {
-        let message = self.receiver.try_recv().ok()?;
-        if !message.is_self && !from_owner(self.owner_qq, &message) {
-            self.evidence.revoke_owner_intent();
+        // 被 hook 挡掉的消息跳过，接着取下一条：它不进上下文，也就不影响证据。
+        loop {
+            let message = self.receiver.try_recv().ok()?;
+            let hook = crate::agent::hooks::fire(
+                self.hooks,
+                crate::config::HookEvent::MessageReceived,
+                Some(self.chat),
+            );
+            if let Some(reason) = hook.blocked {
+                warn!(chat = %self.chat, %reason, "MessageReceived hook dropped a steered message");
+                continue;
+            }
+            if !message.is_self && !from_owner(self.owner_qq, &message) {
+                self.evidence.revoke_owner_intent();
+            }
+            let text = format::render_inbound(&message);
+            self.evidence.record_source(self.chat.to_string(), &text);
+            return Some(AgentMessage::user(text));
         }
-        let text = format::render_inbound(&message);
-        self.evidence.record_source(self.chat.to_string(), &text);
-        Some(AgentMessage::user(text))
     }
 }
 
@@ -158,7 +176,7 @@ mod tests {
         // 工具调用拿到的是克隆：撤销必须对它可见。
         let tool_view = evidence.clone();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut inbound = SteeredInbound::new(ChatId::Group(1), OWNER, evidence, &mut rx);
+        let mut inbound = SteeredInbound::new(ChatId::Group(1), OWNER, &[], evidence, &mut rx);
 
         tx.send(from(OWNER, false)).unwrap();
         let rendered = inbound
@@ -184,5 +202,41 @@ mod tests {
         assert!(inbound.try_next().is_none());
         // 进入回合的内容都记为本 chat 的上下文来源。
         assert_eq!(tool_view.context_sources.lock().unwrap().len(), 3);
+    }
+
+    /// `message_received` 的 `block` 对回合中途进来的消息同样生效：被挡的消息不进上下文、
+    /// 不记为来源，也不撤销 owner intent。只匹配别的 chat 的 hook 不影响这个回合。
+    #[test]
+    fn a_blocked_steered_message_never_enters_the_turn() {
+        let block = |group| crate::config::EventHookConfig {
+            event: crate::config::HookEvent::MessageReceived,
+            action: crate::config::HookAction::Block,
+            reason: "quiet hours".to_owned(),
+            match_: crate::config::HookMatch {
+                group_id: Some(group),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // 挡的是这个群：别人的消息进不来，授权还在。
+        let hooks = [block(1)];
+        let evidence = TurnEvidence::owner("group:1");
+        let tool_view = evidence.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut inbound = SteeredInbound::new(ChatId::Group(1), OWNER, &hooks, evidence, &mut rx);
+        tx.send(from(20002, false)).unwrap();
+        tx.send(from(20003, false)).unwrap();
+        assert!(inbound.try_next().is_none());
+        assert!(tool_view.owner_intent());
+        assert!(tool_view.context_sources.lock().unwrap().is_empty());
+
+        // 挡的是别的群：照常进入。
+        let hooks = [block(2)];
+        let evidence = TurnEvidence::owner("group:1");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut inbound = SteeredInbound::new(ChatId::Group(1), OWNER, &hooks, evidence, &mut rx);
+        tx.send(from(20002, false)).unwrap();
+        assert!(inbound.try_next().is_some());
     }
 }
