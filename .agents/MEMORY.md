@@ -8,12 +8,14 @@
 - [图片工具 local.media.image.*](memory/image-tools.md) -- 5 个 action、系统字体约束、依赖与模块命名坑
 - [功能范围纠正](memory/feature-scope-correction.md) -- 不要把代码限制升级成需求；禁止内置字体
 - [工具表](memory/tool-surface.md) -- 没有 Memory / Download 工具；API 前缀只是命名空间，`local` 待改名 `native`，要能接任意渠道与自定义 action；新增顶层工具要用户同意
-- [文档归属](memory/docs-layout.md) -- 开发文档就是 .agents 记忆；使用文档是内嵌在二进制里的 skill
+- [文档归属](memory/docs-layout.md) -- 开发文档就是 .agents 记忆；使用文档是 `skills/` 下的 skill，内嵌进二进制（`sbot docs`）
+- [维护约定](memory/maintenance-rules.md) -- 迁移只追加、样例配置与内嵌文档的登记、语言、限制写在哪里；动 schema / 存储 / 工具 / 文档前读
+- [提示词结构](memory/prompt-structure.md) -- system 三层、注入归属、新文本放哪里、守着它的测试
+- [实机验证](memory/live-testing.md) -- 真实模型 / Jev / 本地 OneBot mock 的端到端验证命令与验收口径
 - [提交说明](memory/commit-messages.md) -- 不带 Claude Code 共同作者行；2026-11-10 重写过历史，远端已强推
 - [发布状态](memory/release-status.md) -- alpha.44 已发布：20 个产物怎么验证的、哪些平台没实测、测试基线
 - [审查整改计划（2026-11-07）](plan/2026-11-07-review-remediation.md) -- 四份代码审查的已修/待修项与顺序
 - [重构总设计](plan/2026-10-28-rebuild-design.md) -- 0.2 设计依据与取舍理由；与代码冲突时以代码为准
 - [Prompt Catalog](plan/2026-10-29-prompt-catalog.md) -- 模型面文本（工具描述、压缩、子代理、门禁提示）的英文稿
 - [安全分类器调研](plan/2026-10-30-step-guard-research.md) -- Jev 单遍决策模型的能力边界与真实 API 结果
-- [重构基线](plan/2026-10-30-refactor-baseline.md) -- 0.1 代码量基线，`docs/development/refactor-report.md` 的数据来源
 - [0.2 代码审查快照（2026-11-03）](plan/2026-11-03-code-review.md) -- alpha.12 时的问题清单；修复前快照，不代表现状

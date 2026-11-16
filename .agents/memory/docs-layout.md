@@ -5,7 +5,7 @@ metadata:
   type: feedback
   scope: README、docs/、skills/、.agents/ 与二进制内嵌文档
   status: active
-  last_verified: 2026-11-10
+  last_verified: 2026-11-17
 ---
 
 用户 2026-11-10 的规则（原话见 Evidence）：
@@ -28,4 +28,16 @@ metadata:
 自带文档，agent 与人看到的永远是当前版本的说法。
 
 **How to apply:** 改行为时改 skill 源文件（它同时就是内嵌文档），不要另写一份；开发时学到
-的东西写进 `.agents/memory/`。实现落地后把具体路径与命令补到这条记忆里。
+的东西写进 `.agents/memory/`。
+
+落地后的样子（2026-11-17）：
+
+- skill 源文件在仓库的 `skills/<skill>/`（`SKILL.md` 加 `references/`）：`sbot`、
+  `sbot-deploy`、`sbot-use`、`sbot-operate`。
+- `src/cli/docs.rs` 用 `include_str!` 把它们编进二进制；`sbot docs` 列出，
+  `sbot docs <skill> [<reference>]` 打印，`sbot docs --export <DIR>` 导出。新增文件要在那里的
+  `DOCS` 登记，测试会检查磁盘与内嵌清单一致（见 [[maintenance-rules]]）。
+- skill 正文里指向别的文档一律写 `sbot docs …` 命令，不写仓库路径：离开仓库的二进制也要
+  能照着走。
+- `docs/guide/`、`docs/development/` 已删除；README 只留简介与指路。原开发文档里仍成立的内容
+  在 [[maintenance-rules]]、[[prompt-structure]]、[[live-testing]]。

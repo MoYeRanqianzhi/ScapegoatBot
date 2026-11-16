@@ -46,22 +46,20 @@ PR 本身没有动，Dependabot 下次运行时会自己关掉；没关的话可
       是 11 月几轮实机验证建的；`G:\sbot-e2e-{live,perchat,phase7,qq}` 更早，用途未核实。旧历史
       的备份 `G:\sbot-pre-coauthor-rewrite-2026-11-10.bundle` 在远端强推之后已经没用。
 - [ ] 上级目录的 `G:/ClaudeProjects/ScapegoatBot/CLAUDE.md`（不在本仓库里）仍说开发文档在
-      `docs/development/`；删掉那个目录时要用户一起改。
-
-## 用户 2026-11-10 的要求里还没做的
-
-决定本身记在 [`memory/docs-layout.md`](memory/docs-layout.md)。
-
-- [ ] 面向使用者（人或 agent）的 skill：部署、使用、运维；同一份内容内嵌进二进制，用命令
-      查看 / 导出（`sbot docs`），保证 skill 与二进制版本一致。`docs/guide/` 与 skill 不能各写
-      一份：做完后删 `docs/guide/`。计划见
-      [`plan/2026-11-11-embedded-docs-skills.md`](plan/2026-11-11-embedded-docs-skills.md)。
-      现状：只有一个未提交的草稿 `skills/sbot/SKILL.md`，`sbot docs` 命令不存在。做完后要在
-      `.github/scripts/release-notes.sh` 里加一句“`sbot docs` 看文档”，部署 skill 里写
-      “要配自动重启”（原因在 `Cargo.toml` 的 `[profile.release]` 注释与
-      `docs/guide/limits.md`）与发布页怎么选文件（`docs/guide/install.md`）。
-- [ ] 删除 `docs/development/`：仍然成立、且代码里看不出来的内容并入 `.agents/`，其余删除；
-      README / AGENTS.md 里指向它的说法一并改掉。
+      `docs/development/`；那个目录 2026-11-17 已删，这一句要用户自己改（开发文档现在是
+      `.agents/`，使用文档是 `sbot docs` / `skills/`）。
+- [ ] 2026-11-17 核对 skill 与代码时看到、**没有改**的地方。它们不是 bug，但都是“配置或接口
+      说了、程序没做”，要不要做、怎么做由用户定：
+  - `[agent].name` 被校验但从不使用（删掉是破坏性的配置变更）。
+  - `models.json` 的 `max_retries`、`sampling`、`compat` 被解析但不生效。
+  - `compaction_checkpoints` 表只写不读（`checkpoints()` 只有测试在用）。
+  - `api.help` / `api.list` 不告诉 agent 哪些动作是 destructive。
+  - `sbot doctor` 只数 `.jsonl`，启动时的对账数的是 `messages/` 下全部文件：目录里有别的文件
+    时两边的数对不上。
+  - 自定义子代理的 `tools` 里写了不认识的名字会被悄悄跳过，不报错。
+  - MCP 服务器的 stderr 被丢弃，启动失败时看不到它自己打印的原因。
+  - `approve` 的 6 位确认码没有尝试次数限制（靠 60 秒有效期与“只有主人能私聊”）。
+  - `SBOT__*` 环境变量覆盖不了嵌套表里的键（`[security.guard]` 这类可以，表数组不行）。
 
 ## CI / 发布留下的尾巴
 
@@ -82,6 +80,16 @@ PR 本身没有动，Dependabot 下次运行时会自己关掉；没关的话可
 
 核实时顺带看到的两处（VFS 换一种内容覆盖时留下旧内容；transcript 分段文件不在时追加会
 建出没有文件头的文件）也在同一天修了。
+
+2026-11-16 – 17 写 skill 时把文档里的每句话对照代码核了一遍，又查出一批行为与说法不一致的
+地方，都修了并补了测试（CHANGELOG 的 Unreleased“修复”段后半部分，提交 `5ee49c0` 到
+`4f2200c`）：加密开关切换后旧历史读不出、加密配置下未认证的明文行会被当成历史、环境变量
+覆盖只对字符串生效且被 `/config` 写入冲掉、门禁的重复 / 群发规则对字符串形式的消息不生效、
+周期检查的窗口丢掉最新内容、`session_start` 注入要等第一次压缩、`message_received` 的
+`block` 拦不住回合中途到达的消息、未知事件绕过 `[filter]`、自动压缩停掉后只能重启恢复、
+`Grep` 搜历史没有预算。其中两条的取舍值得记住，见
+[`memory/storage-invariants.md`](memory/storage-invariants.md) 与
+[`memory/security-gate-semantics.md`](memory/security-gate-semantics.md)。
 
 ## 仍然超过 100 行的函数（不阻塞）
 

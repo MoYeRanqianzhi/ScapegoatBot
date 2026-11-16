@@ -42,5 +42,5 @@ metadata:
 
 **Why:** 命名层级是用户明确要求；模块名遮蔽 crate 是实际踩过的编译坑。
 
-**How to apply:** 改图片 API 时同步 `docs/guide/tools-and-vfs.md`、CHANGELOG、system prompt 与测试；
+**How to apply:** 改图片 API 时同步 `skills/sbot-use/references/tools-and-vfs.md`、CHANGELOG、system prompt 与测试；
 不要把字体文件加进仓库。

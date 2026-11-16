@@ -42,7 +42,7 @@ shellcheck / CodeQL 在 CI 上全过。
   `gate_approvals`，重启后未过期的请求与批准仍有效。
 - `get_image`、QQ CDN 下载、`get_msg` / `get_forward_msg`、发出媒体。
 
-其他边界见 `docs/guide/limits.md`（该目录计划并入 skill，见 [[docs-layout]]）。
+其他边界见 `skills/sbot-operate/references/limits.md`（`sbot docs sbot-operate limits`）。
 
 **Evidence:** release 运行 43747825572 与试跑 43742813837（全部任务 success）；
 `gh release view v0.2.0-alpha.44`（21 个资产）；2026-11-16 在 WSL Debian 12 与本机 Windows 上
