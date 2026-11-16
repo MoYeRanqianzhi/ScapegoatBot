@@ -120,7 +120,7 @@ sbot resume          # 删除 ESTOP
 - 换过机器但没带 `~/.sbot/key`：守护进程拒绝启动，见上面“起不来”的 canary 一行。
 - 改过 `[storage].encryption`：密文在任何配置下都读得出；从 `none` 改回加密之后，调试期间
   明文写下的行不再读取，日志里记为跳过（`unencrypted line in an encrypted store`）。要读
-  它们就把配置改回 `none`。
+  它们就把配置改回 `none` 并重启；注意这期间新写下的内容也是明文，读完改回加密。
 - 消息文件数与索引里的对不上（手工动过 `data/messages/` 下的文件）：启动时发现数量不等就
   重建索引；重建时读不出的文件、解不开的行只记一条 `skipped` 警告并跳过，其余消息照常
   补回。`doctor` 报告两边的数量。

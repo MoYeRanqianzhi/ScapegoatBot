@@ -173,6 +173,7 @@ WantedBy=multi-user.target
 ```
 
 - `Restart=on-failure` 正好：`sbot stop` 让进程以 0 退出，不会被重新拉起；崩溃是非 0，会。
+  不要用 `Restart=always`：它在 `sbot stop` 之后也把进程拉起来，停不下来。
 - 日志用 `journalctl -u sbot` 看。
 - 由服务管理器运行时，**重启用服务管理器的命令**（`systemctl restart sbot`），不要用
   `sbot restart`：后者自己拉起一个脱离终端的新进程，不归服务管理器管，日志也没有地方去。

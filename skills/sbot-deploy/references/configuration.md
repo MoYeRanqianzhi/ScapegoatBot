@@ -19,7 +19,11 @@
 ```bash
 SBOT__AGENT__MODEL=anthropic/claude-haiku-5-5
 SBOT__NAPCAT__URL=ws://127.0.0.1:3002
+SBOT__AGENT__MAX_STEPS=32
 ```
+
+节与键之间是两个下划线；键名照配置里的写法转成大写，键名自己的下划线保留
+（`max_steps` → `MAX_STEPS`）。
 
 环境变量的值按这一项在配置里的类型解析：字符串项原样使用，其余按 TOML 字面量（`32`、`true`、
 `[1, 2]`）。类型不对或键不存在时启动报错。覆盖只在内存里，不写回文件；agent 经 `/config`
@@ -55,7 +59,7 @@ SBOT__NAPCAT__URL=ws://127.0.0.1:3002
 | `compaction_model` | 空 | 摘要模型；空 = 主模型 |
 | `max_output_tokens` | 8192 | 单次回复上限；不能超过模型的 `max_tokens`，也不能超过 `[compaction].reserve_tokens` |
 | `max_steps` | 64 | 单回合工具循环上限 |
-| `master` | `self` | 报告与审批通知的目标：`self`（登录账号）或 QQ 号 |
+| `master` | `self` | 报告与审批通知的目标：`self`（登录账号）或 QQ 号。文档别处说的 `master_qq` 就是它解析出来的账号 |
 | `receive_scopes` | `["*"]` | agent 能**主动读**的 chat 列表：约束 `/messages`、`/inbox` 等视图与 `napcat.get_*` 查询。它不是准入过滤——范围外的消息照样入库，被 monitor 命中时照样进上下文；不想收就用 `[filter]` |
 | `send_scopes` | `["*"]` | 允许发消息、做群管理的 chat 列表；空 = 一条都不许发 |
 | `retry_attempts` / `retry_base_ms` / `retry_max_ms` | 3 / 400 / 30000 | provider 重试次数、基础间隔、上限 |
