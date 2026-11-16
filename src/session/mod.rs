@@ -507,6 +507,7 @@ impl SessionStore {
             "file_id": file_id,
             "prev_file": prev_file,
             "created_at": started_at.to_rfc3339(),
+            // 建分段时的配置，只作记录：读取按每一行自己的封装方式（见 `decode_line`）。
             "encryption": match self.encryption {
                 EncryptionMode::XChaCha20Poly1305 => "xchacha20poly1305",
                 EncryptionMode::None => "none",
@@ -607,64 +608,65 @@ impl SessionStore {
             .get("line")
             .and_then(Value::as_u64)
             .map(|line| line as usize);
-        let plain = match self.encryption {
-            EncryptionMode::XChaCha20Poly1305 => {
-                let nonce_b64 = value
-                    .get("nonce")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let sealed = envelope::join(nonce_b64, ct_b64)?;
-                // 信封行号优先（正常写入时它就是 AAD 行号）；失败后再试物理行号，
-                // 最后才扫描。
-                //
-                // 扫描存在的原因：AAD 绑定写入时的行号，而分段被重写、拼接，
-                // 或前后插入/删除行之后，物理位置会漂移，信封也可能缺字段，
-                // 此时只能按「能否解开」反推行号。
-                //
-                // 上界用分段总行数而不是固定值：扫描范围随分段增长，长分段靠后的行
-                // 不会在固定值处被截断；候选上限也与读取方实际掌握的文件长度一致。
-                //
-                // 已知取舍：扫描会接受位置被移动但可解的行，所以它恢复的是可读性，
-                // 不是位置完整性；位置完整性仍待签名或链式摘要方案。
-                let first = envelope_line.unwrap_or(line_no);
-                // 位置漂移通常很小（删/插几行）。先试信封与物理行号，再试物理位置
-                // 附近的候选，最后才退回全范围；长分段末尾的行不必从 1 扫起。
-                let mut candidates = Vec::new();
-                candidates.push(first);
-                if line_no != first {
-                    candidates.push(line_no);
+        let nonce_b64 = value
+            .get("nonce")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        // 这一行是密文还是明文由它自己说明，不看当前配置：`[storage].encryption` 改过之后，
+        // 旧分段、以及改动前后都被追加过的当前分段，都要读得出来。
+        let plain = if envelope::is_plain(nonce_b64) {
+            base64::engine::general_purpose::STANDARD.decode(ct_b64)?
+        } else {
+            let sealed = envelope::join(nonce_b64, ct_b64)?;
+            // 信封行号优先（正常写入时它就是 AAD 行号）；失败后再试物理行号，
+            // 最后才扫描。
+            //
+            // 扫描存在的原因：AAD 绑定写入时的行号，而分段被重写、拼接，
+            // 或前后插入/删除行之后，物理位置会漂移，信封也可能缺字段，
+            // 此时只能按「能否解开」反推行号。
+            //
+            // 上界用分段总行数而不是固定值：扫描范围随分段增长，长分段靠后的行
+            // 不会在固定值处被截断；候选上限也与读取方实际掌握的文件长度一致。
+            //
+            // 已知取舍：扫描会接受位置被移动但可解的行，所以它恢复的是可读性，
+            // 不是位置完整性；位置完整性仍待签名或链式摘要方案。
+            let first = envelope_line.unwrap_or(line_no);
+            // 位置漂移通常很小（删/插几行）。先试信封与物理行号，再试物理位置
+            // 附近的候选，最后才退回全范围；长分段末尾的行不必从 1 扫起。
+            let mut candidates = Vec::new();
+            candidates.push(first);
+            if line_no != first {
+                candidates.push(line_no);
+            }
+            for delta in 1..=64usize {
+                if line_no + delta <= max_line {
+                    candidates.push(line_no + delta);
                 }
-                for delta in 1..=64usize {
-                    if line_no + delta <= max_line {
-                        candidates.push(line_no + delta);
-                    }
-                    if line_no > delta {
-                        candidates.push(line_no - delta);
-                    }
+                if line_no > delta {
+                    candidates.push(line_no - delta);
                 }
-                candidates.extend(
-                    (1..=max_line).filter(|candidate| *candidate != first && *candidate != line_no),
-                );
-                let mut plain = None;
-                for (scanned, candidate) in candidates.into_iter().enumerate() {
-                    if scanned >= SCAN_PER_LINE {
-                        break;
-                    }
-                    let aad = format!("session:{file_id}:{candidate}");
-                    if let Ok(value) = self.key.open("session", aad.as_bytes(), &sealed) {
-                        plain = Some(value);
-                        break;
-                    }
+            }
+            candidates.extend(
+                (1..=max_line).filter(|candidate| *candidate != first && *candidate != line_no),
+            );
+            let mut plain = None;
+            for (scanned, candidate) in candidates.into_iter().enumerate() {
+                if scanned >= SCAN_PER_LINE {
+                    break;
                 }
-                plain.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "cannot decrypt transcript line at physical position {line_no} \
+                let aad = format!("session:{file_id}:{candidate}");
+                if let Ok(value) = self.key.open("session", aad.as_bytes(), &sealed) {
+                    plain = Some(value);
+                    break;
+                }
+            }
+            plain.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot decrypt transcript line at physical position {line_no} \
                          (envelope line: {envelope_line:?}; scanned sealed line numbers \
                          1..={max_line})"
-                    )
-                })?
-            }
-            EncryptionMode::None => base64::engine::general_purpose::STANDARD.decode(ct_b64)?,
+                )
+            })?
         };
         Ok(serde_json::from_slice(&plain)?)
     }
@@ -938,6 +940,52 @@ mod tests {
         let second = store.rotate_with(&[AgentMessage::user("summary")]).unwrap();
         assert_eq!(store.current().unwrap().file, second.file);
         assert_eq!(store.read_segment(&second.file).unwrap().len(), 1);
+    }
+
+    /// `[storage].encryption` 在两次启动之间改掉之后，当前分段接着被追加，里面密文行与明文行
+    /// 都有：每一行都按它自己的封装方式读出来，上下文不会因为改了这个设置而丢掉一截。
+    #[test]
+    fn changing_the_encryption_setting_keeps_the_segment_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let key = Arc::new(MasterKey::from_bytes([9u8; 32]));
+        let open = |mode| {
+            SessionStore::open(
+                Arc::clone(&db),
+                Arc::clone(&key),
+                dir.path().to_path_buf(),
+                0,
+                mode,
+            )
+            .unwrap()
+        };
+
+        let sealed = open(EncryptionMode::XChaCha20Poly1305);
+        let file = sealed.current().unwrap().file;
+        sealed
+            .append(&[AgentMessage::user("sealed first")])
+            .unwrap();
+
+        let plain = open(EncryptionMode::None);
+        plain.append(&[AgentMessage::user("plain second")]).unwrap();
+        // 还是同一个分段：改设置不会另起一个。
+        assert_eq!(plain.current().unwrap().file, file);
+
+        let sealed = open(EncryptionMode::XChaCha20Poly1305);
+        sealed
+            .append(&[AgentMessage::user("sealed third")])
+            .unwrap();
+
+        let expected = [
+            AgentMessage::user("sealed first"),
+            AgentMessage::user("plain second"),
+            AgentMessage::user("sealed third"),
+        ];
+        assert_eq!(sealed.read_segment(&file).unwrap(), expected);
+        assert_eq!(plain.read_segment(&file).unwrap(), expected);
+        // 文件里确实两种行都有：第二条是明文（base64），另外两条不是。
+        let text = std::fs::read_to_string(segment_path(dir.path(), &file)).unwrap();
+        assert_eq!(text.matches("\"nonce\":\"\"").count(), 1);
     }
 
     #[test]

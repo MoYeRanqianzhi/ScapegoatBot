@@ -23,6 +23,7 @@ impl MessageStore {
             "scope": scope,
             "peer_id": peer,
             "date": date,
+            // 建文件时的配置，只作记录：读取按每一行自己的封装方式（见 `envelope::open_line`）。
             "encryption": match self.encryption {
                 EncryptionMode::XChaCha20Poly1305 => "xchacha20poly1305",
                 EncryptionMode::None => "none",
@@ -81,7 +82,7 @@ impl MessageStore {
         line_no: usize,
         expected_id: Option<i64>,
     ) -> Result<Option<QqMessage>> {
-        let Some(file) = open_message_file(path, self.encryption)? else {
+        let Some(file) = open_message_file(path)? else {
             return Ok(None);
         };
         self.decode_message_at(&file, line_no, expected_id)
@@ -129,8 +130,7 @@ impl MessageStore {
             .and_then(Value::as_str)
             .unwrap_or_default();
         // AAD 与写入时一致：作用域、对端、消息 id、文件 id 与行号。
-        let plain = envelope::open_as(
-            file.encryption,
+        let plain = envelope::open_line(
             &self.key,
             "message",
             || {
@@ -150,15 +150,11 @@ impl MessageStore {
 pub(super) struct MessageFile {
     pub(super) path: String,
     pub(super) file_id: String,
-    pub(super) encryption: EncryptionMode,
     pub(super) lines: Vec<String>,
 }
 
 /// 打开并读入一个消息文件；不存在返回 `None`。
-pub(super) fn open_message_file(
-    path: &Path,
-    fallback: EncryptionMode,
-) -> Result<Option<MessageFile>> {
+pub(super) fn open_message_file(path: &Path) -> Result<Option<MessageFile>> {
     let file = match std::fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -179,18 +175,6 @@ pub(super) fn open_message_file(
     Ok(Some(MessageFile {
         path: path.display().to_string(),
         file_id,
-        encryption: header_encryption(&header, fallback),
         lines,
     }))
-}
-
-/// 文件头记录的加密方式；没有记录或不认识时用 `fallback`（当前配置）。
-///
-/// 按文件头而不是当前配置解密：切换 `[storage].encryption` 后旧文件仍然可读。
-pub(super) fn header_encryption(header: &Value, fallback: EncryptionMode) -> EncryptionMode {
-    match header.get("encryption").and_then(Value::as_str) {
-        Some("none") => EncryptionMode::None,
-        Some("xchacha20poly1305") => EncryptionMode::XChaCha20Poly1305,
-        _ => fallback,
-    }
 }

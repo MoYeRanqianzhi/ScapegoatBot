@@ -1,4 +1,4 @@
-use super::codec::{MessageFile, header_encryption, open_message_file};
+use super::codec::{MessageFile, open_message_file};
 use super::*;
 
 impl MessageStore {
@@ -102,7 +102,6 @@ impl MessageStore {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
-            encryption: header_encryption(header, self.encryption),
             lines,
         };
         Ok(Some((message_file, row)))
@@ -241,7 +240,7 @@ impl MessageStore {
         let mut files: HashMap<String, Option<MessageFile>> = HashMap::new();
         for (file_path, line_no, message_id) in rows {
             let file = files.entry(file_path.clone()).or_insert_with(|| {
-                match open_message_file(&self.root.join(&file_path), self.encryption) {
+                match open_message_file(&self.root.join(&file_path)) {
                     Ok(file) => file,
                     Err(error) => {
                         warn!(%error, file = %file_path, "cannot open message file");

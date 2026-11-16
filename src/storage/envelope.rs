@@ -27,7 +27,7 @@ pub(crate) fn seal(
     ))
 }
 
-/// 按文件的加密模式封装一行的载荷：`XChaCha20Poly1305` 走 [`seal`]；`None`（仅调试）
+/// 按当前的加密模式封装一行的载荷：`XChaCha20Poly1305` 走 [`seal`]；`None`（仅调试）
 /// 只做 base64，`nonce` 为空。transcript 与消息归档的写入共用它。
 pub(crate) fn seal_as(
     mode: EncryptionMode,
@@ -45,20 +45,28 @@ pub(crate) fn seal_as(
     }
 }
 
-/// [`seal_as`] 的反向：按文件的加密模式取回载荷。`aad` 只在加密模式下才构造（闭包）。
-pub(crate) fn open_as(
-    mode: EncryptionMode,
+/// 一行是不是 [`seal_as`] 在不加密模式下写的：那时 `nonce` 为空，`ct` 只是 base64。
+///
+/// 一行怎么封装由它自己说明，读取时既不看文件头也不看当前配置：`[storage].encryption`
+/// 可以在两次启动之间改掉，而同一个文件（当天的消息文件、当前的 transcript 分段）会接着
+/// 被追加，里面两种行都有。
+pub(crate) fn is_plain(nonce_b64: &str) -> bool {
+    nonce_b64.is_empty()
+}
+
+/// [`seal_as`] 的反向：取回一行的载荷，封装方式按行自身判断（见 [`is_plain`]）。`aad` 只在
+/// 这一行是密文时才构造（闭包）。
+pub(crate) fn open_line(
     key: &MasterKey,
     purpose: &str,
     aad: impl FnOnce() -> String,
     nonce_b64: &str,
     ct_b64: &str,
 ) -> Result<Vec<u8>> {
-    match mode {
-        EncryptionMode::XChaCha20Poly1305 => {
-            open(key, purpose, aad().as_bytes(), nonce_b64, ct_b64)
-        }
-        EncryptionMode::None => Ok(base64::engine::general_purpose::STANDARD.decode(ct_b64)?),
+    if is_plain(nonce_b64) {
+        Ok(base64::engine::general_purpose::STANDARD.decode(ct_b64)?)
+    } else {
+        open(key, purpose, aad().as_bytes(), nonce_b64, ct_b64)
     }
 }
 

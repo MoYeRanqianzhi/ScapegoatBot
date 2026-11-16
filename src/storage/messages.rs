@@ -1022,31 +1022,48 @@ mod tests {
         );
     }
 
+    /// `[storage].encryption` 在两次启动之间改掉之后，同一个消息文件接着被追加，里面密文行
+    /// 与明文行都有：每一行都按它自己的封装方式读出来，不看文件头，也不看当前配置。
     #[test]
-    fn reads_follow_the_file_header_not_the_current_config() {
+    fn changing_the_encryption_setting_keeps_every_line_readable() {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_in_memory().unwrap());
         let key = Arc::new(MasterKey::from_bytes([6u8; 32]));
         let chat = ChatId::Group(1);
         let root = dir.path().to_path_buf();
-        {
-            let store = MessageStore::open(
-                Arc::clone(&db),
-                Arc::clone(&key),
-                root.clone(),
-                0,
-                EncryptionMode::XChaCha20Poly1305,
-            )
+        let open = |mode| {
+            MessageStore::open(Arc::clone(&db), Arc::clone(&key), root.clone(), 0, mode).unwrap()
+        };
+        let text_of = |store: &MessageStore, id: i64| {
+            let loaded = store.load(chat, id).unwrap().unwrap();
+            match &loaded.segments[0] {
+                crate::qq::event::Segment::Text { text } => text.clone(),
+                other => panic!("unexpected {other:?}"),
+            }
+        };
+
+        open(EncryptionMode::XChaCha20Poly1305)
+            .append(&message(chat, 1, "sealed first"))
             .unwrap();
-            store.append(&message(chat, 1, "ciphertext")).unwrap();
-        }
-        // 同一个数据目录按“明文”配置重新打开：文件头写着 xchacha，读取必须照此解密。
-        let reopened = MessageStore::open(db, key, root, 0, EncryptionMode::None).unwrap();
-        let loaded = reopened.load(chat, 1).unwrap().unwrap();
-        match &loaded.segments[0] {
-            crate::qq::event::Segment::Text { text } => assert_eq!(text, "ciphertext"),
-            other => panic!("unexpected {other:?}"),
-        }
+
+        // 按“明文”配置重新打开：旧的密文行照样解密，新的一行写成明文、落在同一个文件里。
+        let plain = open(EncryptionMode::None);
+        plain.append(&message(chat, 2, "plain second")).unwrap();
+        assert_eq!(text_of(&plain, 1), "sealed first");
+        assert_eq!(text_of(&plain, 2), "plain second");
+
+        // 再改回加密：三行分属两种封装，仍然都读得出。
+        let sealed = open(EncryptionMode::XChaCha20Poly1305);
+        sealed.append(&message(chat, 3, "sealed third")).unwrap();
+        assert_eq!(text_of(&sealed, 1), "sealed first");
+        assert_eq!(text_of(&sealed, 2), "plain second");
+        assert_eq!(text_of(&sealed, 3), "sealed third");
+        // 三条确实在同一个文件里（同一个会话、同一天），不是各写各的文件。
+        let files: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM message_files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(files, 1);
     }
 
     #[test]
