@@ -23,7 +23,7 @@ impl MessageStore {
             "scope": scope,
             "peer_id": peer,
             "date": date,
-            // 建文件时的配置，只作记录：读取按每一行自己的封装方式（见 `envelope::open_line`）。
+            // 建文件时的配置，只作记录：读取看每一行自己与当前配置（见 `envelope::plain_payload`）。
             "encryption": match self.encryption {
                 EncryptionMode::XChaCha20Poly1305 => "xchacha20poly1305",
                 EncryptionMode::None => "none",
@@ -131,6 +131,7 @@ impl MessageStore {
             .unwrap_or_default();
         // AAD 与写入时一致：作用域、对端、消息 id、文件 id 与行号。
         let plain = envelope::open_line(
+            self.encryption,
             &self.key,
             "message",
             || {

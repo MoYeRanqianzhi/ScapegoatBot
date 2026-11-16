@@ -12,8 +12,8 @@ use crate::vfs::path::{Order, ViewQuery};
 
 /// 消息是否满足全部条件。
 ///
-/// `state` 是这条消息的收件箱状态；没有状态（不在收件箱里）时为 `None`，此时任何
-/// `state:` 条件都不满足。`self_id` 是本账号 QQ，`mentions_self` 用它判断。
+/// `state` 是这条消息的收件箱状态（本账号发出的消息是已读）；没有状态记录时为 `None`，
+/// 此时任何 `state:` 条件都不满足。`self_id` 是本账号 QQ，`mentions_self` 用它判断。
 pub(super) fn matches_message(
     filter: &ViewFilter,
     message: &QqMessage,

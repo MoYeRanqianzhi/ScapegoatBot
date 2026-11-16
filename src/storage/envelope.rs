@@ -45,28 +45,48 @@ pub(crate) fn seal_as(
     }
 }
 
-/// 一行是不是 [`seal_as`] 在不加密模式下写的：那时 `nonce` 为空，`ct` 只是 base64。
+/// 取出一行明文载荷（[`seal_as`] 在不加密模式下写的：`nonce` 为空，`ct` 只是 base64）。
+/// 这一行是密文时返回 `Ok(None)`，由调用方解密。
 ///
-/// 一行怎么封装由它自己说明，读取时既不看文件头也不看当前配置：`[storage].encryption`
-/// 可以在两次启动之间改掉，而同一个文件（当天的消息文件、当前的 transcript 分段）会接着
-/// 被追加，里面两种行都有。
-pub(crate) fn is_plain(nonce_b64: &str) -> bool {
-    nonce_b64.is_empty()
+/// 一行是密文还是明文由它自己说明，但信不信明文看当前配置：
+///
+/// - 密文行在任何配置下都读——能解开就说明它是持有密钥的一方写的。`[storage].encryption`
+///   从加密改成 `none`（调试）之后，以前的内容照常可读，同一个文件里两种行可以并存。
+/// - 明文行只在配置为 `none` 时读。配置为加密时它是错误：明文没有任何认证，谁能写数据
+///   目录谁就能伪造，而加密的用途之一正是让拿不到密钥的人写不进可信的内容。所以从
+///   `none` 改回加密之后，调试期间明文写下的行不再读取。
+pub(crate) fn plain_payload(
+    mode: EncryptionMode,
+    nonce_b64: &str,
+    ct_b64: &str,
+) -> Result<Option<Vec<u8>>> {
+    if !nonce_b64.is_empty() {
+        return Ok(None);
+    }
+    match mode {
+        EncryptionMode::None => Ok(Some(
+            base64::engine::general_purpose::STANDARD.decode(ct_b64)?,
+        )),
+        EncryptionMode::XChaCha20Poly1305 => anyhow::bail!(
+            "unencrypted line in an encrypted store; lines written while storage.encryption \
+             was \"none\" are not read once encryption is on"
+        ),
+    }
 }
 
-/// [`seal_as`] 的反向：取回一行的载荷，封装方式按行自身判断（见 [`is_plain`]）。`aad` 只在
-/// 这一行是密文时才构造（闭包）。
+/// [`seal_as`] 的反向：取回一行的载荷（规则见 [`plain_payload`]）。`aad` 只在这一行是密文时
+/// 才构造（闭包）。
 pub(crate) fn open_line(
+    mode: EncryptionMode,
     key: &MasterKey,
     purpose: &str,
     aad: impl FnOnce() -> String,
     nonce_b64: &str,
     ct_b64: &str,
 ) -> Result<Vec<u8>> {
-    if is_plain(nonce_b64) {
-        Ok(base64::engine::general_purpose::STANDARD.decode(ct_b64)?)
-    } else {
-        open(key, purpose, aad().as_bytes(), nonce_b64, ct_b64)
+    match plain_payload(mode, nonce_b64, ct_b64)? {
+        Some(plain) => Ok(plain),
+        None => open(key, purpose, aad().as_bytes(), nonce_b64, ct_b64),
     }
 }
 

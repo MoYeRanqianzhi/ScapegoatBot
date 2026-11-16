@@ -188,15 +188,21 @@ impl TurnBufferStore {
         Ok(recovered)
     }
 
+    /// 解出一个块。
+    ///
+    /// 与 transcript、消息归档同一条规则（见 `storage::envelope::plain_payload`）：密文块在
+    /// 任何配置下都解；明文块只在配置为不加密时接受。这里的行没有标记自己是哪一种，所以
+    /// 配置为不加密时先当明文解析，不成再当密文解——`[storage].encryption` 从加密改成 `none`
+    /// 之后重启，崩溃前留下的密文块照样恢复得出来。
     fn decode_line(&self, turn_id: &str, seq: u64, line: &str) -> Result<AgentMessage> {
         let raw = base64::engine::general_purpose::STANDARD.decode(line)?;
-        let plain = match self.encryption {
-            EncryptionMode::XChaCha20Poly1305 => {
-                let aad = format!("turn:{turn_id}:{seq}");
-                self.key.open("turn", aad.as_bytes(), &raw)?
-            }
-            EncryptionMode::None => raw,
-        };
+        if self.encryption == EncryptionMode::None
+            && let Ok(message) = serde_json::from_slice(&raw)
+        {
+            return Ok(message);
+        }
+        let aad = format!("turn:{turn_id}:{seq}");
+        let plain = self.key.open("turn", aad.as_bytes(), &raw)?;
         Ok(serde_json::from_slice(&plain)?)
     }
 }
@@ -322,6 +328,45 @@ mod tests {
         .unwrap();
         let buffer = TurnBufferStore::new(db, key, EncryptionMode::XChaCha20Poly1305);
         (buffer, sessions, dir)
+    }
+
+    /// 崩溃前留在缓冲里的块，重启时 `[storage].encryption` 已经改了：密文块在两种配置下都
+    /// 解得出；明文块只在配置为不加密时解，配置为加密时是错误而不是被当成可信内容。
+    #[test]
+    fn buffered_blocks_follow_the_same_rule_as_stored_lines() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let key = Arc::new(MasterKey::from_bytes([4u8; 32]));
+        let open = |mode| TurnBufferStore::new(Arc::clone(&db), Arc::clone(&key), mode);
+        let sealed = open(EncryptionMode::XChaCha20Poly1305);
+        let plain = open(EncryptionMode::None);
+        sealed
+            .append("turn-a", 0, "shared", &AgentMessage::user("sealed block"))
+            .unwrap();
+        plain
+            .append("turn-b", 0, "shared", &AgentMessage::user("plain block"))
+            .unwrap();
+
+        let blocks = |store: &TurnBufferStore, turn: &str| {
+            store.load(turn).map(|blocks| {
+                blocks
+                    .into_iter()
+                    .map(|(_, message)| message)
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert_eq!(
+            blocks(&plain, "turn-a").unwrap(),
+            [AgentMessage::user("sealed block")]
+        );
+        assert_eq!(
+            blocks(&plain, "turn-b").unwrap(),
+            [AgentMessage::user("plain block")]
+        );
+        assert_eq!(
+            blocks(&sealed, "turn-a").unwrap(),
+            [AgentMessage::user("sealed block")]
+        );
+        assert!(blocks(&sealed, "turn-b").is_err());
     }
 
     fn assistant_with_call(id: &str) -> AgentMessage {

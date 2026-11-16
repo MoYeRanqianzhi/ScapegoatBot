@@ -292,7 +292,7 @@ impl MessageStore {
                 message.is_self as i32
             ],
         )?;
-        // 自身消息不进收件箱；其它消息默认未读。
+        // 自身消息一入库就是已读（它们不算未读、不出现在 `/inbox` 里）；其它消息默认未读。
         tx.execute(
             "INSERT INTO inbox_state (chat, message_id, state, updated_at)
              VALUES (?1, ?2, ?3, ?4)
@@ -440,7 +440,7 @@ impl MessageStore {
 
     /// 某个 chat 某一天全部消息的收件箱状态（`message_id` → 状态），一次查询取完。
     ///
-    /// 不在收件箱里的消息（本账号发出的、补抓的历史）没有状态，不出现在结果里。
+    /// 本账号发出的消息入库时就是已读。没有状态记录的消息不出现在结果里。
     pub(crate) fn states_for_day(
         &self,
         chat: ChatId,
@@ -1023,9 +1023,10 @@ mod tests {
     }
 
     /// `[storage].encryption` 在两次启动之间改掉之后，同一个消息文件接着被追加，里面密文行
-    /// 与明文行都有：每一行都按它自己的封装方式读出来，不看文件头，也不看当前配置。
+    /// 与明文行都有。密文行在哪种配置下都读得出；明文行只在配置为不加密时读——配置为加密时
+    /// 不认没有认证的内容，文件头写着什么都不算数。
     #[test]
-    fn changing_the_encryption_setting_keeps_every_line_readable() {
+    fn sealed_lines_are_always_readable_and_plain_lines_only_without_encryption() {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_in_memory().unwrap());
         let key = Arc::new(MasterKey::from_bytes([6u8; 32]));
@@ -1052,12 +1053,13 @@ mod tests {
         assert_eq!(text_of(&plain, 1), "sealed first");
         assert_eq!(text_of(&plain, 2), "plain second");
 
-        // 再改回加密：三行分属两种封装，仍然都读得出。
+        // 再改回加密：两条密文都读得出，中间那条明文不读。
         let sealed = open(EncryptionMode::XChaCha20Poly1305);
         sealed.append(&message(chat, 3, "sealed third")).unwrap();
         assert_eq!(text_of(&sealed, 1), "sealed first");
-        assert_eq!(text_of(&sealed, 2), "plain second");
         assert_eq!(text_of(&sealed, 3), "sealed third");
+        let error = sealed.load(chat, 2).unwrap_err().to_string();
+        assert!(error.contains("unencrypted line"), "{error}");
         // 三条确实在同一个文件里（同一个会话、同一天），不是各写各的文件。
         let files: i64 = db
             .lock()
