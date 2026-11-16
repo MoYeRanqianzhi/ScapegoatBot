@@ -21,9 +21,10 @@
 [`memory/release-workflow.md`](memory/release-workflow.md)。服务器 `hw1` 的 `sbot.service` 仍
 停止；NapCat 未登录（2026-11-05 起 QR 登录失败）。
 
-Dependabot 开了 4 个 PR（#1 兼容更新合集；#2 getrandom 0.4、#3 chacha20poly1305 0.11、
-#4 windows-sys 0.61 是主版本更新）。**都没有处理**：#1 的一部分已经随安全升级手动做了
-（anyhow、thiserror），它会自己 rebase；#2–#4 要看 API 变化与 CI 结果再合。
+Dependabot 的 PR：#2–#5 的内容已在 2026-11-16 手动合进 main（本地与 Debian 上完整验证过），
+PR 本身没有动，Dependabot 下次运行时会自己关掉；没关的话可以直接关闭。以后的 PR 照此处理：
+补丁 / 次版本的合集看 CI 绿了就合；主版本更新先看 API 变化。加密相关的依赖升级后
+`storage::crypto` 里“旧版本密文必须解得开”的测试必须通过。
 
 ## 等用户决定
 

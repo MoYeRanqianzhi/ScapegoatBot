@@ -124,11 +124,11 @@ impl MasterKey {
         let mut nonce_bytes = [0u8; NONCE_LEN];
         getrandom::fill(&mut nonce_bytes)
             .map_err(|error| anyhow::anyhow!("cannot obtain random nonce: {error}"))?;
-        let nonce = XNonce::from_slice(&nonce_bytes);
+        let nonce = XNonce::from(nonce_bytes);
 
         let ciphertext = cipher
             .encrypt(
-                nonce,
+                &nonce,
                 Payload {
                     msg: plaintext,
                     aad,
@@ -144,15 +144,18 @@ impl MasterKey {
 
     /// 解密 `nonce || ciphertext`。
     pub fn open(&self, purpose: &str, aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
-        if sealed.len() < NONCE_LEN + 16 {
+        // nonce 之后至少还要有 16 字节的认证标签。
+        let Some((nonce_bytes, ciphertext)) = sealed
+            .split_first_chunk::<NONCE_LEN>()
+            .filter(|(_, ciphertext)| ciphertext.len() >= 16)
+        else {
             bail!("ciphertext is too short");
-        }
-        let (nonce_bytes, ciphertext) = sealed.split_at(NONCE_LEN);
+        };
         let key = self.derive(purpose);
         let cipher = XChaCha20Poly1305::new((&key).into());
         cipher
             .decrypt(
-                XNonce::from_slice(nonce_bytes),
+                &XNonce::from(*nonce_bytes),
                 Payload {
                     msg: ciphertext,
                     aad,
@@ -221,6 +224,35 @@ mod tests {
 
     fn fixed_key() -> MasterKey {
         MasterKey::from_bytes([7u8; KEY_LEN])
+    }
+
+    /// 磁盘上的密文必须一直解得开：这段是 chacha20poly1305 0.10 加密出来的（密钥、用途、
+    /// AAD 与明文见下）。升级加密库或改动密钥派生、封装格式之后它解不开，就是把所有已有
+    /// 数据变成了读不出来的东西。
+    #[test]
+    fn data_sealed_by_an_older_build_still_opens() {
+        let sealed = hex::decode(
+            "625d7dab14773bd503ddbc2696614a51d537be98e1ecb990f0943041984a43e2f58b6e325c73fb50\
+             cdee90c63d0485bfec93abd92d00319af7ccf1ce0c668d23ae",
+        )
+        .unwrap();
+        let opened = fixed_key().open("vfs", b"vfs:42:7", &sealed).unwrap();
+        assert_eq!(opened, b"written by an older build");
+        // 同一段密文换一个 AAD 就解不开：认证确实覆盖了 AAD。
+        assert!(fixed_key().open("vfs", b"vfs:42:8", &sealed).is_err());
+    }
+
+    /// 太短的输入（不够 nonce 加认证标签）是错误，不是 panic。
+    #[test]
+    fn truncated_input_is_rejected() {
+        let key = fixed_key();
+        let sealed = key.seal("vfs", b"aad", b"").unwrap();
+        assert_eq!(sealed.len(), NONCE_LEN + 16);
+        assert_eq!(key.open("vfs", b"aad", &sealed).unwrap(), b"");
+        for length in [0, 1, NONCE_LEN - 1, NONCE_LEN, NONCE_LEN + 15] {
+            let error = key.open("vfs", b"aad", &sealed[..length]).unwrap_err();
+            assert!(error.to_string().contains("too short"), "{length}: {error}");
+        }
     }
 
     #[test]

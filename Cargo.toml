@@ -51,12 +51,12 @@ chrono = { version = "0.4", features = ["serde"] }
 # 范围（i64）时返回错误而不是截断。
 rusqlite = { version = "0.43", features = ["bundled", "backup", "fallible_uint"] }
 # 内容加密：XChaCha20-Poly1305（设计 §6.6）。
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 # 从主密钥派生分域密钥。
 hkdf = "0.12"
 sha2 = "0.10"
 # 密钥材料的密码学安全随机源。
-getrandom = "0.3"
+getrandom = "0.4"
 # 单实例文件锁。
 fs2 = "0.4"
 # 定位用户主目录（~/.sbot）。
@@ -84,7 +84,7 @@ unicode-normalization = "0.1"
 mimalloc = "0.1.52"
 # Unix 域套接字权限、Windows 管道 DACL 需要平台 API。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
