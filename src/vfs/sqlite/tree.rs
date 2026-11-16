@@ -43,10 +43,11 @@ impl super::VfsStore {
         Ok(ids)
     }
 
-    /// 事务提交后清理被删节点的 blob 目录；不存在的目录（文本节点、目录节点）跳过。
+    /// 事务提交后清理不再有分块的节点的 blob 目录：被删掉的节点，以及被文本覆盖的二进制
+    /// 节点。不存在的目录（文本节点、目录节点）跳过。
     ///
     /// 删除失败只留下孤立文件，不影响一致性，所以只记录不报错。
-    fn remove_blob_dirs(&self, ids: &[i64]) {
+    pub(super) fn remove_blob_dirs(&self, ids: &[i64]) {
         for node_id in ids {
             let dir = self.storage.join("blobs").join(node_id.to_string());
             if dir.exists()

@@ -288,6 +288,64 @@ mod tests {
         assert_eq!(blob_entries(&dir), vec![id.to_string()]);
     }
 
+    /// 换一种内容覆盖同一个节点，旧的那种内容不留下：二进制盖文本时清掉文本密文，文本盖
+    /// 二进制时删掉分块行与分块目录。留着不影响读取，只是白占空间（而且不计入配额）。
+    #[test]
+    fn overwriting_with_the_other_kind_leaves_no_old_content() {
+        let (store, dir) = store();
+        let leftovers = |store: &VfsStore, raw: &str| -> (bool, i64) {
+            let (id, _) = node(store, raw);
+            let conn = store.db.lock();
+            let has_text: bool = conn
+                .query_row(
+                    "SELECT content_enc IS NOT NULL FROM vfs_nodes WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let chunks: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM vfs_chunks WHERE node_id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (has_text, chunks)
+        };
+
+        // 文本 → 二进制。
+        store
+            .write_text(&path("/tmp/a.dat"), "old text", None)
+            .unwrap();
+        store
+            .write_binary(&path("/tmp/a.dat"), &content(1), NodeKind::Binary)
+            .unwrap();
+        let (id, _) = node(&store, "/tmp/a.dat");
+        assert_eq!(leftovers(&store, "/tmp/a.dat"), (false, 2));
+        assert_eq!(store.read_bytes(&path("/tmp/a.dat")).unwrap(), content(1));
+        assert_eq!(blob_entries(&dir), vec![id.to_string()]);
+
+        // 二进制 → 文本。
+        store
+            .write_text(&path("/tmp/a.dat"), "new text", None)
+            .unwrap();
+        assert_eq!(leftovers(&store, "/tmp/a.dat"), (true, 0));
+        assert_eq!(
+            store.read_bytes(&path("/tmp/a.dat")).unwrap(),
+            b"new text".to_vec()
+        );
+        assert!(blob_entries(&dir).is_empty(), "{:?}", blob_entries(&dir));
+        assert_eq!(node(&store, "/tmp/a.dat").0, id);
+
+        // 再盖回二进制：目录重新建出来，内容是新的。
+        store
+            .write_binary(&path("/tmp/a.dat"), &content(3), NodeKind::Binary)
+            .unwrap();
+        assert_eq!(leftovers(&store, "/tmp/a.dat"), (false, 2));
+        assert_eq!(store.read_bytes(&path("/tmp/a.dat")).unwrap(), content(3));
+        assert_eq!(blob_entries(&dir), vec![id.to_string()]);
+    }
+
     /// 进程死在“目录换了、事务没提交”之间：下次打开时按版本号判断，恢复旧目录。
     #[test]
     fn an_uncommitted_swap_is_undone_on_open() {

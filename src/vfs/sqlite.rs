@@ -322,8 +322,9 @@ impl VfsStore {
             current.replacen(old_text, new_text, 1)
         };
         let replaced = if replace_all { count } else { 1 };
-        let meta = self.write_text_tx(&tx, path, &updated, None, Writer::Agent)?;
+        let (meta, replaced_blob) = self.write_text_tx(&tx, path, &updated, None, Writer::Agent)?;
         tx.commit()?;
+        self.remove_blob_dirs(replaced_blob.as_slice());
         Ok((meta, replaced))
     }
 
@@ -343,8 +344,9 @@ impl VfsStore {
         }
         let mut conn = self.db.lock();
         let tx = conn.transaction()?;
-        let meta = self.write_text_tx(&tx, path, content, None, Writer::System)?;
+        let (meta, replaced_blob) = self.write_text_tx(&tx, path, content, None, Writer::System)?;
         tx.commit()?;
+        self.remove_blob_dirs(replaced_blob.as_slice());
         Ok(meta)
     }
 
@@ -472,6 +474,10 @@ impl VfsStore {
     }
 
     /// 文本写入的核心逻辑，要求调用方已持有连接锁与事务。
+    ///
+    /// 返回值的第二项：被覆盖的是二进制节点时是它的 id。它的分块行已经在事务里删掉，磁盘
+    /// 上的分块目录要等调用方**提交之后**再用 [`Self::remove_blob_dirs`] 清理——先删目录的话，
+    /// 事务没提交成时节点还是二进制，内容却没了。
     fn write_text_tx(
         &self,
         conn: &Connection,
@@ -479,7 +485,7 @@ impl VfsStore {
         content: &str,
         origin_chat: Option<&str>,
         writer: Writer,
-    ) -> Result<NodeMeta, VfsError> {
+    ) -> Result<(NodeMeta, Option<i64>), VfsError> {
         self.reject_trash_target(path)?;
         let len = content.len() as u64;
         self.quota.check_text(len)?;
@@ -492,6 +498,7 @@ impl VfsStore {
         let mime = guess_mime(name).unwrap_or("text/plain");
         let hash = hash_bytes(content.as_bytes());
 
+        let mut replaced_blob = None;
         let (id, version) = match existing {
             None => {
                 let (bytes, nodes) = self.active_usage(conn)?;
@@ -530,6 +537,11 @@ impl VfsStore {
                      WHERE id = ?7",
                     params![sealed, len, mime, version, now, hash, row.id],
                 )?;
+                // 原来是二进制：它的分块不再属于这个节点，留着只是白占空间。
+                if row.kind != NodeKind::Text {
+                    conn.execute("DELETE FROM vfs_chunks WHERE node_id = ?1", params![row.id])?;
+                    replaced_blob = Some(row.id);
+                }
                 (row.id, version)
             }
         };
@@ -543,7 +555,7 @@ impl VfsStore {
         let row = self
             .lookup(conn, path)?
             .ok_or_else(|| VfsError::Storage("just-written node disappeared".to_owned()))?;
-        Ok(self.meta(path, &row))
+        Ok((self.meta(path, &row), replaced_blob))
     }
 }
 
@@ -695,9 +707,11 @@ impl VfsStore {
                 offset += chunk.len() as u64;
             }
             swap.install()?;
+            // `content_enc` 清空：被覆盖的是文本节点时，那里还留着旧文本的密文。
             tx.execute(
                 "UPDATE vfs_nodes
-                 SET size = ?1, mime = ?2, version = ?3, updated_at = ?4, hash = ?5, kind = ?6
+                 SET size = ?1, mime = ?2, version = ?3, updated_at = ?4, hash = ?5, kind = ?6,
+                     content_enc = NULL
                  WHERE id = ?7",
                 params![len, mime, version, now_value, hash, kind.as_str(), id],
             )?;
@@ -841,8 +855,10 @@ impl Vfs for VfsStore {
         }
         let mut conn = self.db.lock();
         let tx = conn.transaction()?;
-        let meta = self.write_text_tx(&tx, path, content, origin_chat, Writer::Agent)?;
+        let (meta, replaced_blob) =
+            self.write_text_tx(&tx, path, content, origin_chat, Writer::Agent)?;
         tx.commit()?;
+        self.remove_blob_dirs(replaced_blob.as_slice());
         Ok(meta)
     }
 

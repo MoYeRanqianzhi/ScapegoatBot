@@ -151,8 +151,9 @@ impl SessionStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let current = self.current_unlocked()?;
         let path = self.root.join("sessions").join(&current.file);
+        // 不带 `create`：分段文件是建分段时连同文件头一起写的。它不在了（被外部删掉）就报错，
+        // 而不是建一个没有文件头的文件——那样的分段之后读不回来，写进去的消息等于丢了。
         let mut file = std::fs::OpenOptions::new()
-            .create(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("cannot open {}", path.display()))?;
@@ -834,6 +835,20 @@ mod tests {
             ]
         );
         assert_eq!(store.current().unwrap().message_count, 3);
+    }
+
+    /// 当前分段的文件不在了（被外部删掉）：追加报错，不建一个没有文件头的文件。
+    #[test]
+    fn appending_to_a_missing_segment_file_is_an_error() {
+        let (store, dir) = store();
+        let current = store.current().unwrap();
+        let path = dir.path().join("sessions").join(&current.file);
+        std::fs::remove_file(&path).unwrap();
+
+        let error = store.append(&[AgentMessage::user("one")]).unwrap_err();
+        assert!(format!("{error:#}").contains("cannot open"), "{error:#}");
+        assert!(!path.exists());
+        assert_eq!(store.current().unwrap().message_count, 0);
     }
 
     /// `sessions/` 下的文件名，排好序。
