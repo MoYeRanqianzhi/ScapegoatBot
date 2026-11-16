@@ -95,13 +95,14 @@ PR 本身没有动，Dependabot 下次运行时会自己关掉；没关的话可
 
 ## 仍然超过 100 行的函数（不阻塞）
 
-`app::dispatch` 176、`runner::run_turn` 168、`views::system::read_system` 156、
+`app::dispatch` 176、`views::system::read_system` 156、
 `loop::run_with_steering` 155、`app::start` 154、`loop::request_once` 133、
 `backup::run_with_paths` 127、`runner::run_subagent` 124、`monitor::validate_monitor` 122、
 `assembly::build_agent` 120、`events::handle_qq_event` 118、
 `delivery::deliver_once` 108、`compaction::compact_scope` 115。其中是“一个 match 平铺 /
-同一层的线性步骤”的不必拆；混了几件事的（`run_turn`）值得拆。`swarm::spawn`（89）、
-`messages::append`（86）与 `write_config`（59）在 2026-11-16 修 bug 时拆过了。
+同一层的线性步骤”的不必拆。`swarm::spawn`（89）、`messages::append`（86）与 `write_config`
+（59）在 2026-11-16 修 bug 时拆过了；`run_turn`（原 168，混着前置检查、入站接收、预算、提示
+组装）在 2026-11-17 拆到 85，准备步骤在 `src/agent/runner/prepare.rs`。
 
 ## 外部验证（需 NapCat 登录）
 

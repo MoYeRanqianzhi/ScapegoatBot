@@ -103,6 +103,8 @@
   才出现。
 - `message_received` hook 的 `block` 对回合中途到达的消息（`[queue].mode = "steer"`，默认）同样
   生效。以前只检查触发回合的那一批，之后进来的消息绕过它。
+- 被 `message_received` hook 的 `block` 拦下的消息不再给回合带来 owner intent。以前主人在被
+  拦的会话里发一条消息，回合照样带着主人的授权开始，而模型根本看不到主人说了什么。
 - 无法归类的 QQ 事件（带 `group_id` / `user_id` 的未知事件类型）现在同样受 `[filter]` 的
   `ignore_groups` / `ignore_users` 约束。以前它们绕过过滤，以 `[unknown]` 写进收件箱。
 - 自动压缩因连续失败停掉之后，一次成功的手动压缩（`agent.compact`）或清空上下文

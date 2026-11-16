@@ -430,8 +430,8 @@ key 放 `auth.json`：
     `group_id` 匹配这个群，`user_id` 匹配与这个人的**私聊**（不是他在群里的发言），所以两项
     同时写永远不命中。
   - `block` 需要 `reason`；`message_received` 上的 `block` 让这个会话的消息不进入上下文
-    （消息仍在 `/messages` 与 `/inbox` 里）。monitor 以 `event` / `prompt` 投递的事件与
-    `sbot chat` 不是会话消息，不经过它。
+    （消息仍在 `/messages` 与 `/inbox` 里），被拦下的主人消息也不构成 owner intent。monitor 以
+    `event` / `prompt` 投递的事件与 `sbot chat` 不是会话消息，不经过它。
   - `rewrite` 用 `pattern`（正则）/ `replacement` 改写消息文本段与群公告正文；上传文件
     没有正文，只受 `block` / `log` 影响。
   - `inject_context` 需要 `text`，或 VFS 路径 `path`（读取时最多 8000 字符，读不到跳过并

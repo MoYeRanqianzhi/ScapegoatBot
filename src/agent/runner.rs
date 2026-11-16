@@ -41,6 +41,7 @@ mod images;
 mod injected;
 mod journal;
 mod ops;
+mod prepare;
 mod review;
 
 pub use ops::RuntimeOps;
@@ -557,68 +558,28 @@ impl Runner {
         steering_rx: &mut mpsc::UnboundedReceiver<QqMessage>,
         unanswered: &mut usize,
     ) -> Result<()> {
-        // `sbot ai stop` 与 `ESTOP` 都只暂停新回合；消息已经入库，下一回合可见。
-        if !self
-            .deps
-            .ai_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            debug!(chat = %input.chat, "ai is stopped; skipping this turn");
-            return Ok(());
-        }
-        if self.deps.estop_file.exists() {
-            debug!(chat = %input.chat, "ESTOP is active; skipping this turn");
+        if self.new_turns_paused(input.chat) {
             return Ok(());
         }
         let chat = input.chat;
         let turn_lock = Arc::clone(&self.turn_lock);
         let _turn_guard = turn_lock.lock().await;
         self.discard_context_if_flagged().await;
-        let inbound_messages = input.messages.clone();
         let sessions = Arc::clone(&self.deps.sessions);
         let history = Arc::clone(&self.history);
         let turn_id = new_turn_id();
-        let first_batch_id = input.messages.first().map(|message| message.message_id);
 
         self.config.last_activity.store(
             chrono::Utc::now().timestamp(),
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        // 1) 入站消息进入 transcript 与共享历史（在请求模型之前）。
-        let mut inbound = Vec::with_capacity(input.messages.len());
-        let mut accepted_messages = Vec::new();
-        for message in &input.messages {
-            let text = format::render_inbound(message);
-            let hook = self
-                .fire_hooks(
-                    crate::config::HookEvent::MessageReceived,
-                    Some(chat),
-                    Some(&text),
-                )
-                .await;
-            if let Some(reason) = hook.blocked {
-                warn!(chat = %chat, %reason, "MessageReceived hook dropped this message");
-                continue;
-            }
-            accepted_messages.push(message.clone());
-            inbound.push(AgentMessage::user(text));
-        }
-        // 整批一次追加（要么全部写进分段，要么分段不变），成功之后才进共享历史：这批消息
-        // 要么两边都有，要么两边都没有。逐条追加的话，中途失败时前几条只在 transcript 里，
-        // 运行中的上下文与重启后恢复出来的上下文就不一样了。
-        sessions.append(&inbound)?;
-        for message in &accepted_messages {
-            if let Err(error) =
-                self.deps
-                    .messages
-                    .set_cursor(chat, message.message_id, &message.time.to_rfc3339())
-            {
-                warn!(%error, "cannot update chat cursor");
-            }
-        }
+        // 1) 入站消息进入 transcript（在请求模型之前）。
+        let (inbound, accepted_messages) = self
+            .accept_inbound(chat, &input.messages, &sessions)
+            .await?;
 
-        // 2) 取历史副本；后续新块只写本地副本。
+        // 2) 写进 transcript 之后才进共享历史；取历史副本，后续新块只写本地副本。
         let mut working = {
             let mut history = history.lock().await;
             history.extend(inbound);
@@ -630,31 +591,8 @@ impl Runner {
         // 2.5) 预算：消息已经入库，只跳过模型回合；下一个窗口/日期自动恢复。
         // 图片也持久化，避免预算恢复后丢失视觉上下文。预算检查必须在压缩之前：
         // 压缩本身要请求模型，预算耗尽后每次唤醒都会白白摘要一次。
-        if let Some(budget) = &self.config.budget {
-            if let Some(reason) = budget.check_daily().await {
-                warn!(chat = %chat, %reason, "skipping this turn");
-                return keep_images(&sessions, &history, image_prompts).await;
-            }
-            let limit = budget.chat_turns_per_hour();
-            if limit > 0 {
-                let mut turns = self.turn_times.lock().await;
-                let queue = turns.entry(chat.to_string()).or_default();
-                while queue
-                    .front()
-                    .is_some_and(|at| at.elapsed() >= Duration::from_secs(3600))
-                {
-                    queue.pop_front();
-                }
-                if queue.len() >= limit as usize {
-                    warn!(
-                        chat = %chat,
-                        limit,
-                        "chat turn budget exhausted; skipping this turn"
-                    );
-                    return keep_images(&sessions, &history, image_prompts).await;
-                }
-                queue.push_back(Instant::now());
-            }
+        if self.turn_budget_exhausted(chat).await {
+            return keep_images(&sessions, &history, image_prompts).await;
         }
 
         // 2.6) 超过工作集上限时先压缩，再重新载入历史副本。
@@ -664,31 +602,11 @@ impl Runner {
         // 也会把保留的旧块重复提交。
         let base = working.len();
 
-        // 3) 组装本回合的即时提示。
-        let evidence = self.evidence_for_batch(chat, &inbound_messages);
-        let mut prompts = vec![AgentMessage::user(
-            self.runtime_context(chat, &sessions).render(),
-        )];
-        // MessageReceived 的 inject_context：本回合的即时提示（不进 transcript），
-        // 只在有消息被接受时加入，每回合一次。
-        if !accepted_messages.is_empty() {
-            for text in self.hook_context(crate::config::HookEvent::MessageReceived, Some(chat)) {
-                prompts.push(AgentMessage::user(format!(
-                    "[hook context | MessageReceived]\n{text}"
-                )));
-            }
-        }
-        if let Some(pending) = self.pending_history(chat, first_batch_id) {
-            evidence.record_source(chat.to_string(), &pending);
-            prompts.push(AgentMessage::user(pending));
-        }
-        if input.dropped > 0 {
-            prompts.push(AgentMessage::user(format!(
-                "Note: {} earlier message(s) from this chat were dropped because the queue \
-                 exceeded its limits. They were not read and cannot be recovered from context.",
-                input.dropped
-            )));
-        }
+        // 3) 组装本回合的即时提示。证据只看被接受的消息：被 `message_received` hook 拦下的
+        // 不进上下文，模型看不到主人说了什么，也就谈不上照主人的话行动。
+        let evidence = self.evidence_for_batch(chat, &accepted_messages);
+        let mut prompts =
+            self.turn_prompts(&input, !accepted_messages.is_empty(), &evidence, &sessions);
 
         // runtime/pending prompt 不落 transcript；入站图片属于真实消息内容，需要落库。
         let runtime_blocks = prompts.len();
@@ -1985,17 +1903,19 @@ mod tests {
             turn_context_budget,
             keep_recent_tokens,
             Vec::new(),
+            None,
         )
         .await
     }
 
-    /// [`runner_with`] 加上事件 hook。
+    /// [`runner_with`] 加上事件 hook，以及一个可选的额外工具（测试用它观察回合内部的状态）。
     async fn runner_with_hooks(
         outcome: Option<crate::security::review::ReviewOutcome>,
         script: Vec<Vec<ProviderEvent>>,
         turn_context_budget: u32,
         keep_recent_tokens: u32,
         event_hooks: Vec<crate::config::EventHookConfig>,
+        extra_tool: Option<Arc<dyn crate::tools::Tool>>,
     ) -> (Arc<Runner>, Arc<Gate>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_in_memory().unwrap());
@@ -2050,7 +1970,11 @@ mod tests {
         let provider = Arc::new(FakeProvider {
             script: StdMutex::new(script.into()),
         });
-        let tools = Arc::new(crate::tools::ToolRegistry::new(Arc::clone(&vfs), None));
+        let mut registry = crate::tools::ToolRegistry::new(Arc::clone(&vfs), None);
+        if let Some(tool) = extra_tool {
+            registry.register(tool);
+        }
+        let tools = Arc::new(registry);
         let history = Arc::new(Mutex::new(Vec::new()));
         let runner = Runner::new(
             provider,
@@ -2191,7 +2115,7 @@ mod tests {
             ..Default::default()
         };
         let (runner, _gate, _dir) =
-            runner_with_hooks(None, Vec::new(), 120_000, 20_000, vec![hook]).await;
+            runner_with_hooks(None, Vec::new(), 120_000, 20_000, vec![hook], None).await;
         let injected = |runner: &Runner| {
             runner
                 .system
@@ -2211,6 +2135,99 @@ mod tests {
         // 重建不会把它加第二遍。
         runner.rebuild_system();
         assert_eq!(injected(&runner), 1);
+    }
+
+    /// 探针工具：每次被调用时记下这个回合带不带 owner intent。
+    struct IntentProbe(Arc<StdMutex<Vec<bool>>>);
+
+    #[async_trait]
+    impl crate::tools::Tool for IntentProbe {
+        fn name(&self) -> &'static str {
+            "Probe"
+        }
+        fn description(&self) -> &'static str {
+            "Records whether the current turn carries owner intent."
+        }
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object", "properties": {}})
+        }
+        async fn execute(
+            &self,
+            ctx: &crate::tools::ToolContext,
+            _args: serde_json::Value,
+        ) -> crate::transcript::ToolResult {
+            self.0.lock().unwrap().push(ctx.evidence.owner_intent());
+            crate::transcript::ToolResult::ok("recorded")
+        }
+    }
+
+    /// 主人的消息触发的回合带 owner intent；同一条消息被 `message_received` 的 `block` 拦下
+    /// 时不带——它没进上下文，模型不知道主人说了什么。
+    #[tokio::test]
+    async fn a_blocked_batch_carries_no_owner_intent() {
+        let chat = ChatId::Group(1);
+        let block = crate::config::EventHookConfig {
+            event: crate::config::HookEvent::MessageReceived,
+            action: crate::config::HookAction::Block,
+            reason: "quiet hours".to_owned(),
+            match_: crate::config::HookMatch {
+                group_id: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for (hooks, expected) in [(Vec::new(), true), (vec![block], false)] {
+            let script = vec![
+                vec![
+                    ProviderEvent::ToolCallStart {
+                        index: 0,
+                        id: "c1".to_owned(),
+                        name: "Probe".to_owned(),
+                    },
+                    ProviderEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        delta: "{}".to_owned(),
+                    },
+                    ProviderEvent::Stop {
+                        reason: StopReason::ToolUse,
+                        refusal: None,
+                    },
+                ],
+                vec![
+                    ProviderEvent::TextDelta("done".to_owned()),
+                    ProviderEvent::Stop {
+                        reason: StopReason::EndTurn,
+                        refusal: None,
+                    },
+                ],
+            ];
+            let seen = Arc::new(StdMutex::new(Vec::new()));
+            let (runner, _gate, _dir) = runner_with_hooks(
+                None,
+                script,
+                120_000,
+                20_000,
+                hooks,
+                Some(Arc::new(IntentProbe(Arc::clone(&seen)))),
+            )
+            .await;
+            // 测试里的主人就是 10000（`runner_with_hooks` 的 `owner_qq`）。
+            let mut from_owner = inbound(chat, 1, "rename the group");
+            from_owner.sender.qq = Some(10000);
+            let (_tx, rx) = mpsc::unbounded_channel();
+            runner
+                .handle(
+                    TurnInput {
+                        chat,
+                        messages: vec![from_owner],
+                        dropped: 0,
+                    },
+                    rx,
+                )
+                .await
+                .expect_ok();
+            assert_eq!(*seen.lock().unwrap(), vec![expected]);
+        }
     }
 
     /// 一个只回 `ok` 的 runner，不带周期审查。
