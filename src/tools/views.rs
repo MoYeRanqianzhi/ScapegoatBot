@@ -1152,6 +1152,25 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
+    /// 环境变量设的值在 `/config` 写入之后仍然生效：换进内存的配置与启动加载得到的是同一份。
+    /// 以前写入时只解析文件文本，agent 改一次配置，环境变量设的值就退回文件里的值，直到重启。
+    #[tokio::test]
+    async fn config_writes_keep_environment_overrides() {
+        let (views, _dir) = views();
+        let handle = Arc::clone(views.context.config.as_ref().unwrap());
+        // 用别的测试不检查的键，避免与并行的测试互相影响。
+        unsafe { std::env::set_var("SBOT__NAPCAT__URL", "ws://from-env:3999") };
+        let written = views.write_config(&target("/config/agent/thinking_level"), "\"low\"");
+        unsafe { std::env::remove_var("SBOT__NAPCAT__URL") };
+        written.unwrap();
+        let loaded = handle.read().unwrap();
+        assert_eq!(loaded.config.agent.thinking_level, "low");
+        assert_eq!(loaded.config.napcat.url, "ws://from-env:3999");
+        // 覆盖只在内存里：文件里不会多出环境变量的值。
+        let on_disk = std::fs::read_to_string(&loaded.path).unwrap();
+        assert!(!on_disk.contains("from-env"), "{on_disk}");
+    }
+
     /// 热更新回调被调用时，配置句柄里已经是新配置，而且回调可以去读它（写锁已经放掉）。
     /// 以前先通知、后换句柄：回调读句柄看到的是旧配置。
     #[tokio::test]

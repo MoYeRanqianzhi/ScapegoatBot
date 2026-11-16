@@ -325,8 +325,11 @@ fn check_protected_keys(old: &toml::Value, new: &toml::Value) -> Result<(), VfsE
 }
 
 /// 解析并校验候选配置；失败时不写盘。
+///
+/// 与启动加载走同一个 [`SbotConfig::parse`]（含环境变量覆盖）：换进内存的配置就是下次启动
+/// 会得到的那一份。
 fn validate_config_text(text: &str, models: Option<&ModelsFile>) -> Result<SbotConfig, VfsError> {
-    let config: SbotConfig = toml::from_str(text)
+    let config = SbotConfig::parse(text)
         .map_err(|error| VfsError::Storage(format!("invalid sbot.toml: {error}")))?;
     config
         .validate_shape()

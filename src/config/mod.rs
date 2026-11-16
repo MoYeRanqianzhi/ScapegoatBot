@@ -225,20 +225,10 @@ impl SbotConfig {
             source,
         })?;
 
-        let mut table: toml::Table =
-            toml::from_str(&text).map_err(|error| ConfigLoadError::Parse {
-                path: path.clone(),
-                message: error.to_string(),
-            })?;
-        apply_env_overrides(&mut table);
-
-        let config: SbotConfig =
-            toml::Value::Table(table)
-                .try_into()
-                .map_err(|error: toml::de::Error| ConfigLoadError::Parse {
-                    path: path.clone(),
-                    message: error.to_string(),
-                })?;
+        let config = Self::parse(&text).map_err(|message| ConfigLoadError::Parse {
+            path: path.clone(),
+            message,
+        })?;
 
         config.validate_shape().map_err(ConfigLoadError::Invalid)?;
 
@@ -249,6 +239,18 @@ impl SbotConfig {
             .unwrap_or_else(|| PathBuf::from("."));
 
         Ok(LoadedConfig { config, path, dir })
+    }
+
+    /// 从配置文件的文本得到配置：解析、套上环境变量覆盖、反序列化。不做校验。
+    ///
+    /// 启动加载与 `/config` 写入共用这一步，两处得到的是同一份配置。各做各的话，agent 改
+    /// 一次配置，环境变量设的值就悄悄退回文件里的值，重启之后又变回来。
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut table: toml::Table = toml::from_str(text).map_err(|error| error.to_string())?;
+        apply_overrides(&mut table, std::env::vars());
+        toml::Value::Table(table)
+            .try_into()
+            .map_err(|error: toml::de::Error| error.to_string())
     }
 
     /// 不依赖 `models.json` 的形状校验。
@@ -318,12 +320,11 @@ impl SbotConfig {
     }
 }
 
-/// 把 `SBOT__A__B=value` 注入 TOML 表。
+/// 把 `SBOT__A__B=value` 形式的变量注入 TOML 表；`vars` 是全部环境变量，别的名字忽略。
 ///
-/// 值先尝试按 TOML 字面量解析（支持数字、布尔、数组），失败则当作字符串。
 /// 这是可选能力：普通部署直接把值写进 `sbot.toml`。
-fn apply_env_overrides(table: &mut toml::Table) {
-    let mut overrides: Vec<(Vec<String>, String)> = std::env::vars()
+fn apply_overrides(table: &mut toml::Table, vars: impl Iterator<Item = (String, String)>) {
+    let mut overrides: Vec<(Vec<String>, String)> = vars
         .filter_map(|(key, value)| {
             let rest = key.strip_prefix("SBOT__")?;
             let parts: Vec<String> = rest
@@ -342,12 +343,45 @@ fn apply_env_overrides(table: &mut toml::Table) {
     // 排序保证同一组的注入顺序稳定，便于测试与排错。
     overrides.sort_by(|a, b| a.0.cmp(&b.0));
 
-    for (parts, raw) in overrides {
-        let value = raw
-            .parse::<toml::Value>()
-            .unwrap_or_else(|_| toml::Value::String(raw.clone()));
-        insert_path(table, &parts, value);
+    if overrides.is_empty() {
+        return;
     }
+    // 环境变量的值都是字符串，要变成哪种 TOML 值看这一项本来是什么类型：默认配置里它是
+    // 字符串就原样用，否则按字面量解析。
+    let defaults = toml::Value::try_from(SbotConfig::default()).ok();
+    for (parts, raw) in overrides {
+        let default = defaults.as_ref().and_then(|defaults| {
+            parts
+                .iter()
+                .try_fold(defaults, |value, part| value.get(part))
+        });
+        insert_path(table, &parts, override_value(&raw, default));
+    }
+}
+
+/// 一个环境变量的值对应的 TOML 值；`default` 是这一项在默认配置里的值（没有就是 `None`）。
+///
+/// - 这一项是字符串：原样当字符串。`SBOT__AGENT__MASTER=123456` 是 QQ 号写成的字符串，
+///   不能因为长得像数字就变成整数。
+/// - 其余：按 TOML 字面量解析（`32`、`true`、`[1, 2]`、`{ a = 1 }`）。解析不了的当作
+///   字符串，类型不对由后面的反序列化报出来，报错里带着键名。
+fn override_value(raw: &str, default: Option<&toml::Value>) -> toml::Value {
+    if matches!(default, Some(toml::Value::String(_))) {
+        return toml::Value::String(raw.to_owned());
+    }
+    parse_literal(raw).unwrap_or_else(|| toml::Value::String(raw.to_owned()))
+}
+
+/// 把 `raw` 当作一个 TOML 值来解析；不是单个值时返回 `None`。
+///
+/// TOML 只能解析整份文档，所以套成 `value = <raw>` 再取出来。解析出来必须恰好是这一个键：
+/// 值里带换行再跟一行 `other = 1` 的写法不是字面量。
+fn parse_literal(raw: &str) -> Option<toml::Value> {
+    let mut document: toml::Table = toml::from_str(&format!("value = {raw}")).ok()?;
+    if document.len() != 1 {
+        return None;
+    }
+    document.remove("value")
 }
 
 /// 按路径写进嵌套表，缺失的中间层自动创建。
@@ -617,15 +651,76 @@ deliver = { to = "main", as = "prompt" }
         assert_eq!(parse_duration_secs(""), None);
     }
 
-    #[test]
-    fn env_override_injects_nested_value() {
-        // 用不常出现的键，避免与宿主环境冲突。
-        unsafe { std::env::set_var("SBOT__AGENT__THINKING_LEVEL", "low") };
+    /// 把一组 `SBOT__…` 变量套到 `version = 1` 上，得到配置。
+    fn with_overrides(vars: &[(&str, &str)]) -> Result<SbotConfig, toml::de::Error> {
         let mut table: toml::Table = toml::from_str("version = 1").unwrap();
-        apply_env_overrides(&mut table);
-        unsafe { std::env::remove_var("SBOT__AGENT__THINKING_LEVEL") };
-        let config: SbotConfig = toml::Value::Table(table).try_into().unwrap();
+        apply_overrides(
+            &mut table,
+            vars.iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+        );
+        toml::Value::Table(table).try_into()
+    }
+
+    /// 环境变量的值都是字符串；每一项要按它在配置里的类型变成对应的 TOML 值。
+    #[test]
+    fn env_overrides_take_the_type_of_the_setting() {
+        let config = with_overrides(&[
+            ("SBOT__AGENT__THINKING_LEVEL", "low"),
+            ("SBOT__AGENT__MAX_STEPS", "32"),
+            ("SBOT__FILTER__REQUIRE_MENTION", "true"),
+            ("SBOT__FILTER__IGNORE_GROUPS", "[1, 2]"),
+            ("SBOT__NAPCAT__URL", "ws://127.0.0.1:3002"),
+            // 长得像数字、布尔的字符串项仍然是字符串。
+            ("SBOT__AGENT__MASTER", "123456"),
+            ("SBOT__AGENT__OWNER_NAME", "true"),
+            // 别的环境变量不相干。
+            ("PATH", "/usr/bin"),
+            ("SBOT_HOME", "/srv/sbot"),
+        ])
+        .unwrap();
         assert_eq!(config.agent.thinking_level, "low");
+        assert_eq!(config.agent.max_steps, 32);
+        assert!(config.filter.require_mention);
+        assert_eq!(config.filter.ignore_groups, [1, 2]);
+        assert_eq!(config.napcat.url, "ws://127.0.0.1:3002");
+        assert_eq!(config.agent.master, "123456");
+        assert_eq!(config.agent.owner_name, "true");
+    }
+
+    /// 类型不对、键不存在都是加载错误，报错里指得出是哪一项；不会被悄悄忽略。
+    #[test]
+    fn a_bad_env_override_is_a_load_error() {
+        let error = with_overrides(&[("SBOT__AGENT__MAX_STEPS", "many")])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_steps"), "{error}");
+        let error = with_overrides(&[("SBOT__AGENT__NO_SUCH_KEY", "1")])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no_such_key"), "{error}");
+    }
+
+    /// 值里夹带换行与别的键不算一个字面量：整个值当作字符串，不会多出一项配置。
+    #[test]
+    fn an_override_value_cannot_smuggle_another_key() {
+        assert_eq!(parse_literal("32"), Some(toml::Value::Integer(32)));
+        assert_eq!(parse_literal("1\nother = 2"), None);
+        assert_eq!(parse_literal("not a literal"), None);
+        assert_eq!(
+            override_value("1\nother = 2", None),
+            toml::Value::String("1\nother = 2".to_owned())
+        );
+    }
+
+    /// `parse` 与启动加载是同一条路：文件里没写的项取环境变量的值。
+    #[test]
+    fn parse_applies_the_environment() {
+        // 用不常出现的键，避免与宿主环境冲突；别的测试不读这个键。
+        unsafe { std::env::set_var("SBOT__AGENT__OWNER_NAME", "from-env") };
+        let parsed = SbotConfig::parse("version = 1");
+        unsafe { std::env::remove_var("SBOT__AGENT__OWNER_NAME") };
+        assert_eq!(parsed.unwrap().agent.owner_name, "from-env");
     }
 
     #[test]
