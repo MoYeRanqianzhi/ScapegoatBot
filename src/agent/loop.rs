@@ -424,8 +424,6 @@ impl AgentLoop {
                 } else {
                     self.build_request(history)
                 };
-                send(events, AgentEvent::MessageStart).await;
-
                 let assistant = match self
                     .request_before_deadline(&request, started, events)
                     .await
@@ -697,13 +695,18 @@ impl AgentLoop {
         }))
     }
 
-    /// 单次流式请求。
+    /// 单次流式请求（一次尝试）。
+    ///
+    /// 开头发 `MessageStart`：流到一半出错时已经发出去的增量属于这次失败的尝试，下一次尝试
+    /// 的 `MessageStart` 告诉消费者把它们丢掉。出错只返回 `Err`，不发 `Error` 事件——这次
+    /// 尝试之后可能重试成功，最终失败时由调用方发一次。
     async fn request_once(
         &self,
         request: &LlmRequest,
         events: &mpsc::Sender<AgentEvent>,
         provider: &Arc<dyn Provider>,
     ) -> Result<AssistantMessage, ProviderError> {
+        send(events, AgentEvent::MessageStart).await;
         let mut receiver = provider.stream(request.clone()).await?;
 
         let mut blocks: Vec<BlockAccumulator> = Vec::new();
@@ -767,16 +770,7 @@ impl AgentLoop {
                 ProviderEvent::Stop { reason, refusal } => {
                     stop = Some((reason, refusal));
                 }
-                ProviderEvent::Error(error) => {
-                    send(
-                        events,
-                        AgentEvent::Error {
-                            message: error.to_string(),
-                        },
-                    )
-                    .await;
-                    return Err(error);
-                }
+                ProviderEvent::Error(error) => return Err(error),
             }
         }
 
@@ -1575,6 +1569,116 @@ mod tests {
 
         assert_eq!(outcome.stop_reason, StopReason::EndTurn);
         assert_eq!(provider.requests.lock().unwrap().len(), 2);
+    }
+
+    /// 一个出错的流：先吐出 `partial`，再报一个错。
+    fn failing_stream(partial: &str, retryable: bool) -> Vec<ProviderEvent> {
+        vec![
+            ProviderEvent::TextDelta(partial.to_owned()),
+            ProviderEvent::Error(ProviderError {
+                kind: crate::providers::ProviderErrorKind::Server,
+                message: "stream broke".to_owned(),
+                status: Some(500),
+                retryable,
+                retry_after_ms: None,
+            }),
+        ]
+    }
+
+    /// 跑一次脚本并收集全部事件。
+    async fn events_of(script: Vec<Vec<ProviderEvent>>) -> (LoopOutcome, Vec<AgentEvent>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.retry.base_ms = 1;
+        config.retry.attempts = 1;
+        let agent = AgentLoop::new(
+            Arc::new(FakeProvider::new(script)),
+            Arc::new(FakeTools::new(false)),
+            gate(dir.path(), GuardMode::Shadow),
+            config,
+        );
+        let (tx, mut rx) = mpsc::channel(128);
+        let mut history = vec![AgentMessage::user("go")];
+        let outcome = agent
+            .run(&mut history, Vec::new(), &mut SteeringQueue::default(), &tx)
+            .await;
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        (outcome, events)
+    }
+
+    /// 最近一次 `MessageStart` 之后的文本增量拼起来。
+    fn text_since_last_start(events: &[AgentEvent]) -> String {
+        let start = events
+            .iter()
+            .rposition(|event| matches!(event, AgentEvent::MessageStart))
+            .expect("a MessageStart");
+        events[start..]
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::MessageUpdate {
+                    kind: crate::agent::event::DeltaKind::Text,
+                    delta,
+                } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 流到一半出错、重试成功：每次尝试各有一个 `MessageStart`，按它分段的增量与最终消息
+    /// 一致（失败那次吐出的半截不混进来）；回合成功了，所以没有 `Error` 事件。
+    #[tokio::test]
+    async fn a_retried_stream_starts_over_and_reports_no_error() {
+        let (outcome, events) = events_of(vec![
+            failing_stream("half an ans", true),
+            text_response("the whole answer"),
+        ])
+        .await;
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+
+        let starts = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::MessageStart))
+            .count();
+        assert_eq!(starts, 2);
+        assert_eq!(text_since_last_start(&events), "the whole answer");
+        let ended: Vec<String> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::MessageEnd { message } => Some(message.text()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ended, vec!["the whole answer"]);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { .. })),
+            "{events:?}"
+        );
+    }
+
+    /// 重试用尽仍然失败：`Error` 事件恰好一条。
+    #[tokio::test]
+    async fn a_failed_request_reports_its_error_once() {
+        let (outcome, events) = events_of(vec![
+            failing_stream("first", true),
+            failing_stream("second", true),
+        ])
+        .await;
+        assert_eq!(outcome.stop_reason, StopReason::Error);
+        let errors: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Error { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("stream broke"), "{errors:?}");
     }
 
     #[tokio::test]

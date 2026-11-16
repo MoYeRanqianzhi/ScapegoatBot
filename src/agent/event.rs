@@ -17,9 +17,10 @@ pub enum AgentEvent {
     AgentStart,
     /// 内层循环的一轮开始。
     TurnStart { turn: u32 },
-    /// 一次模型请求开始。
+    /// 一次模型请求开始。请求失败后重试（或换回退模型）时再发一次：这之前收到的
+    /// `MessageUpdate` 属于失败的那次尝试，作废。
     MessageStart,
-    /// 流式增量。
+    /// 流式增量，属于最近一次 `MessageStart` 开始的那次尝试。
     MessageUpdate { kind: DeltaKind, delta: String },
     /// 一条完整的助手消息。
     MessageEnd { message: AssistantMessage },
@@ -42,7 +43,7 @@ pub enum AgentEvent {
         allowed: bool,
         reason: String,
     },
-    /// 发生错误（严重到终止本轮）。
+    /// 发生错误（严重到终止本轮）。重试之后成功的请求不发它。
     Error { message: String },
 }
 

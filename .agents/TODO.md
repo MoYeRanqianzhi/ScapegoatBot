@@ -83,14 +83,14 @@ Dependabot 开了 4 个 PR（#1 兼容更新合集；#2 getrandom 0.4、#3 chach
 `MessageStore::index_appended` 的调用处；`sbot.toml` 的读改写没有串行化、先通知后换句柄，
 见 `Views::write_config` 与 `config::replace_file`；`sbot backup` 的输出目录检查，见
 `cli::backup::real_location` 与它旁边的“只写进空目录”；monitor 模板的二次展开与等空闲时
-到期，见 `monitor::delivery` 的 `render_prompt` / `expire`）。
+到期，见 `monitor::delivery` 的 `render_prompt` / `expire`；重试时的事件，见
+`AgentEvent::MessageStart` 的文档注释——`MessageUpdate` 现在没有任何消费者，重复片段在生产里
+观察不到，实际的毛病是一次失败的请求会发 3 条 `Error`、重试成功的也发）。
 顺带看到、还没处理的：文本节点被二进制覆盖后 `content_enc` 里留着旧密文；二进制节点被文本
 覆盖后 `vfs_chunks` 行与 `blobs/<id>/` 留着——都只是占空间，读取不受影响，删节点时一并清掉。
 
 核实后：是 bug 就修并补测试，不是就从这里删掉。行号是当时的，会漂移。
 
-- [ ] `agent/loop.rs::request_once`：流中途出错前已经把 text / thinking 分段作为
-      `MessageUpdate` 发出，之后 `request_with_retry` 重试，消费者可能收到重复的片段。
 - [ ] `agent/runner/injected.rs`：`run_control` 检查 `ai_enabled` 但不检查 ESTOP（`run_event`
       与 `run_turn` 都检查）；`run_injected` 先 push history 再 `sessions.append`，与
       `run_turn` 的顺序相反。
@@ -100,7 +100,7 @@ Dependabot 开了 4 个 PR（#1 兼容更新合集；#2 getrandom 0.4、#3 chach
 ## 仍然超过 100 行的函数（不阻塞）
 
 `app::dispatch` 176、`runner::run_turn` 166、`views::system::read_system` 156、
-`loop::run_with_steering` 155、`app::start` 154、`loop::request_once` 141、
+`loop::run_with_steering` 155、`app::start` 154、`loop::request_once` 133、
 `backup::run_with_paths` 127、`runner::run_subagent` 124、`monitor::validate_monitor` 122、
 `assembly::build_agent` 120、`events::handle_qq_event` 118、
 `delivery::deliver_once` 108、`compaction::compact_scope` 115。其中是“一个 match 平铺 /
