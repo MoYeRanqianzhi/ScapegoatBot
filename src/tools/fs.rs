@@ -466,11 +466,13 @@ impl Tool for GrepTool {
     fn description(&self) -> &'static str {
         "Search text file content under a VFS path. `pattern` is a regular expression; `path` \
          defaults to `/`; `file_ext` filters extensions; `case_insensitive` ignores case.\n\n\
-         Large `/messages` and `/sessions` trees are budgeted per direct child. A child that \
-         exceeds the budget is skipped or partially scanned, while matches from other children \
-         are still returned. The result ends with `[skipped]` or `[partial]` notes only for those \
-         children; these notes are informational. Do not scan entire histories.\n\n\
-         Matched entries are marked read; files only scanned are not."
+         The search is budgeted: under each direct child of `path` at most 200 files are \
+         scanned (newest first under `/messages` and `/sessions`), and at most 200 matching \
+         lines are returned in total. A child that hits a budget is listed in a trailing \
+         `[skipped]` note; matches found before that are still returned. Narrow `path` to one \
+         chat or one month instead of scanning entire histories.\n\n\
+         Searching does not change the inbox: messages it finds stay unread until you `Read` \
+         them. A static file with a match counts as read, so you can `Edit` it."
     }
 
     fn parameters(&self) -> Value {
@@ -511,8 +513,11 @@ impl Tool for GrepTool {
             let Some(views) = &ctx.views else {
                 return ToolResult::error(crate::tools::DYNAMIC_UNAVAILABLE);
             };
-            return match views.grep(&root, &regex, file_ext).await {
-                Ok(matches) => ToolResult::ok(render_matches(&matches, &[])),
+            return match views
+                .grep(&root, &regex, file_ext, GREP_MAX_FILES, GREP_MAX_MATCHES)
+                .await
+            {
+                Ok((matches, skipped)) => ToolResult::ok(render_matches(&matches, &skipped)),
                 Err(error) => vfs_error(error),
             };
         }

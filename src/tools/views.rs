@@ -404,36 +404,78 @@ impl Views {
     }
 
     /// 动态路径中的 grep：只返回匹配，不标记已读（内容没有进入上下文）。
+    ///
+    /// 与静态树同一套预算：`root` 的每个直接子节点下最多扫描 `max_files` 个文件，总共最多
+    /// 返回 `max_matches` 行。到了预算的子节点记进返回的第二项（`<路径> (file budget)` /
+    /// `<路径> (match budget)`），之前找到的匹配照常返回。没有预算的话，一次对 `/messages`
+    /// 的搜索会解密并扫描整个历史，所有匹配都留在内存里。
+    ///
+    /// 每个子节点下从路径最大的文件扫起：`/messages` 与 `/sessions` 的路径按日期排，路径
+    /// 最大的就是最新的，预算不够时留下的是近期的内容。
     pub(crate) async fn grep(
         &self,
         root: &VfsPath,
         regex: &regex::Regex,
         file_ext: Option<&str>,
-    ) -> Result<Vec<(String, u64, String)>, VfsError> {
+        max_files: usize,
+        max_matches: usize,
+    ) -> Result<(Vec<(String, u64, String)>, Vec<String>), VfsError> {
         let mut matches = Vec::new();
-        let entries = self.walk(root).await?;
-        for entry in entries {
-            if entry.kind == "dir" {
-                continue;
-            }
-            if let Some(ext) = file_ext
-                && !entry.path.ends_with(&format!(".{ext}"))
-            {
-                continue;
-            }
-            let Ok(path) = VfsPath::parse(&entry.path) else {
-                continue;
+        let mut skipped = Vec::new();
+        // 列不出子节点时，`root` 可能本身就是一个文件：读得出来就只搜它自己，读不出来才是
+        // 错误（路径不存在）。
+        let children = match self.list_all(root).await {
+            Ok(children) => children
+                .into_iter()
+                .map(|entry| (entry.path, entry.kind == "dir"))
+                .collect(),
+            Err(error) => match self.scan(root).await {
+                Ok(ViewRead::Text(_)) => vec![(root.to_string(), false)],
+                _ => return Err(error),
+            },
+        };
+        for (child, is_dir) in children {
+            let mut files: Vec<String> = if is_dir {
+                let Ok(path) = VfsPath::parse(&child) else {
+                    continue;
+                };
+                self.walk(&path)
+                    .await?
+                    .into_iter()
+                    .filter(|entry| entry.kind != "dir")
+                    .map(|entry| entry.path)
+                    .collect()
+            } else {
+                vec![child.clone()]
             };
-            let Ok(ViewRead::Text(text)) = self.scan(&path).await else {
-                continue;
-            };
-            for (line_no, line) in text.lines().enumerate() {
-                if regex.is_match(line) {
-                    matches.push((entry.path.clone(), line_no as u64 + 1, line.to_owned()));
+            if let Some(ext) = file_ext {
+                let suffix = format!(".{ext}");
+                files.retain(|file| file.ends_with(&suffix));
+            }
+            files.sort_unstable_by(|a, b| b.cmp(a));
+            for (scanned, file) in files.iter().enumerate() {
+                if scanned >= max_files {
+                    skipped.push(format!("{child} (file budget)"));
+                    break;
+                }
+                let Ok(path) = VfsPath::parse(file) else {
+                    continue;
+                };
+                let Ok(ViewRead::Text(text)) = self.scan(&path).await else {
+                    continue;
+                };
+                for (line_no, line) in text.lines().enumerate() {
+                    if regex.is_match(line) {
+                        matches.push((file.clone(), line_no as u64 + 1, line.to_owned()));
+                        if matches.len() >= max_matches {
+                            skipped.push(format!("{child} (match budget)"));
+                            return Ok((matches, skipped));
+                        }
+                    }
                 }
             }
         }
-        Ok(matches)
+        Ok((matches, skipped))
     }
 
     // ---------------------------------------------------------------------
@@ -675,11 +717,11 @@ mod tests {
         assert_eq!(views.messages.unread_counts().unwrap(), vec![(chat, 1)]);
 
         let regex = regex::Regex::new("zzz-no-match").unwrap();
-        let matches = views
-            .grep(&VfsPath::parse("/inbox").unwrap(), &regex, None)
+        let (matches, skipped) = views
+            .grep(&VfsPath::parse("/inbox").unwrap(), &regex, None, 200, 200)
             .await
             .unwrap();
-        assert!(matches.is_empty());
+        assert!(matches.is_empty() && skipped.is_empty());
         // 扫描不等于读过。
         assert_eq!(views.messages.unread_counts().unwrap(), vec![(chat, 1)]);
 
@@ -1135,6 +1177,55 @@ mod tests {
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert!(on_disk.contains("s3cret"), "{on_disk}");
         assert!(handle.read().unwrap().config.filter.require_mention);
+    }
+
+    /// 动态视图上的搜索有预算：每个直接子节点下只扫有限个文件（从最新的扫起），匹配的行数
+    /// 有总上限，到了预算的子节点在结果里注明。没有预算时一次搜索会扫完整个历史。
+    #[tokio::test]
+    async fn searching_message_history_is_budgeted() {
+        use chrono::TimeZone;
+        let (views, _dir) = views();
+        let chat = crate::qq::event::ChatId::Group(42);
+        // 三天，每天一条。
+        for (id, day) in [(1, 3), (2, 4), (3, 5)] {
+            let mut stored = message(chat, id, &format!("needle on day {day}"));
+            stored.time = chrono::Local
+                .with_ymd_and_hms(2026, 11, day, 12, 0, 0)
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            views.messages.append(&stored).unwrap();
+        }
+        let regex = regex::Regex::new("needle").unwrap();
+        let root = VfsPath::parse("/messages").unwrap();
+        let days = |matches: &[(String, u64, String)]| {
+            matches
+                .iter()
+                .map(|(path, _, _)| path.rsplit('/').next().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        // 预算够：三天都搜到，没有注记。
+        let (matches, skipped) = views.grep(&root, &regex, None, 200, 200).await.unwrap();
+        assert_eq!(matches.len(), 3, "{matches:?}");
+        assert!(skipped.is_empty(), "{skipped:?}");
+
+        // 每个子节点只许扫两个文件：留下的是最新的两天，并注明这个子节点没扫完。
+        let (matches, skipped) = views.grep(&root, &regex, None, 2, 200).await.unwrap();
+        assert_eq!(days(&matches), ["05.md", "04.md"], "{matches:?}");
+        assert_eq!(skipped, ["/messages/groups (file budget)"]);
+
+        // 匹配行数到上限就停。
+        let (matches, skipped) = views.grep(&root, &regex, None, 200, 1).await.unwrap();
+        assert_eq!(days(&matches), ["05.md"], "{matches:?}");
+        assert_eq!(skipped, ["/messages/groups (match budget)"]);
+
+        // 根就是一个文件时只搜它自己。
+        let file = VfsPath::parse(&matches[0].0).unwrap();
+        let (matches, skipped) = views.grep(&file, &regex, None, 200, 200).await.unwrap();
+        assert_eq!(days(&matches), ["05.md"], "{matches:?}");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        // 搜索不改变未读状态。
+        assert_eq!(views.messages.unread_counts().unwrap(), vec![(chat, 3)]);
     }
 
     #[tokio::test]
