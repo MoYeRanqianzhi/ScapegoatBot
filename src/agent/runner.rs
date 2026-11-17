@@ -765,6 +765,39 @@ impl Runner {
     }
 }
 
+impl Runner {
+    /// 子代理能用的工具：父注册表里按定义筛出的子集，以实例身份调用。
+    fn subagent_tools(
+        &self,
+        request: &crate::swarm::SubagentRequest,
+    ) -> Arc<dyn crate::agent::ToolExecutor> {
+        // 以实例身份调用工具：写保护与 monitor 归属都看这个身份。
+        let mut tools = self
+            .deps
+            .tools
+            .filtered(&request.tools)
+            .for_subagent(request.id.clone());
+        if request.local_only {
+            tools = tools.without_qq();
+        }
+        // 嵌套 spawn：只有未到 max_depth 且 hub 已注入时，才给子代理 Agent 工具。
+        if request.depth + 1 < request.max_depth
+            && let Some(hub) = self.hub.get()
+        {
+            let handle = Arc::new(crate::tools::agent::HubHandle::new());
+            let _ = handle.set(Arc::clone(hub));
+            tools.register(Arc::new(crate::tools::agent::AgentTool::new(
+                handle,
+                request.depth + 1,
+            )));
+        }
+        Arc::new(TurnExecutor {
+            registry: Arc::new(tools),
+            evidence: request.evidence.clone(),
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl TurnHandler for Runner {
     async fn handle(
@@ -796,38 +829,8 @@ impl crate::swarm::SubagentRunner for Runner {
         if self.deps.estop_file.exists() {
             anyhow::bail!("ESTOP is active; the subagent did not run");
         }
-        let mut incoming = request.incoming;
-        let shared_history = request.shared_history.clone();
         let slot = self.provider_snapshot();
-        // 以实例身份调用工具：写保护与 monitor 归属都看这个身份。
-        let mut tools = self
-            .deps
-            .tools
-            .filtered(&request.tools)
-            .for_subagent(request.id.clone());
-        if request.local_only {
-            tools = tools.without_qq();
-        }
-        // 嵌套 spawn：只有未到 max_depth 且 hub 已注入时，才给子代理 Agent 工具。
-        if request.depth + 1 < request.max_depth
-            && let Some(hub) = self.hub.get()
-        {
-            let handle = Arc::new(crate::tools::agent::HubHandle::new());
-            let _ = handle.set(Arc::clone(hub));
-            tools.register(Arc::new(crate::tools::agent::AgentTool::new(
-                handle,
-                request.depth + 1,
-            )));
-        }
-        let executor: Arc<dyn crate::agent::ToolExecutor> = Arc::new(TurnExecutor {
-            registry: Arc::new(tools),
-            evidence: request.evidence.clone(),
-        });
-        let tools = executor;
-        let system = vec![SystemBlock {
-            text: request.system,
-            cache: false,
-        }];
+        let tools = self.subagent_tools(&request);
         let loop_ = AgentLoop::new_with_fallbacks(
             Arc::clone(&slot.provider),
             self.fallbacks.clone(),
@@ -835,7 +838,10 @@ impl crate::swarm::SubagentRunner for Runner {
             Arc::clone(&self.deps.gate),
             // 子代理：自己的精简 system、没有服务端工具、步数来自定义；其余与主回合相同。
             LoopConfig {
-                system,
+                system: vec![SystemBlock {
+                    text: request.system,
+                    cache: false,
+                }],
                 server_tools: Vec::new(),
                 max_steps: request.max_steps,
                 ..self.loop_config(&slot)
@@ -843,71 +849,82 @@ impl crate::swarm::SubagentRunner for Runner {
         );
         let mut history = request.history;
         history.push(AgentMessage::user(request.task));
-        let (tx, mut rx) = mpsc::channel(256);
-        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-        let mut steering = SteeringQueue::default();
-        let mut outcome = loop_
-            .run_with_steering(
-                &mut history,
-                Vec::new(),
-                &mut steering,
-                incoming
-                    .as_mut()
-                    .map(|receiver| receiver as &mut dyn crate::agent::agent_loop::SteeringSource),
-                &tx,
-            )
-            .await;
-        // 收尾：先关闭收件通道，之后的 `Agent message` 会等这次运行写回再续聊
-        // （见 `AgentHub::message`）；关闭前已经送进来、还没回应的消息再跑一轮回应，
-        // 不能“送达”之后没人理。
-        let mut leftovers = steering.drain();
-        if let Some(receiver) = &mut incoming {
-            receiver.close();
-            while let Ok(message) = receiver.try_recv() {
-                leftovers.push(message);
-            }
-        }
-        if !leftovers.is_empty() {
-            if outcome.stop_reason == crate::agent::StopReason::EndTurn {
-                outcome = loop_
-                    .run_with_steering(
-                        &mut history,
-                        leftovers,
-                        &mut SteeringQueue::default(),
-                        None,
-                        &tx,
-                    )
-                    .await;
-            } else {
-                // 提前结束（出错、超限、被闸拦下）：不再请求模型，消息留在历史里，
-                // 下一次续聊时可见。
-                history.extend(leftovers);
-            }
-        }
-        if let Some(shared) = shared_history {
+        let stop_reason = run_until_answered(&loop_, &mut history, request.incoming).await;
+        if let Some(shared) = request.shared_history {
             *shared.lock().await = history.clone();
         }
-        drop(tx);
-        let _ = drain.await;
 
-        if outcome.stop_reason == crate::agent::StopReason::Refusal {
+        if stop_reason == crate::agent::StopReason::Refusal {
             anyhow::bail!("the subagent request was refused by the provider");
         }
-        let text = history
-            .iter()
-            .rev()
-            .find_map(|message| match message {
-                AgentMessage::Assistant(assistant) if !assistant.text().trim().is_empty() => {
-                    Some(assistant.text())
-                }
-                _ => None,
-            })
-            .unwrap_or_default();
+        let text = last_assistant_text(&history);
         if text.trim().is_empty() {
             anyhow::bail!("the subagent returned no text");
         }
         Ok(text)
     }
+}
+
+/// 跑子代理的循环，直到运行中送进来的消息都得到了回应；返回最后一次运行的停止原因。
+///
+/// `incoming` 是 `Agent message` 的收件通道。循环正常结束时通道里可能还有刚送达的消息：
+/// 先关闭通道（之后的 `Agent message` 会等这次运行写回再续聊，见 `AgentHub::message`），
+/// 再为关闭前已经送达的那些补跑一轮——不能“送达”之后没人理。
+async fn run_until_answered(
+    loop_: &AgentLoop,
+    history: &mut Vec<AgentMessage>,
+    mut incoming: Option<mpsc::UnboundedReceiver<AgentMessage>>,
+) -> crate::agent::StopReason {
+    // 子代理的事件没有订阅者：收下丢掉，只为了让循环的发送不阻塞。
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let mut steering = SteeringQueue::default();
+    let mut outcome = loop_
+        .run_with_steering(
+            history,
+            Vec::new(),
+            &mut steering,
+            incoming
+                .as_mut()
+                .map(|receiver| receiver as &mut dyn crate::agent::agent_loop::SteeringSource),
+            &tx,
+        )
+        .await;
+    let mut leftovers = steering.drain();
+    if let Some(receiver) = &mut incoming {
+        receiver.close();
+        while let Ok(message) = receiver.try_recv() {
+            leftovers.push(message);
+        }
+    }
+    if !leftovers.is_empty() {
+        if outcome.stop_reason == crate::agent::StopReason::EndTurn {
+            outcome = loop_
+                .run_with_steering(history, leftovers, &mut SteeringQueue::default(), None, &tx)
+                .await;
+        } else {
+            // 提前结束（出错、超限、被闸拦下）：不再请求模型，消息留在历史里，
+            // 下一次续聊时可见。
+            history.extend(leftovers);
+        }
+    }
+    drop(tx);
+    let _ = drain.await;
+    outcome.stop_reason
+}
+
+/// 历史里最后一条有文字的助手消息的文本；没有则为空串。
+fn last_assistant_text(history: &[AgentMessage]) -> String {
+    history
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            AgentMessage::Assistant(assistant) if !assistant.text().trim().is_empty() => {
+                Some(assistant.text())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
