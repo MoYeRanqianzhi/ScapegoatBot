@@ -392,6 +392,9 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let crlf = format!("{}{}", char::from(13), char::from(10));
+            // 每条连接只答一个请求就关掉，所以每个响应都带 `Connection: close`。不带的话
+            // 客户端按 keep-alive 把连接放回池里，跳转后的请求可能复用到这条正在关闭的连接
+            // 而失败——取决于时序，慢的机器上偶尔出现。
             for _ in 0..2 {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     break;
@@ -401,12 +404,14 @@ mod tests {
                 let request = String::from_utf8_lossy(&buffer[..read]);
                 let response = if request.starts_with("GET /start ") {
                     format!(
-                        "HTTP/1.1 302 Found{crlf}Location: /page{crlf}Content-Length: 0{crlf}{crlf}"
+                        "HTTP/1.1 302 Found{crlf}Location: /page{crlf}Content-Length: 0{crlf}\
+                         Connection: close{crlf}{crlf}"
                     )
                 } else {
                     let body = "<html><script>x</script><p>Hello&nbsp;world</p></html>";
                     format!(
-                        "HTTP/1.1 200 OK{crlf}Content-Type: text/html{crlf}Content-Length: {}{crlf}{crlf}{body}",
+                        "HTTP/1.1 200 OK{crlf}Content-Type: text/html{crlf}Content-Length: {}{crlf}\
+                         Connection: close{crlf}{crlf}{body}",
                         body.len()
                     )
                 };
