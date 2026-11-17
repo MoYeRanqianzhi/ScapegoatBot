@@ -52,17 +52,19 @@ PR 本身没有动——合并 / 关闭 PR 没有得到用户的授权；内容�
 - [ ] 上级目录的 `G:/ClaudeProjects/ScapegoatBot/CLAUDE.md`（不在本仓库里）仍说开发文档在
       `docs/development/`；那个目录 2026-11-17 已删，这一句要用户自己改（开发文档现在是
       `.agents/`，使用文档是 `sbot docs` / `skills/`）。
-- [ ] 2026-11-17 核对 skill 与代码时看到、**没有改**的地方。它们不是 bug，但都是“配置或接口
-      说了、程序没做”，要不要做、怎么做由用户定：
-  - `[agent].name` 被校验但从不使用（删掉是破坏性的配置变更）。
-  - `models.json` 的 `max_retries`、`sampling`、`compat` 被解析但不生效。
-  - `compaction_checkpoints` 表只写不读（`checkpoints()` 只有测试在用）。
-  - `api.help` / `api.list` 不告诉 agent 哪些动作是 destructive。
-  - 自定义子代理的 `tools` 里写了不认识的名字会被悄悄跳过，不报错。
-  - MCP 服务器的 stderr 被丢弃，启动失败时看不到它自己打印的原因。
-  - `approve` 的 6 位确认码没有尝试次数限制（靠 60 秒有效期与“只有主人能私聊”）。
-  - `SBOT__*` 环境变量够不到表数组里的项（`[[monitor]]`、`[[mcp.servers]]`、
-    `[[hooks.events]]`）；普通的嵌套表（`[security.guard]`）可以。
+- [ ] “写了不报错、但不起作用”的三样东西，留着还是删掉 / 接上（文档已经如实写明，见
+      `skills/sbot-deploy/references/configuration.md`；删掉配置键是破坏性变更，所以由用户定）：
+  - `[agent].name`：必须非空，但没有任何地方使用。
+  - `models.json` 的 provider `max_retries`（实际重试次数看 `[agent].retry_attempts`）、模型的
+    `sampling` 与 `compat`（没有透传给 API）。
+  - `compaction_checkpoints` 表只写不读（`SessionStore::checkpoints()` 只有测试在用；新分段的
+    首行才是摘要的权威副本）。
+
+同一批里已经处理掉的（2026-11-17，见 CHANGELOG 的 Unreleased）：`api.list` / `api.help` 给出
+`destructive` 等门禁属性；自定义子代理 `tools` 里的未知名字改为报错；MCP 服务器的 stderr 进
+日志。两条核实后不需要做：确认码不必加尝试次数限制（只有 owner / master 的私聊才会拿去比对，
+见 `src/app/events.rs` 的 `approval_reply_sender`，别人没有可以穷举的入口）；`SBOT__*` 够不到
+表数组是键名格式决定的，已写进配置文档。
 
 ## CI / 发布留下的尾巴
 
@@ -94,16 +96,12 @@ PR 本身没有动——合并 / 关闭 PR 没有得到用户的授权；内容�
 [`memory/storage-invariants.md`](memory/storage-invariants.md) 与
 [`memory/security-gate-semantics.md`](memory/security-gate-semantics.md)。
 
-## 仍然超过 100 行的函数（不阻塞）
+## 函数长度
 
-`app::dispatch` 176、`views::system::read_system` 156、
-`loop::run_with_steering` 155、`app::start` 154、`loop::request_once` 133、
-`backup::run_with_paths` 127、`runner::run_subagent` 124、`monitor::validate_monitor` 122、
-`assembly::build_agent` 120、`events::handle_qq_event` 118、
-`delivery::deliver_once` 108、`compaction::compact_scope` 115。其中是“一个 match 平铺 /
-同一层的线性步骤”的不必拆。`swarm::spawn`（89）、`messages::append`（86）与 `write_config`
-（59）在 2026-11-16 修 bug 时拆过了；`run_turn`（原 168，混着前置检查、入站接收、预算、提示
-组装）在 2026-11-17 拆到 85，准备步骤在 `src/agent/runner/prepare.rs`。
+2026-11-17 把超过 100 行的非测试函数都拆了，只留一个：`app::assembly::build_agent`（119 行）。
+它是二十来个已经各自命名的装配步骤按依赖顺序排成一列，没有分支；再拆只会多出几个带六七个
+参数、只被调用一次的搬运函数，读起来更费劲。以后往里加步骤时先加成独立函数再在这里调用。
+新写的函数超过 100 行时，先看它是不是混着几件事（混着就拆），是一列线性步骤的可以留。
 
 ## 外部验证（需 NapCat 登录）
 
