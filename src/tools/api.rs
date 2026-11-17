@@ -393,6 +393,10 @@ impl ApiTool {
                     "category": spec.category.as_str(),
                     "summary": spec.summary,
                     "hold_allowed": spec.hold_allowed(),
+                    // 两个门禁属性放在列表里：挑动作时就能看出哪些要主人的意图、哪些是
+                    // 破坏性的，不必逐个 `api.help`。
+                    "requires_owner_intent": spec.requires_owner_intent,
+                    "destructive": spec.destructive,
                 })
             })
             .collect();
@@ -423,6 +427,9 @@ impl ApiTool {
                 "params": spec.params,
                 "returns": spec.returns,
                 "requires_owner_intent": spec.requires_owner_intent,
+                // 破坏性动作的目标（`target_field` 指的那个 QQ）是主人或通知账号时恒拒绝。
+                "destructive": spec.destructive,
+                "target_field": spec.target_field,
                 "scope_field": spec.scope_field,
                 "hold": if spec.hold_allowed() { "available" } else { crate::tools::HOLD_DISABLED },
                 "examples": spec.examples,
@@ -711,6 +718,46 @@ mod tests {
         assert!(!result.is_error);
         let value: Value = serde_json::from_str(&result.content).unwrap();
         assert_eq!(value["params"]["text"]["type"], "string");
+    }
+
+    /// 门禁属性对 agent 可见：列表与单条说明都给出“要主人意图”与“破坏性”，并且与
+    /// 注册表一致。
+    #[tokio::test]
+    async fn the_registry_tells_which_actions_are_guarded() {
+        let tool = tool(None, None);
+        let result = call(
+            &tool,
+            "api.help",
+            json!({"action": "napcat.set_group_kick"}),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(value["destructive"], true, "{}", result.content);
+        assert_eq!(value["target_field"], "user_id");
+
+        let result = call(
+            &tool,
+            "api.help",
+            json!({"action": "napcat.get_login_info"}),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(value["destructive"], false, "{}", result.content);
+        assert_eq!(value["target_field"], Value::Null);
+
+        let result = call(&tool, "api.list", json!({"limit": 100})).await;
+        let value: Value = serde_json::from_str(&result.content).unwrap();
+        let items = value["items"].as_array().unwrap();
+        assert!(!items.is_empty());
+        for item in items {
+            let spec = ApiTool::spec(item["action"].as_str().unwrap()).unwrap();
+            assert_eq!(item["destructive"], spec.destructive, "{item}");
+            assert_eq!(
+                item["requires_owner_intent"], spec.requires_owner_intent,
+                "{item}"
+            );
+        }
+        assert!(items.iter().any(|item| item["destructive"] == true));
     }
 
     #[tokio::test]
