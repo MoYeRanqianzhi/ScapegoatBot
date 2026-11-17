@@ -16,14 +16,16 @@
 
 ## 当前状态
 
-`0.2.0-alpha.44` 已发布（2026-11-15 UTC）；测试基线、产物怎么验证的、哪些平台没实测，见
+`0.2.0-alpha.45` 已发布（2026-11-17 UTC）；测试基线、产物怎么验证的、哪些平台没实测，见
 [`memory/release-status.md`](memory/release-status.md)；发版步骤与授权范围见
 [`memory/release-workflow.md`](memory/release-workflow.md)。服务器 `hw1` 的 `sbot.service` 仍
 停止；NapCat 未登录（2026-11-05 起 QR 登录失败）。
 
-Dependabot 的 PR：#2–#5 的内容已在 2026-11-16 手动合进 main（本地与 Debian 上完整验证过），
-PR 本身没有动，Dependabot 下次运行时会自己关掉；没关的话可以直接关闭。以后的 PR 照此处理：
-补丁 / 次版本的合集看 CI 绿了就合；主版本更新先看 API 变化。加密相关的依赖升级后
+Dependabot 的 PR：#2–#5 的内容在 2026-11-16、#6（`getrandom` 0.4.3）的内容在 2026-11-17
+手动做进 main（本地重做同样的升级，锁文件与 PR 的逐字相同，本地与 Debian 上完整验证过）。
+PR 本身没有动——合并 / 关闭 PR 没有得到用户的授权；内容进了 main 之后 Dependabot 下次运行
+会自己关掉它，没关的话用户可以直接关闭。以后的 PR 照此处理：补丁 / 次版本的升级在本地重做
+并验证；主版本更新先看 API 变化。加密相关的依赖升级后
 `storage::crypto` 里“旧版本密文必须解得开”的测试必须通过。
 
 ## 等用户决定
@@ -68,7 +70,7 @@ PR 本身没有动，Dependabot 下次运行时会自己关掉；没关的话可
 - [ ] PGO 没做，也不打算在没有训练负载的情况下做：仓库只有模拟 NapCat，没有模拟 LLM；用
       单元测试当训练数据会把优化引向测试路径，真实负载可能更慢。要做得先有一个能离线重放的
       代表性回合（模拟 provider + 模拟 NapCat）。已告诉用户。
-- [ ] x86_64 的 v4 产物能不能在 CI 上实际运行取决于当次 runner 有没有 AVX-512（alpha.44 有
+- [ ] x86_64 的 v4 产物能不能在 CI 上实际运行取决于当次 runner 有没有 AVX-512（alpha.45 有一个、alpha.44 有
       三个只做了链接检查）。想要每次都跑：用 Intel SDE 模拟，或固定到有 AVX-512 的 runner。
 - [ ] CodeQL 的两条误报已在 GitHub 上标记并写了理由（#1 HKDF 输出缓冲区被当成硬编码密钥，
       #6 `fetch_image` 的 http→https 升级）；`vendor/napcat-link/examples` 的 4 条在

@@ -13,7 +13,7 @@
 - [提示词结构](memory/prompt-structure.md) -- system 三层、注入归属、新文本放哪里、守着它的测试
 - [实机验证](memory/live-testing.md) -- 真实模型 / Jev / 本地 OneBot mock 的端到端验证命令与验收口径
 - [提交说明](memory/commit-messages.md) -- 不带 Claude Code 共同作者行；2026-11-10 重写过历史，远端已强推
-- [发布状态](memory/release-status.md) -- alpha.44 已发布：20 个产物怎么验证的、哪些平台没实测、测试基线
+- [发布状态](memory/release-status.md) -- alpha.45 已发布：20 个产物怎么验证的、哪些平台没实测、测试基线
 - [命名、自定义 action 与渠道（设计稿）](plan/2026-11-17-channels-and-custom-actions.md) -- 等用户确认：属性代替前缀、native 改名、适配器进程、NapCat 可禁用、渠道抽象的分步
 - [审查整改计划（2026-11-07）](plan/2026-11-07-review-remediation.md) -- 四份代码审查的已修/待修项与顺序
 - [重构总设计](plan/2026-10-28-rebuild-design.md) -- 0.2 设计依据与取舍理由；与代码冲突时以代码为准

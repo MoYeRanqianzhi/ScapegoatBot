@@ -5,7 +5,7 @@ metadata:
   type: feedback
   scope: 本仓库所有提交与发布
   status: active
-  last_verified: 2026-11-16
+  last_verified: 2026-11-17
 ---
 
 规则：
@@ -22,8 +22,9 @@ metadata:
 发版步骤（alpha.44 实际走过的）：
 
 1. main 上 CI 全绿（`gh run list --branch main`）。
-2. 改了 `release.yml` 或 `.github/scripts/` 的话先试跑：`gh workflow run release.yml --ref main`
-   （workflow_dispatch 不发布，约 50 分钟）。
+2. 先试跑：`gh workflow run release.yml --ref main`（workflow_dispatch 不发布，约 50 分钟）。
+   改了 `release.yml` 或 `.github/scripts/` 时必须；没改也建议——它在 20 个目标上跑库测试，
+   alpha.45 靠它查出两个 CI 上没出现的测试问题（见 [[release-status]]）。
 3. 升版本、改 CHANGELOG 标题，本地 fmt / clippy / test，提交 `chore(release): <版本>`。
 4. `git tag -a v<版本> -m v<版本>`，`git push origin main`，`git push origin v<版本>`。
 5. 发布跑完后按 [[release-status]] 里的方法抽查下载的包。
