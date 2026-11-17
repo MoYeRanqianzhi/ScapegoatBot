@@ -4,10 +4,10 @@
 //!
 //! 结构（简化自 pi）：
 //! ```text
-//! outer: 追加初始消息 → inner
-//! inner: 准备请求 → 输入闸 → 流式请求 → 输出闸
-//!        → 无工具调用则结束；有则执行工具、追加结果、注入 steering，继续
-//!        结束后若有 follow-up 消息，再开一轮 outer
+//! 循环: 并入待处理的消息（提示、steering、follow-up）→ 一步
+//! 一步: 预算检查 → 输入闸 → 流式请求 → 输出闸 → 追加助手消息
+//!       → 有工具调用则执行并追加结果，下一步之前注入 steering
+//!       → 没有工具调用：有 follow-up 消息就继续，否则结束
 //! ```
 //!
 //! 两个不变量：
@@ -378,150 +378,151 @@ impl AgentLoop {
         mut incoming: Option<&mut dyn SteeringSource>,
         events: &mpsc::Sender<AgentEvent>,
     ) -> LoopOutcome {
-        let mut total_usage = Usage::default();
-        let mut meter = TurnMeter::default();
-        let mut turns = 0u32;
-        let started = std::time::Instant::now();
+        let mut progress = Progress::new();
         let mut pending = prompts;
-        // 自上次输入闸以来新进入上下文的文本；输入闸只检查这段增量。
-        let mut input_delta = String::new();
 
         send(events, AgentEvent::AgentStart).await;
 
-        'outer: loop {
+        loop {
             for message in pending.drain(..) {
-                input_delta.push_str(&render_message(&message));
-                append(history, events, message).await;
+                progress.absorb(history, events, message).await;
             }
-
-            loop {
-                drain_incoming(steering, &mut incoming);
-                turns += 1;
-                if !self.within_limits(started, &meter, turns, events).await {
-                    return conclude(events, total_usage, turns, StopReason::Error).await;
+            // 每个请求边界都把队列送来的消息收进 steering；它们在工具之后或回合收尾时并入。
+            drain_incoming(steering, &mut incoming);
+            match self.step(history, &mut progress, events).await {
+                Step::Stop(reason) => {
+                    return conclude(events, progress.usage, progress.turns, reason).await;
                 }
-                send(events, AgentEvent::TurnStart { turn: turns }).await;
-
-                // 输入闸：检查这一步新进入上下文的 token。
-                if !input_delta.is_empty() {
-                    let allowed = self
-                        .gate_passes(Checkpoint::Input, history, &input_delta, events)
-                        .await;
-                    input_delta.clear();
-                    if !allowed {
-                        return conclude(events, total_usage, turns, StopReason::Aborted).await;
-                    }
+                // 服务端工具暂停：响应已经追加，接着请求，不结束回合。
+                Step::Paused => {}
+                // 工具之后注入 steering，下一次请求前生效。
+                Step::ToolsRan => {
+                    drain_incoming(steering, &mut incoming);
+                    pending = steering.drain();
                 }
-
-                let request = if self.config.prune {
-                    let mut pruned = history.clone();
-                    prune_tool_results(
-                        &mut pruned,
-                        self.config.prune_keep_turns as usize,
-                        self.config.prune_soft_limit,
-                    );
-                    self.build_request(&pruned)
-                } else {
-                    self.build_request(history)
-                };
-                let assistant = match self
-                    .request_before_deadline(&request, started, events)
-                    .await
-                {
-                    Ok(message) => message,
-                    Err(error) => {
-                        send(
-                            events,
-                            AgentEvent::Error {
-                                message: error.to_string(),
-                            },
-                        )
-                        .await;
-                        return conclude(events, total_usage, turns, StopReason::Error).await;
-                    }
-                };
-
-                // 输出闸：在任何副作用之前检查全部输出（文本、思考、工具参数）。
-                let output = render_assistant(&assistant);
-                if !self
-                    .gate_passes(Checkpoint::Output, history, &output, events)
-                    .await
-                {
-                    return conclude(events, total_usage, turns, StopReason::Aborted).await;
-                }
-
-                total_usage.add(assistant.usage);
-                meter.observe(&assistant.usage);
-                let stop_reason = assistant.stop_reason;
-                let has_calls = !assistant.tool_calls().is_empty();
-
-                // 拒绝、出错、带工具调用却被截断：这一步的工具一个都不执行，回合到此结束。
-                let interrupted = match stop_reason {
-                    StopReason::Refusal => {
-                        self.on_refusal(&assistant);
-                        Some("the provider refused the turn")
-                    }
-                    StopReason::Error => Some("the provider returned an error"),
-                    StopReason::MaxTokens if has_calls => {
-                        Some("the response hit max_tokens, so its arguments may be truncated")
-                    }
-                    _ => None,
-                };
-                if let Some(reason) = interrupted {
-                    let calls: Vec<ToolCall> =
-                        assistant.tool_calls().into_iter().cloned().collect();
-                    append(history, events, AgentMessage::Assistant(assistant)).await;
-                    append_interrupted(history, events, &calls, reason).await;
-                    return conclude(events, total_usage, turns, stop_reason).await;
-                }
-
-                let calls: Vec<ToolCall> = assistant.tool_calls().into_iter().cloned().collect();
-                let server_pause = stop_reason == StopReason::PauseTurn;
-                append(history, events, AgentMessage::Assistant(assistant)).await;
-
-                // 服务端工具暂停：追加响应内容后继续请求，不结束回合。
-                if server_pause && calls.is_empty() {
-                    continue;
-                }
-
-                if calls.is_empty() {
+                Step::Idle => {
                     // 最后一轮流式期间到达的消息也要进入下一轮，不能随通道关闭丢失。
                     drain_incoming(steering, &mut incoming);
-                    let followups = steering.drain();
-                    if followups.is_empty() {
-                        break 'outer;
+                    pending = steering.drain();
+                    if pending.is_empty() {
+                        break;
                     }
-                    pending = followups;
-                    break;
                 }
-
-                let results = self.execute_tools(&calls, events).await;
-                for result in results {
-                    input_delta.push_str(&render_message(&AgentMessage::Tool(result.clone())));
-                    append(history, events, AgentMessage::Tool(result)).await;
-                }
-
-                // 工具之后注入 steering，下一次请求前生效。
-                drain_incoming(steering, &mut incoming);
-                for message in steering.drain() {
-                    input_delta.push_str(&render_message(&message));
-                    append(history, events, message).await;
-                }
-            }
-
-            if pending.is_empty() {
-                break 'outer;
             }
         }
 
         // 正常结束：以最后一次没有工具调用的 turn 为准；若从未请求过模型则按 EndTurn。
-        let outcome = LoopOutcome {
-            stop_reason: StopReason::EndTurn,
-            usage: total_usage,
-            turns,
+        conclude(events, progress.usage, progress.turns, StopReason::EndTurn).await
+    }
+
+    /// 循环的一步：预算检查 → 输入闸 → 请求 → 输出闸 → 追加助手消息 → 执行工具。
+    ///
+    /// 返回这一步之后循环该做什么（见 [`Step`]）。任何副作用（工具执行）都在输出闸之后。
+    async fn step(
+        &self,
+        history: &mut Vec<AgentMessage>,
+        progress: &mut Progress,
+        events: &mpsc::Sender<AgentEvent>,
+    ) -> Step {
+        progress.turns += 1;
+        if !self
+            .within_limits(progress.started, &progress.meter, progress.turns, events)
+            .await
+        {
+            return Step::Stop(StopReason::Error);
+        }
+        send(
+            events,
+            AgentEvent::TurnStart {
+                turn: progress.turns,
+            },
+        )
+        .await;
+
+        // 输入闸：检查这一步新进入上下文的 token。
+        if !progress.input_delta.is_empty() {
+            let delta = std::mem::take(&mut progress.input_delta);
+            if !self
+                .gate_passes(Checkpoint::Input, history, &delta, events)
+                .await
+            {
+                return Step::Stop(StopReason::Aborted);
+            }
+        }
+
+        let request = if self.config.prune {
+            let mut pruned = history.clone();
+            prune_tool_results(
+                &mut pruned,
+                self.config.prune_keep_turns as usize,
+                self.config.prune_soft_limit,
+            );
+            self.build_request(&pruned)
+        } else {
+            self.build_request(history)
         };
-        finish(events, &outcome).await;
-        outcome
+        let assistant = match self
+            .request_before_deadline(&request, progress.started, events)
+            .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                send(
+                    events,
+                    AgentEvent::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                return Step::Stop(StopReason::Error);
+            }
+        };
+
+        // 输出闸：在任何副作用之前检查全部输出（文本、思考、工具参数）。
+        let output = render_assistant(&assistant);
+        if !self
+            .gate_passes(Checkpoint::Output, history, &output, events)
+            .await
+        {
+            return Step::Stop(StopReason::Aborted);
+        }
+
+        progress.usage.add(assistant.usage);
+        progress.meter.observe(&assistant.usage);
+        let stop_reason = assistant.stop_reason;
+        let calls: Vec<ToolCall> = assistant.tool_calls().into_iter().cloned().collect();
+
+        // 拒绝、出错、带工具调用却被截断：这一步的工具一个都不执行，回合到此结束。
+        let interrupted = match stop_reason {
+            StopReason::Refusal => {
+                self.on_refusal(&assistant);
+                Some("the provider refused the turn")
+            }
+            StopReason::Error => Some("the provider returned an error"),
+            StopReason::MaxTokens if !calls.is_empty() => {
+                Some("the response hit max_tokens, so its arguments may be truncated")
+            }
+            _ => None,
+        };
+        append(history, events, AgentMessage::Assistant(assistant)).await;
+        if let Some(reason) = interrupted {
+            append_interrupted(history, events, &calls, reason).await;
+            return Step::Stop(stop_reason);
+        }
+        if calls.is_empty() {
+            return if stop_reason == StopReason::PauseTurn {
+                Step::Paused
+            } else {
+                Step::Idle
+            };
+        }
+
+        for result in self.execute_tools(&calls, events).await {
+            progress
+                .absorb(history, events, AgentMessage::Tool(result))
+                .await;
+        }
+        Step::ToolsRan
     }
 
     /// 构造请求。
@@ -539,55 +540,16 @@ impl AgentLoop {
                 }),
                 AgentMessage::User { text, images } => {
                     let mut content = vec![ContentBlock::Text { text: text.clone() }];
-                    content.extend(images.iter().map(|image| ContentBlock::Image {
-                        mime_type: image.mime.clone(),
-                        data_base64: image.data_base64.clone(),
-                    }));
+                    content.extend(images.iter().map(image_block));
                     messages.push(ProviderMessage {
                         role: Role::User,
                         content,
                     });
                 }
-                AgentMessage::Assistant(assistant) => {
-                    let content = assistant
-                        .content
-                        .iter()
-                        .map(|block| match block {
-                            AssistantBlock::Text { text } => {
-                                ContentBlock::Text { text: text.clone() }
-                            }
-                            AssistantBlock::Thinking { text, signature } => {
-                                ContentBlock::Thinking {
-                                    text: text.clone(),
-                                    signature: signature.clone(),
-                                }
-                            }
-                            AssistantBlock::ToolCall(call) => ContentBlock::ToolUse {
-                                id: call.id.clone(),
-                                name: call.name.clone(),
-                                input: call.arguments.clone(),
-                            },
-                            AssistantBlock::ServerToolUse { id, name, input } => {
-                                ContentBlock::ServerToolUse {
-                                    id: id.clone(),
-                                    name: name.clone(),
-                                    input: input.clone(),
-                                }
-                            }
-                            AssistantBlock::ServerToolResult {
-                                tool_use_id,
-                                content,
-                            } => ContentBlock::ServerToolResult {
-                                tool_use_id: tool_use_id.clone(),
-                                content: content.clone(),
-                            },
-                        })
-                        .collect();
-                    messages.push(ProviderMessage {
-                        role: Role::Assistant,
-                        content,
-                    });
-                }
+                AgentMessage::Assistant(assistant) => messages.push(ProviderMessage {
+                    role: Role::Assistant,
+                    content: assistant.content.iter().map(assistant_block).collect(),
+                }),
                 AgentMessage::Tool(_) => {
                     // 连续的 tool 结果合并为同一个 user 消息；图片只能放在所有
                     // tool_result 之后，否则严格协议会拒绝。
@@ -599,10 +561,7 @@ impl AgentLoop {
                             content: result.content.clone(),
                             is_error: result.is_error,
                         });
-                        images.extend(result.images.iter().map(|image| ContentBlock::Image {
-                            mime_type: image.mime.clone(),
-                            data_base64: image.data_base64.clone(),
-                        }));
+                        images.extend(result.images.iter().map(image_block));
                         index += 1;
                     }
                     content.extend(images);
@@ -709,121 +668,13 @@ impl AgentLoop {
         send(events, AgentEvent::MessageStart).await;
         let mut receiver = provider.stream(request.clone()).await?;
 
-        let mut blocks: Vec<BlockAccumulator> = Vec::new();
-        let mut calls: BTreeMap<u32, CallAccumulator> = BTreeMap::new();
-        let mut usage = Usage::default();
-        let mut stop: Option<(StopReason, Option<crate::agent::message::RefusalDetails>)> = None;
-
+        let mut stream = StreamAccumulator::default();
         while let Some(event) = receiver.recv().await {
-            match event {
-                ProviderEvent::TextDelta(delta) => {
-                    push_text(&mut blocks, &delta);
-                    send(
-                        events,
-                        AgentEvent::MessageUpdate {
-                            kind: super::event::DeltaKind::Text,
-                            delta,
-                        },
-                    )
-                    .await;
-                }
-                ProviderEvent::ThinkingDelta(delta) => {
-                    push_thinking(&mut blocks, &delta);
-                    send(
-                        events,
-                        AgentEvent::MessageUpdate {
-                            kind: super::event::DeltaKind::Thinking,
-                            delta,
-                        },
-                    )
-                    .await;
-                }
-                ProviderEvent::ThinkingSignature(signature) => {
-                    if let Some(BlockAccumulator::Thinking {
-                        signature: slot, ..
-                    }) = blocks.last_mut()
-                    {
-                        slot.push_str(&signature);
-                    }
-                }
-                // Start 与 ArgumentsDelta 的先后顺序在不同兼容端点间不一致；
-                // 用占位条目合并，避免参数先到时整段丢弃。
-                ProviderEvent::ToolCallStart { index, id, name } => {
-                    let call = calls.entry(index).or_default();
-                    call.id = id;
-                    call.name = name;
-                }
-                ProviderEvent::ToolCallArgumentsDelta { index, delta } => {
-                    calls.entry(index).or_default().arguments.push_str(&delta);
-                }
-                ProviderEvent::ServerToolUse { id, name, input } => {
-                    blocks.push(BlockAccumulator::ServerToolUse { id, name, input })
-                }
-                ProviderEvent::ServerToolResult {
-                    tool_use_id,
-                    content,
-                } => blocks.push(BlockAccumulator::ServerToolResult {
-                    tool_use_id,
-                    content,
-                }),
-                ProviderEvent::Usage(update) => usage = update,
-                ProviderEvent::Stop { reason, refusal } => {
-                    stop = Some((reason, refusal));
-                }
-                ProviderEvent::Error(error) => return Err(error),
+            if let Some((kind, delta)) = stream.apply(event)? {
+                send(events, AgentEvent::MessageUpdate { kind, delta }).await;
             }
         }
-
-        let (stop_reason, refusal) = stop.ok_or_else(|| {
-            ProviderError::new(
-                crate::providers::ProviderErrorKind::Network,
-                "stream ended without a stop event",
-            )
-        })?;
-
-        // 工具调用按 index 顺序落到块列表末尾；文本/思考块保持到达顺序。
-        for (_, call) in calls {
-            if call.id.is_empty() || call.name.is_empty() {
-                // 没有 id 或名字的调用无法配对，也无法执行；丢掉比把
-                // 半截 tool_use 写进历史更安全。
-                warn!(id = %call.id, name = %call.name, "dropping an incomplete tool call");
-                continue;
-            }
-            let arguments = if call.arguments.trim().is_empty() {
-                Value::Object(Default::default())
-            } else {
-                match serde_json::from_str(&call.arguments) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        // 参数被截断/不是合法 JSON：用 Null 标记，execute_one 会
-                        // 返回错误而不是拿空对象误执行一个有副作用的工具。
-                        warn!(
-                            tool = %call.name,
-                            %error,
-                            "tool arguments are not valid JSON; refusing to execute"
-                        );
-                        Value::Null
-                    }
-                }
-            };
-            blocks.push(BlockAccumulator::ToolCall(ToolCall {
-                id: call.id,
-                name: call.name,
-                arguments,
-            }));
-        }
-
-        let content = blocks
-            .into_iter()
-            .filter_map(BlockAccumulator::finish)
-            .collect::<Vec<_>>();
-
-        let message = AssistantMessage {
-            content,
-            stop_reason,
-            usage,
-            refusal,
-        };
+        let message = stream.finish()?;
         send(
             events,
             AgentEvent::MessageEnd {
@@ -908,6 +759,183 @@ fn drain_incoming(steering: &mut SteeringQueue, incoming: &mut Option<&mut dyn S
     }
 }
 
+/// 一步之后循环该做什么。
+enum Step {
+    /// 回合到此结束，以这个原因。
+    Stop(StopReason),
+    /// 服务端工具暂停：没有要本地执行的调用，继续请求。
+    Paused,
+    /// 执行了工具，结果已经并入上下文。
+    ToolsRan,
+    /// 模型这一步没有调用工具：没有后续消息的话回合正常结束。
+    Idle,
+}
+
+/// 一次运行的累计状态。
+struct Progress {
+    usage: Usage,
+    meter: TurnMeter,
+    turns: u32,
+    started: std::time::Instant,
+    /// 自上次输入闸以来新进入上下文的文本；输入闸只检查这段增量。
+    input_delta: String,
+}
+
+impl Progress {
+    fn new() -> Self {
+        Self {
+            usage: Usage::default(),
+            meter: TurnMeter::default(),
+            turns: 0,
+            started: std::time::Instant::now(),
+            input_delta: String::new(),
+        }
+    }
+
+    /// 把一条新进入上下文的消息（提示、steering、工具结果）并入历史，并记进输入闸的增量。
+    async fn absorb(
+        &mut self,
+        history: &mut Vec<AgentMessage>,
+        events: &mpsc::Sender<AgentEvent>,
+        message: AgentMessage,
+    ) {
+        self.input_delta.push_str(&render_message(&message));
+        append(history, events, message).await;
+    }
+}
+
+/// 图片附件 → 请求里的图片块。
+fn image_block(image: &super::message::ImageAttachment) -> ContentBlock {
+    ContentBlock::Image {
+        mime_type: image.mime.clone(),
+        data_base64: image.data_base64.clone(),
+    }
+}
+
+/// 历史里助手消息的一个块 → 请求里的内容块。
+fn assistant_block(block: &AssistantBlock) -> ContentBlock {
+    match block {
+        AssistantBlock::Text { text } => ContentBlock::Text { text: text.clone() },
+        AssistantBlock::Thinking { text, signature } => ContentBlock::Thinking {
+            text: text.clone(),
+            signature: signature.clone(),
+        },
+        AssistantBlock::ToolCall(call) => ContentBlock::ToolUse {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            input: call.arguments.clone(),
+        },
+        AssistantBlock::ServerToolUse { id, name, input } => ContentBlock::ServerToolUse {
+            id: id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+        },
+        AssistantBlock::ServerToolResult {
+            tool_use_id,
+            content,
+        } => ContentBlock::ServerToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: content.clone(),
+        },
+    }
+}
+
+/// 一次流式响应的累计：把 provider 事件攒成一条完整的助手消息。
+///
+/// 部分流不落历史：只有 [`StreamAccumulator::finish`] 成功才得到消息。
+#[derive(Default)]
+struct StreamAccumulator {
+    /// 文本、思考与服务端工具块，按到达顺序。
+    blocks: Vec<BlockAccumulator>,
+    /// 本地工具调用，按 provider 给的 index。
+    calls: BTreeMap<u32, CallAccumulator>,
+    usage: Usage,
+    stop: Option<(StopReason, Option<super::message::RefusalDetails>)>,
+}
+
+impl StreamAccumulator {
+    /// 记入一个事件。文本与思考增量返回 `Some`，调用方把它转发给事件流；流里的错误返回
+    /// `Err`，这次尝试到此为止。
+    fn apply(
+        &mut self,
+        event: ProviderEvent,
+    ) -> Result<Option<(super::event::DeltaKind, String)>, ProviderError> {
+        match event {
+            ProviderEvent::TextDelta(delta) => {
+                push_text(&mut self.blocks, &delta);
+                return Ok(Some((super::event::DeltaKind::Text, delta)));
+            }
+            ProviderEvent::ThinkingDelta(delta) => {
+                push_thinking(&mut self.blocks, &delta);
+                return Ok(Some((super::event::DeltaKind::Thinking, delta)));
+            }
+            ProviderEvent::ThinkingSignature(signature) => {
+                if let Some(BlockAccumulator::Thinking {
+                    signature: slot, ..
+                }) = self.blocks.last_mut()
+                {
+                    slot.push_str(&signature);
+                }
+            }
+            // Start 与 ArgumentsDelta 的先后顺序在不同兼容端点间不一致；
+            // 用占位条目合并，避免参数先到时整段丢弃。
+            ProviderEvent::ToolCallStart { index, id, name } => {
+                let call = self.calls.entry(index).or_default();
+                call.id = id;
+                call.name = name;
+            }
+            ProviderEvent::ToolCallArgumentsDelta { index, delta } => {
+                self.calls
+                    .entry(index)
+                    .or_default()
+                    .arguments
+                    .push_str(&delta);
+            }
+            ProviderEvent::ServerToolUse { id, name, input } => {
+                self.blocks
+                    .push(BlockAccumulator::ServerToolUse { id, name, input });
+            }
+            ProviderEvent::ServerToolResult {
+                tool_use_id,
+                content,
+            } => self.blocks.push(BlockAccumulator::ServerToolResult {
+                tool_use_id,
+                content,
+            }),
+            ProviderEvent::Usage(update) => self.usage = update,
+            ProviderEvent::Stop { reason, refusal } => self.stop = Some((reason, refusal)),
+            ProviderEvent::Error(error) => return Err(error),
+        }
+        Ok(None)
+    }
+
+    /// 流结束：组装助手消息。没有收到 stop 事件的流是不完整的，按网络错误处理。
+    fn finish(mut self) -> Result<AssistantMessage, ProviderError> {
+        let (stop_reason, refusal) = self.stop.ok_or_else(|| {
+            ProviderError::new(
+                crate::providers::ProviderErrorKind::Network,
+                "stream ended without a stop event",
+            )
+        })?;
+        // 工具调用按 index 顺序落到块列表末尾；文本/思考块保持到达顺序。
+        for (_, call) in self.calls {
+            if let Some(call) = call.finish() {
+                self.blocks.push(BlockAccumulator::ToolCall(call));
+            }
+        }
+        Ok(AssistantMessage {
+            content: self
+                .blocks
+                .into_iter()
+                .filter_map(BlockAccumulator::finish)
+                .collect(),
+            stop_reason,
+            usage: self.usage,
+            refusal,
+        })
+    }
+}
+
 /// 流式块累计。
 enum BlockAccumulator {
     Text(String),
@@ -960,6 +988,40 @@ struct CallAccumulator {
     id: String,
     name: String,
     arguments: String,
+}
+
+impl CallAccumulator {
+    /// 攒完的工具调用；没法用的返回 `None`。
+    fn finish(self) -> Option<ToolCall> {
+        if self.id.is_empty() || self.name.is_empty() {
+            // 没有 id 或名字的调用无法配对，也无法执行；丢掉比把
+            // 半截 tool_use 写进历史更安全。
+            warn!(id = %self.id, name = %self.name, "dropping an incomplete tool call");
+            return None;
+        }
+        let arguments = if self.arguments.trim().is_empty() {
+            Value::Object(Default::default())
+        } else {
+            match serde_json::from_str(&self.arguments) {
+                Ok(value) => value,
+                Err(error) => {
+                    // 参数被截断/不是合法 JSON：用 Null 标记，execute_one 会
+                    // 返回错误而不是拿空对象误执行一个有副作用的工具。
+                    warn!(
+                        tool = %self.name,
+                        %error,
+                        "tool arguments are not valid JSON; refusing to execute"
+                    );
+                    Value::Null
+                }
+            }
+        };
+        Some(ToolCall {
+            id: self.id,
+            name: self.name,
+            arguments,
+        })
+    }
 }
 
 fn push_text(blocks: &mut Vec<BlockAccumulator>, delta: &str) {
