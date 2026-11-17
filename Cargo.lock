@@ -1926,7 +1926,7 @@ dependencies = [
 
 [[package]]
 name = "scapegoat-bot"
-version = "0.2.0-alpha.44"
+version = "0.2.0-alpha.45"
 dependencies = [
  "ab_glyph",
  "anyhow",
