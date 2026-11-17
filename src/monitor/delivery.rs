@@ -134,17 +134,12 @@ fn render_prompt(template: &str, event: &MonitorEvent, count: u64) -> String {
     out
 }
 
-/// 投递一次：检查到期、等空闲、限速、计数上限，渲染文本后交给 sink；`force` 跳过限速
-/// （手动 `fire`）。`count` 是本次合并的事件数，供 `{{count}}` 使用。
-pub(super) async fn deliver_once(
-    monitor: &Monitor,
-    sink: &dyn MonitorSink,
-    event: Option<&MonitorEvent>,
-    count: u64,
-    force: bool,
-) {
+/// 现在能不能投递：没被取消、没到期，`idle_only` 的还要等到 agent 空闲。
+///
+/// 到期时在这里发出到期通知并停用 monitor；返回 `false` 表示本次事件不投递。
+async fn ready_to_deliver(monitor: &Monitor, sink: &dyn MonitorSink) -> bool {
     if monitor.cancelled.load(Ordering::SeqCst) {
-        return;
+        return false;
     }
     let expired = || {
         monitor
@@ -153,31 +148,29 @@ pub(super) async fn deliver_once(
     };
     if expired() {
         expire(monitor, sink).await;
-        return;
+        return false;
     }
     // idle_only：等到 agent 空闲再投递；最多等 10 分钟，超时放弃本次事件。
     if monitor.idle_only {
         let deadline = std::time::Instant::now() + Duration::from_secs(600);
         while !sink.is_idle().await {
             if monitor.cancelled.load(Ordering::SeqCst) || std::time::Instant::now() > deadline {
-                return;
+                return false;
             }
             // 等着的时候到期了：和一开始就到期一样处理，不是悄悄丢掉这次事件。
             if expired() {
                 expire(monitor, sink).await;
-                return;
+                return false;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
+    true
+}
 
-    if force {
-        *monitor.last_delivery.lock().expect("monitor lock") = Some(std::time::Instant::now());
-    } else if !monitor.rate_limit_ok() {
-        return;
-    }
-
-    let text = match (&monitor.prompt, event) {
+/// 投给 agent 的文本：有模板用模板，没有则是一行来源标题加事件正文。
+fn delivery_text(monitor: &Monitor, event: Option<&MonitorEvent>, count: u64) -> String {
+    match (&monitor.prompt, event) {
         (Some(template), Some(event)) => render_prompt(template, event, count),
         (Some(template), None) => template.clone(),
         // 没有 chat 的事件（定时、内部、外部流、合并后的批次）不写空的 chat 段。
@@ -193,21 +186,49 @@ pub(super) async fn deliver_once(
             "[monitor {} | {}] fired manually",
             monitor.name, monitor.source
         ),
-    };
+    }
+}
+
+/// 在 `max_events` 里占一个名额。占不到（已经到上限）时停用 monitor、通知一次，返回 `false`。
+async fn reserve_event_slot(monitor: &Monitor, sink: &dyn MonitorSink) -> bool {
     let previous = monitor.delivered.fetch_add(1, Ordering::SeqCst);
-    if previous >= monitor.max_events {
-        // 回滚预留；并发的两个投递只有一个能拿到最后一个名额。
-        monitor.delivered.fetch_sub(1, Ordering::SeqCst);
-        if !monitor.cancelled.swap(true, Ordering::SeqCst) {
-            sink.deliver(monitor.system_delivery(
-                &monitor.source,
-                format!(
-                    "system: monitor {:?} reached its event limit and was disabled",
-                    monitor.name
-                ),
-            ))
-            .await;
-        }
+    if previous < monitor.max_events {
+        return true;
+    }
+    // 回滚预留；并发的两个投递只有一个能拿到最后一个名额。
+    monitor.delivered.fetch_sub(1, Ordering::SeqCst);
+    if !monitor.cancelled.swap(true, Ordering::SeqCst) {
+        sink.deliver(monitor.system_delivery(
+            &monitor.source,
+            format!(
+                "system: monitor {:?} reached its event limit and was disabled",
+                monitor.name
+            ),
+        ))
+        .await;
+    }
+    false
+}
+
+/// 投递一次：检查到期、等空闲、限速、计数上限，渲染文本后交给 sink；`force` 跳过限速
+/// （手动 `fire`）。`count` 是本次合并的事件数，供 `{{count}}` 使用。
+pub(super) async fn deliver_once(
+    monitor: &Monitor,
+    sink: &dyn MonitorSink,
+    event: Option<&MonitorEvent>,
+    count: u64,
+    force: bool,
+) {
+    if !ready_to_deliver(monitor, sink).await {
+        return;
+    }
+    if force {
+        *monitor.last_delivery.lock().expect("monitor lock") = Some(std::time::Instant::now());
+    } else if !monitor.rate_limit_ok() {
+        return;
+    }
+    let text = delivery_text(monitor, event, count);
+    if !reserve_event_slot(monitor, sink).await {
         return;
     }
 

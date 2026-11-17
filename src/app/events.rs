@@ -221,6 +221,12 @@ async fn handle_qq_event(
     if !matches!(&event, QqEvent::Message(_)) {
         agent.monitors.on_qq_event(&event).await;
     }
+    record_event(agent, messages, event).await;
+}
+
+/// 把通过准入的事件记下来：消息进 inbox（新到的、不是本账号发的再交给 monitor），其余
+/// 事件进审计表；能表示成 inbox 消息的 notice / request / 未知事件另存一份。
+async fn record_event(agent: &AgentRuntime, messages: &MessageStore, event: QqEvent) {
     match event {
         QqEvent::Message(message) => match messages.append(&message) {
             Ok(true) => {

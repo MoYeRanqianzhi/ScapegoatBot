@@ -211,6 +211,41 @@ struct Stores {
     turn_buffer: Arc<TurnBufferStore>,
 }
 
+/// 建安全闸并恢复上次留下的 hold。
+///
+/// 两种“看起来像坏了”的状态在启动时先讲清楚：hold 还开着，以及 enforce 却没有分类器。
+fn open_gate(
+    guard: &crate::config::GuardConfig,
+    auth: &AuthFile,
+    db: &Arc<Database>,
+    paths: &SbotPaths,
+) -> Arc<Gate> {
+    let gate = Arc::new(Gate::from_config(
+        guard,
+        auth.guard_key().and_then(|secret| secret.value()),
+        Some(Arc::clone(db)),
+        paths.security_hold_file(),
+    ));
+    gate.restore_hold();
+    if gate.hold_active() {
+        warn!("starting while SECURITY_HOLD is active; outbound chat stays disabled");
+    }
+    // enforce 但没有可用分类器时，闸会把每条消息都按住；启动时先讲清楚，
+    // 免得主人以为是 NapCat 或模型坏了。
+    if guard.enabled
+        && guard.mode == crate::config::GuardMode::Enforce
+        && !gate.classifier_available()
+        && guard.backend == crate::config::GuardBackend::Jev
+    {
+        warn!(
+            "security.guard.mode = enforce but no classifier is configured: every new turn \
+             will be held. Set security.guard.base_url plus auth.json security.guard.api_key, \
+             or set security.guard.backend = \"off\" for rules-only enforce"
+        );
+    }
+    gate
+}
+
 impl Runtime {
     /// 启动运行时。
     pub async fn start(config_path: Option<PathBuf>) -> Result<()> {
@@ -241,29 +276,7 @@ impl Runtime {
             turn_buffer,
         } = open_stores(&paths, &loaded)?;
 
-        let gate = Arc::new(Gate::from_config(
-            &loaded.config.security.guard,
-            auth.guard_key().and_then(|secret| secret.value()),
-            Some(Arc::clone(&db)),
-            paths.security_hold_file(),
-        ));
-        gate.restore_hold();
-        if gate.hold_active() {
-            warn!("starting while SECURITY_HOLD is active; outbound chat stays disabled");
-        }
-        // enforce 但没有可用分类器时，闸会把每条消息都按住；启动时先讲清楚，
-        // 免得主人以为是 NapCat 或模型坏了。
-        if loaded.config.security.guard.enabled
-            && loaded.config.security.guard.mode == crate::config::GuardMode::Enforce
-            && !gate.classifier_available()
-            && loaded.config.security.guard.backend == crate::config::GuardBackend::Jev
-        {
-            warn!(
-                "security.guard.mode = enforce but no classifier is configured: every new turn \
-                 will be held. Set security.guard.base_url plus auth.json security.guard.api_key, \
-                 or set security.guard.backend = \"off\" for rules-only enforce"
-            );
-        }
+        let gate = open_gate(&loaded.config.security.guard, &auth, &db, &paths);
 
         let (shutdown, shutdown_rx) = watch::channel(false);
         let runtime = Arc::new(Self {
@@ -312,19 +325,28 @@ impl Runtime {
                 Ok(Err(error)) => Stop::StartFailed(error),
             }
         };
+        runtime.wind_down(stop, server).await
+    }
+
+    /// 收尾：SessionEnd hook → 关闭信号 → 等 IPC 结束。返回值就是守护进程的退出结果。
+    async fn wind_down(
+        &self,
+        stop: Stop,
+        server: tokio::task::JoinHandle<Result<()>>,
+    ) -> Result<()> {
         if let Stop::IpcFailed(error) | Stop::StartFailed(error) = &stop {
             tracing::error!(error = %format!("{error:#}"), "shutting down after a fatal error");
         }
 
         // SessionEnd hook：在关闭 IPC 与 QQ 管线之前触发，`notify` 还能发出去；最多等 5 秒。
-        if let Some(agent) = runtime.agent() {
+        if let Some(agent) = self.agent() {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 agent.runner.end_session(),
             )
             .await;
         }
-        let _ = runtime.shutdown.send(true);
+        let _ = self.shutdown.send(true);
         // IPC 任务已经结束（并且被取走了结果）时不能再等它一次。
         if !matches!(stop, Stop::IpcFailed(_)) {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
