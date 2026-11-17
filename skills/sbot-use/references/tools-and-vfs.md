@@ -194,7 +194,8 @@ notice/request/meta/unknown 原始事件（正文已解密）。
 - 自定义定义用 `agent`（定义的名字）：VFS 的 `/agents/<name>.md`，或宿主机上
   `[swarm].agents_dir`（默认 `~/.sbot/agents`，只读）里的同名文件，两边都有时 VFS 的优先。
   frontmatter 支持 `name`、`description`、`tools`、`max_steps`、`allow_send`。`tools` 只认
-  内置工具的名字（没有 `MCP`），写了不认识的名字会被悄悄跳过。子代理用的模型始终是主 agent
+  内置工具的名字（没有 `MCP`），区分大小写；写了不认识的名字，`spawn` 这个定义时直接报错
+  （`lists unknown tools`，并列出能写的名字），不会启动一个少了工具的子代理。子代理用的模型始终是主 agent
   当前的模型，不能单独指定。
 - 工具集强制是父代理的子集。子代理的 `API` 默认只有 `local.*` 与 `api.*`，不能做任何 QQ
   操作（`napcat.*` 的查询也不行）；只有自定义定义写了 `allow_send: true` 才拿到完整的

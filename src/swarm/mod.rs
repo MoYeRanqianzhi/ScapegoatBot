@@ -440,7 +440,20 @@ impl AgentHub {
                     definitions.iter().map(|d| &d.name).collect::<Vec<_>>()
                 )
             })?;
-        // 只接受已知的内置工具名；未知项跳过。
+        // `tools` 只能写内置工具的名字。写了不认识的就拒绝，不悄悄跳过：少了一个工具的
+        // 子代理会照常启动，然后以很难看懂的方式做不成事。
+        let unknown: Vec<&str> = definition
+            .tools
+            .iter()
+            .map(String::as_str)
+            .filter(|name| known_tool(name).is_none())
+            .collect();
+        if !unknown.is_empty() {
+            anyhow::bail!(
+                "agent {agent_name:?} lists unknown tools {unknown:?}; known tools: \
+                 {KNOWN_TOOLS:?}"
+            );
+        }
         let mut tools: Vec<&'static str> = definition
             .tools
             .iter()
@@ -807,27 +820,29 @@ async fn run_instance(
 
 /// 已知工具名白名单；未知名称在加载时被忽略。
 fn known_tool(name: &str) -> Option<&'static str> {
-    const TOOLS: &[&str] = &[
-        "Read",
-        "Write",
-        "Edit",
-        "RM",
-        "MV",
-        "CP",
-        "Mkdir",
-        "Stat",
-        "LS",
-        "Glob",
-        "Grep",
-        "API",
-        "Skill",
-        "WebSearch",
-        "WebFetch",
-        "Monitor",
-        "Agent",
-    ];
-    TOOLS.iter().copied().find(|tool| *tool == name)
+    KNOWN_TOOLS.iter().copied().find(|tool| *tool == name)
 }
+
+/// 自定义定义的 `tools` 里可以写的名字：内置工具（没有 `MCP`）。
+const KNOWN_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "RM",
+    "MV",
+    "CP",
+    "Mkdir",
+    "Stat",
+    "LS",
+    "Glob",
+    "Grep",
+    "API",
+    "Skill",
+    "WebSearch",
+    "WebFetch",
+    "Monitor",
+    "Agent",
+];
 
 #[cfg(test)]
 mod tests {
@@ -921,6 +936,30 @@ mod tests {
         let seen = recorder.seen.lock().await;
         assert_eq!(seen.len(), 3);
         assert!(seen.iter().all(|(_, local_only)| *local_only), "{seen:?}");
+    }
+
+    /// `tools` 里写了不认识的名字（这里是别的客户端才有的 `Bash`）：拒绝，并说出是哪个；
+    /// 不启动一个少了工具的子代理。
+    #[tokio::test]
+    async fn a_definition_with_an_unknown_tool_is_refused() {
+        let recorder = Arc::new(Recorder::default());
+        let hub = hub(recorder.clone());
+        hub.vfs
+            .write_text(
+                &VfsPath::parse("/agents/typo.md").unwrap(),
+                "---\nname: typo\ndescription: test\ntools: Read, Bash, grep\n---\nDo the task.",
+                None,
+            )
+            .unwrap();
+        let error = hub
+            .spawn(None, Some("typo"), "task".to_owned(), 0, Default::default())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(r#"["Bash", "grep"]"#), "{error}");
+        assert!(error.contains("known tools"), "{error}");
+        assert!(recorder.seen.lock().await.is_empty());
+        assert!(hub.instances.read().await.is_empty());
     }
 
     /// 自定义定义：`allow_send = true` 才拿到完整的 `API`；否则即使 `tools` 里写了 `API`
