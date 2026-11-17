@@ -657,6 +657,70 @@ impl Runtime {
         Ok(json!({ "thinking_level": level }))
     }
 
+    /// `sbot chat`：校验、存下这条输入，然后在后台跑一个控制回合。
+    ///
+    /// 返回时回合还没跑完：命令只确认“已接受”，结果看日志里的 `control turn finished` /
+    /// `control turn failed`。失败时返回 `(错误码, 说明)`。
+    fn accept_chat(
+        &self,
+        message: String,
+        scope: Option<String>,
+    ) -> Result<serde_json::Value, (&'static str, String)> {
+        if message.trim().is_empty() {
+            return Err(("bad_request", "message must not be empty".to_owned()));
+        }
+        // `--scope` 在落库与启动回合之前校验，写错了直接拒绝，不会悄悄忽略。
+        let scope = match scope
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty())
+        {
+            None => None,
+            Some(raw) => Some(crate::qq::event::ChatId::parse(raw).ok_or_else(|| {
+                (
+                    "bad_request",
+                    format!("scope {raw:?} must be \"group:<gid>\" or \"private:<qq>\""),
+                )
+            })?),
+        };
+        // 跑不了就直接拒绝，什么都不存：存下来的输入不会在之后补跑，而“已接受”
+        // 应当意味着它会被执行。
+        let agent = self
+            .running_agent()
+            .map_err(|reason| ("not_ready", reason.to_owned()))?;
+        if !self.ai_enabled.load(Ordering::Relaxed) {
+            return Err((
+                "ai_stopped",
+                "model calls are stopped, so this input would not run; `sbot ai start` first"
+                    .to_owned(),
+            ));
+        }
+        let sealed = self
+            .key
+            .seal("control", b"control_inputs.text_enc", message.as_bytes())
+            .map_err(|error| ("internal", format!("cannot encrypt input: {error}")))?;
+        let control_id = self
+            .db
+            .insert_control_input(&sealed, "cli")
+            .map_err(|error| ("internal", format!("cannot store input: {error}")))?;
+        let runner = Arc::clone(&agent.runner);
+        tokio::spawn(async move {
+            match runner.run_control(&message, control_id, scope).await {
+                Ok(outcome) => info!(
+                    stop = ?outcome.stop_reason,
+                    turns = outcome.turns,
+                    "control turn finished"
+                ),
+                Err(error) => warn!(%error, "control turn failed"),
+            }
+        });
+        Ok(json!({
+            "accepted": true,
+            "control_id": control_id,
+            "scope": scope.map(|chat| chat.to_string()),
+        }))
+    }
+
     async fn dispatch(&self, request: Request) -> Response {
         let id = request.id.clone();
         match request.body {
@@ -684,88 +748,10 @@ impl Runtime {
                     Response::ok(id, json!({ "ai_enabled": false }))
                 }
             },
-            RequestBody::Chat { message, scope } => {
-                if message.trim().is_empty() {
-                    return Response::error(id, "bad_request", "message must not be empty");
-                }
-                // `--scope` 在落库与启动回合之前校验，写错了直接拒绝，不会悄悄忽略。
-                let scope = match scope
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|raw| !raw.is_empty())
-                {
-                    None => None,
-                    Some(raw) => match crate::qq::event::ChatId::parse(raw) {
-                        Some(chat) => Some(chat),
-                        None => {
-                            return Response::error(
-                                id,
-                                "bad_request",
-                                format!(
-                                    "scope {raw:?} must be \"group:<gid>\" or \"private:<qq>\""
-                                ),
-                            );
-                        }
-                    },
-                };
-                // 跑不了就直接拒绝，什么都不存：存下来的输入不会在之后补跑，而“已接受”
-                // 应当意味着它会被执行。
-                let agent = match self.running_agent() {
-                    Ok(agent) => agent,
-                    Err(reason) => return Response::error(id, "not_ready", reason),
-                };
-                if !self.ai_enabled.load(Ordering::Relaxed) {
-                    return Response::error(
-                        id,
-                        "ai_stopped",
-                        "model calls are stopped, so this input would not run; \
-                         `sbot ai start` first",
-                    );
-                }
-                let sealed =
-                    match self
-                        .key
-                        .seal("control", b"control_inputs.text_enc", message.as_bytes())
-                    {
-                        Ok(sealed) => sealed,
-                        Err(error) => {
-                            return Response::error(
-                                id,
-                                "internal",
-                                format!("cannot encrypt input: {error}"),
-                            );
-                        }
-                    };
-                let control_id = match self.db.insert_control_input(&sealed, "cli") {
-                    Ok(control_id) => control_id,
-                    Err(error) => {
-                        return Response::error(
-                            id,
-                            "internal",
-                            format!("cannot store input: {error}"),
-                        );
-                    }
-                };
-                let runner = Arc::clone(&agent.runner);
-                tokio::spawn(async move {
-                    match runner.run_control(&message, control_id, scope).await {
-                        Ok(outcome) => info!(
-                            stop = ?outcome.stop_reason,
-                            turns = outcome.turns,
-                            "control turn finished"
-                        ),
-                        Err(error) => warn!(%error, "control turn failed"),
-                    }
-                });
-                Response::ok(
-                    id,
-                    json!({
-                        "accepted": true,
-                        "control_id": control_id,
-                        "scope": scope.map(|chat| chat.to_string()),
-                    }),
-                )
-            }
+            RequestBody::Chat { message, scope } => match self.accept_chat(message, scope) {
+                Ok(payload) => Response::ok(id, payload),
+                Err((code, reason)) => Response::error(id, code, reason),
+            },
             RequestBody::SetModel { model } => match self.set_model(&model) {
                 Ok(payload) => Response::ok(id, payload),
                 Err(error) => Response::error(id, "invalid_model", error.to_string()),

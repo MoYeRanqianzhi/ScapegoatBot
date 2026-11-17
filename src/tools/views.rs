@@ -1057,6 +1057,26 @@ mod tests {
         }
     }
 
+    /// `LS /system` 列出的每个 section 都读得出来：列出的名字与分派是同一组。`events` 需要
+    /// 数据库与密钥，这里的测试视图没有接，它返回“离线”而不是“不存在”。
+    #[tokio::test]
+    async fn every_listed_system_section_is_readable() {
+        let (views, _dir) = views();
+        let listed = views.list(&target("/system")).await.unwrap().items;
+        assert_eq!(listed.len(), 7, "{listed:?}");
+        for entry in listed {
+            match views.read(&target(&entry.path)).await {
+                Ok(ViewRead::Text(text)) => assert!(text.starts_with("# "), "{}", entry.path),
+                Err(VfsError::Offline(_)) => assert_eq!(entry.path, "/system/events"),
+                other => panic!("{}: {other:?}", entry.path),
+            }
+        }
+        assert!(matches!(
+            views.read(&target("/system/nope")).await,
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
     #[tokio::test]
     async fn config_writes_are_validated_and_whitelisted() {
         let (views, _dir) = views();
