@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::{ConfigError, ModelsFile, check_available, non_empty, non_zero, validate_scopes};
+use super::{ConfigError, ModelsFile, check_available, non_zero, validate_scopes};
 
 // ---------------------------------------------------------------------------
 // [agent]
@@ -33,7 +33,6 @@ pub enum RetryMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
-    pub name: String,
     pub mode: AgentMode,
     /// companion 必填；stand_in 由登录账号决定。
     pub owner_qq: u64,
@@ -59,7 +58,6 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            name: "ScapegoatBot".to_owned(),
             mode: AgentMode::StandIn,
             owner_qq: 0,
             owner_name: String::new(),
@@ -88,7 +86,6 @@ impl Default for AgentConfig {
 
 impl AgentConfig {
     pub(in crate::config) fn validate(&self, errors: &mut Vec<ConfigError>) {
-        non_empty(errors, "agent.name", &self.name);
         if self.owner_name.chars().count() > 64 {
             errors.push(ConfigError::new(
                 "agent.owner_name",

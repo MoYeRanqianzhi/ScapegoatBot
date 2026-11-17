@@ -9,6 +9,17 @@
 
 ### 破坏性变更
 
+- 删掉了三样“写了不报错、但从来不起作用”的东西。配置是严格 schema，所以**写着它们的文件
+  现在解析失败、守护进程起不来**：换掉二进制之后、重启之前先跑 `sbot doctor`（只读），按报错
+  里的键名删掉对应的行。
+  - `sbot.toml` 的 `[agent].name`。旧版本自动生成的配置里都有这一行（`name = "ScapegoatBot"`），
+    所以几乎每个已有的部署都要删它；报错是 `unknown field name … in agent`。别的节的 `name`
+    （`[ipc]`、`[[monitor]]`）不受影响。
+  - `models.json` 里 provider 的 `max_retries`、模型的 `sampling` 与 `compat`。重试次数一直由
+    `sbot.toml` 的 `[agent].retry_attempts` 决定；`sampling` / `compat` 从未透传给 API。
+  - 数据库的 `compaction_checkpoints` 表（迁移 14，自动执行，schema 升到 v14）。它存的是压缩
+    摘要的副本，没有任何代码读它；摘要本身在新会话分段的首行，不受影响。迁移只往前走：
+    升级后的数据库不能交回旧版本使用。
 - 自定义子代理定义的 `tools` 里写了不认识的名字，`spawn` 现在报错并列出能写的名字。以前
   不认识的名字被悄悄跳过，子代理照常启动、少一个工具（把 `Grep` 写成 `grep`，或写了别的
   客户端才有的 `Bash`），然后以很难看懂的方式做不成事。已有的定义里有这种名字的，改对或删掉。

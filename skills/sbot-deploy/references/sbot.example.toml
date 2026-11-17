@@ -16,7 +16,6 @@ auth_file = "~/.sbot/auth.json"
 name = "scapegoat-bot"
 
 [agent]
-name = "ScapegoatBot"
 # stand_in：使用主人自己的 QQ；companion：使用另一个账号。
 mode = "stand_in"
 # stand_in 留 0 表示用登录账号；companion 必须填且不能等于登录账号。

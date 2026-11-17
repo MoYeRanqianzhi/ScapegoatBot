@@ -27,8 +27,9 @@ metadata:
 - 崩溃恢复：`turn_buffer` 中 open/committing 的回合在启动时补齐缺失的 tool_result，
   按“已写入 transcript 的后缀”去重后追加，避免 committing 中断导致整段重复。
   单会话化后 `turn_buffer.scope` / `transcript_files.scope` 列只为旧数据保留，新写入恒为 `shared`。
-- 迁移只追加、不修改已发布条目；当前最新是 v13（删除 `memory_entries` 表：只有已删除的
-  `Memory` 工具写过它）。
+- 迁移只追加、不修改已发布条目；当前最新是 v14。v13 与 v14 都是删表（`memory_entries`：只有
+  已删除的 `Memory` 工具写过它；`compaction_checkpoints`：只写不读的摘要副本）——没有读者的
+  派生表删掉，不留着当“以后也许有用”的副本。
 
 **Evidence:** `src/storage/messages.rs`（`append` / `read_line` / `rebuild_index`）、
 `src/storage/mod.rs`（`MIGRATIONS`）、`src/session/{mod,turn_buffer}.rs`；

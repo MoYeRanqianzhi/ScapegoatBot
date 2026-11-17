@@ -187,10 +187,6 @@ impl Runner {
         // 关闭旧分段、建新分段、写入新历史是一步（`rotate_with`）：失败时当前分段还是旧的那个，
         // 内存里的历史也没动，下次照常重试。
         let next = sessions.rotate_with(&new_history)?;
-        // 检查点只是可查询的副本（新分段的首行才是权威），记不上不影响这次压缩。
-        if let Err(error) = sessions.record_checkpoint(&previous.file, &summary) {
-            warn!(%error, "cannot record the compaction checkpoint");
-        }
         let kept_messages = new_history.len() - 1;
         *history.lock().await = new_history;
         // 任何一次成功的压缩都把连续失败数清零，包括 agent 自己调用的 `agent.compact`：

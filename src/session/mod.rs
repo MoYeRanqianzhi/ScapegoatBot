@@ -36,10 +36,6 @@ const LINE_VERSION: u32 = 1;
 /// 候选先取物理位置 ±64，再退回全范围。若整段都解不开（错 key、file_id 不匹配），
 /// 每行最多 128 次 AEAD 尝试，避免旧实现「逐行扫全文件」的 O(n²) 卡顿。
 const SCAN_PER_LINE: usize = 128;
-/// 检查点摘要的加密域。
-const CHECKPOINT_PURPOSE: &str = "compaction-checkpoint";
-/// 保留的检查点条数。
-const CHECKPOINT_KEEP: u32 = 20;
 
 /// 一个 transcript 分段的元信息。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -300,67 +296,6 @@ impl SessionStore {
     /// 是否设了保留期或总大小上限（任一非零就需要清理）。
     pub(crate) fn limits_retention(&self) -> bool {
         self.retention_days > 0 || self.max_bytes != 0
-    }
-
-    /// 记录一次压缩检查点（加密存储）。
-    ///
-    /// 设计 §8.1：`compaction_checkpoints` 用于崩溃恢复与审计；
-    /// 分段首行的摘要仍是权威，这里的行只是可查询的缓存。
-    /// 只保留最近 [`CHECKPOINT_KEEP`] 条，避免无限增长。
-    pub(crate) fn record_checkpoint(&self, from_file: &str, summary: &str) -> Result<()> {
-        let sealed = match self.encryption {
-            EncryptionMode::XChaCha20Poly1305 => {
-                self.key
-                    .seal(CHECKPOINT_PURPOSE, from_file.as_bytes(), summary.as_bytes())?
-            }
-            EncryptionMode::None => summary.as_bytes().to_vec(),
-        };
-        let conn = self.db.lock();
-        conn.execute(
-            "INSERT INTO compaction_checkpoints (from_file, summary_enc, created_at)
-             VALUES (?1, ?2, ?3)",
-            params![from_file, sealed, Utc::now().to_rfc3339()],
-        )?;
-        conn.execute(
-            "DELETE FROM compaction_checkpoints
-             WHERE id NOT IN (SELECT id FROM compaction_checkpoints ORDER BY id DESC LIMIT ?1)",
-            params![CHECKPOINT_KEEP],
-        )?;
-        Ok(())
-    }
-
-    /// 最近的检查点：`(from_file, summary, created_at)`，最新在前。
-    #[cfg(test)]
-    pub(crate) fn checkpoints(&self, limit: usize) -> Result<Vec<(String, String, String)>> {
-        let conn = self.db.lock();
-        let mut statement = conn.prepare(
-            "SELECT from_file, summary_enc, created_at FROM compaction_checkpoints
-             ORDER BY id DESC LIMIT ?1",
-        )?;
-        let rows = statement.query_map(params![limit as u32], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (from_file, sealed, created_at) = row?;
-            let summary = match self.encryption {
-                EncryptionMode::XChaCha20Poly1305 => {
-                    let plain = self
-                        .key
-                        .open(CHECKPOINT_PURPOSE, from_file.as_bytes(), &sealed)?;
-                    String::from_utf8(plain).context("checkpoint summary is not valid UTF-8")?
-                }
-                EncryptionMode::None => {
-                    String::from_utf8(sealed).context("checkpoint summary is not valid UTF-8")?
-                }
-            };
-            out.push((from_file, summary, created_at));
-        }
-        Ok(out)
     }
 
     /// 用量：字节数与消息条数。
@@ -746,32 +681,6 @@ mod tests {
             AgentMessage::Assistant(message) => assert_eq!(message.text(), "hello"),
             other => panic!("unexpected {other:?}"),
         }
-    }
-
-    #[test]
-    fn checkpoints_are_encrypted_and_readable() {
-        let (store, _dir) = store();
-        let previous = store.current().unwrap();
-        store
-            .record_checkpoint(&previous.file, "## Facts\nremembered")
-            .unwrap();
-
-        // 磁盘上的摘要不是明文。
-        let sealed: Vec<u8> = {
-            let conn = store.db.lock();
-            conn.query_row(
-                "SELECT summary_enc FROM compaction_checkpoints ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
-        assert!(!sealed.windows(11).any(|window| window == b"remembered"));
-
-        let checkpoints = store.checkpoints(10).unwrap();
-        assert_eq!(checkpoints.len(), 1);
-        assert_eq!(checkpoints[0].0, previous.file);
-        assert!(checkpoints[0].1.contains("remembered"));
     }
 
     #[test]

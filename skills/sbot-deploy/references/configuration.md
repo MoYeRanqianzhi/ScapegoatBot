@@ -51,7 +51,6 @@ SBOT__AGENT__MAX_STEPS=32
 
 | 键 | 默认 | 说明 |
 |----|------|------|
-| `name` | `ScapegoatBot` | 保留键：必须非空，目前没有任何地方使用 |
 | `mode` | `stand_in` | `stand_in`（用主人账号）或 `companion`（独立账号） |
 | `owner_qq` | 0 | companion 必填；stand_in 留 0 表示用登录账号 |
 | `owner_name` | 空 | 称呼主人的名字，最多 64 个字符 |
@@ -486,8 +485,8 @@ key 放 `auth.json`：
   工具循环的每一步都命中上一步写下的前缀；摘要、审查这类一次性请求不打历史断点。
   OpenAI 兼容接口由服务端自动缓存。
 - `base_url` 对新 provider 是必填的，留空启动失败：程序里没有任何默认地址。
-- 有三个字段写了不报错、但目前不起作用：provider 的 `max_retries`（重试次数看 `sbot.toml` 的
-  `[agent].retry_attempts`），模型的 `sampling` 与 `compat`（没有透传给 API）。
+- 和 `sbot.toml` 一样是严格 schema：不认识的字段直接报错（`unknown field`），不会写了没用还
+  没人知道。重试次数不在这里配，看 `sbot.toml` 的 `[agent].retry_attempts`。
 
 **合并规则，覆盖内置 provider 时要小心：**
 

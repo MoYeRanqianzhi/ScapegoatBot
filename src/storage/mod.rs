@@ -194,6 +194,7 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
     (
         5,
         "phase3: transcript segments, turn buffer, checkpoints",
+        // 其中的 `compaction_checkpoints` 已由迁移 14 删除。已发布的迁移不改，保留原样。
         r#"
     -- transcript 分段索引；事实来源是 sessions/*.jsonl，本表可重建。
     CREATE TABLE transcript_files (
@@ -327,6 +328,17 @@ const MIGRATIONS: &[(u32, &str, &str)] = &[
         r#"
     DROP INDEX IF EXISTS memory_entries_kind;
     DROP TABLE IF EXISTS memory_entries;
+    "#,
+    ),
+    (
+        14,
+        "drop compaction checkpoints",
+        // `compaction_checkpoints` 是压缩摘要的副本（最近 20 条），只有写入、从来没有读它的
+        // 代码：摘要的权威位置是新分段的首行（`[checkpoint summary | …]`），恢复与续聊都从那里
+        // 读。表里的摘要还不受会话保留期约束：分段文件过期删掉了，它的摘要仍留在这里。
+        // 删掉不丢数据。
+        r#"
+    DROP TABLE IF EXISTS compaction_checkpoints;
     "#,
     ),
 ];
@@ -667,49 +679,78 @@ mod tests {
         assert_eq!(db.schema_version().unwrap(), version);
     }
 
-    /// 迁移 13 删除 `memory_entries`：从 v12（表里有数据）升级后表不存在，其他表不受影响。
-    #[test]
-    fn migration_13_drops_memory_entries_from_an_existing_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("sbot.db");
+    /// 手工建一个停在 `version` 的数据库：依次执行到那一版为止的迁移并登记版本。
+    fn database_at(path: &Path, version: u32) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (
+                 version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        for (applied, _, sql) in MIGRATIONS
+            .iter()
+            .filter(|(applied, _, _)| *applied <= version)
         {
-            // 手工建一个停在 v12 的数据库：依次执行前 12 条迁移并登记版本。
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE schema_migrations (
-                     version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);",
-            )
-            .unwrap();
-            for (version, _, sql) in MIGRATIONS.iter().filter(|(version, _, _)| *version <= 12) {
-                conn.execute_batch(sql).unwrap();
-                conn.execute(
-                    "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, 'then')",
-                    params![version],
-                )
-                .unwrap();
-            }
+            conn.execute_batch(sql).unwrap();
             conn.execute(
-                "INSERT INTO memory_entries (slug, path, kind, source, observed_at, updated_at)
-                 VALUES ('a', '/memory/a.md', 'user', 'self', '', '')",
-                [],
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, 'then')",
+                params![applied],
             )
             .unwrap();
         }
+        conn
+    }
 
-        let db = Database::open(&path).unwrap();
-        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.last().unwrap().0);
-        let conn = db.lock();
-        let tables = |name: &str| -> i64 {
-            conn.query_row(
+    /// `sqlite_master` 里叫这个名字的对象（表或索引）有几个。
+    fn objects_named(db: &Database, name: &str) -> i64 {
+        db.lock()
+            .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
                 params![name],
                 |row| row.get(0),
             )
             .unwrap()
-        };
-        assert_eq!(tables("memory_entries"), 0);
-        assert_eq!(tables("memory_entries_kind"), 0);
-        assert_eq!(tables("event_audit"), 1);
+    }
+
+    /// 迁移 13 删除 `memory_entries`：从 v12（表里有数据）升级后表不存在，其他表不受影响。
+    #[test]
+    fn migration_13_drops_memory_entries_from_an_existing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sbot.db");
+        database_at(&path, 12)
+            .execute(
+                "INSERT INTO memory_entries (slug, path, kind, source, observed_at, updated_at)
+                 VALUES ('a', '/memory/a.md', 'user', 'self', '', '')",
+                [],
+            )
+            .unwrap();
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.last().unwrap().0);
+        assert_eq!(objects_named(&db, "memory_entries"), 0);
+        assert_eq!(objects_named(&db, "memory_entries_kind"), 0);
+        assert_eq!(objects_named(&db, "event_audit"), 1);
+    }
+
+    /// 迁移 14 删除 `compaction_checkpoints`：从 v13（表里有数据）升级后表不存在，同一条迁移
+    /// 建的另外两张表不受影响。
+    #[test]
+    fn migration_14_drops_compaction_checkpoints_from_an_existing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sbot.db");
+        database_at(&path, 13)
+            .execute(
+                "INSERT INTO compaction_checkpoints (from_file, summary_enc, created_at)
+                 VALUES ('a.jsonl', x'00', 'then')",
+                [],
+            )
+            .unwrap();
+
+        let db = Database::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), MIGRATIONS.last().unwrap().0);
+        assert_eq!(objects_named(&db, "compaction_checkpoints"), 0);
+        assert_eq!(objects_named(&db, "transcript_files"), 1);
+        assert_eq!(objects_named(&db, "turn_buffer"), 1);
     }
 
     #[test]

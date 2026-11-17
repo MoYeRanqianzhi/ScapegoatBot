@@ -219,6 +219,7 @@ Windows 上用任务计划程序（“失败时重新启动”）或 NSSM / WinS
 ```bash
 sbot backup --output <一个新目录>     # 先备份：包含主密钥与 auth.json，按机密保管
 # 换掉 sbot 可执行文件
+sbot doctor                           # 只读；新版本读不了的配置在这里报出来，改完再重启
 systemctl restart sbot                # 或者 sbot stop 之后再 sbot start
 sbot status                           # version 是新版本，agent.state 回到 running
 sbot docs --export <你的 skills 目录>  # 文档跟着二进制走：导出过的话重新导出一次
@@ -226,6 +227,11 @@ sbot docs --export <你的 skills 目录>  # 文档跟着二进制走：导出�
 
 新版本启动时自动跑数据库迁移。迁移只往前走：升级之后不保证还能换回旧版本，所以升级前的
 那份备份要留着。每个版本的破坏性变更写在发布页的说明里，升级前看一眼。
+
+配置文件是严格 schema，新版本删掉或改名的键会让它解析失败、守护进程起不来（交给 systemd 的话
+会反复重启）。所以换掉二进制之后、重启之前先跑 `sbot doctor`：它不改任何东西，报
+`ERROR config: … unknown field …` 时按报错里的键名与节名改 `sbot.toml` / `models.json`，
+直到这一项通过。
 
 ## 再开一个实例
 

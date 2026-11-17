@@ -34,8 +34,6 @@ pub struct ProviderDef {
     /// 等待响应头的秒数（连接阶段另限 30 秒内）；流式响应体不受它限制，
     /// 而是按“30 秒没有新数据”判定中断。
     pub timeout_secs: u64,
-    /// 保留字段：解析但不使用。重试次数由 `[agent].retry_attempts` 决定。
-    pub max_retries: u32,
     pub models: Vec<ModelDef>,
 }
 
@@ -46,7 +44,6 @@ impl Default for ProviderDef {
             api: Protocol::Anthropic,
             base_url: String::new(),
             timeout_secs: 120,
-            max_retries: 2,
             models: Vec::new(),
         }
     }
@@ -85,10 +82,6 @@ pub struct ModelDef {
     pub capabilities: Vec<String>,
     /// 每百万 token 价格（美元）；缺省按 0 计。
     pub cost: CostDef,
-    /// 供应商特有的采样参数。保留字段：解析但不使用，没有透传给 API。
-    pub sampling: serde_json::Value,
-    /// 兼容性开关。保留字段：解析但不使用。
-    pub compat: serde_json::Value,
 }
 
 impl Default for ModelDef {
@@ -104,8 +97,6 @@ impl Default for ModelDef {
             max_tokens: 8_192,
             capabilities: vec!["tools".to_owned()],
             cost: CostDef::default(),
-            sampling: serde_json::Value::Null,
-            compat: serde_json::Value::Null,
         }
     }
 }
@@ -208,7 +199,6 @@ impl ModelsFile {
                         existing.base_url = provider.base_url;
                     }
                     existing.timeout_secs = provider.timeout_secs;
-                    existing.max_retries = provider.max_retries;
                     for model in provider.models {
                         match existing.models.iter_mut().find(|item| item.id == model.id) {
                             None => existing.models.push(model),
@@ -271,6 +261,20 @@ mod tests {
     fn embedded_models_are_valid() {
         let models = ModelsFile::embedded().expect("embedded models parse");
         models.validate().expect("embedded models validate");
+    }
+
+    /// 清单是严格 schema：不认识的字段直接报错，包括以前接受、但从未生效的 `max_retries`、
+    /// `sampling`、`compat`——写了没用还没人知道，比报错更糟。
+    #[test]
+    fn fields_that_do_nothing_are_refused() {
+        for text in [
+            r#"{"providers":{"x":{"base_url":"http://h","max_retries":2,"models":[]}}}"#,
+            r#"{"providers":{"x":{"base_url":"http://h","models":[{"id":"m","sampling":{}}]}}}"#,
+            r#"{"providers":{"x":{"base_url":"http://h","models":[{"id":"m","compat":{}}]}}}"#,
+        ] {
+            let error = ModelsFile::parse(text).unwrap_err().to_string();
+            assert!(error.contains("unknown field"), "{text}: {error}");
+        }
     }
 
     fn sample() -> ModelsFile {
