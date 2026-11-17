@@ -611,7 +611,10 @@ fn new_file_id() -> String {
     )
 }
 
-/// 递归列出目录下的文件。
+/// 递归列出目录下的消息文件（`*.jsonl`），按路径排序。
+///
+/// 别的文件不算：系统或编辑器留在目录里的东西（`.DS_Store`、备份文件）不是消息文件，把它们
+/// 数进去的话，磁盘上的文件数永远比索引多，每次启动都会白白重建一遍索引。
 fn walk_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -621,7 +624,10 @@ fn walk_files(dir: &Path) -> Result<Vec<PathBuf>> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else {
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+            {
                 files.push(path);
             }
         }
@@ -1088,6 +1094,31 @@ mod tests {
         let (disk, indexed) = store.index_file_counts().unwrap();
         assert_eq!(disk, indexed);
         assert_eq!(disk, 1);
+    }
+
+    /// 消息目录里不是 `.jsonl` 的文件不算消息文件：不计入磁盘文件数（否则每次启动都判定
+    /// 索引过期），重建时也不去读它。
+    #[test]
+    fn stray_files_are_not_message_files() {
+        let (store, dir) = store();
+        let chat = ChatId::Group(1);
+        store.append(&message(chat, 1, "a")).unwrap();
+        let day_dir = std::fs::read_dir(dir.path().join("messages/groups/1"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        std::fs::write(day_dir.join(".DS_Store"), b"not a message file").unwrap();
+        std::fs::write(day_dir.join("29.jsonl.bak"), b"an editor backup").unwrap();
+        std::fs::write(dir.path().join("messages/notes.txt"), b"notes").unwrap();
+
+        let (disk, indexed) = store.index_file_counts().unwrap();
+        assert_eq!((disk, indexed), (1, 1));
+        // 重建不受它们影响：没有新补的行，文件数仍然一致。
+        assert_eq!(store.rebuild_index().unwrap(), 0);
+        assert_eq!(store.index_file_counts().unwrap(), (1, 1));
+        assert_eq!(store.load(chat, 1).unwrap().unwrap().message_id, 1);
     }
 
     #[test]
