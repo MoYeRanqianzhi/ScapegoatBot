@@ -419,7 +419,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn reload_config_updates_the_snapshot() {
         let handler = Arc::new(RecordingHandler::default());
         let queue = ChatQueue::new(config(), handler);
@@ -432,7 +432,7 @@ mod tests {
         assert_eq!(snapshot.debounce_ms, 7);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn debounce_coalesces_bursts() {
         let handler = Arc::new(RecordingHandler::default());
         let mut cfg = config();
@@ -449,7 +449,7 @@ mod tests {
         assert_eq!(calls[0].messages.len(), 3);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn different_chats_get_independent_turns() {
         let handler = Arc::new(RecordingHandler::default());
         let mut cfg = config();
@@ -466,7 +466,7 @@ mod tests {
         assert!(chats.contains(&ChatId::Private(2)));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn caps_drop_and_count_for_summarize() {
         let handler = Arc::new(RecordingHandler::default());
         let mut cfg = config();
@@ -484,7 +484,7 @@ mod tests {
         assert_eq!(calls[0].dropped, 3);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn follow_up_does_not_leak_the_batch_reservation() {
         let handler = Arc::new(RecordingHandler {
             delay_ms: 30,
@@ -514,7 +514,7 @@ mod tests {
         assert!(state.pending.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn followup_runs_queued_messages_one_turn_each_and_collect_merges_them() {
         for (mode, expected) in [
             (QueueMode::Followup, vec![vec![1], vec![2], vec![3]]),
@@ -555,7 +555,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn steering_reaches_running_turn() {
         let handler = Arc::new(RecordingHandler {
             delay_ms: 200,
@@ -582,7 +582,7 @@ mod tests {
         assert_eq!(steer[0].message_id, 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn idle_covers_pending_debounce_batches() {
         let handler = Arc::new(RecordingHandler::default());
         let queue = ChatQueue::new(config(), handler);
@@ -616,7 +616,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn send_after_close_requeues_the_message() {
         let handler = Arc::new(ClosingHandler {
             calls: StdMutex::new(Vec::new()),
@@ -685,7 +685,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn unanswered_steering_messages_open_a_follow_up_turn_in_order() {
         let handler = Arc::new(UnansweredHandler {
             calls: StdMutex::new(Vec::new()),
