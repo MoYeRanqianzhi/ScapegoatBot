@@ -648,7 +648,7 @@ impl Runner {
         prompts: Vec<AgentMessage>,
         evidence: TurnEvidence,
         steering_rx: &mut mpsc::UnboundedReceiver<QqMessage>,
-        mut journal: journal::TurnJournal,
+        journal: journal::TurnJournal,
     ) -> (LoopOutcome, usize, journal::TurnJournal) {
         // 4) 运行循环。工具执行器带上本回合证据。
         let slot = self.provider_snapshot();
@@ -672,22 +672,7 @@ impl Runner {
             self.loop_config(&slot),
         );
         let turn_id = journal.turn_id().to_owned();
-        let (events_tx, mut events_rx) = mpsc::channel(256);
-        let logger = tokio::spawn(async move {
-            while let Some(event) = events_rx.recv().await {
-                match event {
-                    AgentEvent::Appended { message } => journal.record(&message),
-                    AgentEvent::Security {
-                        checkpoint,
-                        allowed: false,
-                        reason,
-                    } => warn!(?checkpoint, %reason, "security gate blocked this turn"),
-                    AgentEvent::Error { message } => warn!(%message, "agent error"),
-                    _ => {}
-                }
-            }
-            journal
-        });
+        let (events_tx, logger) = spawn_turn_logger(journal);
         let mut steering = SteeringQueue::default();
         let outcome = loop_
             .run_with_steering(
@@ -714,15 +699,7 @@ impl Runner {
         unanswered += steering.drain().len();
 
         drop(events_tx);
-        let journal = match logger.await {
-            Ok(journal) => journal,
-            // 事件任务没把日志交回来（调试构建里它 panic 了；发布构建的 panic 直接结束进程，
-            // 到不了这里）：用同一个 turn id 重建日志，提交时按 seq 覆盖重写，不会重复。
-            Err(error) => {
-                warn!(%error, "the turn event task failed");
-                journal::TurnJournal::new(Arc::clone(&self.deps.turn_buffer), turn_id, 0)
-            }
-        };
+        let journal = self.reclaim_journal(logger, turn_id).await;
         // 用量已由计量 provider 逐请求记账（见 `providers::metered`）。
         // `Stop` 只允许 `log`（设计 §7.5）。
         let _ = self
@@ -765,7 +742,54 @@ impl Runner {
     }
 }
 
+/// 把模型循环的事件接到回合日志上，返回事件的发送端与后台任务。
+///
+/// 并入上下文的块实时写进 turn buffer（进程中途退出也能恢复），错误与安全闸的拦截记进
+/// 日志。发送端全部丢弃后任务结束，把日志交回来（见 [`Runner::reclaim_journal`]）。
+fn spawn_turn_logger(
+    mut journal: journal::TurnJournal,
+) -> (
+    mpsc::Sender<AgentEvent>,
+    tokio::task::JoinHandle<journal::TurnJournal>,
+) {
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let logger = tokio::spawn(async move {
+        while let Some(event) = events_rx.recv().await {
+            match event {
+                AgentEvent::Appended { message } => journal.record(&message),
+                AgentEvent::Security {
+                    checkpoint,
+                    allowed: false,
+                    reason,
+                } => warn!(?checkpoint, %reason, "security gate blocked this turn"),
+                AgentEvent::Error { message } => warn!(%message, "agent error"),
+                _ => {}
+            }
+        }
+        journal
+    });
+    (events_tx, logger)
+}
+
 impl Runner {
+    /// 从事件任务手里取回回合日志；调用前必须已经丢弃事件的发送端。
+    ///
+    /// 任务没把日志交回来时（调试构建里它 panic 了；发布构建的 panic 直接结束进程，到不了
+    /// 这里）用同一个 turn id 重建：提交时按 seq 覆盖重写，不会重复。
+    async fn reclaim_journal(
+        &self,
+        logger: tokio::task::JoinHandle<journal::TurnJournal>,
+        turn_id: String,
+    ) -> journal::TurnJournal {
+        match logger.await {
+            Ok(journal) => journal,
+            Err(error) => {
+                warn!(%error, "the turn event task failed");
+                journal::TurnJournal::new(Arc::clone(&self.deps.turn_buffer), turn_id, 0)
+            }
+        }
+    }
+
     /// 子代理能用的工具：父注册表里按定义筛出的子集，以实例身份调用。
     fn subagent_tools(
         &self,

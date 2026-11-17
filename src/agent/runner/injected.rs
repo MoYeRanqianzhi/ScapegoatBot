@@ -115,35 +115,18 @@ impl Runner {
             self.loop_config(&slot),
         );
         let turn_id = new_turn_id();
-        let mut journal = super::journal::TurnJournal::new(
+        let journal = super::journal::TurnJournal::new(
             Arc::clone(&self.deps.turn_buffer),
             turn_id.clone(),
             runtime_blocks,
         );
-        let (tx, mut rx) = mpsc::channel(256);
-        let logger = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                match event {
-                    AgentEvent::Appended { message } => journal.record(&message),
-                    AgentEvent::Error { message } => warn!(%message, "agent error"),
-                    _ => {}
-                }
-            }
-            journal
-        });
+        let (tx, logger) = super::spawn_turn_logger(journal);
         let mut steering = SteeringQueue::default();
         let outcome = loop_
             .run_with_steering(&mut working, prompts, &mut steering, None, &tx)
             .await;
         drop(tx);
-        let journal = match logger.await {
-            Ok(journal) => journal,
-            // 同一个 turn id 重建：提交时按 seq 覆盖重写，不会重复。
-            Err(error) => {
-                warn!(%error, "the turn event task failed");
-                super::journal::TurnJournal::new(Arc::clone(&self.deps.turn_buffer), turn_id, 0)
-            }
-        };
+        let journal = self.reclaim_journal(logger, turn_id).await;
         // 用量已由计量 provider 逐请求记账（见 `providers::metered`）。
 
         for message in steering.drain() {

@@ -76,6 +76,59 @@ impl Runner {
         .await
     }
 
+    /// 把要压缩掉的那段历史交给模型摘要（附上 PreCompact hook 的上下文）。
+    ///
+    /// 摘要可以用独立模型（`[compaction].model`）；默认是主 provider。
+    async fn summarize_for_compaction(&self, old: &[AgentMessage]) -> Result<String> {
+        let mut input = crate::session::compaction::render_for_summary(old, 80_000);
+        let pre_compact = self.hook_context(crate::config::HookEvent::PreCompact, None);
+        if !pre_compact.is_empty() {
+            input.push_str("\n\n[hook context]\n");
+            input.push_str(&pre_compact.join("\n"));
+        }
+        let (provider, model) = match &self.config.compaction {
+            Some(compaction) => (Arc::clone(&compaction.provider), compaction.model.clone()),
+            None => {
+                let slot = self.provider_snapshot();
+                (slot.provider, slot.api_model)
+            }
+        };
+        crate::session::compaction::summarize(&*provider, &model, &input, 4096)
+            .await
+            .map_err(|error| anyhow::anyhow!("compaction request failed: {error}"))
+    }
+
+    /// 压缩后追加在新历史末尾的上下文：PostCompact hook 的输出与记忆索引。
+    fn post_compact_context(&self) -> Vec<AgentMessage> {
+        let mut context: Vec<AgentMessage> = self
+            .hook_context(crate::config::HookEvent::PostCompact, None)
+            .into_iter()
+            .map(|text| AgentMessage::System {
+                text: format!("[hook context | PostCompact]\n{text}"),
+            })
+            .collect();
+        // PostCompact recall：把记忆索引作为新分段里的上下文，避免压缩后
+        // 新回合在 system prompt 重建前“失忆”。只读、不标记已读。
+        if self.config.post_compact_recall
+            && let Ok(index) = self
+                .deps
+                .vfs
+                .read_text_unrecorded(&crate::vfs::VfsPath::parse("/MEMORY.md").expect("valid"))
+            && !index.trim().is_empty()
+        {
+            let mut text: String = index.chars().take(8_000).collect();
+            if index.chars().count() > 8_000 {
+                text.push('…');
+            }
+            context.push(AgentMessage::System {
+                text: format!(
+                    "<memory_context source=\"post_compact\">\n{text}\n</memory_context>"
+                ),
+            });
+        }
+        context
+    }
+
     /// 在指定链上压缩。
     ///
     /// 调用方必须在回合锁之内（自动压缩在回合开头，`agent.compact` 是回合里的一次工具调用）：
@@ -111,24 +164,8 @@ impl Runner {
         {
             warn!(%error, "memory flush before compaction failed");
         }
-        let mut input = crate::session::compaction::render_for_summary(&old, 80_000);
-        let pre_compact = self.hook_context(crate::config::HookEvent::PreCompact, None);
-        if !pre_compact.is_empty() {
-            input.push_str("\n\n[hook context]\n");
-            input.push_str(&pre_compact.join("\n"));
-        }
         let previous = sessions.current()?;
-        // 摘要可以用独立模型；默认仍是主 provider。
-        let (provider, model) = match &self.config.compaction {
-            Some(compaction) => (Arc::clone(&compaction.provider), compaction.model.clone()),
-            None => {
-                let slot = self.provider_snapshot();
-                (slot.provider, slot.api_model)
-            }
-        };
-        let summary = crate::session::compaction::summarize(&*provider, &model, &input, 4096)
-            .await
-            .map_err(|error| anyhow::anyhow!("compaction request failed: {error}"))?;
+        let summary = self.summarize_for_compaction(&old).await?;
 
         let summary_message = AgentMessage::System {
             text: format!(
@@ -146,30 +183,7 @@ impl Runner {
             }
             message
         }));
-        for text in self.hook_context(crate::config::HookEvent::PostCompact, None) {
-            new_history.push(AgentMessage::System {
-                text: format!("[hook context | PostCompact]\n{text}"),
-            });
-        }
-        // PostCompact recall：把记忆索引作为新分段的第一条上下文，避免压缩后
-        // 新回合在 system prompt 重建前“失忆”。只读、不标记已读。
-        if self.config.post_compact_recall
-            && let Ok(index) = self
-                .deps
-                .vfs
-                .read_text_unrecorded(&crate::vfs::VfsPath::parse("/MEMORY.md").expect("valid"))
-            && !index.trim().is_empty()
-        {
-            let mut text: String = index.chars().take(8_000).collect();
-            if index.chars().count() > 8_000 {
-                text.push('…');
-            }
-            new_history.push(AgentMessage::System {
-                text: format!(
-                    "<memory_context source=\"post_compact\">\n{text}\n</memory_context>"
-                ),
-            });
-        }
+        new_history.extend(self.post_compact_context());
         // 关闭旧分段、建新分段、写入新历史是一步（`rotate_with`）：失败时当前分段还是旧的那个，
         // 内存里的历史也没动，下次照常重试。
         let next = sessions.rotate_with(&new_history)?;

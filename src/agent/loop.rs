@@ -415,7 +415,7 @@ impl AgentLoop {
         conclude(events, progress.usage, progress.turns, StopReason::EndTurn).await
     }
 
-    /// 循环的一步：预算检查 → 输入闸 → 请求 → 输出闸 → 追加助手消息 → 执行工具。
+    /// 循环的一步：向模型要一条通过两道闸的回应（[`Self::ask`]）→ 追加助手消息 → 执行工具。
     ///
     /// 返回这一步之后循环该做什么（见 [`Step`]）。任何副作用（工具执行）都在输出闸之后。
     async fn step(
@@ -424,68 +424,10 @@ impl AgentLoop {
         progress: &mut Progress,
         events: &mpsc::Sender<AgentEvent>,
     ) -> Step {
-        progress.turns += 1;
-        if !self
-            .within_limits(progress.started, &progress.meter, progress.turns, events)
-            .await
-        {
-            return Step::Stop(StopReason::Error);
-        }
-        send(
-            events,
-            AgentEvent::TurnStart {
-                turn: progress.turns,
-            },
-        )
-        .await;
-
-        // 输入闸：检查这一步新进入上下文的 token。
-        if !progress.input_delta.is_empty() {
-            let delta = std::mem::take(&mut progress.input_delta);
-            if !self
-                .gate_passes(Checkpoint::Input, history, &delta, events)
-                .await
-            {
-                return Step::Stop(StopReason::Aborted);
-            }
-        }
-
-        let request = if self.config.prune {
-            let mut pruned = history.clone();
-            prune_tool_results(
-                &mut pruned,
-                self.config.prune_keep_turns as usize,
-                self.config.prune_soft_limit,
-            );
-            self.build_request(&pruned)
-        } else {
-            self.build_request(history)
+        let assistant = match self.ask(history, progress, events).await {
+            Ok(assistant) => assistant,
+            Err(reason) => return Step::Stop(reason),
         };
-        let assistant = match self
-            .request_before_deadline(&request, progress.started, events)
-            .await
-        {
-            Ok(message) => message,
-            Err(error) => {
-                send(
-                    events,
-                    AgentEvent::Error {
-                        message: error.to_string(),
-                    },
-                )
-                .await;
-                return Step::Stop(StopReason::Error);
-            }
-        };
-
-        // 输出闸：在任何副作用之前检查全部输出（文本、思考、工具参数）。
-        let output = render_assistant(&assistant);
-        if !self
-            .gate_passes(Checkpoint::Output, history, &output, events)
-            .await
-        {
-            return Step::Stop(StopReason::Aborted);
-        }
 
         progress.usage.add(assistant.usage);
         progress.meter.observe(&assistant.usage);
@@ -523,6 +465,81 @@ impl AgentLoop {
                 .await;
         }
         Step::ToolsRan
+    }
+
+    /// 一步的前半：预算检查 → 输入闸 → 请求 → 输出闸。
+    ///
+    /// 只有通过两道闸的助手消息才返回；`Err` 是回合该以什么原因结束（原因已经作为事件
+    /// 发出）。到这里为止没有任何副作用，历史也没有动。
+    async fn ask(
+        &self,
+        history: &[AgentMessage],
+        progress: &mut Progress,
+        events: &mpsc::Sender<AgentEvent>,
+    ) -> Result<AssistantMessage, StopReason> {
+        progress.turns += 1;
+        if !self
+            .within_limits(progress.started, &progress.meter, progress.turns, events)
+            .await
+        {
+            return Err(StopReason::Error);
+        }
+        send(
+            events,
+            AgentEvent::TurnStart {
+                turn: progress.turns,
+            },
+        )
+        .await;
+
+        // 输入闸：检查这一步新进入上下文的 token。
+        if !progress.input_delta.is_empty() {
+            let delta = std::mem::take(&mut progress.input_delta);
+            if !self
+                .gate_passes(Checkpoint::Input, history, &delta, events)
+                .await
+            {
+                return Err(StopReason::Aborted);
+            }
+        }
+
+        let request = if self.config.prune {
+            let mut pruned = history.to_vec();
+            prune_tool_results(
+                &mut pruned,
+                self.config.prune_keep_turns as usize,
+                self.config.prune_soft_limit,
+            );
+            self.build_request(&pruned)
+        } else {
+            self.build_request(history)
+        };
+        let assistant = match self
+            .request_before_deadline(&request, progress.started, events)
+            .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                send(
+                    events,
+                    AgentEvent::Error {
+                        message: error.to_string(),
+                    },
+                )
+                .await;
+                return Err(StopReason::Error);
+            }
+        };
+
+        // 输出闸：在任何副作用之前检查全部输出（文本、思考、工具参数）。
+        let output = render_assistant(&assistant);
+        if !self
+            .gate_passes(Checkpoint::Output, history, &output, events)
+            .await
+        {
+            return Err(StopReason::Aborted);
+        }
+        Ok(assistant)
     }
 
     /// 构造请求。
