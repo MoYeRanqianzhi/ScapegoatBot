@@ -5,6 +5,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 变更
+
+- 依赖升级：`getrandom` 0.4.2 → 0.4.3。新版本不再依赖 WASI preview 3 的那一串包，锁文件里
+  少了 16 个包；它们只在 WASI 目标上编译，发布的各平台本来就没有编进去。
+
 ## [0.2.0-alpha.45] - 2026-11-17
 
 ### 破坏性变更
