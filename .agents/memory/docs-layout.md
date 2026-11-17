@@ -41,3 +41,12 @@ metadata:
   能照着走。
 - `docs/guide/`、`docs/development/` 已删除；README 只留简介与指路。原开发文档里仍成立的内容
   在 [[maintenance-rules]]、[[prompt-structure]]、[[live-testing]]。
+
+用户 2026-11-17 说明了 skill 的读者是谁：**替用户干活的 agent**。设想中的常态是 agent 自己
+登录服务器完成 sbot 的部署，也由 agent 替用户开发、接入自定义 action 与渠道；“现代很少有用户
+自己手动部署了，几乎都是依赖 agent”。
+
+**How to apply（追加）:** 凡是用户要动手的事（部署、配置、接入、写适配器、排错），skill 必须
+写到一个没有任何上下文的 agent 能照着做完的程度：给出确切的命令、文件位置、协议与能直接改的
+示例，以及做完怎么验证；新功能没有对应的 skill 就不算做完。写完用不带上下文的子代理按 skill
+实际做一遍（2026-11-17 的盲测做法），按它卡住的地方补文档。

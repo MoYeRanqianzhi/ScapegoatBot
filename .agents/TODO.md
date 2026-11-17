@@ -28,39 +28,38 @@ PR 本身没有动——合并 / 关闭 PR 没有得到用户的授权；内容�
 并验证；主版本更新先看 API 变化。加密相关的依赖升级后
 `storage::crypto` 里“旧版本密文必须解得开”的测试必须通过。
 
-## 等用户决定
+## 进行中（用户 2026-11-17 的决定，按这个顺序做）
 
-- [ ] **压缩策略**（用户 2026-11-13 提的问题）：压缩后保留最近几条吗？要不要“无感”——在到
-      硬上限之前提前压缩、算好再替换，压缩时 bot 不停顿？六个参考实现的调研结果与 agent 的
-      建议在 2026-11-17 的收尾报告里给了用户，**等用户选**。结论要点（重新调研的话看
-      `.ref/` 下的 grok-build、codex、hermes）：现在的实现已经保留最近约 2 万 token 的原文
-      （pi / openclaw 同款）；“无感”的三家（grok-build 默认开、codex 与 hermes 默认关）都不是
-      后台算完直接换，而是提前算好一部分、到阈值时仍有一步同步操作；codex 的做法（快照时记
-      长度，采用时把之后追加的消息原样接回去）最适合这里。建议：保留尾巴不变；空闲时在
-      软阈值提前压缩，回合边界采用；硬阈值保留同步压缩兜底。实现时注意：现在的
-      `compact_scope` 靠回合锁保证“快照到替换之间没人追加”（见它的文档注释），提前压缩
-      在回合之外做摘要，这条前提就不成立了，必须改成“记长度、接回后缀”。
-- [ ] **命名与可扩展性**（`local.*` → `native.*`、自定义 action、任意渠道、可禁用 NapCat）：
-      设计稿写好了，在
-      [`plan/2026-11-17-channels-and-custom-actions.md`](plan/2026-11-17-channels-and-custom-actions.md)，
-      文末列了六件要用户定的事并各给了建议。**等用户确认，确认前不动代码。** 用户同意后从
-      步骤 A（属性代替前缀，纯重构）做起。
-- [ ] 是否授权部署 hw1。
+- [ ] **删掉不起作用的配置**（用户选“删掉无效的”）：`[agent].name`、`models.json` 的 provider
+      `max_retries` 与模型的 `sampling` / `compat`、`compaction_checkpoints` 的写入。破坏性变更：
+      写着这些键的文件之后会报未知字段，CHANGELOG 要写清楚怎么改；内置 `models.json` 与
+      样例配置、skill 一起改。表本身留着不删（迁移只追加，见 `memory/maintenance-rules.md`）。
+- [ ] **空闲预压缩**（用户选“加空闲预压缩”）：保留尾巴不变；到软阈值时在回合之外提前算好
+      摘要，回合边界采用；硬阈值保留同步压缩兜底。现在的 `compact_scope` 靠回合锁保证“快照
+      到替换之间没人追加”（见它的文档注释）；提前压缩在回合之外做摘要，这条前提不成立，必须
+      改成 codex 的做法——快照时记长度，采用时把之后追加的消息原样接回去。六个参考实现在
+      `.ref/` 下（grok-build、codex、hermes 是做了“无感”的三家）。
+- [ ] **命名与可扩展性，A – E 全做**（用户选“按设计稿全做”）。设计、每步的边界与验证方式在
+      [`plan/2026-11-17-channels-and-custom-actions.md`](plan/2026-11-17-channels-and-custom-actions.md)。
+      每一步单独提交、单独验证；每一步都同步改 `skills/`，C 另加讲适配器的 skill。
+  - [ ] A 属性代替前缀（纯重构，先加“属性与旧前缀规则等价”的测试）
+  - [ ] B `local.*` → `native.*`（不保留旧名）
+  - [ ] C 适配器进程提供自定义 action + 对应的 skill 与示例
+  - [ ] D `[napcat].enabled = false`
+  - [ ] E 渠道抽象、带渠道的会话标识、适配器渠道（动手前先把 E 的细节设计补进设计稿）
+
+## 等用户动手
+
+- [ ] hw1：用户 2026-11-17 决定**暂不部署**（NapCat 没登录，部署了也只能停在
+      `waiting_for_napcat`）。要部署时需要用户重新授权并扫码登录。
 - [ ] 临时目录要用户手动删（安全检查拦下了 `rm -rf`）：`G:\sbot-e2e-{lists,startwait,startwait-other,fresh,tmp}`
       是 11 月几轮实机验证建的；`G:\sbot-e2e-{live,perchat,phase7,qq}` 更早，用途未核实。旧历史
       的备份 `G:\sbot-pre-coauthor-rewrite-2026-11-10.bundle` 在远端强推之后已经没用。
 - [ ] 上级目录的 `G:/ClaudeProjects/ScapegoatBot/CLAUDE.md`（不在本仓库里）仍说开发文档在
       `docs/development/`；那个目录 2026-11-17 已删，这一句要用户自己改（开发文档现在是
       `.agents/`，使用文档是 `sbot docs` / `skills/`）。
-- [ ] “写了不报错、但不起作用”的三样东西，留着还是删掉 / 接上（文档已经如实写明，见
-      `skills/sbot-deploy/references/configuration.md`；删掉配置键是破坏性变更，所以由用户定）：
-  - `[agent].name`：必须非空，但没有任何地方使用。
-  - `models.json` 的 provider `max_retries`（实际重试次数看 `[agent].retry_attempts`）、模型的
-    `sampling` 与 `compat`（没有透传给 API）。
-  - `compaction_checkpoints` 表只写不读（`SessionStore::checkpoints()` 只有测试在用；新分段的
-    首行才是摘要的权威副本）。
 
-同一批里已经处理掉的（2026-11-17，见 CHANGELOG 的 Unreleased）：`api.list` / `api.help` 给出
+2026-11-17 核对 skill 与代码时列出的“配置或接口说了、程序没做”的清单，同一批里已经处理掉的（2026-11-17，见 CHANGELOG 的 Unreleased）：`api.list` / `api.help` 给出
 `destructive` 等门禁属性；自定义子代理 `tools` 里的未知名字改为报错；MCP 服务器的 stderr 进
 日志。两条核实后不需要做：确认码不必加尝试次数限制（只有 owner / master 的私聊才会拿去比对，
 见 `src/app/events.rs` 的 `approval_reply_sender`，别人没有可以穷举的入口）；`SBOT__*` 够不到
