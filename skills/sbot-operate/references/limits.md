@@ -73,7 +73,9 @@
   多少次都只补投一次，事件里写明错过的次数（最多计到 1000）。
 - `sbot doctor` 是只读的：它发现的问题需要你按提示手工修复。它不检查 MCP 服务器，也不连
   NapCat。
-- MCP 服务器进程的 stderr 被丢弃；它启动失败时日志里只有 sbot 这一侧看到的原因。
+- MCP 服务器进程的 stderr 不进 agent 的上下文，只进 sbot 的日志：平时每行一条 `debug`
+  （`MCP stderr: …`，要 `RUST_LOG=debug` 才看得到），服务器启动失败时最后 20 行按 `warn`
+  写出。每行最多留 4 KiB。
 - 文件头损坏的消息文件（`message file has no usable header`）不会进索引，启动时的
   文件数校验因此每次都不一致，每次启动都会重建一遍索引；把这个文件移出
   `~/.sbot/data/messages/`（或从备份恢复）即可停止。

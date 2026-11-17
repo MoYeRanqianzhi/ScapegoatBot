@@ -34,6 +34,68 @@ const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESULT_BYTES: usize = 256 * 1024;
 /// 协议版本：与当前 MCP 规范一致。
 const PROTOCOL_VERSION: &str = "2025-06-18";
+/// stderr 一行最多留下的字节数；超出的部分读掉丢弃。
+const MAX_STDERR_LINE_BYTES: usize = 4 * 1024;
+/// 为启动失败的诊断留下的 stderr 行数。
+const STDERR_TAIL_LINES: usize = 20;
+
+/// 一个 MCP 服务器 stderr 的最近几行。
+type StderrTail = Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+
+/// 读 MCP 服务器的 stderr 直到它关闭：逐行写进日志（`debug` 级），最近几行留在 `tail`。
+///
+/// stderr 必须一直有人读：管道写满后，服务器会卡在写诊断输出上。所以超长的行截断后接着
+/// 读，不因为它停下。
+async fn forward_stderr(name: String, stderr: impl AsyncRead + Unpin, tail: StderrTail) {
+    let mut reader = BufReader::new(stderr);
+    let mut raw = Vec::new();
+    loop {
+        raw.clear();
+        match read_capped_line(&mut reader, &mut raw, MAX_STDERR_LINE_BYTES).await {
+            Ok(true) => {}
+            Ok(false) | Err(_) => return,
+        }
+        let line = String::from_utf8_lossy(&raw);
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        tracing::debug!(server = %name, "MCP stderr: {line}");
+        let mut kept = tail.lock().expect("stderr tail lock");
+        if kept.len() == STDERR_TAIL_LINES {
+            kept.pop_front();
+        }
+        kept.push_back(line.to_owned());
+    }
+}
+
+/// 读一行到 `raw`，最多留 `limit` 字节，超出的读掉丢弃。流已经结束、什么都没读到时返回
+/// `false`。
+async fn read_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    raw: &mut Vec<u8>,
+    limit: usize,
+) -> std::io::Result<bool> {
+    let mut read_any = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(read_any);
+        }
+        read_any = true;
+        let (chunk, done) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(position) => (&available[..=position], true),
+            None => (available, false),
+        };
+        let consumed = chunk.len();
+        let room = limit.saturating_sub(raw.len());
+        raw.extend_from_slice(&chunk[..consumed.min(room)]);
+        reader.consume(consumed);
+        if done {
+            return Ok(true);
+        }
+    }
+}
 
 /// 一个 MCP 工具的描述。
 #[derive(Debug, Clone, PartialEq)]
@@ -64,22 +126,60 @@ impl McpClient {
             .envs(&server.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = command
             .spawn()
             .with_context(|| format!("cannot start MCP server {:?}", server.name))?;
         let stdin = child.stdin.take().context("MCP stdin is missing")?;
         let stdout = child.stdout.take().context("MCP stdout is missing")?;
+        let stderr_tail = StderrTail::default();
+        let stderr_task = child.stderr.take().map(|stderr| {
+            tokio::spawn(forward_stderr(
+                server.name.clone(),
+                stderr,
+                Arc::clone(&stderr_tail),
+            ))
+        });
         let mut client = Self::from_io(
             Box::new(stdout),
             Box::new(stdin),
             server.name.clone(),
             Some(child),
         );
-        client.initialize().await?;
-        client.tools = client.list_tools().await?;
-        Ok(client)
+        let started = async {
+            client.initialize().await?;
+            client.list_tools().await
+        }
+        .await;
+        match started {
+            Ok(tools) => {
+                client.tools = tools;
+                Ok(client)
+            }
+            Err(error) => {
+                // 握手失败时服务器多半已经退出，原因在它的 stderr 里：等那边读完（还活着的
+                // 服务器最多等半秒），把最后几行按 warn 写进日志。只进日志、不进返回的错误：
+                // 错误会出现在 agent 能读到的 MCP 状态里，而 stderr 的内容不受我们控制。
+                if let Some(task) = stderr_task {
+                    let _ = tokio::time::timeout(Duration::from_millis(500), task).await;
+                }
+                let tail = stderr_tail
+                    .lock()
+                    .expect("stderr tail lock")
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if !tail.is_empty() {
+                    warn!(
+                        server = %server.name,
+                        "MCP server stderr before it failed:\n{}",
+                        tail.join("\n")
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     /// 由任意读写流构造；测试用 `tokio::io::duplex`。
@@ -529,6 +629,79 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(buffer.is_empty());
+    }
+
+    /// stderr 的转发：超长的行截断后继续读（不停在那里），只留最近的几行，流结束时返回。
+    #[tokio::test]
+    async fn stderr_is_drained_and_only_its_tail_is_kept() {
+        let (reader, mut writer) = duplex(64);
+        let tail = StderrTail::default();
+        let task = tokio::spawn(forward_stderr("demo".to_owned(), reader, Arc::clone(&tail)));
+        let mut text = format!("{}\n\n", "x".repeat(MAX_STDERR_LINE_BYTES * 3));
+        for index in 0..STDERR_TAIL_LINES + 5 {
+            text.push_str(&format!("line {index}\r\n"));
+        }
+        text.push_str("no newline at the end");
+        writer.write_all(text.as_bytes()).await.unwrap();
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the forwarder ends with the stream")
+            .unwrap();
+
+        let kept = tail.lock().unwrap();
+        assert_eq!(kept.len(), STDERR_TAIL_LINES);
+        assert_eq!(kept.back().unwrap(), "no newline at the end");
+        assert_eq!(
+            kept[STDERR_TAIL_LINES - 2],
+            format!("line {}", STDERR_TAIL_LINES + 4)
+        );
+        assert!(kept.iter().all(|line| line.len() <= MAX_STDERR_LINE_BYTES));
+    }
+
+    /// 真实子进程：往 stderr 写了很多就退出的“服务器”——启动报失败而不是卡住；返回的错误
+    /// （agent 能在 MCP 状态里读到）不带 stderr 的内容。
+    #[tokio::test]
+    async fn a_server_that_dies_at_startup_fails_without_its_stderr_in_the_error() {
+        let script = if cfg!(windows) {
+            "for /L %i in (1,1,200) do @echo stderr-detail-%i 1>&2"
+        } else {
+            "i=0; while [ $i -lt 200 ]; do echo stderr-detail-$i >&2; i=$((i+1)); done"
+        };
+        let (command, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+        let server = McpServerConfig {
+            name: "dying".to_owned(),
+            command: command.to_owned(),
+            args: vec![flag.to_owned(), script.to_owned()],
+            ..McpServerConfig::default()
+        };
+        let error = tokio::time::timeout(Duration::from_secs(20), McpClient::spawn(&server))
+            .await
+            .expect("a dead server is reported, not waited for")
+            .err()
+            .expect("the handshake cannot succeed");
+        let text = format!("{error:#}");
+        assert!(text.contains("closed its stdout"), "{text}");
+        assert!(!text.contains("stderr-detail"), "{text}");
+    }
+
+    /// 截断只影响留下的内容，不影响读到哪里：超长行之后的那一行完整。
+    #[tokio::test]
+    async fn a_capped_line_is_consumed_to_its_end() {
+        let mut reader = BufReader::new(&b"0123456789\nnext\n"[..]);
+        let mut raw = Vec::new();
+        assert!(read_capped_line(&mut reader, &mut raw, 4).await.unwrap());
+        assert_eq!(raw, b"0123");
+        raw.clear();
+        assert!(read_capped_line(&mut reader, &mut raw, 4).await.unwrap());
+        assert_eq!(raw, b"next");
+        raw.clear();
+        assert!(!read_capped_line(&mut reader, &mut raw, 4).await.unwrap());
+        assert!(raw.is_empty());
     }
 
     #[tokio::test]
