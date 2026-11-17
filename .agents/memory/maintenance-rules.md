@@ -26,13 +26,18 @@ metadata:
   （见 [[security-gate-semantics]]）；新增顶层工具要用户同意（见 [[tool-surface]]）。
 - **结构**：不要上帝结构。单函数、单结构过大就按职责拆；先例是 `src/actions.rs`、
   `src/config/sections/`、`src/tools/views/`、`src/app/assembly/`、`src/monitor/`。
+- **测试不改进程级的状态**（环境变量、当前目录）。测试在同一个进程里并行跑，一个测试
+  `set_var` 的值会被别的测试读到。要测“读环境”的代码，把值作为参数传进去；要证明二进制真的
+  读了进程环境，在集成测试里起子进程设（`tests/config_example.rs` 有先例）。
 - **提交前**：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、
   `cargo test --all-targets`；CI（`.github/workflows/ci.yml`）跑同样三项再加别的平台。
 
 **Evidence:** 这些原先写在 `docs/development/README.md` 的“结构约定”“维护约定”里（2026-11-17
 随目录删除，git 历史可查）；`MIGRATIONS`、`tests/config_example.rs`、`src/cli/docs.rs` 的测试
 于 2026-11-17 对照代码核实。“禁止上帝结构、冗余代码、代码和注释和文档不一致”是用户
-2026-11-13 给的长期验收标准。
+2026-11-13 给的长期验收标准。“测试不改进程级状态”来自 2026-11-17 的一次事故：两个测试
+设了 `SBOT__*` 环境变量，本地与 CI 都过了，release 试跑（20 个目标各跑一遍库测试）里有两个
+目标上另一个并发测试读到了它而失败（提交 `8a035df`）。
 
 **Recheck when:** 样例配置或 skill 文件换了位置；测试不再锁住上面某一条。
 
