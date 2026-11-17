@@ -47,77 +47,14 @@ fn run_with_paths(
             .backups_dir()
             .join(chrono::Local::now().format("%Y%m%dT%H%M%S").to_string())
     });
-    // 写到词法规范化后的绝对路径：下面按它判断真实位置，两者必须是同一个地方（`a/../b`
-    // 交给操作系统的话，Unix 上还会顺手把 `a` 建出来）。
-    let output = crate::paths::normalize(&std::path::absolute(&output).unwrap_or(output));
-    // 归档目录不能落在被复制的目录里，否则复制会递归包含正在写入的归档。比的是真实位置：
-    // 同一个目录可以有别的写法（相对路径、符号链接、Windows 上的大小写）。
-    let real_output = real_location(&output);
-    for (name, source) in [
-        ("storage.path", &data_dir),
-        ("swarm.agents_dir", &agents_dir),
-    ] {
-        if real_output.starts_with(real_location(source)) {
-            bail!(
-                "refusing to write the backup inside {name} ({}); choose another --output",
-                source.display()
-            );
-        }
-    }
-    // 只写进空目录。已有内容的目录要么是上一次的备份（混在一起就不是一致的快照），要么是
-    // 实例目录本身——那时密钥、配置的“备份位置”就是它们自己，而把文件复制到自身会把它清空。
-    if std::fs::read_dir(&output).is_ok_and(|mut entries| entries.next().is_some()) {
-        bail!(
-            "refusing to write the backup into {}: the directory is not empty; choose an empty \
-             or new --output",
-            output.display()
-        );
-    }
-    std::fs::create_dir_all(&output)
-        .with_context(|| format!("cannot create {}", output.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o700));
-    }
-
-    // SQLite 一致性快照。
-    //
-    // 用底层 `Backup` 句柄而不是 `Connection::backup(path)`：
-    // 守护进程运行时源库仍可能被写入，`Busy` / `Locked` 应当重试而不是直接失败。
-    {
-        let source =
-            Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .with_context(|| format!("cannot open {}", db_path.display()))?;
-        source
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .context("cannot configure the source busy timeout")?;
-        let mut destination = Connection::open(output.join("data.db"))?;
-        {
-            let backup = rusqlite::backup::Backup::new(&source, &mut destination)
-                .context("cannot start the SQLite backup")?;
-            let mut attempts = 0u32;
-            loop {
-                match backup.step(100)? {
-                    StepResult::Done => break,
-                    // 还有页未复制，继续。
-                    StepResult::More => continue,
-                    // 源库正在写：等待后重试，最多 10 秒。
-                    StepResult::Busy | StepResult::Locked => {
-                        attempts += 1;
-                        if attempts > 100 {
-                            bail!("SQLite backup stayed busy for 10 seconds");
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                    // `StepResult` 是 non_exhaustive；未知结果按失败处理，
-                    // 避免在不认识的返回码上死循环。
-                    other => bail!("unexpected SQLite backup step result: {other:?}"),
-                }
-            }
-        }
-        destination.close().map_err(|(_, error)| error)?;
-    }
+    let output = prepare_output(
+        output,
+        &[
+            ("storage.path", &data_dir),
+            ("swarm.agents_dir", &agents_dir),
+        ],
+    )?;
+    snapshot_database(&db_path, &output.join("data.db"))?;
 
     let mut copied = 0u64;
     // 配置与密钥按“实际生效的路径”复制：它们可能被显式放在根目录之外。
@@ -164,6 +101,81 @@ fn run_with_paths(
         output.display()
     );
     Ok(output)
+}
+
+/// 检查并建好输出目录，返回它的规范化绝对路径。
+///
+/// `sources` 是会被整个复制的目录（配置键名、路径）：输出目录不能落在它们里面。
+fn prepare_output(output: PathBuf, sources: &[(&str, &PathBuf)]) -> Result<PathBuf> {
+    // 写到词法规范化后的绝对路径：下面按它判断真实位置，两者必须是同一个地方（`a/../b`
+    // 交给操作系统的话，Unix 上还会顺手把 `a` 建出来）。
+    let output = crate::paths::normalize(&std::path::absolute(&output).unwrap_or(output));
+    // 归档目录不能落在被复制的目录里，否则复制会递归包含正在写入的归档。比的是真实位置：
+    // 同一个目录可以有别的写法（相对路径、符号链接、Windows 上的大小写）。
+    let real_output = real_location(&output);
+    for (name, source) in sources {
+        if real_output.starts_with(real_location(source)) {
+            bail!(
+                "refusing to write the backup inside {name} ({}); choose another --output",
+                source.display()
+            );
+        }
+    }
+    // 只写进空目录。已有内容的目录要么是上一次的备份（混在一起就不是一致的快照），要么是
+    // 实例目录本身——那时密钥、配置的“备份位置”就是它们自己，而把文件复制到自身会把它清空。
+    if std::fs::read_dir(&output).is_ok_and(|mut entries| entries.next().is_some()) {
+        bail!(
+            "refusing to write the backup into {}: the directory is not empty; choose an empty \
+             or new --output",
+            output.display()
+        );
+    }
+    std::fs::create_dir_all(&output)
+        .with_context(|| format!("cannot create {}", output.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(output)
+}
+
+/// SQLite 一致性快照：把 `db_path` 复制成 `destination`，守护进程运行中也可以做。
+///
+/// 用底层 `Backup` 句柄而不是 `Connection::backup(path)`：守护进程运行时源库仍可能被
+/// 写入，`Busy` / `Locked` 应当重试而不是直接失败。
+fn snapshot_database(db_path: &Path, destination: &Path) -> Result<()> {
+    let source = Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("cannot open {}", db_path.display()))?;
+    source
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .context("cannot configure the source busy timeout")?;
+    let mut destination = Connection::open(destination)?;
+    {
+        let backup = rusqlite::backup::Backup::new(&source, &mut destination)
+            .context("cannot start the SQLite backup")?;
+        let mut attempts = 0u32;
+        loop {
+            match backup.step(100)? {
+                StepResult::Done => break,
+                // 还有页未复制，继续。
+                StepResult::More => continue,
+                // 源库正在写：等待后重试，最多 10 秒。
+                StepResult::Busy | StepResult::Locked => {
+                    attempts += 1;
+                    if attempts > 100 {
+                        bail!("SQLite backup stayed busy for 10 seconds");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                // `StepResult` 是 non_exhaustive；未知结果按失败处理，
+                // 避免在不认识的返回码上死循环。
+                other => bail!("unexpected SQLite backup step result: {other:?}"),
+            }
+        }
+    }
+    destination.close().map_err(|(_, error)| error)?;
+    Ok(())
 }
 
 /// 一个（可能还不存在的）路径在磁盘上的真实位置：最近的已存在祖先解析掉符号链接，后面
