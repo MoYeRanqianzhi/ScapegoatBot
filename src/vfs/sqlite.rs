@@ -618,19 +618,8 @@ fn hash_bytes(bytes: &[u8]) -> String {
 }
 
 impl VfsStore {
-    /// 写入二进制节点的公共实现：整块写入与分段提交共用。
-    ///
-    /// `chunks` 依次给出 1 MiB 的明文分块（最后一块可以更短），总长必须是 `len`、
-    /// 整体 SHA-256 必须是 `hash`。失败时节点保持写之前的样子：数据库的改动随事务回滚，
-    /// 磁盘上的旧分块原样留着（见 `swap.rs`）。
-    fn write_binary_chunks(
-        &self,
-        path: &VfsPath,
-        kind: NodeKind,
-        len: u64,
-        hash: &str,
-        chunks: &mut dyn Iterator<Item = Result<Cow<'_, [u8]>, VfsError>>,
-    ) -> Result<NodeMeta, VfsError> {
+    /// 写二进制节点之前、不需要查数据库的检查：节点类型、只读视图、回收站与配额。
+    fn check_blob_target(&self, path: &VfsPath, kind: NodeKind, len: u64) -> Result<(), VfsError> {
         if kind == NodeKind::Dir {
             return Err(VfsError::IsADirectory(path.to_string()));
         }
@@ -647,7 +636,56 @@ impl VfsStore {
         }
         self.reject_trash_target(path)?;
         self.quota.check_blob(len)?;
-        self.quota.check_disk(&self.storage)?;
+        self.quota.check_disk(&self.storage)
+    }
+
+    /// 把分块加密后写进暂存目录、换掉节点的分块索引行，写完后把暂存目录换到正式位置。
+    ///
+    /// 出错时调用方负责 `swap.rollback()` 并让事务回滚。
+    fn stage_chunks(
+        &self,
+        conn: &rusqlite::Connection,
+        swap: &mut BlobSwap,
+        id: i64,
+        chunks: &mut dyn Iterator<Item = Result<Cow<'_, [u8]>, VfsError>>,
+    ) -> Result<(), VfsError> {
+        conn.execute("DELETE FROM vfs_chunks WHERE node_id = ?1", params![id])?;
+        let mut offset = 0u64;
+        for (index, chunk) in chunks.enumerate() {
+            let chunk = chunk?;
+            let sealed = self.seal_blob(id, index, &chunk)?;
+            std::fs::write(swap.staging().join(index.to_string()), sealed)?;
+            conn.execute(
+                "INSERT INTO vfs_chunks (node_id, idx, offset, length, hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    id,
+                    index as i64,
+                    offset as i64,
+                    chunk.len() as i64,
+                    hash_bytes(&chunk)
+                ],
+            )?;
+            offset += chunk.len() as u64;
+        }
+        swap.install()?;
+        Ok(())
+    }
+
+    /// 写入二进制节点的公共实现：整块写入与分段提交共用。
+    ///
+    /// `chunks` 依次给出 1 MiB 的明文分块（最后一块可以更短），总长必须是 `len`、
+    /// 整体 SHA-256 必须是 `hash`。失败时节点保持写之前的样子：数据库的改动随事务回滚，
+    /// 磁盘上的旧分块原样留着（见 `swap.rs`）。
+    fn write_binary_chunks(
+        &self,
+        path: &VfsPath,
+        kind: NodeKind,
+        len: u64,
+        hash: &str,
+        chunks: &mut dyn Iterator<Item = Result<Cow<'_, [u8]>, VfsError>>,
+    ) -> Result<NodeMeta, VfsError> {
+        self.check_blob_target(path, kind, len)?;
 
         let mut conn = self.db.lock();
         let tx = conn.transaction()?;
@@ -687,26 +725,7 @@ impl VfsStore {
         let old_version = existing.as_ref().map(|row| row.version);
         let mut swap = BlobSwap::begin(&self.storage.join("blobs"), id, old_version)?;
         let written = (|| -> Result<(), VfsError> {
-            tx.execute("DELETE FROM vfs_chunks WHERE node_id = ?1", params![id])?;
-            let mut offset = 0u64;
-            for (index, chunk) in chunks.enumerate() {
-                let chunk = chunk?;
-                let sealed = self.seal_blob(id, index, &chunk)?;
-                std::fs::write(swap.staging().join(index.to_string()), sealed)?;
-                tx.execute(
-                    "INSERT INTO vfs_chunks (node_id, idx, offset, length, hash)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        id,
-                        index as i64,
-                        offset as i64,
-                        chunk.len() as i64,
-                        hash_bytes(&chunk)
-                    ],
-                )?;
-                offset += chunk.len() as u64;
-            }
-            swap.install()?;
+            self.stage_chunks(&tx, &mut swap, id, chunks)?;
             // `content_enc` 清空：被覆盖的是文本节点时，那里还留着旧文本的密文。
             tx.execute(
                 "UPDATE vfs_nodes

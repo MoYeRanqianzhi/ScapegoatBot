@@ -278,7 +278,7 @@ impl super::VfsStore {
         Ok(())
     }
 
-    /// 递归复制节点。
+    /// 递归复制节点，返回新节点的 id。`path` 是新节点的路径。
     fn copy_node(
         &self,
         conn: &Connection,
@@ -287,106 +287,132 @@ impl super::VfsStore {
         name: &str,
         path: &VfsPath,
     ) -> Result<i64, VfsError> {
-        let now_value = now();
         match source.kind {
-            NodeKind::Dir => {
-                conn.execute(
-                    "INSERT INTO vfs_nodes
-                        (parent_id, name, kind, size, mode, version, created_at, updated_at)
-                     VALUES (?1, ?2, 'dir', 0, 493, 1, ?3, ?3)",
-                    params![parent_id, name, now_value],
-                )?;
-                let new_id = conn.last_insert_rowid();
-
-                let children = {
-                    let mut statement = conn.prepare(
-                        "SELECT id, parent_id, name, kind, content_enc, size, mime, version, created_at,
-                                updated_at, hash, trashed_at, trash_origin
-                         FROM vfs_nodes WHERE parent_id = ?1 ORDER BY name ASC",
-                    )?;
-                    statement
-                        .query_map(params![source.id], NodeRow::from_row)?
-                        .collect::<Result<Vec<_>, _>>()?
-                };
-                for child in children {
-                    let child_path = path.join(&child.name)?;
-                    self.copy_node(conn, &child, new_id, &child.name, &child_path)?;
-                }
-                Ok(new_id)
-            }
-            NodeKind::Text => {
-                let text = self.open_text(source)?;
-                // 新节点 id 要等插入后才知道，先插入占位再回填密文。
-                conn.execute(
-                    "INSERT INTO vfs_nodes
-                        (parent_id, name, kind, content_enc, size, mime, mode, version,
-                         created_at, updated_at, hash)
-                     VALUES (?1, ?2, 'text', NULL, ?3, ?4, 420, 1, ?5, ?5, ?6)",
-                    params![
-                        parent_id,
-                        name,
-                        source.size,
-                        source.mime,
-                        now_value,
-                        source.hash
-                    ],
-                )?;
-                let new_id = conn.last_insert_rowid();
-                let sealed = self.seal_text(new_id, 1, &text)?;
-                conn.execute(
-                    "UPDATE vfs_nodes SET content_enc = ?1 WHERE id = ?2",
-                    params![sealed, new_id],
-                )?;
-                Ok(new_id)
-            }
-            _ => {
-                // 二进制：逐块解密、按新 id 重新加密；内存里同时只有一个分块。
-                // 分块的偏移、长度与 hash 不变，直接沿用源节点的索引行。
-                let chunks: Vec<(i64, i64, i64, String)> = {
-                    let mut statement = conn.prepare(
-                        "SELECT idx, offset, length, hash FROM vfs_chunks
-                         WHERE node_id = ?1 ORDER BY idx ASC",
-                    )?;
-                    statement
-                        .query_map(params![source.id], |row| {
-                            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                        })?
-                        .collect::<Result<Vec<_>, _>>()?
-                };
-
-                conn.execute(
-                    "INSERT INTO vfs_nodes
-                        (parent_id, name, kind, size, mime, mode, version, created_at, updated_at, hash)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 420, 1, ?6, ?6, ?7)",
-                    params![
-                        parent_id,
-                        name,
-                        source.kind.as_str(),
-                        source.size,
-                        source.mime,
-                        now_value,
-                        source.hash
-                    ],
-                )?;
-                let new_id = conn.last_insert_rowid();
-
-                let target = self.storage.join("blobs").join(new_id.to_string());
-                std::fs::create_dir_all(&target)?;
-                for (idx, offset, length, hash) in chunks {
-                    let index = idx as usize;
-                    let sealed = std::fs::read(self.blob_path(source.id, index))?;
-                    let plain = self.open_blob(source.id, index, &sealed)?;
-                    let resealed = self.seal_blob(new_id, index, &plain)?;
-                    std::fs::write(target.join(index.to_string()), resealed)?;
-                    conn.execute(
-                        "INSERT INTO vfs_chunks (node_id, idx, offset, length, hash)
-                         VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![new_id, idx, offset, length, hash],
-                    )?;
-                }
-                Ok(new_id)
-            }
+            NodeKind::Dir => self.copy_dir_node(conn, source, parent_id, name, path),
+            NodeKind::Text => self.copy_text_node(conn, source, parent_id, name),
+            _ => self.copy_blob_node(conn, source, parent_id, name),
         }
+    }
+
+    /// 复制目录：建一个空目录，再逐个复制子节点。
+    fn copy_dir_node(
+        &self,
+        conn: &Connection,
+        source: &NodeRow,
+        parent_id: i64,
+        name: &str,
+        path: &VfsPath,
+    ) -> Result<i64, VfsError> {
+        conn.execute(
+            "INSERT INTO vfs_nodes
+                (parent_id, name, kind, size, mode, version, created_at, updated_at)
+             VALUES (?1, ?2, 'dir', 0, 493, 1, ?3, ?3)",
+            params![parent_id, name, now()],
+        )?;
+        let new_id = conn.last_insert_rowid();
+
+        let children = {
+            let mut statement = conn.prepare(
+                "SELECT id, parent_id, name, kind, content_enc, size, mime, version, created_at,
+                        updated_at, hash, trashed_at, trash_origin
+                 FROM vfs_nodes WHERE parent_id = ?1 ORDER BY name ASC",
+            )?;
+            statement
+                .query_map(params![source.id], NodeRow::from_row)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for child in children {
+            let child_path = path.join(&child.name)?;
+            self.copy_node(conn, &child, new_id, &child.name, &child_path)?;
+        }
+        Ok(new_id)
+    }
+
+    /// 复制文本节点：密文与节点 id 绑定，所以解密后按新 id 重新加密。
+    fn copy_text_node(
+        &self,
+        conn: &Connection,
+        source: &NodeRow,
+        parent_id: i64,
+        name: &str,
+    ) -> Result<i64, VfsError> {
+        let text = self.open_text(source)?;
+        // 新节点 id 要等插入后才知道，先插入占位再回填密文。
+        conn.execute(
+            "INSERT INTO vfs_nodes
+                (parent_id, name, kind, content_enc, size, mime, mode, version,
+                 created_at, updated_at, hash)
+             VALUES (?1, ?2, 'text', NULL, ?3, ?4, 420, 1, ?5, ?5, ?6)",
+            params![
+                parent_id,
+                name,
+                source.size,
+                source.mime,
+                now(),
+                source.hash
+            ],
+        )?;
+        let new_id = conn.last_insert_rowid();
+        let sealed = self.seal_text(new_id, 1, &text)?;
+        conn.execute(
+            "UPDATE vfs_nodes SET content_enc = ?1 WHERE id = ?2",
+            params![sealed, new_id],
+        )?;
+        Ok(new_id)
+    }
+
+    /// 复制二进制节点：逐块解密、按新 id 重新加密；内存里同时只有一个分块。
+    fn copy_blob_node(
+        &self,
+        conn: &Connection,
+        source: &NodeRow,
+        parent_id: i64,
+        name: &str,
+    ) -> Result<i64, VfsError> {
+        // 分块的偏移、长度与 hash 不变，直接沿用源节点的索引行。
+        let chunks: Vec<(i64, i64, i64, String)> = {
+            let mut statement = conn.prepare(
+                "SELECT idx, offset, length, hash FROM vfs_chunks
+                 WHERE node_id = ?1 ORDER BY idx ASC",
+            )?;
+            statement
+                .query_map(params![source.id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        conn.execute(
+            "INSERT INTO vfs_nodes
+                (parent_id, name, kind, size, mime, mode, version, created_at, updated_at, hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, 420, 1, ?6, ?6, ?7)",
+            params![
+                parent_id,
+                name,
+                source.kind.as_str(),
+                source.size,
+                source.mime,
+                now(),
+                source.hash
+            ],
+        )?;
+        let new_id = conn.last_insert_rowid();
+
+        let target = self.storage.join("blobs").join(new_id.to_string());
+        std::fs::create_dir_all(&target)?;
+        for (idx, offset, length, hash) in chunks {
+            let index = idx as usize;
+            let sealed = std::fs::read(self.blob_path(source.id, index))?;
+            let plain = self.open_blob(source.id, index, &sealed)?;
+            let resealed = self.seal_blob(new_id, index, &plain)?;
+            std::fs::write(target.join(index.to_string()), resealed)?;
+            conn.execute(
+                "INSERT INTO vfs_chunks (node_id, idx, offset, length, hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![new_id, idx, offset, length, hash],
+            )?;
+        }
+        Ok(new_id)
     }
 
     /// 清理回收站（运行时定期调用，见 `app::maintenance`）。返回清除的节点数。
