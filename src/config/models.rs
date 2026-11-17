@@ -34,6 +34,7 @@ pub struct ProviderDef {
     /// 等待响应头的秒数（连接阶段另限 30 秒内）；流式响应体不受它限制，
     /// 而是按“30 秒没有新数据”判定中断。
     pub timeout_secs: u64,
+    /// 保留字段：解析但不使用。重试次数由 `[agent].retry_attempts` 决定。
     pub max_retries: u32,
     pub models: Vec<ModelDef>,
 }
@@ -84,9 +85,9 @@ pub struct ModelDef {
     pub capabilities: Vec<String>,
     /// 每百万 token 价格（美元）；缺省按 0 计。
     pub cost: CostDef,
-    /// 供应商特有的采样参数，原样透传。
+    /// 供应商特有的采样参数。保留字段：解析但不使用，没有透传给 API。
     pub sampling: serde_json::Value,
-    /// 兼容性开关，原样透传。
+    /// 兼容性开关。保留字段：解析但不使用。
     pub compat: serde_json::Value,
 }
 

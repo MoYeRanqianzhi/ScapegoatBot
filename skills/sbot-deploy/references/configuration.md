@@ -29,6 +29,9 @@ SBOT__AGENT__MAX_STEPS=32
 `[1, 2]`）。类型不对或键不存在时启动报错。覆盖只在内存里，不写回文件；agent 经 `/config`
 改配置之后它仍然生效。
 
+环境变量够不到表数组里的项（`[[monitor]]`、`[[mcp.servers]]`、`[[hooks.events]]`）：键名里没有
+写“第几项”的办法。普通的嵌套表可以（`SBOT__SECURITY__GUARD__MODE`）。
+
 `models_file` / `auth_file` 可以在 `sbot.toml` 里改成绝对路径或相对配置文件目录的路径。
 
 ## 什么时候生效
@@ -483,6 +486,8 @@ key 放 `auth.json`：
   工具循环的每一步都命中上一步写下的前缀；摘要、审查这类一次性请求不打历史断点。
   OpenAI 兼容接口由服务端自动缓存。
 - `base_url` 对新 provider 是必填的，留空启动失败：程序里没有任何默认地址。
+- 有三个字段写了不报错、但目前不起作用：provider 的 `max_retries`（重试次数看 `sbot.toml` 的
+  `[agent].retry_attempts`），模型的 `sampling` 与 `compat`（没有透传给 API）。
 
 **合并规则，覆盖内置 provider 时要小心：**
 

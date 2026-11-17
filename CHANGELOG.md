@@ -7,6 +7,21 @@
 
 ## [Unreleased]
 
+### 破坏性变更
+
+- 自定义子代理定义的 `tools` 里写了不认识的名字，`spawn` 现在报错并列出能写的名字。以前
+  不认识的名字被悄悄跳过，子代理照常启动、少一个工具（把 `Grep` 写成 `grep`，或写了别的
+  客户端才有的 `Bash`），然后以很难看懂的方式做不成事。已有的定义里有这种名字的，改对或删掉。
+
+### 新增
+
+- `api.list` 的每一项多了 `requires_owner_intent` 与 `destructive`，`api.help` 多了
+  `destructive` 与 `target_field`：agent 挑动作时就能看出哪些要主人的意图、哪些是破坏性的
+  （目标是主人或通知账号时恒拒绝），不必撞上拒绝才知道。
+- MCP 服务器的 stderr 不再丢弃：每行一条 `debug` 日志（`MCP stderr: …`），服务器启动失败时把
+  最后 20 行按 `warn` 写出。以前启动失败只能看到 sbot 这一侧的原因（“closed its stdout”），
+  服务器自己说了什么要到终端里手工重跑才知道。stderr 只进日志，不进 agent 的上下文。
+
 ### 修复
 
 - 消息目录（`data/messages/`）里出现不是 `.jsonl` 的文件时，不再每次启动都重建消息索引。
