@@ -121,6 +121,37 @@ fn config_example_values_match_code_defaults() {
     );
 }
 
+/// `SBOT__*` 覆盖取自进程环境：给子进程设一个类型不对的值，`sbot doctor` 加载配置失败并指出
+/// 是哪一项；换成合法的值就能加载。
+///
+/// 放在子进程里做，是因为改本进程的环境会被同时在跑的其它测试读到。
+#[test]
+fn the_binary_takes_overrides_from_its_environment() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("sbot.toml"), "version = 1\n").unwrap();
+    let doctor = |max_steps: &str| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sbot"))
+            .arg("doctor")
+            .env("SBOT_HOME", home.path())
+            .env("SBOT__AGENT__MAX_STEPS", max_steps)
+            .output()
+            .expect("sbot doctor runs");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+
+    let rejected = doctor("many");
+    assert!(rejected.contains("ERROR config"), "{rejected}");
+    assert!(rejected.contains("agent.max_steps"), "{rejected}");
+
+    let accepted = doctor("7");
+    assert!(!accepted.contains("ERROR config"), "{accepted}");
+    assert!(accepted.contains("config:"), "{accepted}");
+}
+
 /// 逐键比较示例与默认值，把不同的叶子按 `a.b.c: example=… default=…` 记下来。
 fn collect_differences(
     path: &str,

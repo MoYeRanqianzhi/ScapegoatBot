@@ -676,6 +676,7 @@ mod tests {
             config,
             path,
             dir: dir.path().to_path_buf(),
+            overrides: Vec::new(),
         }));
         let models = ModelsFile::embedded().unwrap();
         let views = Views::new(vfs, messages, sessions, None).with_context(ViewContext {
@@ -1249,11 +1250,14 @@ mod tests {
     async fn config_writes_keep_environment_overrides() {
         let (views, _dir) = views();
         let handle = Arc::clone(views.context.config.as_ref().unwrap());
-        // 用别的测试不检查的键，避免与并行的测试互相影响。
-        unsafe { std::env::set_var("SBOT__NAPCAT__URL", "ws://from-env:3999") };
-        let written = views.write_config(&target("/config/agent/thinking_level"), "\"low\"");
-        unsafe { std::env::remove_var("SBOT__NAPCAT__URL") };
-        written.unwrap();
+        // 启动时取到的覆盖存在句柄里；测试直接放进去，不去改进程环境（那会影响并行的测试）。
+        handle.write().unwrap().overrides = vec![(
+            "SBOT__NAPCAT__URL".to_owned(),
+            "ws://from-env:3999".to_owned(),
+        )];
+        views
+            .write_config(&target("/config/agent/thinking_level"), "\"low\"")
+            .unwrap();
         let loaded = handle.read().unwrap();
         assert_eq!(loaded.config.agent.thinking_level, "low");
         assert_eq!(loaded.config.napcat.url, "ws://from-env:3999");

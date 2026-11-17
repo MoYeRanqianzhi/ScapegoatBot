@@ -212,6 +212,11 @@ pub struct LoadedConfig {
     pub path: PathBuf,
     /// 配置文件所在目录；相对路径以此为基准。
     pub dir: PathBuf,
+    /// 加载时进程环境里的 `SBOT__*` 变量（见 [`env_overrides`]）。
+    ///
+    /// `/config` 写入重新解析文件时套用的是这一份，而不是再读一次进程环境：两处得到的是同一份
+    /// 配置，解析也不依赖进程级的可变状态。
+    pub overrides: Vec<(String, String)>,
 }
 
 impl SbotConfig {
@@ -225,7 +230,8 @@ impl SbotConfig {
             source,
         })?;
 
-        let config = Self::parse(&text).map_err(|message| ConfigLoadError::Parse {
+        let overrides = env_overrides();
+        let config = Self::parse(&text, &overrides).map_err(|message| ConfigLoadError::Parse {
             path: path.clone(),
             message,
         })?;
@@ -238,16 +244,24 @@ impl SbotConfig {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
 
-        Ok(LoadedConfig { config, path, dir })
+        Ok(LoadedConfig {
+            config,
+            path,
+            dir,
+            overrides,
+        })
     }
 
     /// 从配置文件的文本得到配置：解析、套上环境变量覆盖、反序列化。不做校验。
     ///
     /// 启动加载与 `/config` 写入共用这一步，两处得到的是同一份配置。各做各的话，agent 改
     /// 一次配置，环境变量设的值就悄悄退回文件里的值，重启之后又变回来。
-    pub fn parse(text: &str) -> Result<Self, String> {
+    ///
+    /// `overrides` 是 `SBOT__*` 变量：启动时来自进程环境，之后用 [`LoadedConfig::overrides`] 里
+    /// 存下的那一份。
+    pub fn parse(text: &str, overrides: &[(String, String)]) -> Result<Self, String> {
         let mut table: toml::Table = toml::from_str(text).map_err(|error| error.to_string())?;
-        apply_overrides(&mut table, std::env::vars());
+        apply_overrides(&mut table, overrides.iter().cloned());
         toml::Value::Table(table)
             .try_into()
             .map_err(|error: toml::de::Error| error.to_string())
@@ -320,7 +334,21 @@ impl SbotConfig {
     }
 }
 
-/// 把 `SBOT__A__B=value` 形式的变量注入 TOML 表；`vars` 是全部环境变量，别的名字忽略。
+/// 进程环境里的 `SBOT__*` 变量。
+///
+/// 名字不是合法 Unicode 的变量不可能是我们的，跳过；值按有损转换取——`std::env::vars` 遇到
+/// 任何一个非 Unicode 的变量（哪怕与 sbot 无关）都会 panic，这里不用它。
+pub fn env_overrides() -> Vec<(String, String)> {
+    std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            key.starts_with("SBOT__")
+                .then(|| (key, value.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
+/// 把 `SBOT__A__B=value` 形式的变量注入 TOML 表；别的名字忽略。
 ///
 /// 这是可选能力：普通部署直接把值写进 `sbot.toml`。
 fn apply_overrides(table: &mut toml::Table, vars: impl Iterator<Item = (String, String)>) {
@@ -652,14 +680,12 @@ deliver = { to = "main", as = "prompt" }
     }
 
     /// 把一组 `SBOT__…` 变量套到 `version = 1` 上，得到配置。
-    fn with_overrides(vars: &[(&str, &str)]) -> Result<SbotConfig, toml::de::Error> {
-        let mut table: toml::Table = toml::from_str("version = 1").unwrap();
-        apply_overrides(
-            &mut table,
-            vars.iter()
-                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
-        );
-        toml::Value::Table(table).try_into()
+    fn with_overrides(vars: &[(&str, &str)]) -> Result<SbotConfig, String> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        SbotConfig::parse("version = 1", &vars)
     }
 
     /// 环境变量的值都是字符串；每一项要按它在配置里的类型变成对应的 TOML 值。
@@ -713,14 +739,29 @@ deliver = { to = "main", as = "prompt" }
         );
     }
 
-    /// `parse` 与启动加载是同一条路：文件里没写的项取环境变量的值。
+    /// 文件里写了的项也被覆盖；没有覆盖时就是文件里的值。
     #[test]
-    fn parse_applies_the_environment() {
-        // 用不常出现的键，避免与宿主环境冲突；别的测试不读这个键。
-        unsafe { std::env::set_var("SBOT__AGENT__OWNER_NAME", "from-env") };
-        let parsed = SbotConfig::parse("version = 1");
-        unsafe { std::env::remove_var("SBOT__AGENT__OWNER_NAME") };
-        assert_eq!(parsed.unwrap().agent.owner_name, "from-env");
+    fn overrides_win_over_the_file() {
+        let text = "version = 1\n[agent]\nowner_name = \"from-file\"\n";
+        let vars = [("SBOT__AGENT__OWNER_NAME".to_owned(), "from-env".to_owned())];
+        assert_eq!(
+            SbotConfig::parse(text, &vars).unwrap().agent.owner_name,
+            "from-env"
+        );
+        assert_eq!(
+            SbotConfig::parse(text, &[]).unwrap().agent.owner_name,
+            "from-file"
+        );
+    }
+
+    /// 只取 `SBOT__` 开头的变量；`SBOT_HOME` 这样的不算。
+    #[test]
+    fn env_overrides_only_collects_prefixed_names() {
+        assert!(
+            env_overrides()
+                .iter()
+                .all(|(key, _)| key.starts_with("SBOT__"))
+        );
     }
 
     #[test]

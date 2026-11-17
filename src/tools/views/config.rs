@@ -172,7 +172,8 @@ impl Views {
             _ => return Err(VfsError::NotFound(target.path.to_string())),
         };
         // 校验不过就不落盘；落盘不成就不换内存里的配置。
-        let config = validate_config_text(&new_text, self.context.models.as_ref())?;
+        let config =
+            validate_config_text(&new_text, &loaded.overrides, self.context.models.as_ref())?;
         crate::config::replace_file(&path, &new_text)
             .map_err(|error| VfsError::Storage(error.to_string()))?;
         loaded.config = config.clone();
@@ -326,10 +327,14 @@ fn check_protected_keys(old: &toml::Value, new: &toml::Value) -> Result<(), VfsE
 
 /// 解析并校验候选配置；失败时不写盘。
 ///
-/// 与启动加载走同一个 [`SbotConfig::parse`]（含环境变量覆盖）：换进内存的配置就是下次启动
-/// 会得到的那一份。
-fn validate_config_text(text: &str, models: Option<&ModelsFile>) -> Result<SbotConfig, VfsError> {
-    let config = SbotConfig::parse(text)
+/// 与启动加载走同一个 [`SbotConfig::parse`]，套用启动时取到的环境变量覆盖：换进内存的配置
+/// 就是下次启动会得到的那一份。
+fn validate_config_text(
+    text: &str,
+    overrides: &[(String, String)],
+    models: Option<&ModelsFile>,
+) -> Result<SbotConfig, VfsError> {
+    let config = SbotConfig::parse(text, overrides)
         .map_err(|error| VfsError::Storage(format!("invalid sbot.toml: {error}")))?;
     config
         .validate_shape()
