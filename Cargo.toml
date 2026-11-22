@@ -36,7 +36,7 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # TOML 解析：sbot.toml。写入用 toml_edit 以保留用户注释。
-toml = "0.8"
+toml = "1.2"
 toml_edit = "0.22"
 # 错误处理。
 anyhow = "1"
