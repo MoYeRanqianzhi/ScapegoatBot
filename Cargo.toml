@@ -29,7 +29,7 @@ futures-util = "0.3"
 # monitor 的 stream 源（外部 WebSocket）；与 napcat-link 用同一版本与 TLS 后端。
 # TLS 用 rustls + 内置的 Mozilla 根证书（webpki-roots），与 reqwest 一致：二进制不依赖系统的
 # OpenSSL（native-tls 在 Linux 上动态链接 libssl.so.3，发行版之间不通用），也不读系统证书库。
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 # 异步 trait：IPC Handler 需要 `Arc<dyn Handler>`。
 async-trait = "0.1"
 # 序列化 / 反序列化：IPC 帧、auth.json、models.json、审计记录。
