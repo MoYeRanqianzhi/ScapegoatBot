@@ -60,7 +60,7 @@ getrandom = "0.4"
 # 单实例文件锁。
 fs2 = "0.4"
 # 定位用户主目录（~/.sbot）。
-dirs = "6"
+dirs = "7"
 # 过滤器正则（sbot.toml 的 [filter].ignore_patterns）。
 regex = "1"
 # 图片：解码 / 缩放 / 重新编码（入站图片、local.media.image.*）。
