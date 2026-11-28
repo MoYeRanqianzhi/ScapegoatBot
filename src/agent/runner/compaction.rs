@@ -1,6 +1,9 @@
-use super::*;
+use std::sync::atomic::Ordering;
 
-struct PreparedCompaction {
+use super::*;
+use crate::session::compaction::estimate_messages;
+
+pub(super) struct PreparedCompaction {
     snapshot: Vec<AgentMessage>,
     cut: usize,
     session_file: String,
@@ -9,25 +12,34 @@ struct PreparedCompaction {
 }
 
 impl Runner {
-    /// 自动压缩：超过工作集上限时压缩，并把 `working` 换成压缩后的历史。
+    /// 回合边界先采用已准备好的摘要；只有超过硬阈值才等待后台或同步摘要。
     ///
-    /// 两种回合（普通消息与控制/monitor 注入）共用，避免只在一边做压缩。
+    /// 全程在回合锁内，避免对完整历史复核之后又追加消息才安装。
     pub(super) async fn maybe_auto_compact(
         &self,
         working: &mut Vec<AgentMessage>,
         history: &Arc<Mutex<Vec<AgentMessage>>>,
         sessions: &Arc<SessionStore>,
     ) {
-        let estimated = crate::session::compaction::estimate_messages(working);
-        if estimated <= self.compaction_budget() {
+        if let Ok(_guard) = self.compaction_lock.try_lock() {
+            self.adopt_precompaction(working, history, sessions).await;
+        }
+        if self.discard_context.load(Ordering::SeqCst)
+            || estimate_messages(working) <= self.compaction_budget()
+        {
             return;
         }
-        let failures = self
-            .compaction_failures
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if self.config.compaction_max_failures > 0
-            && failures >= self.config.compaction_max_failures
+        // 后台已经做了一部分工作；等它交出结果比重复发一次摘要请求更快。
+        drop(self.compaction_lock.lock().await);
+        if let Ok(_guard) = self.compaction_lock.try_lock() {
+            self.adopt_precompaction(working, history, sessions).await;
+        }
+        if self.discard_context.load(Ordering::SeqCst)
+            || estimate_messages(working) <= self.compaction_budget()
         {
+            return;
+        }
+        if let Some(failures) = self.compaction_failure_limit() {
             warn!(
                 failures,
                 "automatic compaction is disabled after repeated failures"
@@ -42,11 +54,118 @@ impl Runner {
                 *working = history.lock().await.clone();
             }
             Err(error) => {
-                self.compaction_failures
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.compaction_failures.fetch_add(1, Ordering::Relaxed);
                 warn!(%error, "automatic compaction failed");
             }
         }
+    }
+
+    /// 采用前复核的是此刻的完整历史，不只是已经交给摘要器的快照。
+    async fn adopt_precompaction(
+        &self,
+        working: &mut Vec<AgentMessage>,
+        history: &Mutex<Vec<AgentMessage>>,
+        sessions: &SessionStore,
+    ) {
+        let Some(prepared) = self.prepared.lock().unwrap().take() else {
+            return;
+        };
+        if self.config.check_on_compaction {
+            let snapshot = history.lock().await.clone();
+            self.run_security_review(&snapshot).await;
+            if self.discard_context.load(Ordering::SeqCst) {
+                // 留给下一回合开头清空，不能再安装或尝试同步压缩。
+                warn!(
+                    "dropped a background compaction: a critical security review will discard the context"
+                );
+                return;
+            }
+        }
+        match self.install_compaction(prepared, history, sessions).await {
+            Ok(Some((_, appended))) => {
+                *working = history.lock().await.clone();
+                info!(
+                    appended,
+                    "installed the compaction prepared in the background"
+                );
+            }
+            Ok(None) => {
+                debug!("discarded a background compaction: the history changed after its snapshot");
+            }
+            Err(error) => {
+                self.compaction_failures.fetch_add(1, Ordering::Relaxed);
+                warn!(%error, "installing a background compaction failed");
+            }
+        }
+    }
+
+    /// 已提交的历史在回合锁内取样；后台为快照准备摘要，只持压缩锁，不占回合锁。
+    pub(super) async fn maybe_start_precompaction(&self) {
+        let percent = self.config.precompact_percent;
+        if percent == 0
+            || self.model_pause_reason().is_some()
+            || self.discard_context.load(Ordering::SeqCst)
+            || self.compaction_failure_limit().is_some()
+            || self.prepared.lock().unwrap().is_some()
+        {
+            return;
+        }
+        let threshold = ((self.compaction_budget() as u64 * u64::from(percent) / 100) as usize)
+            .max(self.config.keep_recent_tokens as usize + 1);
+        let estimated = {
+            let history = self.history.lock().await;
+            estimate_messages(&history)
+        };
+        if estimated <= threshold {
+            return;
+        }
+        // 后台摘要不是独立回合，查每日用量但不占用每个 chat 的回合限额。
+        if let Some(budget) = &self.config.budget
+            && budget.check_daily().await.is_some()
+        {
+            return;
+        }
+        let Ok(guard) = Arc::clone(&self.compaction_lock).try_lock_owned() else {
+            return;
+        };
+        // 前一个任务可能在预算查询期间完成；不能覆盖刚发布的结果或越过失败上限。
+        if self.compaction_failure_limit().is_some() || self.prepared.lock().unwrap().is_some() {
+            return;
+        }
+        let Some(this) = self.this.upgrade() else {
+            return;
+        };
+        let snapshot = self.history.lock().await.clone();
+        let session_file = self.deps.sessions.current().map(|current| current.file);
+        debug!(
+            estimated,
+            threshold, "preparing a compaction in the background"
+        );
+        tokio::spawn(async move {
+            // 先公布结果或记下失败，再释放锁；硬阈值等待者醒来就能看到最终状态。
+            let _guard = guard;
+            match this
+                .prepare_compaction("idle", snapshot, session_file)
+                .await
+            {
+                Ok(Some(prepared)) => {
+                    *this.prepared.lock().unwrap() = Some(prepared);
+                    info!("prepared a compaction summary in the background");
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    this.compaction_failures.fetch_add(1, Ordering::Relaxed);
+                    warn!(%error, "background compaction failed");
+                }
+            }
+        });
+    }
+
+    /// 后台和同步压缩共用失败上限；摘要反复失败时，换到前台重试也不会更可靠。
+    fn compaction_failure_limit(&self) -> Option<u32> {
+        let failures = self.compaction_failures.load(Ordering::Relaxed);
+        (self.config.compaction_max_failures > 0 && failures >= self.config.compaction_max_failures)
+            .then_some(failures)
     }
 
     /// 清空上下文：轮转唯一 transcript，并清空内存历史。
@@ -62,9 +181,9 @@ impl Runner {
         let current = self.deps.sessions.current()?;
         let next = self.deps.sessions.rotate()?;
         self.history.lock().await.clear();
+        self.prepared.lock().unwrap().take();
         // 上下文空了，之前压缩失败的原因不再成立：自动压缩重新开始尝试。
-        self.compaction_failures
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.compaction_failures.store(0, Ordering::Relaxed);
         Ok(serde_json::json!({
             "cleared": true,
             "previous_session": current.file,
@@ -148,14 +267,12 @@ impl Runner {
         sessions: Arc<SessionStore>,
     ) -> Result<serde_json::Value> {
         let _guard = self.compaction_lock.lock().await;
+        self.prepared.lock().unwrap().take();
         let snapshot = history.lock().await.clone();
         let session_file = sessions.current().map(|current| current.file);
         if self.config.check_on_compaction {
             self.run_security_review(&snapshot).await;
-            if self
-                .discard_context
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
+            if self.discard_context.load(Ordering::SeqCst) {
                 return Ok(serde_json::json!({
                     "compacted": false,
                     "reason": "the context will be discarded after a critical security review",
@@ -267,8 +384,7 @@ impl Runner {
         drop(current);
         // 任何一次成功的压缩都把连续失败数清零，包括 agent 自己调用的 `agent.compact`：
         // 自动压缩停掉之后，agent 手动压缩成功一次就恢复，不必等人来重启进程。
-        self.compaction_failures
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.compaction_failures.store(0, Ordering::Relaxed);
         // PostCompact：hooks 可能依赖刚写入的记忆/技能，重新读盘并重建。
         self.rebuild_system();
         let _ = self

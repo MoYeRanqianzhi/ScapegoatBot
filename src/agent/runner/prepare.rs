@@ -10,19 +10,26 @@ impl Runner {
     ///
     /// 两者都只挡新回合；消息已经入库，恢复之后的回合看得到。
     pub(super) fn new_turns_paused(&self, chat: ChatId) -> bool {
+        if let Some(reason) = self.model_pause_reason() {
+            debug!(chat = %chat, "{reason}");
+            return true;
+        }
+        false
+    }
+
+    /// 判断能否开始新的模型工作，不为跳过的后台工作记录回合日志。
+    pub(super) fn model_pause_reason(&self) -> Option<&'static str> {
         if !self
             .deps
             .ai_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            debug!(chat = %chat, "ai is stopped; skipping this turn");
-            return true;
+            Some("ai is stopped; skipping this turn")
+        } else if self.deps.estop_file.exists() {
+            Some("ESTOP is active; skipping this turn")
+        } else {
+            None
         }
-        if self.deps.estop_file.exists() {
-            debug!(chat = %chat, "ESTOP is active; skipping this turn");
-            return true;
-        }
-        false
     }
 
     /// 把触发回合的这批消息写进 transcript，并推进这个会话的游标。

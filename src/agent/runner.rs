@@ -76,6 +76,8 @@ pub struct RunnerConfig {
     pub turn_context_budget: u32,
     /// 压缩后保留的最近 token 数。
     pub keep_recent_tokens: u32,
+    /// 硬阈值的百分比；超过软阈值可在回合结束后准备摘要，0 不启动后台准备。
+    pub precompact_percent: u32,
     /// 连续自动压缩失败多少次后停止尝试（避免每个回合都打一次失败的摘要请求）。
     pub compaction_max_failures: u32,
     /// 周期安全检查器；`None` = 关闭。
@@ -148,6 +150,10 @@ pub struct Runner {
     system: std::sync::RwLock<Vec<SystemBlock>>,
     /// 压缩互斥：同一时刻只允许一次。
     compaction_lock: Arc<Mutex<()>>,
+    /// 弱自引用让后台任务能持有 Runner，但 Runner 不延长自己的生命周期。
+    this: std::sync::Weak<Runner>,
+    /// 摘要已准备好但还未采用；只在取放时持锁，不跨 `await`。
+    prepared: std::sync::Mutex<Option<compaction::PreparedCompaction>>,
     /// 连续自动压缩失败次数；达到上限后不再自动尝试。
     compaction_failures: std::sync::atomic::AtomicU32,
     /// 每 chat 最近允许的回合时间，用于 `chat_turns_per_hour`。
@@ -309,7 +315,7 @@ impl Runner {
             ai_enabled,
             estop_file,
         });
-        let runner = Arc::new(Self {
+        let runner = Arc::new_cyclic(|this| Self {
             slot,
             fallbacks,
             hub: std::sync::OnceLock::new(),
@@ -320,6 +326,8 @@ impl Runner {
             // 下面由 `rebuild_system` 填上：启动与压缩之后是同一套组装。
             system: std::sync::RwLock::new(Vec::new()),
             compaction_lock: Arc::new(Mutex::new(())),
+            this: this.clone(),
+            prepared: std::sync::Mutex::new(None),
             compaction_failures: std::sync::atomic::AtomicU32::new(0),
             turn_times: Mutex::new(HashMap::new()),
             unchecked_tokens: std::sync::atomic::AtomicU64::new(0),
@@ -628,6 +636,7 @@ impl Runner {
             prompt_tokens,
         )
         .await?;
+        self.maybe_start_precompaction().await;
         // 每个回合一行 info：排障文档让用户找的就是这一行。
         info!(
             chat = %chat,
@@ -955,7 +964,7 @@ fn last_assistant_text(history: &[AgentMessage]) -> String {
 mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use async_trait::async_trait;
     use serde_json::json;
@@ -967,6 +976,7 @@ mod tests {
     };
     use crate::providers::{EventReceiver, LlmRequest, Provider, ProviderError, ProviderEvent};
     use crate::qq::event::{Segment, Sender};
+    use crate::security::review::{ReviewOutcome, Risk, SecurityCheck};
     use crate::storage::Database;
     use crate::storage::crypto::MasterKey;
     use crate::tools::api::{AgentOps, ApiTool, NapcatGateway};
@@ -1192,6 +1202,7 @@ mod tests {
                 server_tools: Vec::new(),
                 turn_context_budget: 120_000,
                 keep_recent_tokens: 20_000,
+                precompact_percent: 0,
                 compaction_max_failures: 3,
                 security_review: None,
                 check_every_tokens: 0,
@@ -1358,6 +1369,7 @@ mod tests {
                 server_tools: Vec::new(),
                 turn_context_budget: 120_000,
                 keep_recent_tokens: 20_000,
+                precompact_percent: 0,
                 compaction_max_failures: 3,
                 security_review: None,
                 check_every_tokens: 0,
@@ -1538,8 +1550,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn compact_now_summarizes_and_rotates() {
+    async fn compaction_test_runner(
+        provider: Arc<dyn Provider>,
+        configure: impl FnOnce(&mut RunnerConfig),
+    ) -> (Arc<Runner>, Arc<Database>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(Database::open_in_memory().unwrap());
         let key = Arc::new(MasterKey::from_bytes([8u8; 32]));
@@ -1590,6 +1604,67 @@ mod tests {
             crate::security::gate::hold_path(dir.path()),
         ));
         let tools = Arc::new(crate::tools::ToolRegistry::new(Arc::clone(&vfs), None));
+        let mut config = RunnerConfig {
+            model: "fake".to_owned(),
+            mode: AgentMode::StandIn,
+            account_qq: 10000,
+            owner_qq: 10000,
+            master_qq: 10000,
+            owner_name: String::new(),
+            receive_scopes: vec!["*".to_owned()],
+            send_scopes: vec!["*".to_owned()],
+            gate_mode: GateMode::Auto,
+            max_tokens: 256,
+            supports_images: true,
+            thinking: ThinkingOptions::default(),
+            max_steps: 4,
+            retry: crate::agent::agent_loop::RetryPolicy::default(),
+            chat_history_limit: 10,
+            context_budget: prompt::context::ContextBudget::default(),
+            server_tools: Vec::new(),
+            turn_context_budget: 120_000,
+            keep_recent_tokens: 5,
+            precompact_percent: 0,
+            compaction_max_failures: 3,
+            security_review: None,
+            check_every_tokens: 0,
+            check_overlap_tokens: 0,
+            check_on_compaction: false,
+            context_window: 200_000,
+            reserve_tokens: 16_384,
+            prune: false,
+            prune_soft_limit: 4_000,
+            prune_keep_turns: 3,
+            memory_flush: None,
+            post_compact_recall: false,
+            compaction: None,
+            last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            budget: None,
+            max_state_chars: 32_000,
+            event_hooks: Vec::new(),
+        };
+        configure(&mut config);
+        let runner = Runner::new(
+            provider,
+            tools,
+            gate,
+            vfs,
+            messages,
+            sessions,
+            turn_buffer,
+            None,
+            config,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(AtomicBool::new(true)),
+            dir.path().join("ESTOP"),
+        )
+        .await
+        .unwrap();
+        (runner, db, dir)
+    }
+
+    #[tokio::test]
+    async fn compact_now_summarizes_and_rotates() {
         // 两次摘要请求：第一次压缩在落盘时失败，第二次成功。
         let summary_reply = || {
             vec![
@@ -1603,60 +1678,9 @@ mod tests {
         let provider = Arc::new(FakeProvider {
             script: StdMutex::new(vec![summary_reply(), summary_reply()].into()),
         });
-        let history = Arc::new(Mutex::new(Vec::new()));
-        let runner = Runner::new(
-            provider,
-            tools,
-            gate,
-            vfs,
-            messages,
-            Arc::clone(&sessions),
-            turn_buffer,
-            None,
-            RunnerConfig {
-                model: "fake".to_owned(),
-                mode: AgentMode::StandIn,
-                account_qq: 10000,
-                owner_qq: 10000,
-                master_qq: 10000,
-                owner_name: String::new(),
-                receive_scopes: vec!["*".to_owned()],
-                send_scopes: vec!["*".to_owned()],
-                gate_mode: GateMode::Auto,
-                max_tokens: 256,
-                supports_images: true,
-                thinking: ThinkingOptions::default(),
-                max_steps: 4,
-                retry: crate::agent::agent_loop::RetryPolicy::default(),
-                chat_history_limit: 10,
-                context_budget: prompt::context::ContextBudget::default(),
-                server_tools: Vec::new(),
-                turn_context_budget: 120_000,
-                keep_recent_tokens: 5,
-                compaction_max_failures: 3,
-                security_review: None,
-                check_every_tokens: 0,
-                check_overlap_tokens: 0,
-                check_on_compaction: false,
-                context_window: 200_000,
-                reserve_tokens: 16_384,
-                prune: false,
-                prune_soft_limit: 4_000,
-                prune_keep_turns: 3,
-                memory_flush: None,
-                post_compact_recall: false,
-                compaction: None,
-                last_activity: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-                budget: None,
-                max_state_chars: 32_000,
-                event_hooks: Vec::new(),
-            },
-            Arc::clone(&history),
-            Arc::new(AtomicBool::new(true)),
-            dir.path().join("ESTOP"),
-        )
-        .await
-        .unwrap();
+        let (runner, db, _dir) = compaction_test_runner(provider, |_| {}).await;
+        let history = &runner.history;
+        let sessions = &runner.deps.sessions;
 
         {
             let mut shared = history.lock().await;
@@ -1730,6 +1754,411 @@ mod tests {
         // 新分段里落盘的就是内存里的新历史：进程重启后恢复出的上下文与现在相同。
         assert_eq!(sessions.read_segment(&current.file).unwrap(), *new_history);
         assert_eq!(current.message_count, new_history.len() as u64);
+    }
+
+    #[derive(Default)]
+    struct CompactionProvider {
+        requests: std::sync::atomic::AtomicUsize,
+        fail: bool,
+        hold_first: bool,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl Provider for CompactionProvider {
+        fn protocol(&self) -> crate::config::models::Protocol {
+            crate::config::models::Protocol::Chat
+        }
+
+        fn model_id(&self) -> &str {
+            "fake"
+        }
+
+        async fn stream(&self, _request: LlmRequest) -> Result<EventReceiver, ProviderError> {
+            let previous = self.requests.fetch_add(1, Ordering::Relaxed);
+            if self.hold_first && previous == 0 {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            if self.fail {
+                return Err(ProviderError::new(
+                    crate::providers::ProviderErrorKind::Server,
+                    "summary request failed",
+                ));
+            }
+            let (tx, rx) = mpsc::channel(2);
+            tx.try_send(ProviderEvent::TextDelta("## Facts\ncompacted".to_owned()))
+                .unwrap();
+            tx.try_send(ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+                refusal: None,
+            })
+            .unwrap();
+            Ok(rx)
+        }
+    }
+
+    struct RecordingReview {
+        risk: Risk,
+        windows: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl SecurityCheck for RecordingReview {
+        async fn review(&self, window: &str) -> Result<ReviewOutcome, String> {
+            self.windows.lock().unwrap().push(window.to_owned());
+            Ok(ReviewOutcome {
+                risk: self.risk,
+                complied: false,
+                categories: Vec::new(),
+                findings: Vec::new(),
+            })
+        }
+    }
+
+    fn compaction_reply(text: &str, tokens: u64) -> AgentMessage {
+        AgentMessage::Assistant(crate::agent::AssistantMessage {
+            content: vec![crate::agent::AssistantBlock::Text {
+                text: text.to_owned(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: Usage {
+                input_tokens: tokens,
+                ..Usage::default()
+            },
+            refusal: None,
+        })
+    }
+
+    async fn idle_compaction_runner(
+        provider: Arc<CompactionProvider>,
+        percent: u32,
+        tokens: u64,
+        reviewer: Option<Arc<RecordingReview>>,
+    ) -> (Arc<Runner>, tempfile::TempDir) {
+        let (runner, _db, dir) = compaction_test_runner(provider, |config| {
+            config.turn_context_budget = 1_000;
+            config.precompact_percent = percent;
+            config.post_compact_recall = true;
+            config.check_on_compaction = reviewer.is_some();
+            config.security_review = reviewer.map(|reviewer| reviewer as Arc<dyn SecurityCheck>);
+        })
+        .await;
+        // 留存窗口从第二个 User 开始。实际用量让阈值测试不依赖文本估算的舍入规则。
+        append_compaction_history(
+            &runner,
+            &[
+                AgentMessage::user("old private text"),
+                AgentMessage::user("retained user"),
+                compaction_reply("retained reply", tokens),
+            ],
+        )
+        .await;
+        (runner, dir)
+    }
+
+    async fn append_compaction_history(runner: &Runner, blocks: &[AgentMessage]) {
+        runner.deps.sessions.append(blocks).unwrap();
+        runner.history.lock().await.extend_from_slice(blocks);
+    }
+
+    async fn prepare_idle_compaction(runner: &Runner) {
+        runner.maybe_start_precompaction().await;
+        drop(runner.compaction_lock.lock().await);
+        assert!(runner.prepared.lock().unwrap().is_some());
+    }
+
+    async fn compact_at_boundary(runner: &Runner) -> Vec<AgentMessage> {
+        let mut working = runner.history.lock().await.clone();
+        runner
+            .maybe_auto_compact(&mut working, &runner.history, &runner.deps.sessions)
+            .await;
+        working
+    }
+
+    #[tokio::test]
+    async fn idle_compaction_preserves_the_suffix_and_clears_its_usage() {
+        use crate::vfs::{Vfs, VfsPath};
+
+        let provider = Arc::new(CompactionProvider::default());
+        let (runner, _dir) = idle_compaction_runner(Arc::clone(&provider), 80, 850, None).await;
+        let memory = VfsPath::parse("/MEMORY.md").unwrap();
+        runner.deps.vfs.read(&memory, None, None).unwrap();
+        runner
+            .deps
+            .vfs
+            .write_text(&memory, "memory index", None)
+            .unwrap();
+        let sessions = &runner.deps.sessions;
+        let previous = sessions.current().unwrap().file;
+        let snapshot = runner.history.lock().await.clone();
+        prepare_idle_compaction(&runner).await;
+        assert_eq!(*runner.history.lock().await, snapshot);
+        assert_eq!(sessions.current().unwrap().file, previous);
+        append_compaction_history(
+            &runner,
+            &[
+                AgentMessage::user("suffix user"),
+                compaction_reply("suffix reply", 910),
+            ],
+        )
+        .await;
+
+        let working = compact_at_boundary(&runner).await;
+        let expected = vec![
+            AgentMessage::System {
+                text: format!(
+                    "[checkpoint summary | previous_session=/sessions/{previous} | reason=idle]\n## Facts\ncompacted"
+                ),
+            },
+            AgentMessage::user("retained user"),
+            compaction_reply("retained reply", 0),
+            AgentMessage::user("suffix user"),
+            compaction_reply("suffix reply", 0),
+            AgentMessage::System {
+                text: "<memory_context source=\"post_compact\">\nmemory index\n</memory_context>"
+                    .to_owned(),
+            },
+        ];
+        let current = sessions.current().unwrap().file;
+        assert_ne!(current, previous);
+        assert_eq!(working, expected);
+        assert_eq!(*runner.history.lock().await, expected);
+        assert_eq!(sessions.read_segment(&current).unwrap(), expected);
+        assert!(runner.prepared.lock().unwrap().is_none());
+        assert_eq!(provider.requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn idle_compaction_drops_a_snapshot_changed_by_redaction() {
+        let (runner, _dir) =
+            idle_compaction_runner(Arc::new(CompactionProvider::default()), 80, 850, None).await;
+        prepare_idle_compaction(&runner).await;
+        let sessions = &runner.deps.sessions;
+        let previous = sessions.current().unwrap().file;
+        let disk = sessions.read_segment(&previous).unwrap();
+        let redacted = {
+            let mut history = runner.history.lock().await;
+            // 隔离只替换内存里的原文，不改作为审计记录的旧分段。
+            assert_eq!(
+                history[0].redact("old private text", "[quarantined: /quarantine/sample.md]"),
+                1
+            );
+            history.clone()
+        };
+        assert_eq!(compact_at_boundary(&runner).await, redacted);
+        assert_eq!(*runner.history.lock().await, redacted);
+        assert_eq!(sessions.current().unwrap().file, previous);
+        assert_eq!(sessions.read_segment(&previous).unwrap(), disk);
+        assert!(runner.prepared.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn clearing_context_discards_a_prepared_compaction() {
+        let (runner, _dir) =
+            idle_compaction_runner(Arc::new(CompactionProvider::default()), 80, 850, None).await;
+        prepare_idle_compaction(&runner).await;
+        let sessions = &runner.deps.sessions;
+        let previous = sessions.current().unwrap().file;
+        runner.clear_all_context().await.unwrap();
+        assert!(runner.prepared.lock().unwrap().is_none());
+        let cleared = sessions.current().unwrap().file;
+        assert_ne!(previous, cleared);
+        assert!(compact_at_boundary(&runner).await.is_empty());
+        assert!(runner.history.lock().await.is_empty());
+        assert_eq!(sessions.current().unwrap().file, cleared);
+        assert!(sessions.read_segment(&cleared).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_compaction_failure_counts_towards_the_shared_limit() {
+        let provider = Arc::new(CompactionProvider {
+            fail: true,
+            ..CompactionProvider::default()
+        });
+        let (runner, _dir) = idle_compaction_runner(Arc::clone(&provider), 80, 850, None).await;
+        let before = runner.history.lock().await.clone();
+        let sessions = &runner.deps.sessions;
+        let current = sessions.current().unwrap().file;
+        runner.maybe_start_precompaction().await;
+        drop(runner.compaction_lock.lock().await);
+        assert_eq!(provider.requests.load(Ordering::Relaxed), 1);
+        assert!(runner.prepared.lock().unwrap().is_none());
+        assert_eq!(runner.compaction_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(*runner.history.lock().await, before);
+        assert_eq!(sessions.current().unwrap().file, current);
+        assert_eq!(sessions.read_segment(&current).unwrap(), before);
+
+        runner
+            .compaction_failures
+            .store(runner.config.compaction_max_failures, Ordering::Relaxed);
+        runner.maybe_start_precompaction().await;
+        drop(runner.compaction_lock.lock().await);
+        assert_eq!(provider.requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn hard_threshold_compaction_waits_for_the_background_summary() {
+        let provider = Arc::new(CompactionProvider {
+            hold_first: true,
+            ..CompactionProvider::default()
+        });
+        let (runner, _dir) = idle_compaction_runner(Arc::clone(&provider), 80, 850, None).await;
+        let previous = runner.deps.sessions.current().unwrap().file;
+        runner.maybe_start_precompaction().await;
+        assert!(runner.compaction_lock.try_lock().is_err());
+        provider.started.notified().await;
+
+        // 软阈值不能等锁；响应未放行时轮询一次也应立即结束。
+        let before = runner.history.lock().await.clone();
+        let mut working = before.clone();
+        assert!(
+            std::pin::pin!(runner.maybe_auto_compact(
+                &mut working,
+                &runner.history,
+                &runner.deps.sessions
+            ))
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+            .is_ready()
+        );
+        assert_eq!(working, before);
+
+        append_compaction_history(
+            &runner,
+            &[
+                AgentMessage::user("has crossed the hard threshold"),
+                compaction_reply("large prompt, short reply", 1_500),
+            ],
+        )
+        .await;
+        let (started, polled) = tokio::sync::oneshot::channel();
+        let adopt = {
+            let runner = Arc::clone(&runner);
+            tokio::spawn(async move {
+                let _turn = runner.turn_lock.lock().await;
+                let future = compact_at_boundary(&runner);
+                tokio::pin!(future);
+                let mut started = Some(started);
+                // 确认采用已经被轮询到等待点才放行响应，不靠任务调度顺序或墙钟。
+                std::future::poll_fn(|cx| {
+                    let state = future.as_mut().poll(cx);
+                    if let Some(started) = started.take() {
+                        assert!(state.is_pending());
+                        started.send(()).unwrap();
+                    }
+                    state
+                })
+                .await
+            })
+        };
+        polled.await.unwrap();
+        provider.release.notify_one();
+        let working = adopt.await.unwrap();
+        assert_eq!(provider.requests.load(Ordering::Relaxed), 1);
+        assert!(
+            matches!(&working[0], AgentMessage::System { text } if text.contains("reason=idle"))
+        );
+        assert_ne!(runner.deps.sessions.current().unwrap().file, previous);
+        assert_eq!(*runner.history.lock().await, working);
+        assert!(runner.prepared.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_compaction_does_not_start_when_disabled_paused_or_below_soft_threshold() {
+        for (percent, ai_enabled, tokens) in [(0, true, 850), (80, false, 850), (80, true, 799)] {
+            let provider = Arc::new(CompactionProvider::default());
+            let (runner, _dir) =
+                idle_compaction_runner(Arc::clone(&provider), percent, tokens, None).await;
+            runner.deps.ai_enabled.store(ai_enabled, Ordering::Relaxed);
+            runner.maybe_start_precompaction().await;
+            drop(runner.compaction_lock.lock().await);
+            assert_eq!(
+                provider.requests.load(Ordering::Relaxed),
+                0,
+                "percent={percent}, ai_enabled={ai_enabled}, tokens={tokens}"
+            );
+            assert!(runner.prepared.lock().unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_compaction_reviews_the_full_history_only_at_adoption() {
+        for (risk, suffix_tokens) in [(Risk::Low, 910), (Risk::Critical, 1_500)] {
+            let provider = Arc::new(CompactionProvider::default());
+            let review = Arc::new(RecordingReview {
+                risk,
+                windows: StdMutex::new(Vec::new()),
+            });
+            let (runner, _dir) =
+                idle_compaction_runner(Arc::clone(&provider), 80, 850, Some(Arc::clone(&review)))
+                    .await;
+            runner.unchecked_tokens.store(42, Ordering::Relaxed);
+            prepare_idle_compaction(&runner).await;
+            assert!(review.windows.lock().unwrap().is_empty());
+            assert_eq!(runner.unchecked_tokens.load(Ordering::Relaxed), 42);
+            append_compaction_history(
+                &runner,
+                &[
+                    AgentMessage::user("a new suffix to review"),
+                    compaction_reply("suffix reply to review", suffix_tokens),
+                ],
+            )
+            .await;
+            let sessions = &runner.deps.sessions;
+            let previous = sessions.current().unwrap().file;
+            let before = runner.history.lock().await.clone();
+            let working = compact_at_boundary(&runner).await;
+            {
+                let windows = review.windows.lock().unwrap();
+                assert_eq!(windows.len(), 1);
+                assert!(windows[0].contains("old private text"));
+                assert!(windows[0].contains("a new suffix to review"));
+            }
+            assert!(runner.prepared.lock().unwrap().is_none());
+            assert_eq!(provider.requests.load(Ordering::Relaxed), 1);
+            assert_eq!(runner.unchecked_tokens.load(Ordering::Relaxed), 0);
+            if risk == Risk::Critical {
+                // 即使已到硬阈值，也不能再发第二次复核或摘要请求。
+                assert!(runner.discard_context.load(Ordering::SeqCst));
+                assert_eq!(working, before);
+                assert_eq!(*runner.history.lock().await, before);
+                assert_eq!(sessions.current().unwrap().file, previous);
+                assert_eq!(sessions.read_segment(&previous).unwrap(), before);
+            } else {
+                assert!(!runner.discard_context.load(Ordering::SeqCst));
+                assert!(
+                    matches!(&working[0], AgentMessage::System { text } if text.contains("reason=idle"))
+                );
+                assert_ne!(sessions.current().unwrap().file, previous);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn synchronous_compaction_does_not_request_a_summary_after_critical_review() {
+        let provider = Arc::new(CompactionProvider::default());
+        let review = Arc::new(RecordingReview {
+            risk: Risk::Critical,
+            windows: StdMutex::new(Vec::new()),
+        });
+        let (runner, _dir) =
+            idle_compaction_runner(Arc::clone(&provider), 0, 850, Some(Arc::clone(&review))).await;
+        let before = runner.history.lock().await.clone();
+        let previous = runner.deps.sessions.current().unwrap().file;
+        let result = runner.compact_now("test").await.unwrap();
+        assert_eq!(
+            result,
+            json!({
+                "compacted": false,
+                "reason": "the context will be discarded after a critical security review",
+            })
+        );
+        assert_eq!(review.windows.lock().unwrap().len(), 1);
+        assert_eq!(provider.requests.load(Ordering::Relaxed), 0);
+        assert!(runner.discard_context.load(Ordering::SeqCst));
+        assert_eq!(*runner.history.lock().await, before);
+        assert_eq!(runner.deps.sessions.current().unwrap().file, previous);
     }
 
     #[tokio::test]
@@ -1843,6 +2272,7 @@ mod tests {
                 // 故意压到很小：任何真实上下文都会触发自动压缩。
                 turn_context_budget: 2,
                 keep_recent_tokens: 1,
+                precompact_percent: 0,
                 compaction_max_failures: 3,
                 security_review: None,
                 check_every_tokens: 0,
@@ -2046,6 +2476,7 @@ mod tests {
                 server_tools: Vec::new(),
                 turn_context_budget,
                 keep_recent_tokens,
+                precompact_percent: 0,
                 compaction_max_failures: 3,
                 security_review: outcome.map(|outcome| {
                     Arc::new(FixedReview(outcome))

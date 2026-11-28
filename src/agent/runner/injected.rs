@@ -141,6 +141,7 @@ impl Runner {
             prompt_tokens + crate::session::compaction::estimate_messages(&new_blocks),
         );
         self.maybe_security_review(&history).await;
+        self.maybe_start_precompaction().await;
         Ok(outcome)
     }
 }

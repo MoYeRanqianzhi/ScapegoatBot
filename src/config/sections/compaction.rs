@@ -12,6 +12,7 @@ pub struct CompactionConfig {
     pub reserve_tokens: u32,
     pub turn_context_budget: u32,
     pub keep_recent_tokens: u32,
+    pub precompact_percent: u32,
     pub max_failures: u32,
     pub memory_flush: bool,
     pub post_compact_recall: bool,
@@ -26,6 +27,7 @@ impl Default for CompactionConfig {
             reserve_tokens: 16_384,
             turn_context_budget: 120_000,
             keep_recent_tokens: 20_000,
+            precompact_percent: 80,
             max_failures: 3,
             memory_flush: true,
             post_compact_recall: true,
@@ -48,6 +50,12 @@ impl CompactionConfig {
         ] {
             non_zero(errors, field, u64::from(value));
         }
+        if self.precompact_percent > 99 {
+            errors.push(ConfigError::new(
+                "compaction.precompact_percent",
+                "must be between 0 and 99 (0 turns background compaction off)",
+            ));
+        }
         if self.reserve_tokens < agent.max_output_tokens {
             errors.push(ConfigError::new(
                 "compaction.reserve_tokens",
@@ -57,5 +65,33 @@ impl CompactionConfig {
                 ),
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn precompact_percent_defaults_to_80_and_accepts_zero_but_not_100() {
+        let default: CompactionConfig = toml::from_str("").unwrap();
+        assert_eq!(default.precompact_percent, 80);
+        let agent = AgentConfig::default();
+
+        let disabled: CompactionConfig = toml::from_str("precompact_percent = 0").unwrap();
+        assert_eq!(disabled.precompact_percent, 0);
+        let mut errors = Vec::new();
+        disabled.validate(&mut errors, &agent);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        let invalid: CompactionConfig = toml::from_str("precompact_percent = 100").unwrap();
+        invalid.validate(&mut errors, &agent);
+        assert_eq!(
+            errors,
+            [ConfigError::new(
+                "compaction.precompact_percent",
+                "must be between 0 and 99 (0 turns background compaction off)",
+            )]
+        );
     }
 }

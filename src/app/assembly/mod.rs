@@ -480,6 +480,7 @@ fn runner_config(
         server_tools: parts.server_tools,
         turn_context_budget: config.compaction.turn_context_budget,
         keep_recent_tokens: config.compaction.keep_recent_tokens,
+        precompact_percent: config.compaction.precompact_percent,
         compaction_max_failures: config.compaction.max_failures,
         security_review: parts.security_review,
         check_every_tokens: config.security.check_every_tokens,
