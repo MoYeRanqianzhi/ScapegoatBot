@@ -74,7 +74,7 @@ imageproc = { version = "0.27.0", default-features = false, features = ["text"] 
 fontdb = "0.24.0"
 ab_glyph = "0.2.32"
 # Base64：加密后的 JSONL 行、发给 NapCat 的 base64:// 文件。
-base64 = "0.22"
+base64 = "0.23"
 # 十六进制编码：主密钥文件与哈希摘要。
 hex = "0.4"
 # VFS 路径的 Unicode NFC 规范化（设计 §6.3）。
