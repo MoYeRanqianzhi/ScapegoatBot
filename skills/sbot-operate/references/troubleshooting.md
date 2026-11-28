@@ -133,7 +133,11 @@ sbot resume          # 删除 ESTOP
   （`[agent].max_steps`）、`turn token budget exhausted`（`[budget].turn_tokens`）、
   `turn wall-clock budget exhausted`（`[budget].round_trip_wall_secs`）；
 - provider 重试与回退链会拉长耗时：看日志里的重试与 fallback；
-- 上下文过大触发压缩：压缩本身要一次模型请求；
+- 上下文过大触发压缩：压缩本身要一次模型请求。默认会在快到阈值时提前在后台算好
+  （`[compaction].precompact_percent`），回合只在后台还没算完、或者提前准备关掉时才等它。
+  日志能看出走的是哪条路：`prepared a compaction summary in the background`（后台算好）、
+  `installed the compaction prepared in the background`（回合开头装上）、`background compaction
+  failed`（后台失败，计入 `max_failures`）；没有这几条、回合又慢，看 `automatic compaction failed`；
 - 主 agent 回合是串行的：前一个回合未结束时，新的唤醒会等待它完成。
 
 ## 磁盘与配额

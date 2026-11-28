@@ -1,43 +1,48 @@
 ---
-name: 历史压缩的不变量
-description: 改动压缩、会话轮转、回合锁或压缩前安全复核时读取
+name: compaction
+description: 历史压缩（同步与后台提前准备）必须守住的不变量；改压缩、会话轮转、回合锁或压缩前安全复核时读
 metadata:
   type: project
-  scope: Runner 的同步与后台压缩、会话轮转
+  scope: src/agent/runner/compaction.rs 的 Runner 压缩路径、会话轮转
   status: active
   last_verified: 2026-11-28
 ---
 
-**Evidence:**
+一次压缩分两步：**准备**（切分、PreCompact hook、记忆提取、请求摘要；只读快照，不改历史与分段）
+和**安装**（校验后轮转分段、替换历史）。同步压缩是“拿锁 → 准备 → 安装”；后台提前准备在回合
+结束后启动，下一个回合开头安装（用户 2026-11-17 选的“空闲预压缩”）。完成后计划文件已删，设计与
+逐步的决定记录在 git 历史里：`git show 5c839ea:.agents/plan/2026-11-28-idle-precompaction.md`。
 
-- `src/agent/runner/compaction.rs:304`（`Runner::prepare_compaction`）只从快照准备摘要，
-  可以执行 PreCompact 和提取记忆，但不改历史、不轮转分段；同步与后台都只有在
-  `src/agent/runner/compaction.rs:339`（`Runner::install_compaction`）才安装。
-- `src/agent/runner/compaction.rs:339`（`Runner::install_compaction`）持有历史锁，
-  既逐条校验当前历史仍以快照开头，也校验当前分段仍是快照时的文件；任一不符就作废，
-  不写新历史或新分段。
-- `src/agent/runner/compaction.rs:339`（`Runner::install_compaction`）将快照之后的消息
-  原序原样（仅 `usage` 例外）接到保留窗口之后、PostCompact 上下文之前，再用同一份
-  新历史写入分段并替换内存。
-- `src/agent/runner/compaction.rs:339`（`Runner::install_compaction`）将保留窗口和后缀
-  的 assistant `usage` 都清零。`src/session/compaction.rs:76`（`estimate_messages`）优先用
-  最后一次非零用量做估算基准；这些用量描述的是压缩前的提示，保留可能让新历史仍被估为超限。
-- `src/agent/runner/compaction.rs:103`（`Runner::maybe_start_precompaction`）先拿到
-  `compaction_lock`，把锁交给后台任务，直到发布结果或记录失败才释放。低于硬阈值时不等待
-  正在准备的摘要；超过时先等已有任务，再决定是否同步摘要（同文件 `Runner::maybe_auto_compact`）。
-- `src/agent/runner/compaction.rs:103`（`Runner::maybe_start_precompaction`）与同文件
-  `Runner::maybe_auto_compact` 共用 `compaction_failures` 和停用上限。`Runner::install_compaction`
-  成功或 `Runner::clear_all_context` 清空时将它重置。
-- `check_on_compaction` 打开时，`src/agent/runner/compaction.rs:64`（`Runner::adopt_precompaction`）
-  在回合锁内把安装时的完整历史（含后缀）交给安全复核；critical 时丢弃准备结果。
-  `Runner::compact_scope` 同样在回合锁内先复核，critical 时不请求摘要。后台不复核、不拿
-  `review_lock`，不重置 `unchecked_tokens`（`src/agent/runner/review.rs:39` 的
-  `Runner::run_security_review` 收到成功的复核结论时才重置）。
+必须守住的：
 
-**Why:** 仅追加的回合不能丢；隔离能改已提交的旧消息而不改审计分段，轮转也会改变摘要的来源。
-前缀和分段都要匹配。复核必须覆盖采用时的新消息；后台复核还可能把未复核的新增用量一起清掉。
+1. **安装前校验两样东西**，在同一把历史锁里：当前历史仍以快照逐条开头（清空、隔离、别的压缩
+   都会让它不成立），当前分段仍是快照时的那个。任一不符就作废，历史与分段都不动。
+2. **后缀原样接回**：快照之后追加的消息按原顺序接在保留窗口之后、PostCompact 上下文之前；
+   校验、`rotate_with` 与替换内存历史在同一把历史锁里完成。
+3. **保留窗口与后缀里 assistant 消息的 `usage` 清零**：`estimate_messages` 拿最后一个非零
+   用量当基准，那是压缩前的提示长度，留着会让新历史仍被估为超限、下次又压缩一次。
+4. **后台准备在整个准备期间持有 `compaction_lock`**（拿到锁再 spawn，把 guard 交给任务，先
+   发布结果或记下失败再释放）：“有后台准备在跑” ⇔ 锁被占着。硬阈值时等这把锁一次再试安装，
+   不重复发摘要请求；软阈值时用 `try_lock`，不等。
+5. **后台准备不做安全复核**。复核只在回合锁里做：同步压缩在摘要前复核快照，后台结果在安装前
+   复核安装时的完整历史（快照 + 后缀）；判 critical（`discard_context` 置位）就不摘要 / 不安装。
+   原因：后台复核的结论会晚于下一回合开头的丢弃检查，而且 `run_security_review` 结束时把
+   `unchecked_tokens` 清零，会抹掉复核期间回合新累计、快照里没有的那部分。
+6. 后台与同步共用 `compaction_failures` 和 `max_failures` 上限；任何一次成功安装或清空上下文
+   都清零。
 
-**How to apply:** 保持校验、`rotate_with` 和替换历史在同一把历史锁内；保留后缀与 `usage` 的
-例外。改锁时检查软阈值不等待、硬阈值不重复摘要，以及压缩的安全复核只在前台的回合锁内完成。
+**Evidence:** `src/agent/runner/compaction.rs`：`prepare_compaction`、`install_compaction`、
+`maybe_start_precompaction`、`maybe_auto_compact`、`adopt_precompaction`、`compact_scope`；
+`src/agent/runner.rs` 测试模块里的 `idle_compaction_*`、`hard_threshold_compaction_waits_for_the_background_summary`、
+`synchronous_compaction_does_not_request_a_summary_after_critical_review`（Codex 2026-11-28 临时
+去掉后缀接回、前缀校验、清空时丢弃、硬阈值等待，四条测试各自失败，恢复后通过）。第 5 条的两处
+竞态是 Codex 2026-11-28 核对源码时指出的。
 
-**Recheck when:** 历史追加或隔离、分段轮转、token 估算基准、调度锁或安全复核记账方式变化。
+**Why:** 压缩会整体替换历史与分段；校验或锁的次序一错，就会悄悄丢消息、复活被隔离的原文，
+或把被判 critical 的上下文摘要进新分段。
+
+**How to apply:** 改压缩相关代码时逐条对照上面六条；新增会改写已提交历史的操作（类似隔离）时，
+确认它会让前缀校验失败，而不是被安装覆盖。
+
+**Recheck when:** 历史追加或隔离的方式、分段轮转、token 估算基准、压缩或回合锁的用法、安全
+复核的记账方式变化。

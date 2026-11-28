@@ -37,8 +37,6 @@ CHANGELOG；Codex 写代码与测试、跑检查，并且边做边把决定记�
 - [ ] **依赖：chrono 必须换掉**（用户 2026-11-28：RUSTSEC-2026-0543 宣布 chrono 不再维护，
       “不支持了就一定不能用”；倾向 jiff，但要先核实合适）。CI 的 `deny` 在这之前一直是红的，
       也就不能发版。同一批顺带审查其余直接依赖（维护状态、星数、有没有明显更好的替代品）。
-- [ ] **空闲预压缩**（用户选“加空闲预压缩”）：设计与不变量在
-      [`plan/2026-11-28-idle-precompaction.md`](plan/2026-11-28-idle-precompaction.md)。
 - [ ] **命名与可扩展性，A – E 全做**（用户选“按设计稿全做”）。设计、每步的边界与验证方式在
       [`plan/2026-11-17-channels-and-custom-actions.md`](plan/2026-11-17-channels-and-custom-actions.md)。
       每一步单独提交、单独验证；每一步都同步改 `skills/`，C 另加讲适配器的 skill。

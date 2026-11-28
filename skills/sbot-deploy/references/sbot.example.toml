@@ -199,6 +199,9 @@ llm_review = false
 reserve_tokens = 16384
 turn_context_budget = 120000
 keep_recent_tokens = 20000
+# 上下文到压缩阈值的这个百分比时，回合结束后在后台先把摘要算好，下一个回合开头直接用；
+# 0 = 不提前算，到阈值时当场摘要（回合要等它）。
+precompact_percent = 80
 max_failures = 3
 # 压缩前提取记忆、压缩后注入记忆索引、裁剪旧工具结果。
 memory_flush = true

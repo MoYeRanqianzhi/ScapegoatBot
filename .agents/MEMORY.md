@@ -5,7 +5,7 @@
 - [版本与发布](memory/release-workflow.md) -- 每批升版本号打 tag；push 与 GitHub release 已授权，部署 hw1 没有；发版步骤
 - [安全闸语义](memory/security-gate-semantics.md) -- shadow/enforce、fail-closed、llm 后端装入、hold 只拦 napcat.*、resume 复核
 - [存储不变量](memory/storage-invariants.md) -- append 串行、(chat, message_id) 去重、索引校验、文件头加密、迁移 v13
-- [历史压缩的不变量](memory/compaction.md) -- 准备与安装分离；快照和分段校验、后缀与用量、压缩锁与前台复核
+- [压缩的不变量](memory/compaction.md) -- 准备与安装分离、安装前校验快照与分段、后缀原样接回、后台不做安全复核；改压缩前读
 - [图片工具 local.media.image.*](memory/image-tools.md) -- 5 个 action、系统字体约束、依赖与模块命名坑
 - [功能范围纠正](memory/feature-scope-correction.md) -- 不要把代码限制升级成需求；禁止内置字体
 - [工具表](memory/tool-surface.md) -- 没有 Memory / Download 工具；API 前缀只是命名空间，`local` 改名 `native`，要能接任意渠道与自定义 action（已确认，在做）；新增顶层工具要用户同意

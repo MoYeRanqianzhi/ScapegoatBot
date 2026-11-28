@@ -83,7 +83,7 @@ timeout_ms = 3000  # 默认的 800 对通用模型通常不够；超时算“无
 | 键 | 默认 | 说明 |
 |----|------|------|
 | `check_every_tokens` | 262144 | 自上次检查新增这么多 token 后触发；0 = 关闭 |
-| `check_on_compaction` | true | 压缩前也检查一次 |
+| `check_on_compaction` | true | 压缩前也检查一次（后台提前准备的摘要在装上之前检查） |
 | `check_overlap_tokens` | 4096 | 检查窗口在基本长度之外向前多看的近似 token |
 | `review_model` | 空 | 检查模型；空 = 主模型 |
 | `check_timeout_secs` | 60 | 超时放行（只告警，不暂停） |

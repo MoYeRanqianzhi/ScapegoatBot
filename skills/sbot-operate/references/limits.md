@@ -63,7 +63,8 @@
   monitor（`deliver.to = "<id>"`）不会随子代理结束删除（结束的子代理仍可续聊），由
   `expires` / `max_events` 收尾。
 - 压缩失败连续达到 `[compaction].max_failures` 后，自动压缩停止尝试，直到重启、一次手动
-  `agent.compact` 成功，或 `agent.clear_context` 清空上下文。
+  `agent.compact` 成功，或 `agent.clear_context` 清空上下文。后台提前准备摘要的失败也算在内，
+  停止之后也不再提前准备。
 - `[compaction].post_compact_recall` 注入的是 `/MEMORY.md` 索引，不是按语义检索
   的相关条目；预算 8000 字符。
 - `[memory].review = every_turn` 实际是每 5 秒轮询一次并检查 transcript 是否有新增，

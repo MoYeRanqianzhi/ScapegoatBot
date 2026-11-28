@@ -354,7 +354,7 @@ key 放 `auth.json`：
 | 键 | 默认 | 说明 |
 |----|------|------|
 | `check_every_tokens` | 262144 | 每新增这么多 token，在回合边界跑一次独立检查；0 = 关闭 |
-| `check_on_compaction` | true | 压缩前也检查一次 |
+| `check_on_compaction` | true | 压缩前也检查一次（后台提前准备的摘要在装上之前检查） |
 | `check_overlap_tokens` | 4096 | 检查窗口在基本长度之外向前多看的近似 token |
 | `review_model` | 空 | 检查用模型；空 = 主模型 |
 | `check_timeout_secs` | 60 | 检查超时时间；超时放行、只告警 |
@@ -376,6 +376,7 @@ key 放 `auth.json`：
 | `turn_context_budget` | 120000 | 单回合工作集上限，超过先压缩 |
 | `reserve_tokens` | 16384 | 模型窗口里预留给输出/系统提示的 token；不能小于 `[agent].max_output_tokens` |
 | `keep_recent_tokens` | 20000 | 压缩后保留的最近 token |
+| `precompact_percent` | 80 | 上下文到压缩阈值的这个百分比时提前在后台准备摘要；0 = 关闭，最大 99 |
 | `max_failures` | 3 | 自动压缩连续失败这么多次后停止自动尝试；一次成功的手动压缩（`agent.compact`）或清空上下文之后恢复 |
 | `memory_flush` | true | 压缩前静默提取 durable facts |
 | `post_compact_recall` | true | 压缩后把 `/MEMORY.md` 索引写进新分段 |
@@ -385,6 +386,19 @@ key 放 `auth.json`：
 
 自动压缩阈值 = `min(turn_context_budget, context_window - reserve_tokens - max_output_tokens)`，
 且不低于 `keep_recent_tokens`。摘要默认用主模型；`[agent].compaction_model` 可指定独立模型。
+
+提前准备（`precompact_percent`）：上下文超过“阈值 × 百分比”后，回合一结束就在后台请求摘要
+（不占回合，新消息照常处理）；下一个回合开头把摘要装上，后台准备期间新增的消息原样接在保留的
+消息后面。所以正常情况下回合不用等摘要。几种例外：
+
+- 到了阈值而后台还没算完：回合等它算完再用，不会再发一次摘要请求；
+- 后台准备失败：和同步压缩失败一样计入 `max_failures`；
+- 准备期间上下文被清空、隔离或别的压缩改过：这份摘要作废，按需要重新准备；
+- `[security].check_on_compaction` 打开时，装上之前在回合里对当时的完整上下文做一次安全检查，
+  判为 `critical` 就不装（下一回合开头整个丢弃）；后台准备本身不做安全检查。
+
+`memory_flush` 与 `pre_compact` hook 在准备时执行（可能在后台），`post_compact_recall`、
+`post_compact` hook 与系统提示重建在装上时执行。`agent.compact` 仍是当场同步压缩。
 
 ### `[budget]` / `[gate]` / `[hooks]`
 
@@ -424,8 +438,8 @@ key 放 `auth.json`：
   |------|--------|----------|------------------------|
   | `session_start` | 启动 | `log`、`inject_context` | system 块（启动时与每次压缩之后都在） |
   | `session_end` | 进程退出、清空上下文（`agent.clear_context`） | `log`、`notify` | — |
-  | `pre_compact` | 压缩前 | `log`、`inject_context` | 摘要的输入 |
-  | `post_compact` | 压缩后 | `log`、`inject_context` | 新分段里，排在摘要与保留的消息之后 |
+  | `pre_compact` | 准备摘要前（提前准备时在后台；那份摘要之后可能作废） | `log`、`inject_context` | 摘要的输入 |
+  | `post_compact` | 摘要装上之后 | `log`、`inject_context` | 新分段里，排在摘要与保留的消息之后 |
   | `message_received` | QQ 消息进入会话回合前：触发回合的那一批，以及回合中途到达的 | `log`、`block`、`inject_context` | 本回合的即时提示（不进 transcript） |
   | `before_send` | `API` 发布动作前 | `log`、`block`、`rewrite` | — |
   | `stop` | 回合结束 | `log` | — |
