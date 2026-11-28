@@ -48,9 +48,9 @@ PR 本身没有动——合并 / 关闭 PR 没有得到用户的授权；内容�
 
 - [ ] hw1：用户 2026-11-17 决定**暂不部署**（NapCat 没登录，部署了也只能停在
       `waiting_for_napcat`）。要部署时需要用户重新授权并扫码登录。
-- [ ] 临时目录要用户手动删（安全检查拦下了 `rm -rf`）：`G:\sbot-e2e-{lists,startwait,startwait-other,fresh,tmp}`
-      是 11 月几轮实机验证建的；`G:\sbot-e2e-{live,perchat,phase7,qq}` 更早，用途未核实。旧历史
-      的备份 `G:\sbot-pre-coauthor-rewrite-2026-11-10.bundle` 在远端强推之后已经没用。
+- [ ] 旧历史的备份 `G:\sbot-pre-coauthor-rewrite-2026-11-10.bundle` 在远端强推之后已经没用，
+      可以删。仓库外的临时目录（`G:\sbot-e2e-*`、本地 Debian 验证用的 `G:\sbot-wsl`）用户
+      2026-11-28 已经删了；本地没有 Linux 验证环境了，Linux / macOS 上的验证看 CI。
 - [ ] 上级目录的 `G:/ClaudeProjects/ScapegoatBot/CLAUDE.md`（不在本仓库里）仍说开发文档在
       `docs/development/`；那个目录 2026-11-17 已删，这一句要用户自己改（开发文档现在是
       `.agents/`，使用文档是 `sbot docs` / `skills/`）。
