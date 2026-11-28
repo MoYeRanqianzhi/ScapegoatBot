@@ -147,7 +147,7 @@ pub struct Runner {
     /// 静态 + hooks 组成的 system 块；压缩成功后重建（`PostCompact` 语义）。
     system: std::sync::RwLock<Vec<SystemBlock>>,
     /// 压缩互斥：同一时刻只允许一次。
-    compaction_lock: Mutex<()>,
+    compaction_lock: Arc<Mutex<()>>,
     /// 连续自动压缩失败次数；达到上限后不再自动尝试。
     compaction_failures: std::sync::atomic::AtomicU32,
     /// 每 chat 最近允许的回合时间，用于 `chat_turns_per_hour`。
@@ -319,7 +319,7 @@ impl Runner {
             turn_lock: Arc::new(tokio::sync::Mutex::new(())),
             // 下面由 `rebuild_system` 填上：启动与压缩之后是同一套组装。
             system: std::sync::RwLock::new(Vec::new()),
-            compaction_lock: Mutex::new(()),
+            compaction_lock: Arc::new(Mutex::new(())),
             compaction_failures: std::sync::atomic::AtomicU32::new(0),
             turn_times: Mutex::new(HashMap::new()),
             unchecked_tokens: std::sync::atomic::AtomicU64::new(0),

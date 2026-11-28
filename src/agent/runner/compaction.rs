@@ -1,5 +1,13 @@
 use super::*;
 
+struct PreparedCompaction {
+    snapshot: Vec<AgentMessage>,
+    cut: usize,
+    session_file: String,
+    summary: String,
+    reason: String,
+}
+
 impl Runner {
     /// 自动压缩：超过工作集上限时压缩，并把 `working` 换成压缩后的历史。
     ///
@@ -132,8 +140,7 @@ impl Runner {
     /// 在指定链上压缩。
     ///
     /// 调用方必须在回合锁之内（自动压缩在回合开头，`agent.compact` 是回合里的一次工具调用）：
-    /// 这里先取历史的快照、做完摘要再整体替换，中间不持有历史的锁。回合锁保证这段时间没有
-    /// 别的回合往共享历史与 transcript 里追加；没有它，追加的内容会被替换掉。
+    /// 复核和替换之间没有别的回合能改写或追加未复核的消息，摘要期间不占用历史锁。
     async fn compact_scope(
         &self,
         reason: &str,
@@ -142,18 +149,53 @@ impl Runner {
     ) -> Result<serde_json::Value> {
         let _guard = self.compaction_lock.lock().await;
         let snapshot = history.lock().await.clone();
-        let (old, keep) = crate::session::compaction::split_for_compaction(
-            &snapshot,
-            self.config.keep_recent_tokens as usize,
-        );
-        if old.is_empty() {
+        let session_file = sessions.current().map(|current| current.file);
+        if self.config.check_on_compaction {
+            self.run_security_review(&snapshot).await;
+            if self
+                .discard_context
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(serde_json::json!({
+                    "compacted": false,
+                    "reason": "the context will be discarded after a critical security review",
+                }));
+            }
+        }
+        let Some(prepared) = self
+            .prepare_compaction(reason, snapshot, session_file)
+            .await?
+        else {
             return Ok(serde_json::json!({
                 "compacted": false,
                 "reason": "nothing older than the retention window",
             }));
-        }
-        if self.config.check_on_compaction {
-            self.run_security_review(&snapshot).await;
+        };
+        let Some((result, _appended)) = self
+            .install_compaction(prepared, &history, &sessions)
+            .await?
+        else {
+            return Err(anyhow::anyhow!(
+                "the history changed while it was being compacted; nothing was replaced"
+            ));
+        };
+        Ok(result)
+    }
+
+    /// 准备摘要，不轮转分段、不替换历史。分段名随历史一起快照，不能在等待 hook 和记忆
+    /// 提取之后再取：那时当前分段可能已经不是这份历史的来源。
+    async fn prepare_compaction(
+        &self,
+        reason: &str,
+        snapshot: Vec<AgentMessage>,
+        session_file: Result<String>,
+    ) -> Result<Option<PreparedCompaction>> {
+        let (old, _) = crate::session::compaction::split_for_compaction(
+            &snapshot,
+            self.config.keep_recent_tokens as usize,
+        );
+        if old.is_empty() {
+            return Ok(None);
         }
         let _ = self
             .fire_hooks(crate::config::HookEvent::PreCompact, None, Some(reason))
@@ -164,31 +206,65 @@ impl Runner {
         {
             warn!(%error, "memory flush before compaction failed");
         }
-        let previous = sessions.current()?;
+        // 先完成 hook 与记忆提取，再处理取得分段名时的错误；保留压缩的副作用顺序。
+        let session_file = session_file?;
         let summary = self.summarize_for_compaction(&old).await?;
+        Ok(Some(PreparedCompaction {
+            snapshot,
+            cut: old.len(),
+            session_file,
+            summary,
+            reason: reason.to_owned(),
+        }))
+    }
 
+    /// 校验与替换共用同一把历史锁，确保校验过的快照前缀和追加的后缀正是写进新分段的来源。
+    async fn install_compaction(
+        &self,
+        prepared: PreparedCompaction,
+        history: &Mutex<Vec<AgentMessage>>,
+        sessions: &SessionStore,
+    ) -> Result<Option<(serde_json::Value, usize)>> {
+        let PreparedCompaction {
+            snapshot,
+            cut,
+            session_file,
+            summary,
+            reason,
+        } = prepared;
+        let mut current = history.lock().await;
+        if !current.starts_with(&snapshot) || sessions.current()?.file != session_file {
+            return Ok(None);
+        }
+        let suffix = &current[snapshot.len()..];
+        let appended = suffix.len();
         let summary_message = AgentMessage::System {
             text: format!(
-                "[checkpoint summary | previous_session=/sessions/{} | reason={reason}]\n\
-{summary}",
-                previous.file
+                "[checkpoint summary | previous_session=/sessions/{session_file} | reason={reason}]\n{summary}"
             ),
         };
         let mut new_history = vec![summary_message];
-        // 保留消息上的 `usage` 描述的是压缩前那段（已经不存在的）提示：留着它，
-        // `estimate_messages` 会拿它当基准，判定仍然超限，下次唤醒又压缩一次。
-        new_history.extend(keep.into_iter().map(|mut message| {
-            if let AgentMessage::Assistant(assistant) = &mut message {
-                assistant.usage = Default::default();
-            }
-            message
-        }));
+        // 保留窗口和后缀上的 `usage` 都描述压缩前的提示。留着它，估算会把已经不存在的
+        // 提示当作基准，下次唤醒可能又压缩一次；除此之外，后缀保持原样和原顺序。
+        new_history.extend(
+            snapshot[cut..]
+                .iter()
+                .chain(suffix)
+                .cloned()
+                .map(|mut message| {
+                    if let AgentMessage::Assistant(assistant) = &mut message {
+                        assistant.usage = Default::default();
+                    }
+                    message
+                }),
+        );
         new_history.extend(self.post_compact_context());
         // 关闭旧分段、建新分段、写入新历史是一步（`rotate_with`）：失败时当前分段还是旧的那个，
         // 内存里的历史也没动，下次照常重试。
         let next = sessions.rotate_with(&new_history)?;
         let kept_messages = new_history.len() - 1;
-        *history.lock().await = new_history;
+        *current = new_history;
+        drop(current);
         // 任何一次成功的压缩都把连续失败数清零，包括 agent 自己调用的 `agent.compact`：
         // 自动压缩停掉之后，agent 手动压缩成功一次就恢复，不必等人来重启进程。
         self.compaction_failures
@@ -203,13 +279,16 @@ impl Runner {
             )
             .await;
 
-        Ok(serde_json::json!({
-            "compacted": true,
-            "previous_session": previous.file,
-            "current_session": next.file,
-            "summary_bytes": summary.len(),
-            "kept_messages": kept_messages,
-        }))
+        Ok(Some((
+            serde_json::json!({
+                "compacted": true,
+                "previous_session": session_file,
+                "current_session": next.file,
+                "summary_bytes": summary.len(),
+                "kept_messages": kept_messages,
+            }),
+            appended,
+        )))
     }
 
     /// 自动压缩阈值：配置的工作集上限与模型窗口减去预留后的较小者。
