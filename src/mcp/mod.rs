@@ -203,6 +203,22 @@ impl McpClient {
         &self.tools
     }
 
+    /// 裸 I/O 错误既不指明服务器，也不提示它可能已退出；错误会出现在 agent 读取的
+    /// MCP 状态里，所以要带上这些信息。
+    async fn write_line(&mut self, line: &str) -> Result<()> {
+        async {
+            self.writer.write_all(line.as_bytes()).await?;
+            self.writer.flush().await
+        }
+        .await
+        .with_context(|| {
+            format!(
+                "cannot write to MCP server {:?} (it has probably exited)",
+                self.name
+            )
+        })
+    }
+
     /// 发送请求并等待同 id 的响应；通知与未知 id 被忽略。
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
@@ -215,8 +231,7 @@ impl McpClient {
         });
         let mut line = serde_json::to_string(&request)?;
         line.push('\n');
-        self.writer.write_all(line.as_bytes()).await?;
-        self.writer.flush().await?;
+        self.write_line(&line).await?;
 
         let mut buffer = String::new();
         let read = async {
@@ -275,9 +290,7 @@ impl McpClient {
             "method": "notifications/initialized",
         }))?;
         line.push('\n');
-        self.writer.write_all(line.as_bytes()).await?;
-        self.writer.flush().await?;
-        Ok(())
+        self.write_line(&line).await
     }
 
     async fn list_tools(&mut self) -> Result<Vec<McpToolInfo>> {
@@ -661,6 +674,7 @@ mod tests {
 
     /// 真实子进程：往 stderr 写了很多就退出的“服务器”——启动报失败而不是卡住；返回的错误
     /// （agent 能在 MCP 状态里读到）不带 stderr 的内容。
+    /// 报写入失败还是 stdout 关闭，取决于子进程是否在第一次写入前就已退出。
     #[tokio::test]
     async fn a_server_that_dies_at_startup_fails_without_its_stderr_in_the_error() {
         let script = if cfg!(windows) {
@@ -685,8 +699,27 @@ mod tests {
             .err()
             .expect("the handshake cannot succeed");
         let text = format!("{error:#}");
-        assert!(text.contains("closed its stdout"), "{text}");
+        assert!(
+            text.contains("closed its stdout")
+                || text.contains("cannot write to MCP server \"dying\""),
+            "{text}"
+        );
         assert!(!text.contains("stderr-detail"), "{text}");
+    }
+
+    /// 先关闭对端，使第一次写入一定失败，不依赖子进程的退出时机。
+    #[tokio::test]
+    async fn initialize_names_a_server_whose_stdin_is_closed() {
+        let (ours, theirs) = tokio::io::duplex(64);
+        drop(theirs);
+        let (r, w) = tokio::io::split(ours);
+        let mut client = McpClient::from_io(Box::new(r), Box::new(w), "gone".to_owned(), None);
+        let error = client.initialize().await.unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("cannot write to MCP server \"gone\""),
+            "{text}"
+        );
     }
 
     /// 截断只影响留下的内容，不影响读到哪里：超长行之后的那一行完整。
