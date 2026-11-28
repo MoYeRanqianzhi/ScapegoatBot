@@ -39,6 +39,15 @@
   以前启动时把目录下的任何文件都算成消息文件：系统或编辑器留下一个 `.DS_Store`、备份文件，
   磁盘上的文件数就永远比索引多一个，每次启动都判定索引过期、把全部历史重读一遍；
   `sbot doctor` 只数 `.jsonl`，报告的却是“一致”。现在两边都只数 `.jsonl`。
+- MCP 服务器一启动就退出时，报错不再只是一句 `Broken pipe (os error 32)`：现在是
+  `cannot write to MCP server "<名字>" (it has probably exited)`，指明是哪个服务器、多半是什么
+  原因。服务器退出得慢一点时报的是原来的 `closed its stdout`，两种意思相同。
+
+### 安全
+
+- 依赖升级：`url` 2.5.8 → 2.5.9（连带 `form_urlencoded` 1.2.2 → 1.2.3），修复
+  RUSTSEC-2026-0592：嵌套很多层的 `blob:` URL 会让 `Url::origin()` 栈溢出、整个进程退出。
+  sbot 自己的代码不调用 `Url::origin()`；升级是为了不带着有已知漏洞的版本发布。
 
 ### 变更
 

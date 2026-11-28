@@ -155,8 +155,12 @@ sbot resume          # 删除 ESTOP
 
 - 服务器启动失败只告警，不影响主进程：日志 `MCP server failed to start`（带服务器名与
   原因）。检查 `command` / `args` 能否在守护进程的环境里直接运行；
-- 服务器自己打印的报错紧跟在后面：`MCP server stderr before it failed:` 加它 stderr 的最后
-  20 行。运行中的 stderr 是 `debug` 级的 `MCP stderr: …`（`RUST_LOG=debug`）；
+- 服务器一启动就退出时，原因是下面两种之一，取决于它退出得有多快，意思相同：
+  `cannot write to MCP server "<名字>" (it has probably exited)`（第一次写请求时它已经退出），
+  或 `MCP server "<名字>" closed its stdout`（写进去了，等回复时它退出）；
+- 服务器自己打印的报错在这条告警**之前**：`MCP server stderr before it failed:` 加它 stderr 的
+  最后 20 行（服务器没打印任何东西时没有这一条）。运行中的 stderr 是 `debug` 级的
+  `MCP stderr: …`（`RUST_LOG=debug`）；
 - 单次请求 30 秒超时；结果被截断会显式标注。
 
 ## 命令报错

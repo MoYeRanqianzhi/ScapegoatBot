@@ -9,7 +9,7 @@
 
 - 子代理禁止运行任何 `cargo` 命令；构建只在主 checkout 用默认 `target/` 统一执行。
 - 不使用 C: 盘放构建产物；G: 空间不足时先清 worktree target / incremental，再报告。
-- 本机 cargo 访问 crates.io 的 TLS/schannel 失败；用 `target/scratch/cargo-rs.sh`（做法与
+- 本机 cargo 访问 crates.io 的 TLS/schannel 失败；用 `.agents/tools.local/cargo-rs.sh`（做法与
   工具位置见 `memory/cargo-network.local.md`），不要把镜像配置提交进仓库。
 - Bash 工具会吞掉一层反斜杠（heredoc 里 sed 的反向引用会变成控制字符）；含 `\` 的编辑用 Edit 工具
   （见 `memory/shell-editing.local.md`）。
@@ -30,11 +30,15 @@ PR 本身没有动——合并 / 关闭 PR 没有得到用户的授权；内容�
 
 ## 进行中（用户 2026-11-17 的决定，按这个顺序做）
 
-- [ ] **空闲预压缩**（用户选“加空闲预压缩”）：保留尾巴不变；到软阈值时在回合之外提前算好
-      摘要，回合边界采用；硬阈值保留同步压缩兜底。现在的 `compact_scope` 靠回合锁保证“快照
-      到替换之间没人追加”（见它的文档注释）；提前压缩在回合之外做摘要，这条前提不成立，必须
-      改成 codex 的做法——快照时记长度，采用时把之后追加的消息原样接回去。六个参考实现在
-      `.ref/` 下（grok-build、codex、hermes 是做了“无感”的三家）。
+2026-11-28 起写代码交给 Codex（用户的决定）：主代理写任务书、审查合并、写 skill / 文档 /
+CHANGELOG；Codex 写代码与测试、跑检查，并且边做边把决定记进对应的计划文件。每个任务在
+`codex/<任务>` 分支上做，审完快进合并。
+
+- [ ] **依赖：chrono 必须换掉**（用户 2026-11-28：RUSTSEC-2026-0543 宣布 chrono 不再维护，
+      “不支持了就一定不能用”；倾向 jiff，但要先核实合适）。CI 的 `deny` 在这之前一直是红的，
+      也就不能发版。同一批顺带审查其余直接依赖（维护状态、星数、有没有明显更好的替代品）。
+- [ ] **空闲预压缩**（用户选“加空闲预压缩”）：设计与不变量在
+      [`plan/2026-11-28-idle-precompaction.md`](plan/2026-11-28-idle-precompaction.md)。
 - [ ] **命名与可扩展性，A – E 全做**（用户选“按设计稿全做”）。设计、每步的边界与验证方式在
       [`plan/2026-11-17-channels-and-custom-actions.md`](plan/2026-11-17-channels-and-custom-actions.md)。
       每一步单独提交、单独验证；每一步都同步改 `skills/`，C 另加讲适配器的 skill。
